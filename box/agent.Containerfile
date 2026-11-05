@@ -2,8 +2,8 @@
 #   container build -f box/agent.Containerfile -t cred-agent box
 # halti pins the result by digest (name@sha256:...); a box's policy keeps that pin.
 # The image's name and the shim's (cred-shim, /usr/local/bin/cred-shim) are from before halti was
-# renamed from cred: box policies pin this image by digest, so they stay until the M1 workspace
-# migration (EMA-60). src/legacy.rs lists them.
+# renamed from cred: box policies pin this image by digest, so they stay until the workspace
+# migration. src/legacy.rs lists them.
 
 # The shim, the guest side of the door, built here: the Mac has no Linux target.
 FROM rust:1.92-slim-bookworm AS shim
