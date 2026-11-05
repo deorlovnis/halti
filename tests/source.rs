@@ -287,7 +287,7 @@ fn macos_block(path: &str, starts: &str) -> String {
 #[test]
 fn the_macos_only_code_is_frozen() {
     // Touch ID and the Keychain can't be built or run on the Linux host, so nothing changes them
-    // until the Mac adapters are written on a Mac (M1b), which updates these hashes.
+    // until the Mac adapters are written on a Mac, which updates these hashes.
     for (path, starts, sha256) in [
         ("src/approve.rs", "fn ask_person(", "b7b125f8ba2dabaa2481bdfea29cfc6d779a96ab8f3542fe7c9dadfb55db2bdf"),
         ("src/keychain.rs", "mod backend {", "c3d98940a584a9742da7b7320e60843eca9ea2387779635ef6027c2b3442a3b8"),

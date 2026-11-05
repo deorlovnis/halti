@@ -5,7 +5,7 @@
 #     --build-arg AGENT=cred-agent@sha256:<digest> box
 # A box uses it by pinning cred-agent-jvm@sha256:... as its `image`.
 # The image names are from before halti was renamed from cred: box policies pin them by digest,
-# so they stay until the M1 workspace migration (EMA-60). src/legacy.rs lists them.
+# so they stay until the workspace migration. src/legacy.rs lists them.
 
 ARG AGENT
 FROM ${AGENT}

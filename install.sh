@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 
 # Names from before halti was renamed from cred, which an existing install still depends on
 # (src/legacy.rs says what depends on each). The identifier is permanent; the rest move with
-# the M1 workspace migration (EMA-60).
+# the workspace migration.
 identifier=com.deorlovnis.cred
 old_identity="cred code signing"
 agent=cred-agent

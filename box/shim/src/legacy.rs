@@ -1,7 +1,7 @@
 //! The guest contract from before halti was renamed from cred: the shim's half of the names in
 //! halti's src/legacy.rs, which says what depends on each. Every agent image a box policy pins
 //! by digest has a shim built with these, and the host names them on the VM's command line, so
-//! they stay until the M1 workspace migration (EMA-60) re-pins the images.
+//! they stay until the workspace migration re-pins the images.
 
 /// This binary's name (`[[bin]]` of the crate), the VM's entrypoint and the command of the MCP
 /// server in box homes. Installed as /usr/local/bin/cred-shim.

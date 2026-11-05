@@ -4,7 +4,7 @@
 # halti pins the result by digest (name@sha256:...), like the agent image.
 # The image's name and the shim's (cred-shim, /usr/local/bin/cred-shim) are from before halti was
 # renamed from cred: the shim is the one the agent images carry, which box policies pin by
-# digest, so they stay until the M1 workspace migration (EMA-60). src/legacy.rs lists them.
+# digest, so they stay until the workspace migration. src/legacy.rs lists them.
 
 # The shim, the guest side of the door, built here: the Mac has no Linux target.
 FROM rust:1.92-slim-bookworm AS shim

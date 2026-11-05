@@ -1,5 +1,5 @@
 /target
-# local design notes with private examples
+# internal docs and planning stay out of this public repo
 /docs/
 /runner/node_modules
 /box/shim/target
