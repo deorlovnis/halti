@@ -352,7 +352,7 @@ pub fn exec_runner(vm: &str, env: &[(String, String)]) -> Result<Child> {
 }
 
 fn runner_command(vm: &str, env: &[(String, String)]) -> Result<Command> {
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(halti_dev))]
     if let Some((key, _)) = env.iter().find(|(key, _)| key.starts_with("HALTI_RUNNER_DEBUG") || key.starts_with(&format!("{}RUNNER_DEBUG", legacy::ENV_PREFIX))) {
         bail!("{key} is only for tests");
     }

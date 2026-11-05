@@ -26,6 +26,8 @@ mod legacy;
 
 const HALTI: &str = env!("CARGO_BIN_EXE_halti");
 const TOKEN: &str = "s3cret-token-value";
+/// Where a debug build keeps box stores under its home (`util::DEV_STORE_ROOT`).
+const DEV_STORE_ROOT: &str = "Library/Application Support/halti-dev";
 
 /// A private home for one test: index, policies and fake Keychain, removed when dropped.
 struct Env {
@@ -34,8 +36,9 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
-        // Only debug builds honor the test variables; a release build would use the real Keychain.
-        if !cfg!(debug_assertions) {
+        // Only debug-profile builds honor the test variables; a release build would use the real
+        // Keychain.
+        if !cfg!(halti_dev) {
             panic!("run the e2e tests with a debug build (no --release)");
         }
         static COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -111,9 +114,9 @@ fn stdout(out: &Output) -> String {
     text(&out.stdout)
 }
 
-/// What a failed command said, for assertion messages.
+/// What a command said on stderr, without the banner every debug build starts with.
 fn stderr(out: &Output) -> String {
-    text(&out.stderr)
+    text(&out.stderr).lines().filter(|l| !l.starts_with("halti: [DEV, not protected]")).map(|l| format!("{l}\n")).collect()
 }
 
 // --- an MCP client, as an agent's would talk to `halti mcp` ---
@@ -406,19 +409,6 @@ fn policy_edit_shows_a_diff_against_the_approved_version() {
     assert!(stdout(&edit(&env)).contains("no change from the approved policy"));
 }
 
-#[test]
-fn the_old_variable_names_still_point_at_the_index_and_policies() {
-    // Read when the HALTI_ one isn't set, so a shell that sets them from before the rename works.
-    let env = Env::new();
-    env.store("app", "token", TOKEN);
-    env.policy("app", "[run]\nmode = \"allow\"\nexport = { token = \"APP_TOKEN\" }\n");
-    let old = |suffix: &str| format!("{}{suffix}", legacy::ENV_PREFIX);
-    let mut cmd = env.command();
-    cmd.env_remove("HALTI_INDEX").env_remove("HALTI_POLICY_DIR").env(old("INDEX"), env.dir.join("index.json")).env(old("POLICY_DIR"), env.dir.join("policy"));
-    let ls = stdout(&cmd.arg("ls").output().unwrap());
-    assert!(ls.contains("app") && ls.contains("run:allow"), "{ls}");
-}
-
 // --- halti mcp ---
 
 #[test]
@@ -539,7 +529,7 @@ impl Env {
 
     /// The store of a box; the test's HOME holds it, so nothing lands in the real Library.
     fn box_store(&self, name: &str) -> PathBuf {
-        self.dir.join("home").join(legacy::STORE_ROOT).join("box").join(format!("{name}.sparsebundle"))
+        self.dir.join("home").join(DEV_STORE_ROOT).join("box").join(format!("{name}.sparsebundle"))
     }
 
     /// An "editor" that replaces the policy with `toml`.
@@ -692,7 +682,7 @@ fn box_login_signs_in_site_by_site_and_seals_each_session_in_the_box() {
     assert!(!stdout(&out).contains("signing in"));
 
     // A running box can't be signed in to: nothing may change a folder its VM has mounted.
-    let open_dir = env.dir.join("home").join(legacy::STORE_ROOT).join("box/open");
+    let open_dir = env.dir.join("home").join(DEV_STORE_ROOT).join("box/open");
     fs::create_dir_all(&open_dir).unwrap();
     let held = fs::OpenOptions::new().create(true).truncate(false).write(true).open(open_dir.join("research.lock")).unwrap();
     held.lock().unwrap();
@@ -775,7 +765,7 @@ fn box_import_export_and_log_go_through_touch_id_and_stay_in_the_box() {
     let out = env.boxed("true", &["import", "research", note.to_str().unwrap()]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("work/note.txt"), "{}", stdout(&out));
-    assert!(!env.dir.join("home").join(legacy::STORE_ROOT).join("box/open/research").exists(), "the store is closed again");
+    assert!(!env.dir.join("home").join(DEV_STORE_ROOT).join("box/open/research").exists(), "the store is closed again");
     assert!(
         !fs::read_dir(env.box_store("research").join("bands")).unwrap().any(|b| fs::read(b.unwrap().path()).unwrap().windows(9).any(|w| w == b"hello box")),
         "ciphertext at rest"

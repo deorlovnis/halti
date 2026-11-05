@@ -7,8 +7,8 @@
 //! encrypted with a key derived from the "Chrome Safe Storage" Keychain password.
 
 use std::cmp::Reverse;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::{env, fs};
 
 use aes::Aes128;
 use anyhow::{Context, Result, anyhow, bail};
@@ -105,7 +105,7 @@ fn firefox_profile() -> Result<PathBuf> {
     if let Some(p) = util::env_var("FIREFOX_PROFILE") {
         return Ok(p.into());
     }
-    let root = PathBuf::from(env::var_os("HOME").unwrap_or_default()).join("Library/Application Support/Firefox");
+    let root = home().join("Library/Application Support/Firefox");
     let ini = fs::read_to_string(root.join("profiles.ini")).context("reading Firefox profiles.ini")?;
     let rel = default_profile(&ini).context("no profile in Firefox profiles.ini")?;
     // Paths in profiles.ini are relative to it unless absolute.

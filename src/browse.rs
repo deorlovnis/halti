@@ -30,8 +30,8 @@ const RUNNER_DIR: &str = "/usr/local/lib/halti/runner";
 
 fn runner_dir() -> PathBuf {
     // Tests run a checkout's runner. Release builds don't contain this.
-    #[cfg(debug_assertions)]
-    if let Some(dir) = std::env::var_os("HALTI_RUNNER_DIR") {
+    #[cfg(halti_dev)]
+    if let Some(dir) = crate::util::dev_var("HALTI_RUNNER_DIR") {
         return dir.into();
     }
     PathBuf::from(RUNNER_DIR)

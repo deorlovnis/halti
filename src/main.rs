@@ -6,6 +6,11 @@
 //! fields `halti run` exports, how fields refresh, and what an agent may do through `halti mcp`.
 //! Agents never get the credentials themselves.
 
+// `halti_dev` (the test hooks) comes from build.rs, for the debug profile only; every other
+// profile gets `halti_release`. Both at once means `--cfg halti_dev` came from somewhere else.
+#[cfg(all(halti_dev, any(halti_release, not(debug_assertions))))]
+compile_error!("halti_dev is only for debug-profile builds: a release build or one without debug assertions must not have the test hooks");
+
 mod approve;
 mod audit;
 mod boxes;
@@ -43,6 +48,10 @@ use policy::Mode;
 use refresh::{auto_resources, refresh_due};
 
 const MASK: &[u8] = b"********";
+
+/// The target check.sh builds and tests this source on. x86_64 Linux and macOS aren't, until
+/// there is a machine to run them on.
+const VERIFIED: &str = "linux-aarch64";
 
 #[derive(Parser)]
 #[command(name = "halti", version, about = "Keychain-backed secrets for humans and agents")]
@@ -152,6 +161,9 @@ enum Cmd {
         #[command(subcommand)]
         action: BoxCmd,
     },
+    /// How this binary was built: whether it has the test hooks, its target, and where it keeps its files
+    #[command(name = "build-info", hide = true)]
+    BuildInfo,
 }
 
 #[derive(Subcommand)]
@@ -648,8 +660,26 @@ fn cmd_run(resources: Vec<String>, command: Vec<String>) -> Result<u8> {
     Ok(code as u8)
 }
 
+/// For installers and check.sh: a build to install must say that both flags are false.
+fn cmd_build_info() {
+    println!("debug_assertions={} halti_dev={}", cfg!(debug_assertions), cfg!(halti_dev));
+    println!("target={}", env!("BUILD_TARGET"));
+    println!("verified: {VERIFIED}");
+    println!("home={}", util::home().display());
+    println!("config={}", util::config_dir().display());
+    println!("store={}", util::store_root().display());
+}
+
 fn main() -> ExitCode {
     util::blocking_stdio();
+    // Without an absolute home, every path halti uses would be relative to the current folder.
+    if !util::home().is_absolute() {
+        eprintln!("halti: no home folder in your passwd entry");
+        return ExitCode::FAILURE;
+    }
+    // Always, so a debug build can't pass for an installed one.
+    #[cfg(halti_dev)]
+    eprintln!("halti: [DEV, not protected] a debug build: test variables can answer its prompts, and it keeps its files in {}", util::config_dir().display());
     let ok = |r: Result<()>| r.map(|_| 0);
     let result = match Cli::parse().cmd {
         Cmd::Set { resource, field, expires, meta } => ok(cmd_set(&resource, &field, expires, meta)),
@@ -683,6 +713,10 @@ fn main() -> ExitCode {
             BoxCmd::Login { name, site, all } => ok(boxes::login(&name, site.as_deref(), all)),
             BoxCmd::Rm { name } => ok(boxes::rm(&name)),
         },
+        Cmd::BuildInfo => {
+            cmd_build_info();
+            Ok(0)
+        }
     };
     match result {
         Ok(code) => ExitCode::from(code),

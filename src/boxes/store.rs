@@ -22,8 +22,7 @@ use jiff::Timestamp;
 use serde_json::json;
 
 use crate::chain::Chain;
-use crate::legacy;
-use crate::util::home;
+use crate::util::store_root;
 
 /// The most a store can hold; the bundle grows as needed and starts small.
 const SIZE: &str = "100g";
@@ -35,21 +34,24 @@ const CA_FILE: &str = "door/ca.sealed";
 
 /// Where a box's files live on the Mac. `real()` is the user's; tests build their own.
 pub struct Layout {
-    /// Stores, mount points and locks: box/ under the store root (`legacy::STORE_ROOT`)
+    /// Stores, mount points and locks: box/ under the store root (`util::store_root`)
     pub root: PathBuf,
     /// The sockets the VMs publish, in a short path (104-byte limit): /tmp/halti-<uid>
+    /// (/tmp/halti-dev-<uid> for debug builds)
     pub sockets: PathBuf,
     uid: u32,
 }
 
 impl Layout {
     pub fn real() -> Result<Self> {
-        let home = home();
-        if !home.is_absolute() {
-            bail!("HOME isn't set");
+        let root = store_root();
+        if !root.is_absolute() {
+            bail!("no home folder");
         }
         let uid = uid()?;
-        Ok(Self { root: home.join(legacy::STORE_ROOT).join("box"), sockets: PathBuf::from(format!("/tmp/halti-{uid}")), uid })
+        // Debug builds' VMs publish their sockets apart from an installed halti's.
+        let sockets = PathBuf::from(format!("/tmp/{}-{uid}", if cfg!(halti_dev) { "halti-dev" } else { "halti" }));
+        Ok(Self { root: root.join("box"), sockets, uid })
     }
 
     #[cfg(test)]

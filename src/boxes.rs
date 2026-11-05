@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use crate::chain::{self, Chain};
 use crate::door::inspect::parse_prefix;
 use crate::policy::{self, Approval, Mode, Site, Status};
-use crate::util::{config_dir, env_var, expand_home, home};
+use crate::util::{config_dir, expand_home, home, store_root};
 use crate::{approve, engine, keychain, legacy, parse_env, parse_resource};
 pub use login::login;
 use store::Layout;
@@ -64,7 +64,12 @@ pub fn parse_name(s: &str) -> Result<String, String> {
 }
 
 pub fn dir() -> PathBuf {
-    env_var("BOX_DIR").map(PathBuf::from).unwrap_or_else(|| config_dir().join("box"))
+    // Tests keep their box policies apart. Release builds don't contain this.
+    #[cfg(halti_dev)]
+    if let Some(dir) = crate::util::dev_var("HALTI_BOX_DIR") {
+        return dir.into();
+    }
+    config_dir().join("box")
 }
 
 pub fn path(name: &str) -> PathBuf {
@@ -211,7 +216,7 @@ pub fn mount_problem(path: &Path) -> Option<String> {
     if path == Path::new("/") || path == home() {
         return Some("is too broad".into());
     }
-    [config_dir(), home().join(legacy::STORE_ROOT)].iter().any(|own| path.starts_with(own) || own.starts_with(path)).then(|| "holds halti's own files".into())
+    [config_dir(), store_root()].iter().any(|own| path.starts_with(own) || own.starts_with(path)).then(|| "holds halti's own files".into())
 }
 
 impl BoxPolicy {
@@ -867,14 +872,7 @@ mod tests {
 
     #[test]
     fn keeps_halti_s_own_folders_out_of_boxes() {
-        for path in [
-            home(),
-            config_dir(),
-            config_dir().join("policy"),
-            home().join(".config"),
-            home().join(legacy::STORE_ROOT).join("box/open/x"),
-            home().join("Library/Application Support"),
-        ] {
+        for path in [home(), config_dir(), config_dir().join("policy"), home().join(".config"), store_root().join("box/open/x"), home().join("Library/Application Support")] {
             let text = format!("[[mount]]\npath = \"{}\"", path.display());
             let e = err(&text);
             assert!(e.contains("too broad") || e.contains("halti's own"), "{text}: {e}");

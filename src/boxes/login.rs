@@ -122,12 +122,16 @@ pub fn login(name: &str, only: Option<&str>, all: bool) -> Result<()> {
 /// A window on the Mac. Debug builds can name a stand-in program (without a window), so tests
 /// need no screen.
 fn headed() -> bool {
-    !(cfg!(debug_assertions) && std::env::var_os("HALTI_TEST_LOGIN_RUNNER").is_some())
+    #[cfg(halti_dev)]
+    if crate::util::dev_var("HALTI_TEST_LOGIN_RUNNER").is_some() {
+        return false;
+    }
+    true
 }
 
 fn spawn() -> Result<Child> {
-    #[cfg(debug_assertions)]
-    if let Some(script) = std::env::var_os("HALTI_TEST_LOGIN_RUNNER") {
+    #[cfg(halti_dev)]
+    if let Some(script) = crate::util::dev_var("HALTI_TEST_LOGIN_RUNNER") {
         return std::process::Command::new("node")
             .arg(script)
             .stdin(std::process::Stdio::piped())
