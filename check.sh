@@ -22,6 +22,10 @@ cargo clippy --all-targets -- -D warnings
 step tests
 cargo test
 
+# Again with their output, to show which escape tests ran here and which were skipped.
+step "escape tests"
+cargo test --test sandbox -- --nocapture --test-threads=1 2>&1 | grep -oE 'escape test (ran|skipped): .*|test result: .*'
+
 step "release check"
 cargo check --release
 
