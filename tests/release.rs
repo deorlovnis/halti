@@ -162,10 +162,20 @@ fn no_variable_moves_the_index_the_policies_the_boxes_or_the_keychain() {
     fs::write(dirs.path("hooks/policy/hooked.toml"), "[run]\nmode = \"allow\"\n").unwrap();
     fs::write(dirs.path("hooks/box/hookedbox.toml"), "about = \"a box\"\n").unwrap();
 
+    // What the passwd home has, so the release binary is seen reading somewhere.
+    fs::write(dirs.path("home/.config/cred/index.json"), r#"{"passwdres":{"fields":{"token":{}}}}"#).unwrap();
+    fs::create_dir_all(dirs.path("home/.config/cred/box")).unwrap();
+    fs::write(dirs.path("home/.config/cred/box/passwdbox.toml"), "about = \"a box\"\n").unwrap();
+
     let release = release();
     let debug = Path::new(DEBUG);
-    let ls = |bin: &Path| text(&dirs.run(bin, &["ls"]).stdout);
-    assert!(!ls(&release).contains("hooked"), "{}", ls(&release));
+    let ls = |bin: &Path| {
+        let out = dirs.run(bin, &["ls"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    let said = ls(&release);
+    assert!(said.contains("passwdres") && !said.contains("hooked"), "{said}");
     assert!(ls(debug).contains("hooked"), "{}", ls(debug));
 
     let copy = |bin: &Path| text(&dirs.run(bin, &["copy", "hooked", "token"]).stderr);
@@ -176,7 +186,37 @@ fn no_variable_moves_the_index_the_policies_the_boxes_or_the_keychain() {
     assert!(shown(&release).contains("no policy yet"), "{}", shown(&release));
     assert!(shown(debug).contains("mode = \"allow\""), "{}", shown(debug));
 
-    let boxes = |bin: &Path| text(&dirs.run(bin, &["box", "ls"]).stdout);
-    assert!(!boxes(&release).contains("hookedbox"), "{}", boxes(&release));
+    let boxes = |bin: &Path| {
+        let out = dirs.run(bin, &["box", "ls"]);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    let said = boxes(&release);
+    assert!(said.contains("passwdbox") && !said.contains("hookedbox"), "{said}");
     assert!(boxes(debug).contains("hookedbox"), "{}", boxes(debug));
+}
+
+#[test]
+#[ignore = "needs a ci-release binary: HALTI_RELEASE_BIN=<path>, as check.sh sets"]
+fn without_a_passwd_home_nothing_runs() {
+    // A uid with no passwd entry, as in a container run with `--user N`: its home would be empty,
+    // and every path relative to the current folder, where these planted files are.
+    let dirs = Dirs::new();
+    let cwd = dirs.path("cwd");
+    fs::create_dir_all(cwd.join(".config/cred/policy")).unwrap();
+    fs::write(cwd.join(".config/cred/index.json"), r#"{"planted":{"fields":{"token":{}}}}"#).unwrap();
+    fs::write(cwd.join(".config/cred/policy/planted.toml"), "[run]\nmode = \"allow\"\n").unwrap();
+    for args in [&["ls"][..], &["policy", "show", "planted"], &["build-info"]] {
+        let out = Command::new("unshare")
+            .args(["-U", "--map-user=4242", "--map-group=4242", "--"])
+            .arg(release())
+            .args(args)
+            .current_dir(&cwd)
+            .env_remove("HOME")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let said = format!("{}{}", text(&out.stdout), text(&out.stderr));
+        assert!(!out.status.success() && said.contains("no home folder") && !said.contains("planted"), "{args:?}: {said}");
+    }
 }

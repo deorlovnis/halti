@@ -6,9 +6,10 @@
 //! fields `halti run` exports, how fields refresh, and what an agent may do through `halti mcp`.
 //! Agents never get the credentials themselves.
 
-// `halti_dev` (the test hooks) comes from build.rs, for the debug profile only.
-#[cfg(all(halti_dev, not(debug_assertions)))]
-compile_error!("halti_dev is only for debug builds: a build without debug assertions must not have the test hooks");
+// `halti_dev` (the test hooks) comes from build.rs, for the debug profile only; every other
+// profile gets `halti_release`. Both at once means `--cfg halti_dev` came from somewhere else.
+#[cfg(all(halti_dev, any(halti_release, not(debug_assertions))))]
+compile_error!("halti_dev is only for debug-profile builds: a release build or one without debug assertions must not have the test hooks");
 
 mod approve;
 mod audit;
@@ -671,6 +672,11 @@ fn cmd_build_info() {
 
 fn main() -> ExitCode {
     util::blocking_stdio();
+    // Without an absolute home, every path halti uses would be relative to the current folder.
+    if !util::home().is_absolute() {
+        eprintln!("halti: no home folder in your passwd entry");
+        return ExitCode::FAILURE;
+    }
     // Always, so a debug build can't pass for an installed one.
     #[cfg(halti_dev)]
     eprintln!("halti: [DEV, not protected] a debug build: test variables can answer its prompts, and it keeps its files in {}", util::config_dir().display());

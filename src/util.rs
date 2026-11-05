@@ -21,13 +21,15 @@ pub const DEV_CONFIG_DIR: &str = ".config/halti-dev";
 pub const DEV_STORE_ROOT: &str = "Library/Application Support/halti-dev";
 
 /// The home folder. Release builds take it from the passwd entry and ignore `HOME`, so the
-/// environment can't move halti's files; debug builds honour `HOME`, which tests set.
+/// environment can't move halti's files; debug builds honour `HOME`, which tests set. Empty when
+/// there's no absolute one (a uid without a passwd entry), and then `main` refuses to run, since
+/// every path would be relative to the current folder.
 pub fn home() -> PathBuf {
     #[cfg(halti_dev)]
-    if let Some(home) = env::var_os("HOME").filter(|h| !h.is_empty()) {
-        return home.into();
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from).filter(|h| h.is_absolute()) {
+        return home;
     }
-    passwd_home().unwrap_or_default()
+    passwd_home().filter(|h| h.is_absolute()).unwrap_or_default()
 }
 
 /// The home folder in the passwd entry of the user halti runs as.

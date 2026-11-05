@@ -71,13 +71,26 @@ const OTHER_LITERALS: &[&str] = &[
     "\"HALTI_RUNNER_DEBUG\"",
 ];
 
-/// Other variables release code outside util.rs reads, and why.
-const OTHER_VARIABLES: &[&str] = &[
+/// Other variables release code reads directly, and why: each file's reads, as the text from
+/// `env::var` up to the closing parenthesis.
+const OTHER_VARIABLES: &[(&str, &str)] = &[
     // keychain: the account of the Keychain items.
-    "\"USER\"",
+    ("src/keychain.rs", "env::var(\"USER\")"),
     // policy edit and box edit: the editor to run.
-    "\"VISUAL\"",
-    "\"EDITOR\"",
+    ("src/policy.rs", "env::var(\"VISUAL\")"),
+    ("src/policy.rs", "env::var(\"EDITOR\")"),
+    // util::home, in debug builds only (checked below).
+    ("src/util.rs", "env::var_os(\"HOME\")"),
+    // util::env_var, which reads the names on the release list.
+    ("src/util.rs", "env::var_os)"),
+    // util::dev_var, which only debug builds have.
+    ("src/util.rs", "env::var_os(name)"),
+];
+
+/// Reads of that list only debug builds have: the code each must follow, `#[cfg(halti_dev)]` and all.
+const DEV_ONLY_READS: &[(&str, &str, &str)] = &[
+    ("src/util.rs", "env::var_os(\"HOME\")", "#[cfg(halti_dev)]\n    if let Some(home) = "),
+    ("src/util.rs", "env::var_os(name)", "#[cfg(halti_dev)]\npub fn dev_var(name: &str) -> Option<OsString> {\n    "),
 ];
 
 fn root() -> PathBuf {
@@ -173,10 +186,10 @@ fn names(text: &str) -> Vec<String> {
 #[test]
 fn no_hook_is_keyed_to_debug_assertions() {
     // A release profile can turn debug assertions on; `halti_dev` only comes with the debug
-    // profile. main.rs keeps two: the guard against `halti_dev` without debug assertions, and
-    // what `build-info` prints.
+    // profile. main.rs keeps two: the guard against `halti_dev` in a release-profile build or one
+    // without debug assertions, and what `build-info` prints.
     let allowed = [
-        ("src/main.rs", "#[cfg(all(halti_dev, not(debug_assertions)))]"),
+        ("src/main.rs", "#[cfg(all(halti_dev, any(halti_release, not(debug_assertions))))]"),
         ("src/main.rs", "println!(\"debug_assertions={} halti_dev={}\", cfg!(debug_assertions), cfg!(halti_dev));"),
     ];
     let mut found = Vec::new();
@@ -220,15 +233,21 @@ fn release_code_reads_only_the_listed_variables() {
         if code.contains("ENV_PREFIX") && !["src/util.rs", "src/engine.rs", "src/legacy.rs"].contains(&path.as_str()) {
             problems.push(format!("{path}: uses legacy::ENV_PREFIX"));
         }
-        if path == "src/util.rs" {
-            continue;
+        // `env::var`, `var_os`, `vars` and `vars_os`, called or passed as a function.
+        for (at, _) in code.match_indices("env::var") {
+            let rest = &code[at..];
+            let read = &rest[..rest.find(')').map_or(rest.len(), |end| end + 1)];
+            if !OTHER_VARIABLES.contains(&(path.as_str(), read)) {
+                problems.push(format!("{path}: {read}"));
+            } else if let Some((.., before)) = DEV_ONLY_READS.iter().find(|(p, r, _)| (*p, *r) == (path.as_str(), read))
+                && !code[..at].ends_with(before)
+            {
+                problems.push(format!("{path}: {read} isn't under #[cfg(halti_dev)] as listed"));
+            }
         }
-        for call in ["env::var(", "env::var_os(", "env::vars"] {
-            for (at, _) in code.match_indices(call) {
-                let arg = &code[at + call.len()..];
-                if !OTHER_VARIABLES.iter().any(|v| arg.starts_with(v)) {
-                    problems.push(format!("{path}: {call}{}", &arg[..arg.find(')').unwrap_or(0)]));
-                }
+        for call in ["getenv(", "secure_getenv("] {
+            if code.contains(call) {
+                problems.push(format!("{path}: {call}"));
             }
         }
     }
