@@ -278,16 +278,6 @@ fn run_exports_fields_and_masks_them_in_output() {
 }
 
 #[test]
-fn run_loads_resources_from_a_credfile() {
-    let env = Env::new();
-    env.store("app", "token", TOKEN);
-    env.policy("app", "[run]\nmode = \"allow\"\nexport = { token = \"APP_TOKEN\" }\n");
-    fs::write(env.dir.join(".cred"), "# resources for this repo\napp\n").unwrap();
-    let out = env.halti(&["run", "--", "sh", "-c", "echo $APP_TOKEN"]);
-    assert_eq!(stdout(&out), "********\n", "{}", stderr(&out));
-}
-
-#[test]
 fn run_refuses_policies_that_are_not_approved_or_not_permissive() {
     let env = Env::new();
     env.store("app", "token", TOKEN);

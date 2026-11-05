@@ -31,7 +31,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
-use std::{env, fs, thread};
+use std::thread;
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::{Context, Result, bail};
@@ -122,11 +122,10 @@ enum Cmd {
         field: String,
     },
     /// Run CMD with the fields the policies export, values masked in its output
-    #[command(after_help = "Each resource's policy decides: [run] mode = allow, ask (Touch ID) or deny. \
-                            Also loads resource names listed in ./.cred (one per line, # comments ok), \
-                            searching upward from the current directory.")]
+    #[command(after_help = "Name each resource with -s RESOURCE (at least one; repeat for more). \
+                            Each resource's policy decides: [run] mode = allow, ask (Touch ID) or deny.")]
     Run {
-        #[arg(short = 's', long = "secret", value_name = "RESOURCE", value_parser = parse_resource)]
+        #[arg(short = 's', long = "secret", value_name = "RESOURCE", required = true, value_parser = parse_resource)]
         resources: Vec<String>,
         #[arg(last = true, required = true, value_name = "CMD")]
         command: Vec<String>,
@@ -585,19 +584,6 @@ fn cmd_reseal(resources: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn find_credfile() -> Option<PathBuf> {
-    let mut dir = env::current_dir().ok()?;
-    loop {
-        let f = dir.join(".cred");
-        if f.is_file() {
-            return Some(f);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
 /// Copy src to dst line by line, replacing every secret value with ********.
 fn pump(src: impl Read, mut dst: impl Write, ac: &AhoCorasick) {
     let reps = vec![MASK; ac.patterns_len()];
@@ -615,18 +601,7 @@ fn pump(src: impl Read, mut dst: impl Write, ac: &AhoCorasick) {
     }
 }
 
-fn cmd_run(mut resources: Vec<String>, command: Vec<String>) -> Result<u8> {
-    if let Some(f) = find_credfile() {
-        for line in fs::read_to_string(&f)?.lines() {
-            let n: String = line.split('#').next().unwrap_or("").split_whitespace().collect();
-            if !n.is_empty() {
-                resources.push(parse_resource(&n).map_err(|e| anyhow::anyhow!("{}: '{n}': {e}", f.display()))?);
-            }
-        }
-    }
-    if resources.is_empty() {
-        bail!("no resources requested (use -s RESOURCE or a .cred file)");
-    }
+fn cmd_run(resources: Vec<String>, command: Vec<String>) -> Result<u8> {
     // A failed refresh is reported; the stored value is still tried.
     refresh_due(&resources, false, false);
 

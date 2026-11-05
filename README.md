@@ -68,7 +68,7 @@ halti check                                  # expired / expiring within 14 days
 halti audit                                  # what agents did through halti mcp (never values)
 ```
 
-`halti copy RES FIELD` asks for Touch ID. `halti describe RES` edits the link and description, and `halti rm RES [FIELD]` deletes. Put resource names (one per line) in a `.cred` file in a repo and `halti run -- CMD` loads them. `halti --help` lists everything.
+`halti copy RES FIELD` asks for Touch ID. `halti describe RES` edits the link and description, and `halti rm RES [FIELD]` deletes. `halti --help` lists everything.
 
 ## Policies
 
