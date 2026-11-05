@@ -79,6 +79,8 @@ const OTHER_VARIABLES: &[(&str, &str)] = &[
     // policy edit and box edit: the editor to run.
     ("src/policy.rs", "env::var(\"VISUAL\")"),
     ("src/policy.rs", "env::var(\"EDITOR\")"),
+    // sandbox: the terminal type a box's command is given.
+    ("src/sandbox.rs", "env::var_os(\"TERM\")"),
     // util::home, in debug builds only (checked below).
     ("src/util.rs", "env::var_os(\"HOME\")"),
     // util::env_var, which reads the names on the release list.

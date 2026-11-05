@@ -28,6 +28,8 @@ mod mask;
 mod mcp;
 mod policy;
 mod refresh;
+#[cfg(all(halti_dev, target_os = "linux"))]
+mod sandbox;
 mod seal;
 mod util;
 
@@ -164,6 +166,15 @@ enum Cmd {
     /// How this binary was built: whether it has the test hooks, its target, and where it keeps its files
     #[command(name = "build-info", hide = true)]
     BuildInfo,
+    /// Makes a sandbox's namespaces and runs CMD in it: what `box sh --engine sandbox` starts
+    #[cfg(all(halti_dev, target_os = "linux"))]
+    #[command(name = "__sandbox-init", hide = true)]
+    SandboxInit {
+        #[arg(long = "tool", value_name = "PATH")]
+        tools: Vec<PathBuf>,
+        #[arg(last = true, required = true, value_name = "CMD")]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -243,6 +254,18 @@ Closing a window (or Enter) takes the session; Ctrl-C skips that site. --all sig
     Rm {
         #[arg(value_parser = boxes::parse_name)]
         name: String,
+    },
+    /// A shell, or CMD, in a new sandbox with no store, door or policy (debug builds on Linux)
+    #[cfg(all(halti_dev, target_os = "linux"))]
+    Sh {
+        /// The only one yet: a rootless kernel sandbox
+        #[arg(long, value_parser = ["sandbox"])]
+        engine: String,
+        /// A host file or folder the box may run, read-only at the same path (claude is one already)
+        #[arg(long = "tool", value_name = "PATH")]
+        tools: Vec<PathBuf>,
+        #[arg(last = true, value_name = "CMD")]
+        command: Vec<String>,
     },
 }
 
@@ -712,11 +735,15 @@ fn main() -> ExitCode {
             BoxCmd::Import { name, path } => ok(boxes::import(&name, &path)),
             BoxCmd::Login { name, site, all } => ok(boxes::login(&name, site.as_deref(), all)),
             BoxCmd::Rm { name } => ok(boxes::rm(&name)),
+            #[cfg(all(halti_dev, target_os = "linux"))]
+            BoxCmd::Sh { engine: _, tools, command } => sandbox::sh(tools, command),
         },
         Cmd::BuildInfo => {
             cmd_build_info();
             Ok(0)
         }
+        #[cfg(all(halti_dev, target_os = "linux"))]
+        Cmd::SandboxInit { tools, command } => sandbox::init(&tools, &command),
     };
     match result {
         Ok(code) => ExitCode::from(code),
