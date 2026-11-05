@@ -818,6 +818,7 @@ pub fn offer_approval(p: &Path, approve_cmd: &str, approve_now: impl FnOnce() ->
 }
 
 /// The policy `policy edit` starts from. CONFIG becomes the config folder, RES the resource.
+/// The `run` line's comment lines up with the others once CONFIG is expanded.
 const TEMPLATE: &str = r#"# halti policy for RES. It takes effect only once approved: halti policy approve RES
 
 [run]
@@ -829,7 +830,7 @@ consent = "session"    # session: Touch ID once per agent session | none
 consent_minutes = 240  # a session consent lapses after this long (0: only when the agent disconnects)
 
 # [refresh.token]
-# run = "~/CONFIG/refresh/RES.sh"           # prints a fresh value; gets the fields that
+# run = "~/CONFIG/refresh/RES.sh"     # prints a fresh value; gets the fields that
 #                                           # aren't exported as HALTI_<FIELD>
 # from = "firefox:https://example.com#key"  # or: read it from Firefox Local Storage
 #                                           # (firefox-cookie:… and chrome-cookie:… read a cookie)

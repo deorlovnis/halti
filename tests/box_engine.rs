@@ -12,6 +12,9 @@ mod engine;
 #[path = "../src/legacy.rs"]
 #[allow(dead_code)] // the engine uses a few
 mod legacy;
+#[path = "../box/shim/src/legacy.rs"]
+#[allow(dead_code)]
+mod shim_legacy;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -148,6 +151,15 @@ fn sh(vm: &str, env: &[(String, String)], script: &str) -> (bool, String) {
     let out = engine::exec_command(vm, env, &cmd, false).stdin(Stdio::null()).output().unwrap();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     (out.status.success(), text.trim().to_string())
+}
+
+/// The host and the shim keep separate copies of the guest names; they have to say the same.
+#[test]
+fn host_and_shim_agree_on_the_guest_names() {
+    assert_eq!(
+        (legacy::SHIM, legacy::DOOR_SOCKET, legacy::LOCAL_SOCKET, legacy::DOOR_KIND),
+        (shim_legacy::SHIM, shim_legacy::DOOR_SOCKET, shim_legacy::LOCAL_SOCKET, shim_legacy::DOOR_KIND)
+    );
 }
 
 #[test]

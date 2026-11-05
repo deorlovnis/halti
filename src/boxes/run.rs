@@ -958,7 +958,20 @@ mod tests {
         assert_eq!(fake.calls(), ["bearer: anthropic", "exec"], "no second VM");
         assert_eq!(fake.seen.lock().unwrap().exec_vm.as_deref(), Some(old.as_str()));
         assert_eq!(vm_names("r"), ["halti-box-r".to_string(), old]);
+        // Joining doesn't install the CA again, so it's named where the old binary put it.
+        let (env, _, _) = fake.seen.lock().unwrap().exec.clone().unwrap();
+        assert!(env.contains(&("NODE_EXTRA_CA_CERTS".into(), legacy::CA_CERT.into())), "{env:?}");
         drop(held);
+    }
+
+    #[test]
+    fn stops_a_browser_vm_left_under_its_name_from_before_the_rename() {
+        let s = setup();
+        let p = policy(&s, "");
+        let fake = Fake { running: Mutex::new(true), only: Some(engine::legacy_browser_vm_name("r")), unavailable: true, ..Fake::default() };
+        assert!(run(&s.layout, &fake, &request(&s, &p, false)).is_err());
+        assert_eq!(fake.calls(), ["stop_vm", "available"]);
+        assert_put_away(&s);
     }
 
     #[test]

@@ -35,9 +35,9 @@ const DOOR_SOCKET: &str = legacy::DOOR_SOCKET;
 /// What the box holds in place of the model key; the door's gateway swaps in the real one.
 /// Same value as the door's `STANDIN`.
 const STANDIN: &str = legacy::STANDIN;
-/// Where the box CA is installed in the VM, and the bundle `update-ca-certificates` builds from it
-/// and the system's roots.
-pub const CA_CERT: &str = "/usr/local/share/ca-certificates/halti-box.crt";
+/// Where the box CA is installed in the VM (under its name from before the rename, see `legacy`),
+/// and the bundle `update-ca-certificates` builds from it and the system's roots.
+pub const CA_CERT: &str = legacy::CA_CERT;
 const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 /// The browser VM's image, and what it holds: where the runner is, the user's home (Chromium runs
 /// as the image's user 1000), and where the Mac's downloads folder appears.

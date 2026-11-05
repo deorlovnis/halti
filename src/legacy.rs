@@ -115,3 +115,34 @@ pub const MCP_SERVER_KEY: &str = "cred";
 /// box cred started instead of starting a second VM for it. Move with EMA-60.
 pub const BOX_VM_PREFIX: &str = "cred-box-";
 pub const BROWSER_VM_PREFIX: &str = "cred-browser-";
+
+/// Where the box CA is installed in the agent's VM, which NODE_EXTRA_CA_CERTS names. A box cred
+/// started has it only there, and halti joins such a box without installing the CA again, so
+/// the path stays. Moves with EMA-60.
+pub const CA_CERT: &str = "/usr/local/share/ca-certificates/cred-box.crt";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Byte for byte: each of these is a key label, a Keychain or disk name, or baked into a
+    /// pinned image, so any edit loses data or breaks boxes (see above).
+    #[test]
+    fn the_kept_names_are_unchanged() {
+        assert_eq!(SEAL_LABEL, b"cred box key v1");
+        assert_eq!(LOG_KEY_LABEL, b"cred box key derivation stub\0");
+        assert_eq!(MASK_KEYWORD, "cred");
+        assert_eq!(CODESIGN_IDENTIFIER, "com.deorlovnis.cred");
+        assert_eq!(KEYCHAIN_PREFIX, "cred:");
+        assert_eq!(CONFIG_DIR, ".config/cred");
+        assert_eq!(STORE_ROOT, "Library/Application Support/cred");
+        assert_eq!(ENV_PREFIX, "CRED_");
+        assert_eq!(SIGN_IDENTITY, "cred code signing");
+        assert_eq!([AGENT_IMAGE, AGENT_IMAGE_JVM, AGENT_IMAGE_RUST, BROWSER_IMAGE], ["cred-agent", "cred-agent-jvm", "cred-agent-rust", "cred-browser"]);
+        assert_eq!((SHIM, SHIM_PATH), ("cred-shim", "/usr/local/bin/cred-shim"));
+        assert_eq!((DOOR_SOCKET, LOCAL_SOCKET, DOOR_KIND), ("/run/cred/door.sock", "/run/cred/local.sock", "cred"));
+        assert_eq!((STANDIN, MCP_SERVER_KEY), ("cred-managed", "cred"));
+        assert_eq!((BOX_VM_PREFIX, BROWSER_VM_PREFIX), ("cred-box-", "cred-browser-"));
+        assert_eq!(CA_CERT, "/usr/local/share/ca-certificates/cred-box.crt");
+    }
+}

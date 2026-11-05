@@ -17,11 +17,15 @@ agent=cred-agent
 browser=cred-browser
 config="$HOME/.config/cred"
 
-# HALTI_SIGN_IDENTITY, else CRED_SIGN_IDENTITY, else "halti code signing" if it exists, else the old one.
+# HALTI_SIGN_IDENTITY, else CRED_SIGN_IDENTITY, else "halti code signing", unless only the old
+# one exists.
 identity="${HALTI_SIGN_IDENTITY:-${CRED_SIGN_IDENTITY:-}}"
 if [ -z "$identity" ]; then
   identity="halti code signing"
-  security find-identity -p codesigning | grep -qF "\"$identity\"" || identity="$old_identity"
+  if ! security find-identity -p codesigning | grep -qF "\"$identity\"" &&
+    security find-identity -p codesigning | grep -qF "\"$old_identity\""; then
+    identity="$old_identity"
+  fi
 fi
 dest=/usr/local/bin/halti
 

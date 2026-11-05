@@ -310,6 +310,44 @@ fn run_in_ask_mode_follows_the_touch_id_answer() {
     assert!(!out.status.success() && stdout(&out).is_empty(), "nothing runs when Touch ID is refused");
 }
 
+#[test]
+fn run_needs_a_resource_and_ignores_a_cred_file() {
+    let env = Env::new();
+    env.store("app", "token", TOKEN);
+    env.policy("app", "[run]\nmode = \"allow\"\nexport = { token = \"APP_TOKEN\" }\n");
+    // A repo file named resources for `run` before the rename; it's read no more.
+    fs::write(env.dir.join(".cred"), "app\n").unwrap();
+    let out = env.halti(&["run", "--", "sh", "-c", "echo $APP_TOKEN"]);
+    assert!(!out.status.success() && stderr(&out).contains("--secret <RESOURCE>"), "{}", stderr(&out));
+    assert!(stdout(&out).is_empty());
+}
+
+// --- halti refresh ---
+
+#[test]
+fn refresh_scripts_get_the_fields_under_both_names() {
+    let env = Env::new();
+    env.store("app", "login", "someone");
+    env.store("app", "token", "old");
+    // Scripts approved before the rename read the old names; their bytes are pinned.
+    let old = |suffix: &str| format!("{}{suffix}", legacy::ENV_PREFIX);
+    let script = env.dir.join("refresh.sh");
+    fs::write(&script, format!("#!/bin/sh\nprintf '%s-%s-%s-%s' \"$HALTI_LOGIN\" \"${}\" \"$HALTI_REFRESHING\" \"${}\"\n", old("LOGIN"), old("REFRESHING"))).unwrap();
+    env.policy("app", &format!("[refresh.token]\nrun = \"{}\"\n", script.display()));
+    let token = || fs::read_to_string(env.dir.join("keychain/app.token")).unwrap();
+
+    // A halti inside a refresh script refreshes nothing, whichever name says so.
+    for var in ["HALTI_REFRESHING".to_string(), old("REFRESHING")] {
+        let out = env.command().args(["refresh", "app", "--force"]).env(&var, "app").output().unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(token(), "old", "refreshed inside {var}");
+    }
+
+    let out = env.halti(&["refresh", "app", "--force"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(token(), "someone-someone-app-app");
+}
+
 // --- info, ls and policy edit ---
 
 #[test]
