@@ -23,9 +23,9 @@ pub fn confirm(reason: &str) -> Result<()> {
 
 fn prompt(reason: &str) -> Result<()> {
     // Automated tests answer for the user. Release builds don't contain this.
-    #[cfg(debug_assertions)]
-    if let Ok(answer) = std::env::var("HALTI_TEST_APPROVE") {
-        eprintln!("halti: [test] {reason}: {answer}");
+    #[cfg(halti_dev)]
+    if let Some(answer) = crate::util::dev_var("HALTI_TEST_APPROVE") {
+        eprintln!("halti: [test] {reason}: {}", answer.to_string_lossy());
         return if answer == "yes" { Ok(()) } else { bail!("not approved: {reason}") };
     }
 

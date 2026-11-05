@@ -23,7 +23,7 @@ pub struct BrowserVm {
     /// Whether the VM is running; held while it starts, so two first runners start one VM.
     up: Mutex<bool>,
     /// For tests: variables for the next runners (see `engine::exec_runner`).
-    #[cfg(debug_assertions)]
+    #[cfg(halti_dev)]
     runner_env: Mutex<Vec<(String, String)>>,
 }
 
@@ -38,14 +38,14 @@ impl BrowserVm {
             ca_pem,
             tokens,
             up: Mutex::new(false),
-            #[cfg(debug_assertions)]
+            #[cfg(halti_dev)]
             runner_env: Mutex::new(Vec::new()),
         }
     }
 
     /// Give the runners started from now on these variables (the `HALTI_RUNNER_DEBUG_*` ones
     /// switch protections off; release builds refuse them).
-    #[cfg(debug_assertions)]
+    #[cfg(halti_dev)]
     pub fn set_runner_env(&self, env: Vec<(String, String)>) {
         *self.runner_env.lock().unwrap_or_else(|e| e.into_inner()) = env;
     }
@@ -57,9 +57,9 @@ impl BrowserVm {
     pub fn runner(&self, site: &str) -> Result<(Child, String)> {
         self.start()?;
         let token = self.tokens.issue(site)?;
-        #[cfg(debug_assertions)]
+        #[cfg(halti_dev)]
         let env = self.runner_env.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        #[cfg(not(debug_assertions))]
+        #[cfg(not(halti_dev))]
         let env = Vec::new();
         match engine::exec_runner(&self.spec.name, &env) {
             Ok(child) => Ok((child, token)),

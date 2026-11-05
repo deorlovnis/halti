@@ -185,7 +185,7 @@ halti box rm research              # Touch ID; deletes the key, then the store
 
 `halti policy approve` with no names approves your boxes too, so `install.sh` still needs one Touch ID.
 
-`~/.config/cred/box/<name>.toml` (`HALTI_BOX_DIR` overrides the folder):
+`~/.config/cred/box/<name>.toml`:
 
 ```toml
 about = "Market research"
@@ -251,14 +251,15 @@ Deny direct Keychain and clipboard reads in `~/.claude/settings.json` too:
 ] } }
 ```
 
-Metadata (never values) is kept in `~/.config/cred/index.json`; `HALTI_INDEX` overrides it, and `HALTI_POLICY_DIR` the policy folder, `HALTI_BOX_DIR` the box policy folder. `HALTI_WARN_DAYS` sets the warning window. The old `CRED_` names of these still work.
+Metadata (never values) is kept in `~/.config/cred/index.json`. `HALTI_WARN_DAYS` sets the warning window (the old `CRED_WARN_DAYS` still works). The home folder is the one your user account names (the passwd entry), not `$HOME`, and no variable moves halti's files.
 
 ## Development
 
 ```sh
-mise run check       # format, clippy, release check and all tests that need no human: run before pushing
+./check.sh           # format, clippy, all tests that need no human, and a release build's check: run before pushing
+mise run check       # the same
 mise run e2e         # end-to-end tests: the built binary, a local test site, `halti run` and `halti mcp`
 mise run e2e-opt-in  # also the sandboxed browser, and one real Touch ID approval (you tap)
 ```
 
-`cargo test` runs the unit tests and the same end-to-end tests. Debug builds keep Keychain items in a temp folder when `HALTI_TEST_KEYCHAIN` is set and take `HALTI_TEST_APPROVE=yes|no` as the Touch ID answer, so those tests need no human and never touch your Keychain; release builds contain neither. The opt-in tests are `#[ignore]`d (`HALTI_E2E_BROWSER=1 cargo test -- --include-ignored` runs the ones that start the runner, including a session that a local site rotates on every visit surviving close and a box restart): the browser ones need `npm ci` in `runner/` and Playwright's Chromium (`install.sh` fetches it), and the Touch ID one uses the real Keychain with a throwaway resource name and removes it afterwards.
+`cargo test` runs the unit tests and the same end-to-end tests. Debug builds keep Keychain items in a temp folder when `HALTI_TEST_KEYCHAIN` is set and take `HALTI_TEST_APPROVE=yes|no` as the Touch ID answer, so those tests need no human and never touch your Keychain. These test hooks, and `HALTI_INDEX`, `HALTI_POLICY_DIR` and `HALTI_BOX_DIR`, which move the files, are compiled only into builds with the debug profile (the `halti_dev` cfg that `build.rs` sets), never into release builds, even ones with debug assertions turned on. Debug builds honour `$HOME`, keep their files in `~/.config/halti-dev` and `~/Library/Application Support/halti-dev`, apart from an installed halti's, and say so on stderr every time. `halti build-info` says how a binary was built; `check.sh` builds a `ci-release` profile (release without link-time optimisation), requires `debug_assertions=false halti_dev=false` from it, and runs it with every hook set to see it ignore them (`tests/release.rs`, Linux only). `tests/source.rs` lists every `HALTI_*` variable and who reads it, and fails on a new one, on a hook keyed to `debug_assertions`, and on any change to the macOS-only code, which can't be built on the Linux host. The opt-in tests are `#[ignore]`d (`HALTI_E2E_BROWSER=1 cargo test -- --include-ignored` runs the ones that start the runner, including a session that a local site rotates on every visit surviving close and a box restart): the browser ones need `npm ci` in `runner/` and Playwright's Chromium (`install.sh` fetches it), and the Touch ID one uses the real Keychain with a throwaway resource name and removes it afterwards.

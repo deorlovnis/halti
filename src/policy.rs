@@ -19,7 +19,7 @@ use serde_json::{Map, Value};
 use similar::TextDiff;
 use url::{Host, Url};
 
-use crate::util::{self, config_dir, expand_home, sha256_hex};
+use crate::util::{config_dir, expand_home, sha256_hex};
 use crate::{approve, ask, boxes, browser, interactive, keychain, legacy, parse_env, parse_field, parse_resource};
 
 /// Keychain field of a resource's approval record. Field names can't start with "_".
@@ -601,7 +601,12 @@ impl Status {
 }
 
 pub fn dir() -> PathBuf {
-    util::env_var("POLICY_DIR").map(PathBuf::from).unwrap_or_else(|| config_dir().join("policy"))
+    // Tests keep their policies apart. Release builds don't contain this.
+    #[cfg(halti_dev)]
+    if let Some(dir) = crate::util::dev_var("HALTI_POLICY_DIR") {
+        return dir.into();
+    }
+    config_dir().join("policy")
 }
 
 pub fn path(res: &str) -> PathBuf {

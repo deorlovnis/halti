@@ -15,12 +15,51 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Debug builds keep their files apart from an installed halti's, so a test build never reads or
+/// changes the real index, policies and boxes.
+pub const DEV_CONFIG_DIR: &str = ".config/halti-dev";
+pub const DEV_STORE_ROOT: &str = "Library/Application Support/halti-dev";
+
+/// The home folder. Release builds take it from the passwd entry and ignore `HOME`, so the
+/// environment can't move halti's files; debug builds honour `HOME`, which tests set.
 pub fn home() -> PathBuf {
-    PathBuf::from(env::var_os("HOME").unwrap_or_default())
+    #[cfg(halti_dev)]
+    if let Some(home) = env::var_os("HOME").filter(|h| !h.is_empty()) {
+        return home.into();
+    }
+    passwd_home().unwrap_or_default()
+}
+
+/// The home folder in the passwd entry of the user halti runs as.
+fn passwd_home() -> Option<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found = std::ptr::null_mut();
+    let mut buf = vec![0 as libc::c_char; 4096];
+    loop {
+        let err = unsafe { libc::getpwuid_r(libc::getuid(), &mut entry, buf.as_mut_ptr(), buf.len(), &mut found) };
+        match err {
+            0 => break,
+            libc::ERANGE if buf.len() < 1 << 20 => buf.resize(buf.len() * 2, 0),
+            _ => return None,
+        }
+    }
+    if found.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    let dir = unsafe { CStr::from_ptr(entry.pw_dir) };
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
 }
 
 pub fn config_dir() -> PathBuf {
-    home().join(legacy::CONFIG_DIR)
+    home().join(if cfg!(halti_dev) { DEV_CONFIG_DIR } else { legacy::CONFIG_DIR })
+}
+
+/// Box stores, mount points and locks (`box/`) and downloads.
+pub fn store_root() -> PathBuf {
+    home().join(if cfg!(halti_dev) { DEV_STORE_ROOT } else { legacy::STORE_ROOT })
 }
 
 /// The two names of a user-facing environment variable: `HALTI_<suffix>`, then the old
@@ -29,9 +68,18 @@ pub fn env_names(suffix: &str) -> [String; 2] {
     [format!("HALTI_{suffix}"), format!("{}{suffix}", legacy::ENV_PREFIX)]
 }
 
-/// A user-facing environment variable: `HALTI_<suffix>`, or else the old `CRED_<suffix>`.
+/// A user-facing environment variable: `HALTI_<suffix>`, or else the old `CRED_<suffix>`. Release
+/// builds read only the suffixes on the list in tests/source.rs, none of which picks where
+/// halti keeps its files or what protects them.
 pub fn env_var(suffix: &str) -> Option<OsString> {
     env_names(suffix).iter().find_map(env::var_os)
+}
+
+/// A test hook's variable, such as `HALTI_TEST_APPROVE`. Only debug builds have this, so nothing
+/// in the environment can switch a release build's protections off or move its files.
+#[cfg(halti_dev)]
+pub fn dev_var(name: &str) -> Option<OsString> {
+    env::var_os(name)
 }
 
 /// Expand a leading "~/" to the home directory.
@@ -98,6 +146,17 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
+
+    #[test]
+    fn the_passwd_home_is_a_folder() {
+        let home = super::passwd_home().unwrap();
+        assert!(home.is_absolute() && home.is_dir(), "{}", home.display());
+    }
+
+    #[test]
+    fn debug_builds_keep_their_own_files() {
+        assert!(super::config_dir().ends_with(super::DEV_CONFIG_DIR) && super::store_root().ends_with(super::DEV_STORE_ROOT));
+    }
 
     #[test]
     fn environment_variables_have_the_new_name_first() {

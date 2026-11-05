@@ -7,8 +7,6 @@
 //! last breaks the chain from there on, which `halti audit --verify` reports. Cutting off the
 //! end of the log can't be seen: there is no later line to notice it.
 
-#[cfg(debug_assertions)]
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -168,9 +166,9 @@ fn chain_mac(key: &[u8], prev: &str, body: &Body) -> Result<String> {
 
 fn keychain_key(create: bool) -> Result<Vec<u8>> {
     // Tests inject a key instead of touching the Keychain. Release builds don't contain this.
-    #[cfg(debug_assertions)]
-    if let Ok(key) = env::var("HALTI_AUDIT_KEY") {
-        return Ok(key.into_bytes());
+    #[cfg(halti_dev)]
+    if let Some(key) = crate::util::dev_var("HALTI_AUDIT_KEY") {
+        return Ok(key.into_encoded_bytes());
     }
     if keychain::exists(KEY_RES, KEY_FIELD) {
         return keychain::get(KEY_RES, KEY_FIELD).map(String::into_bytes).ok_or_else(|| anyhow!("can't read the audit key from the Keychain"));
@@ -199,8 +197,8 @@ impl Log {
     /// The log in its usual place with its key in the Keychain, created on first use if `create_key`.
     pub fn standard(create_key: bool) -> Self {
         // Tests run with a log of their own. Release builds don't contain this.
-        #[cfg(debug_assertions)]
-        if let Some(path) = env::var_os("HALTI_AUDIT") {
+        #[cfg(halti_dev)]
+        if let Some(path) = crate::util::dev_var("HALTI_AUDIT") {
             return Self::new(path.into(), move || keychain_key(create_key));
         }
         Self::new(config_dir().join("audit.log"), move || keychain_key(create_key))

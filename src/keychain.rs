@@ -2,7 +2,7 @@
 //! (the prefix is `legacy::KEYCHAIN_PREFIX`), account = the macOS user.
 
 use std::env;
-#[cfg(debug_assertions)]
+#[cfg(halti_dev)]
 use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
@@ -19,13 +19,13 @@ fn service(res: &str, field: &str) -> String {
 
 /// Debug builds keep items in files under $HALTI_TEST_KEYCHAIN when it is set, so end-to-end
 /// tests never touch the real Keychain. Release builds don't contain this.
-#[cfg(debug_assertions)]
+#[cfg(halti_dev)]
 fn fake(res: &str, field: &str) -> Option<PathBuf> {
-    Some(PathBuf::from(env::var_os("HALTI_TEST_KEYCHAIN")?).join(format!("{res}.{field}")))
+    Some(PathBuf::from(crate::util::dev_var("HALTI_TEST_KEYCHAIN")?).join(format!("{res}.{field}")))
 }
 
 pub fn get(res: &str, field: &str) -> Option<String> {
-    #[cfg(debug_assertions)]
+    #[cfg(halti_dev)]
     if let Some(file) = fake(res, field) {
         return fs::read_to_string(file).ok();
     }
@@ -35,7 +35,7 @@ pub fn get(res: &str, field: &str) -> Option<String> {
 /// Read an item only if macOS lets halti do so without asking. Approval records are read this
 /// way: one planted by another program would need a prompt, so it reads as missing.
 pub fn get_silently(res: &str, field: &str) -> Option<String> {
-    #[cfg(debug_assertions)]
+    #[cfg(halti_dev)]
     if fake(res, field).is_some() {
         return get(res, field);
     }
@@ -52,7 +52,7 @@ pub fn get_app_password(service: &str, account: &str) -> Result<Vec<u8>> {
 /// Whether the item exists, without reading its value: only reading a value can make
 /// macOS ask for Keychain access, so status checks never prompt.
 pub fn exists(res: &str, field: &str) -> bool {
-    #[cfg(debug_assertions)]
+    #[cfg(halti_dev)]
     if let Some(file) = fake(res, field) {
         return file.exists();
     }
@@ -60,7 +60,7 @@ pub fn exists(res: &str, field: &str) -> bool {
 }
 
 pub fn set(res: &str, field: &str, value: &str) -> Result<()> {
-    #[cfg(debug_assertions)]
+    #[cfg(halti_dev)]
     if let Some(file) = fake(res, field) {
         return fs::write(file, value).with_context(|| format!("storing {res}/{field}"));
     }
@@ -75,7 +75,7 @@ pub fn replace(res: &str, field: &str, value: &str) -> Result<()> {
 }
 
 pub fn delete(res: &str, field: &str) -> bool {
-    #[cfg(debug_assertions)]
+    #[cfg(halti_dev)]
     if let Some(file) = fake(res, field) {
         return fs::remove_file(file).is_ok();
     }

@@ -99,8 +99,17 @@ pub struct Index {
 }
 
 impl Index {
+    fn path() -> PathBuf {
+        // Tests keep an index of their own. Release builds don't contain this.
+        #[cfg(halti_dev)]
+        if let Some(path) = util::dev_var("HALTI_INDEX") {
+            return path.into();
+        }
+        config_dir().join("index.json")
+    }
+
     pub fn load() -> Result<Self> {
-        let path = util::env_var("INDEX").map(PathBuf::from).unwrap_or_else(|| config_dir().join("index.json"));
+        let path = Self::path();
         let map = match fs::read_to_string(&path) {
             Ok(s) => serde_json::from_str(&s).with_context(|| format!("reading {}", path.display()))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
