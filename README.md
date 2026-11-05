@@ -9,7 +9,7 @@ Secrets are grouped by **resource**, one thing you sign in to (`github`, `aws`, 
 Requires macOS, Rust (`mise use -g rust@stable`, or rustup), and Node.js for the sandboxed browser.
 
 ```sh
-git clone https://github.com/deorlovnis/cred.git ~/Git/halti
+git clone https://github.com/deorlovnis/halti.git ~/Git/halti
 ~/Git/halti/install.sh       # builds, signs, installs /usr/local/bin/halti and the browser runner (root-owned)
 halti --help
 ```
@@ -22,7 +22,7 @@ Boxes (in progress) run agents in VMs made by Apple's [`container`](https://gith
 
 halti was called cred. The binary is now `/usr/local/bin/halti`, with its runner in `/usr/local/lib/halti`; `install.sh` removes the old `/usr/local/bin/cred` and `/usr/local/lib/cred`. Register the MCP server again under the new name (see Agents), and change a `Bash(cred copy:*)` deny rule to `Bash(halti copy:*)` (see With Claude Code). Its tools on the Mac are now `mcp__halti__*`, so update permission rules that name `mcp__cred__*` (inside a box they stay `mcp__cred__*`, see below). `halti run` no longer reads a `.cred` file: name each resource with `-s`. Environment variables are `HALTI_*` now; the old `CRED_*` names are still read when the new one isn't set, and refresh scripts get both.
 
-Some names still say cred, because an existing install depends on them; `src/legacy.rs` lists each one and what depends on it. The Keychain items (`cred:…`), `~/.config/cred` and `~/Library/Application Support/cred` hold your secrets, approvals, policies and boxes, and the agent and browser images (`cred-agent`, `cred-agent-jvm`, `cred-agent-rust`, `cred-browser`) are pinned in approved box policies, along with what is inside them (`cred-shim`, `/run/cred`, the stand-in `cred-managed`, and the `cred` MCP server in a box, so the agent's tools there stay `mcp__cred__*`). These move to halti's names with a later migration. The codesign identifier `com.deorlovnis.cred` stays for good: Keychain items you allowed trust it, and changing it asks again for each. `install.sh` still signs with a "cred code signing" identity when there is no "halti code signing" one. The repository is still github.com/deorlovnis/cred.
+Some names still say cred, because an existing install depends on them; `src/legacy.rs` lists each one and what depends on it. The Keychain items (`cred:…`), `~/.config/cred` and `~/Library/Application Support/cred` hold your secrets, approvals, policies and boxes, and the agent and browser images (`cred-agent`, `cred-agent-jvm`, `cred-agent-rust`, `cred-browser`) are pinned in approved box policies, along with what is inside them (`cred-shim`, `/run/cred`, the stand-in `cred-managed`, and the `cred` MCP server in a box, so the agent's tools there stay `mcp__cred__*`). These move to halti's names with a later migration. The codesign identifier `com.deorlovnis.cred` stays for good: Keychain items you allowed trust it, and changing it asks again for each. `install.sh` still signs with a "cred code signing" identity when there is no "halti code signing" one.
 
 ### Signing
 
