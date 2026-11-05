@@ -1,4 +1,4 @@
-//! Time limits in `cred mcp`: how long a consent lasts and how long a browser may sit idle
+//! Time limits in `halti mcp`: how long a consent lasts and how long a browser may sit idle
 //! or stay open. The clock is passed in, so the rules are testable. 0 minutes means no limit.
 
 use std::time::{Duration, Instant};

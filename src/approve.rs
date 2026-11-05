@@ -1,6 +1,6 @@
 //! Confirmation by the person at the Mac: Touch ID, or the login password as a fallback.
 //! An agent can't answer this prompt, so it gates everything that loosens a policy or
-//! releases a value outside cred.
+//! releases a value outside halti.
 
 use std::sync::Mutex;
 
@@ -14,7 +14,7 @@ pub fn take_answers() -> Vec<bool> {
     std::mem::take(&mut *ANSWERS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Ask for confirmation; macOS shows it as "cred is trying to <reason>."
+/// Ask for confirmation; macOS shows it as "halti is trying to <reason>."
 pub fn confirm(reason: &str) -> Result<()> {
     let result = prompt(reason);
     ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).push(result.is_ok());
@@ -24,8 +24,8 @@ pub fn confirm(reason: &str) -> Result<()> {
 fn prompt(reason: &str) -> Result<()> {
     // Automated tests answer for the user. Release builds don't contain this.
     #[cfg(debug_assertions)]
-    if let Ok(answer) = std::env::var("CRED_TEST_APPROVE") {
-        eprintln!("cred: [test] {reason}: {answer}");
+    if let Ok(answer) = std::env::var("HALTI_TEST_APPROVE") {
+        eprintln!("halti: [test] {reason}: {answer}");
         return if answer == "yes" { Ok(()) } else { bail!("not approved: {reason}") };
     }
 

@@ -1,5 +1,5 @@
 //! The `proxy` kind: an HTTP proxy that understands CONNECT to port 443 and nothing else. The
-//! box's tools send host names; cred decides by name whether the box may reach it, resolves it
+//! box's tools send host names; halti decides by name whether the box may reach it, resolves it
 //! itself and connects to a public address (see `addr`).
 //!
 //! With a box CA (the normal case) the door then ends TLS. It makes its own verified TLS
@@ -116,7 +116,7 @@ fn page_head(sh: &Shared, reader: &mut BufReader<UnixStream>, writer: &mut UnixS
             Identity::Refused => ("blocked:identity", 403, "Not an identity of this box's browser"),
             Identity::Missing if asked => ("blocked:no-identity", 407, "Proxy authentication required"),
             Identity::Missing => {
-                let challenge = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"cred\"\r\nContent-Length: 0\r\n\r\n";
+                let challenge = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"halti\"\r\nContent-Length: 0\r\n\r\n";
                 if writer.write_all(challenge.as_bytes()).and_then(|()| writer.flush()).is_err() {
                     return None;
                 }
@@ -180,7 +180,7 @@ fn refuse(sh: &Shared, writer: &mut UnixStream, entry: Entry, status: u16, why: 
     let reason = http::reason(status);
     let allow = match status {
         405 => "Allow: CONNECT\r\n",
-        407 => "Proxy-Authenticate: Basic realm=\"cred\"\r\n",
+        407 => "Proxy-Authenticate: Basic realm=\"halti\"\r\n",
         _ => "",
     };
     // `why` may carry another library's words; keep them to one line.

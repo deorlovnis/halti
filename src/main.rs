@@ -1,9 +1,9 @@
-//! cred — macOS Keychain-backed secrets for humans and agents.
+//! halti — macOS Keychain-backed secrets for humans and agents.
 //!
 //! Secrets are grouped by resource: one thing you sign in to (GitHub, AWS, …). A resource has
 //! fields — token, user, password, … — each its own Keychain item. What may happen to them is
 //! decided by the resource's policy, which counts only once approved with Touch ID: which
-//! fields `cred run` exports, how fields refresh, and what an agent may do through `cred mcp`.
+//! fields `halti run` exports, how fields refresh, and what an agent may do through `halti mcp`.
 //! Agents never get the credentials themselves.
 
 mod approve;
@@ -17,6 +17,7 @@ mod engine;
 mod fetch;
 mod index;
 mod keychain;
+mod legacy;
 mod limits;
 mod mask;
 mod mcp;
@@ -30,7 +31,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
-use std::{env, fs, thread};
+use std::thread;
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use anyhow::{Context, Result, bail};
@@ -44,7 +45,7 @@ use refresh::{auto_resources, refresh_due};
 const MASK: &[u8] = b"********";
 
 #[derive(Parser)]
-#[command(name = "cred", version, about = "Keychain-backed secrets for humans and agents")]
+#[command(name = "halti", version, about = "Keychain-backed secrets for humans and agents")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -102,7 +103,7 @@ enum Cmd {
     Ls,
     /// List expired/expiring fields; exit 1 if any
     Check {
-        /// Warning window in days [default: $CRED_WARN_DAYS or 14]
+        /// Warning window in days [default: $HALTI_WARN_DAYS or 14]
         days: Option<i64>,
     },
     /// Delete one field, or the whole resource
@@ -121,18 +122,17 @@ enum Cmd {
         field: String,
     },
     /// Run CMD with the fields the policies export, values masked in its output
-    #[command(after_help = "Each resource's policy decides: [run] mode = allow, ask (Touch ID) or deny. \
-                            Also loads resource names listed in ./.cred (one per line, # comments ok), \
-                            searching upward from the current directory.")]
+    #[command(after_help = "Name each resource with -s RESOURCE (at least one; repeat for more). \
+                            Each resource's policy decides: [run] mode = allow, ask (Touch ID) or deny.")]
     Run {
-        #[arg(short = 's', long = "secret", value_name = "RESOURCE", value_parser = parse_resource)]
+        #[arg(short = 's', long = "secret", value_name = "RESOURCE", required = true, value_parser = parse_resource)]
         resources: Vec<String>,
         #[arg(last = true, required = true, value_name = "CMD")]
         command: Vec<String>,
     },
-    /// Serve agents over MCP (stdio): requests and site tools, credentials added by cred
+    /// Serve agents over MCP (stdio): requests and site tools, credentials added by halti
     Mcp,
-    /// Show what agents did through `cred mcp` (never values); --verify checks nothing was altered
+    /// Show what agents did through `halti mcp` (never values); --verify checks nothing was altered
     Audit {
         /// How many of the latest entries to show
         #[arg(short = 'n', long, default_value_t = 20)]
@@ -141,12 +141,12 @@ enum Cmd {
         #[arg(long)]
         verify: bool,
     },
-    /// Re-create Keychain items so only the running cred may read them (after re-signing cred)
+    /// Re-create Keychain items so only the running halti may read them (after re-signing halti)
     Reseal {
         #[arg(value_parser = parse_resource)]
         resources: Vec<String>,
     },
-    /// Boxes: isolated, encrypted places where an agent works, with cred as its only door
+    /// Boxes: isolated, encrypted places where an agent works, with halti as its only door
     #[command(name = "box")]
     Box {
         #[command(subcommand)]
@@ -215,7 +215,7 @@ enum BoxCmd {
         name: String,
         path: String,
     },
-    /// Sign in to a box's sites by hand, in a window on this Mac; cred seals each session into the box (Touch ID, box stopped)
+    /// Sign in to a box's sites by hand, in a window on this Mac; halti seals each session into the box (Touch ID, box stopped)
     #[command(after_help = "Without SITE, goes through the box's sites that allow browsing and have no sealed session yet, one window after another. \
 Closing a window (or Enter) takes the session; Ctrl-C skips that site. --all signs in again to the ones that have a session.")]
     Login {
@@ -328,13 +328,13 @@ fn cmd_set(res: &str, field: &str, expires: Option<Date>, mut meta: Meta) -> Res
     if policy::path(res).exists() {
         return Ok(());
     }
-    println!("{res} has no policy, so nothing can use it yet (cred policy edit {res})");
+    println!("{res} has no policy, so nothing can use it yet (halti policy edit {res})");
     Ok(())
 }
 
 fn cmd_update(res: &str, field: &str, expires: Option<Date>) -> Result<()> {
     let Some(current) = keychain::get(res, field) else {
-        bail!("{res}/{field} is not stored yet (add it with: cred set {res} {field})");
+        bail!("{res}/{field} is not stored yet (add it with: halti set {res} {field})");
     };
     // Strip surrounding whitespace and newlines that come along when copying from a web page.
     let value = pbpaste()?.trim().to_string();
@@ -423,14 +423,14 @@ fn cmd_info(res: &str) -> Result<()> {
             }
         }
         None if !matches!(status, policy::Status::Missing) => {
-            println!("  nothing in it applies until approved (cred policy approve {res})");
+            println!("  nothing in it applies until approved (halti policy approve {res})");
         }
         None => {}
     }
     for (name, f) in &r.fields {
         let mut parts = vec![if keychain::exists(res, name) { "stored" } else { "MISSING" }.to_string()];
         let export = approved.as_ref().and_then(|a| a.policy.run.export.get(name));
-        parts.push(export.map_or("inside cred".to_string(), |v| format!("exported as {v}")));
+        parts.push(export.map_or("inside halti".to_string(), |v| format!("exported as {v}")));
         if let Some(t) = f.expiry_text() {
             parts.push(format!("expires {t}"));
         }
@@ -512,7 +512,7 @@ fn cmd_check(days: Option<i64>) -> Result<u8> {
                 if !f.expired() {
                     continue;
                 }
-                format!("{res}/{name} expired and auto-refresh failed (cred refresh {res})")
+                format!("{res}/{name} expired and auto-refresh failed (halti refresh {res})")
             } else if d < 0 {
                 format!("{res}/{name} expired {}d ago ({exp})", -d)
             } else if d <= within {
@@ -536,7 +536,7 @@ fn cmd_rm(res: &str, field: Option<String>) -> Result<()> {
     };
     for name in &names {
         if !keychain::delete(res, name) {
-            eprintln!("cred: {res}/{name} not in Keychain");
+            eprintln!("halti: {res}/{name} not in Keychain");
         }
     }
     match field {
@@ -570,31 +570,18 @@ fn cmd_reseal(resources: Vec<String>) -> Result<()> {
         for name in idx.get(res)?.fields.keys() {
             // Reading may ask for Keychain access once; the new item needs no approval.
             let Some(value) = keychain::get(res, name) else {
-                eprintln!("cred: {res}/{name} not in Keychain, skipped");
+                eprintln!("halti: {res}/{name} not in Keychain, skipped");
                 continue;
             };
-            keychain::replace(res, name, &value).with_context(|| format!("{res}/{name} was removed but not stored again: set it with cred set {res} {name}"))?;
+            keychain::replace(res, name, &value).with_context(|| format!("{res}/{name} was removed but not stored again: set it with halti set {res} {name}"))?;
             println!("resealed {res}/{name}");
         }
         // Approvals aren't carried over: one planted by another program must not become trusted.
         if policy::path(res).exists() && !matches!(policy::status(res), policy::Status::Approved) {
-            println!("approve {res}'s policy again: cred policy approve {res}");
+            println!("approve {res}'s policy again: halti policy approve {res}");
         }
     }
     Ok(())
-}
-
-fn find_credfile() -> Option<PathBuf> {
-    let mut dir = env::current_dir().ok()?;
-    loop {
-        let f = dir.join(".cred");
-        if f.is_file() {
-            return Some(f);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
 }
 
 /// Copy src to dst line by line, replacing every secret value with ********.
@@ -614,18 +601,7 @@ fn pump(src: impl Read, mut dst: impl Write, ac: &AhoCorasick) {
     }
 }
 
-fn cmd_run(mut resources: Vec<String>, command: Vec<String>) -> Result<u8> {
-    if let Some(f) = find_credfile() {
-        for line in fs::read_to_string(&f)?.lines() {
-            let n: String = line.split('#').next().unwrap_or("").split_whitespace().collect();
-            if !n.is_empty() {
-                resources.push(parse_resource(&n).map_err(|e| anyhow::anyhow!("{}: '{n}': {e}", f.display()))?);
-            }
-        }
-    }
-    if resources.is_empty() {
-        bail!("no resources requested (use -s RESOURCE or a .cred file)");
-    }
+fn cmd_run(resources: Vec<String>, command: Vec<String>) -> Result<u8> {
     // A failed refresh is reported; the stored value is still tried.
     refresh_due(&resources, false, false);
 
@@ -633,19 +609,19 @@ fn cmd_run(mut resources: Vec<String>, command: Vec<String>) -> Result<u8> {
     cmd.args(&command[1..]).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut masks = Vec::new();
     for res in &resources {
-        let approved = policy::load(res).with_context(|| format!("cred run needs an approved policy for {res}"))?;
+        let approved = policy::load(res).with_context(|| format!("halti run needs an approved policy for {res}"))?;
         let run = &approved.policy.run;
         if run.export.is_empty() {
-            bail!("the policy for {res} exports no fields to cred run");
+            bail!("the policy for {res} exports no fields to halti run");
         }
         let fields: Vec<&str> = run.export.keys().map(String::as_str).collect();
         match run.mode {
-            Mode::Deny => bail!("the policy for {res} doesn't allow cred run (agents can use cred mcp)"),
+            Mode::Deny => bail!("the policy for {res} doesn't allow halti run (agents can use halti mcp)"),
             Mode::Ask => approve::confirm(&format!("run {} with {res}'s {}", command[0], fields.join(", ")))?,
             Mode::Allow => {}
         }
         for (name, var) in &run.export {
-            let Some(v) = keychain::get(res, name) else { bail!("{res}/{name} not found in Keychain (add it with: cred set {res} {name})") };
+            let Some(v) = keychain::get(res, name) else { bail!("{res}/{name} not found in Keychain (add it with: halti set {res} {name})") };
             cmd.env(var, &v);
             if !v.is_empty() {
                 masks.push(v);
@@ -657,7 +633,7 @@ fn cmd_run(mut resources: Vec<String>, command: Vec<String>) -> Result<u8> {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("cred: {}: {e}", command[0]);
+            eprintln!("halti: {}: {e}", command[0]);
             return Ok(127);
         }
     };
@@ -711,7 +687,7 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
-            eprintln!("cred: {e:#}");
+            eprintln!("halti: {e:#}");
             ExitCode::FAILURE
         }
     }

@@ -1,5 +1,5 @@
-//! Keychain items: every value is its own generic password, service "cred:<resource>/<field>",
-//! account = the macOS user.
+//! Keychain items: every value is its own generic password, service "<prefix><resource>/<field>"
+//! (the prefix is `legacy::KEYCHAIN_PREFIX`), account = the macOS user.
 
 use std::env;
 #[cfg(debug_assertions)]
@@ -7,21 +7,21 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 
-const PREFIX: &str = "cred:";
+use crate::legacy;
 
 fn account() -> String {
     env::var("USER").unwrap_or_default()
 }
 
 fn service(res: &str, field: &str) -> String {
-    format!("{PREFIX}{res}/{field}")
+    format!("{}{res}/{field}", legacy::KEYCHAIN_PREFIX)
 }
 
-/// Debug builds keep items in files under $CRED_TEST_KEYCHAIN when it is set, so end-to-end
+/// Debug builds keep items in files under $HALTI_TEST_KEYCHAIN when it is set, so end-to-end
 /// tests never touch the real Keychain. Release builds don't contain this.
 #[cfg(debug_assertions)]
 fn fake(res: &str, field: &str) -> Option<PathBuf> {
-    Some(PathBuf::from(env::var_os("CRED_TEST_KEYCHAIN")?).join(format!("{res}.{field}")))
+    Some(PathBuf::from(env::var_os("HALTI_TEST_KEYCHAIN")?).join(format!("{res}.{field}")))
 }
 
 pub fn get(res: &str, field: &str) -> Option<String> {
@@ -32,7 +32,7 @@ pub fn get(res: &str, field: &str) -> Option<String> {
     backend::get(&service(res, field), &account()).ok().map(|v| String::from_utf8_lossy(&v).into_owned())
 }
 
-/// Read an item only if macOS lets cred do so without asking. Approval records are read this
+/// Read an item only if macOS lets halti do so without asking. Approval records are read this
 /// way: one planted by another program would need a prompt, so it reads as missing.
 pub fn get_silently(res: &str, field: &str) -> Option<String> {
     #[cfg(debug_assertions)]
@@ -44,7 +44,7 @@ pub fn get_silently(res: &str, field: &str) -> Option<String> {
 }
 
 /// A password another app keeps, e.g. Chrome's "Chrome Safe Storage". macOS asks the user
-/// before cred may read it.
+/// before halti may read it.
 pub fn get_app_password(service: &str, account: &str) -> Result<Vec<u8>> {
     backend::get(service, account)
 }
@@ -68,7 +68,7 @@ pub fn set(res: &str, field: &str, value: &str) -> Result<()> {
     backend::set(&service(res, field), &account(), value.as_bytes()).with_context(|| format!("storing {res}/{field} in Keychain"))
 }
 
-/// Store the value in a new item, so its access list names only the cred running now.
+/// Store the value in a new item, so its access list names only the halti running now.
 pub fn replace(res: &str, field: &str, value: &str) -> Result<()> {
     delete(res, field);
     set(res, field, value)
@@ -117,7 +117,7 @@ mod backend {
     }
 }
 
-/// No Keychain here (a box's Linux, for building and testing cred): nothing is stored or found.
+/// No Keychain here (a box's Linux, for building and testing halti): nothing is stored or found.
 /// The debug builds' `fake` still works, so the tests run.
 #[cfg(not(target_os = "macos"))]
 mod backend {

@@ -1,4 +1,4 @@
-//! HTTP requests cred makes on an agent's behalf. cred adds the resource's credentials itself,
+//! HTTP requests halti makes on an agent's behalf. halti adds the resource's credentials itself,
 //! only for hosts its approved policy lists, and never follows redirects, which could carry
 //! the credentials elsewhere.
 
@@ -39,7 +39,7 @@ pub fn perform(res: &str, approved: &Approved, req: &Request) -> Result<String> 
 
     let mut request = http::Request::builder().method(method.as_str()).uri(url.as_str());
     if let Some(template) = &fetch.auth {
-        let value = policy::fill(template, |field| keychain::get(res, field).ok_or_else(|| anyhow!("{res}/{field} isn't stored (cred set {res} {field})")))?;
+        let value = policy::fill(template, |field| keychain::get(res, field).ok_or_else(|| anyhow!("{res}/{field} isn't stored (halti set {res} {field})")))?;
         request = request.header(fetch.auth_header.as_str(), value);
     }
     for (name, value) in &fetch.headers {

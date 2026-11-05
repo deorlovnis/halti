@@ -1,4 +1,4 @@
-//! The `cred` kind: plain HTTP/1.1 to cred itself, with keep-alive because Claude Code reuses
+//! The gateway kind (`legacy::DOOR_KIND`): plain HTTP/1.1 to halti itself, with keep-alive because Claude Code reuses
 //! its connections. Its one route is `/model/...`, the model gateway. The box holds a stand-in
 //! key; the gateway checks for it, drops the box's own auth headers, adds the real one from the
 //! model resource's approved policy and fields, sends the call over TLS to the policy's first
@@ -71,7 +71,7 @@ fn denied(status: u16, decision: &'static str, message: impl Into<String>) -> De
 struct Plan {
     url: String,
     headers: Vec<(String, String)>,
-    /// The key's parts, which must not appear in anything cred says.
+    /// The key's parts, which must not appear in anything halti says.
     secrets: Vec<String>,
 }
 
@@ -117,7 +117,7 @@ fn exchange(sh: &Shared, reader: &mut BufReader<UnixStream>, writer: &mut UnixSt
 /// is loaded for each call, so a change or a revocation takes effect at once.
 fn plan(sh: &Shared, head: &Head, method: &str, target: &str) -> Result<Plan, Denied> {
     let Some(rest) = target.strip_prefix("/model/") else {
-        return Err(denied(404, "blocked:route", "cred has only /model/... here"));
+        return Err(denied(404, "blocked:route", "halti has only /model/... here"));
     };
     if target.bytes().any(|b| b <= b' ' || b == 0x7f) {
         return Err(denied(400, "blocked:bad-request", "bad request target"));
@@ -126,7 +126,7 @@ fn plan(sh: &Shared, head: &Head, method: &str, target: &str) -> Result<Plan, De
         return Err(denied(404, "blocked:no-model", format!("box {} has no model configured", sh.cfg.name)));
     };
     if !has_standin(head) {
-        return Err(denied(401, "blocked:no-standin", format!("send {STANDIN} as the key; cred adds the real one")));
+        return Err(denied(401, "blocked:no-standin", format!("send {STANDIN} as the key; halti adds the real one")));
     }
     let approved = policy::load(model).map_err(|e| denied(403, "blocked:policy", format!("{e:#}")))?;
     crate::refresh::refresh_due(std::slice::from_ref(model), false, false);
@@ -146,7 +146,7 @@ fn plan(sh: &Shared, head: &Head, method: &str, target: &str) -> Result<Plan, De
     let auth = match &fetch.auth {
         Some(template) => {
             let value = policy::fill(template, |field| {
-                let value = keychain::get(model, field).ok_or_else(|| anyhow::anyhow!("{model}/{field} isn't stored (cred set {model} {field})"))?;
+                let value = keychain::get(model, field).ok_or_else(|| anyhow::anyhow!("{model}/{field} isn't stored (halti set {model} {field})"))?;
                 secrets.push(value.clone());
                 Ok(value)
             });
@@ -157,8 +157,8 @@ fn plan(sh: &Shared, head: &Head, method: &str, target: &str) -> Result<Plan, De
     Ok(Plan { url: format!("{}/{rest}", host.trim_end_matches('/')), headers: rewrite_headers(&head.headers, &fetch.auth_header, &fetch.headers, auth.as_deref()), secrets })
 }
 
-/// Whether the box sent the stand-in as its key: `x-api-key: cred-managed`, or
-/// `Authorization: Bearer cred-managed` for a subscription token.
+/// Whether the box sent the stand-in as its key: `x-api-key: STANDIN`, or
+/// `Authorization: Bearer STANDIN` for a subscription token.
 fn has_standin(head: &Head) -> bool {
     let bearer = |v: &str| match v.split_once(' ') {
         Some((scheme, token)) if scheme.eq_ignore_ascii_case("bearer") => token.trim().to_string(),
@@ -203,7 +203,7 @@ fn send(sh: &Shared, plan: &Plan, method: &str, body: Vec<u8>) -> Result<Respons
     let result = if body.is_empty() { sh.agent.run(request.body(()).map_err(bad)?) } else { sh.agent.run(request.body(body).map_err(bad)?) };
     result.map_err(|e| {
         let masker = Masker::new(plan.secrets.clone());
-        denied(502, "failed:upstream", masker.mask(&format!("cred couldn't get an answer from the model host: {e}")))
+        denied(502, "failed:upstream", masker.mask(&format!("halti couldn't get an answer from the model host: {e}")))
     })
 }
 
@@ -291,11 +291,11 @@ mod tests {
 
     #[test]
     fn the_standin_is_accepted_as_an_api_key_or_a_bearer_token() {
-        assert!(has_standin(&head(&[("x-api-key", "cred-managed")])));
-        assert!(has_standin(&head(&[("X-Api-Key", " cred-managed ")])));
-        assert!(has_standin(&head(&[("Authorization", "Bearer cred-managed")])));
-        assert!(has_standin(&head(&[("authorization", "bearer cred-managed")])));
-        assert!(has_standin(&head(&[("authorization", "cred-managed")])));
+        assert!(has_standin(&head(&[("x-api-key", STANDIN)])));
+        assert!(has_standin(&head(&[("X-Api-Key", &format!(" {STANDIN} "))])));
+        assert!(has_standin(&head(&[("Authorization", &format!("Bearer {STANDIN}"))])));
+        assert!(has_standin(&head(&[("authorization", &format!("bearer {STANDIN}"))])));
+        assert!(has_standin(&head(&[("authorization", STANDIN)])));
     }
 
     #[test]
@@ -303,17 +303,17 @@ mod tests {
         assert!(!has_standin(&head(&[])));
         assert!(!has_standin(&head(&[("x-api-key", "sk-ant-real")])));
         assert!(!has_standin(&head(&[("authorization", "Bearer sk-ant-oat-real")])));
-        assert!(!has_standin(&head(&[("x-api-key", "not-cred-managed")])));
-        assert!(!has_standin(&head(&[("authorization", "Basic cred-managed")])));
-        assert!(!has_standin(&head(&[("x-other", "cred-managed")])));
+        assert!(!has_standin(&head(&[("x-api-key", &format!("not-{STANDIN}"))])));
+        assert!(!has_standin(&head(&[("authorization", &format!("Basic {STANDIN}"))])));
+        assert!(!has_standin(&head(&[("x-other", STANDIN)])));
     }
 
     #[test]
     fn rewriting_drops_the_boxs_credentials_and_adds_the_real_one() {
         let incoming = pairs(&[
-            ("Host", "cred.internal"),
-            ("X-Api-Key", "cred-managed"),
-            ("Authorization", "Bearer cred-managed"),
+            ("Host", "halti.internal"),
+            ("X-Api-Key", STANDIN),
+            ("Authorization", &format!("Bearer {STANDIN}")),
             ("anthropic-version", "2023-06-01"),
             ("Content-Type", "application/json"),
             ("Content-Length", "42"),
@@ -331,12 +331,12 @@ mod tests {
                 ("accept-encoding", "identity"),
             ])
         );
-        assert!(!out.iter().any(|(_, v)| v.contains("cred-managed")));
+        assert!(!out.iter().any(|(_, v)| v.contains(STANDIN)));
     }
 
     #[test]
     fn rewriting_uses_the_policys_auth_header() {
-        let incoming = pairs(&[("authorization", "Bearer cred-managed"), ("anthropic-beta", "oauth-2025-04-20")]);
+        let incoming = pairs(&[("authorization", &format!("Bearer {STANDIN}")), ("anthropic-beta", "oauth-2025-04-20")]);
         let out = rewrite_headers(&incoming, "Authorization", &BTreeMap::new(), Some("Bearer real-token"));
         assert_eq!(out[0], ("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()));
         assert_eq!(out[1], ("Authorization".to_string(), "Bearer real-token".to_string()));

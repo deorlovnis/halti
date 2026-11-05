@@ -7,7 +7,7 @@
 //!
 //! A store never shrinks when files are deleted: `hdiutil compact` fails on APFS images, and
 //! `diskutil image attach` (which gives space back) mounts `noowners`, so files would show the
-//! wrong owner. TODO: `cred box compact` (copy into a new store) if this matters in practice.
+//! wrong owner. TODO: `halti box compact` (copy into a new store) if this matters in practice.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
@@ -22,21 +22,22 @@ use jiff::Timestamp;
 use serde_json::json;
 
 use crate::chain::Chain;
+use crate::legacy;
 use crate::util::home;
 
 /// The most a store can hold; the bundle grows as needed and starts small.
 const SIZE: &str = "100g";
 /// Folders of a store. `log`, `door` (the box CA, sealed) and `browser` (sealed sessions) are
-/// cred's; no VM mounts them.
+/// halti's; no VM mounts them.
 pub const FOLDERS: [&str; 6] = ["home", "work", "downloads", "log", "door", "browser"];
 const DOOR_LOG: &str = "log/door.log";
 const CA_FILE: &str = "door/ca.sealed";
 
 /// Where a box's files live on the Mac. `real()` is the user's; tests build their own.
 pub struct Layout {
-    /// Stores, mount points and locks: ~/Library/Application Support/cred/box
+    /// Stores, mount points and locks: box/ under the store root (`legacy::STORE_ROOT`)
     pub root: PathBuf,
-    /// The sockets the VMs publish, in a short path (104-byte limit): /tmp/cred-<uid>
+    /// The sockets the VMs publish, in a short path (104-byte limit): /tmp/halti-<uid>
     pub sockets: PathBuf,
     uid: u32,
 }
@@ -48,7 +49,7 @@ impl Layout {
             bail!("HOME isn't set");
         }
         let uid = uid()?;
-        Ok(Self { root: home.join("Library/Application Support/cred/box"), sockets: PathBuf::from(format!("/tmp/cred-{uid}")), uid })
+        Ok(Self { root: home.join(legacy::STORE_ROOT).join("box"), sockets: PathBuf::from(format!("/tmp/halti-{uid}")), uid })
     }
 
     #[cfg(test)]
@@ -78,7 +79,7 @@ impl Layout {
         self.open_dir().join(format!("{id}.lock"))
     }
 
-    /// The hash of the approved policy an open box runs with, written by the cred that opened it.
+    /// The hash of the approved policy an open box runs with, written by the halti that opened it.
     pub fn opened_with(&self, id: &str) -> PathBuf {
         self.open_dir().join(format!("{id}.policy"))
     }
@@ -94,7 +95,7 @@ impl Layout {
     }
 
     /// Where the box's browser VM saves downloads, one folder per site: outside every store, and
-    /// mounted into the browser VM only (~/Library/Application Support/cred/downloads/<box>).
+    /// mounted into the browser VM only (downloads/<box> under the store root).
     #[allow(dead_code)] // for the browser VM of box runs
     pub fn downloads(&self, name: &str) -> PathBuf {
         self.root.parent().unwrap_or(&self.root).join("downloads").join(name)
@@ -254,7 +255,7 @@ impl Drop for Open {
                 let _ = shred(&self.bundle);
             }
             Ok(()) => {}
-            Err(e) => eprintln!("cred: {e:#} (detach it with: hdiutil detach -force '{}')", self.mnt.display()),
+            Err(e) => eprintln!("halti: {e:#} (detach it with: hdiutil detach -force '{}')", self.mnt.display()),
         }
     }
 }
@@ -294,7 +295,7 @@ pub fn open(bundle: &Path, mnt: &Path, key: &str, readonly: bool) -> Result<Open
     Ok(store)
 }
 
-/// An exclusive lock on a file, held until dropped: one cred process per open box.
+/// An exclusive lock on a file, held until dropped: one halti process per open box.
 pub struct Lock(#[allow(dead_code)] File);
 
 /// Take the lock; `None` if another process holds it. A busy lock is tried again for a moment:
@@ -370,7 +371,7 @@ pub struct Copied {
 }
 
 /// Copy a file or a folder to `dst`, which must not exist. Links, sockets and devices are
-/// skipped, never followed, so a link in a box can't make cred read a file outside it. Modes are
+/// skipped, never followed, so a link in a box can't make halti read a file outside it. Modes are
 /// reduced to rw-r--r-- or rwxr-xr-x.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<Copied> {
     let meta = fs::symlink_metadata(src).with_context(|| format!("reading {}", src.display()))?;
@@ -431,7 +432,7 @@ mod tests {
 
     #[test]
     fn copies_trees_without_following_links() {
-        let dir = TempDir::new("cred-copy").unwrap();
+        let dir = TempDir::new("halti-copy").unwrap();
         let src = dir.0.join("src");
         fs::create_dir_all(src.join("sub")).unwrap();
         fs::write(src.join("a.txt"), "a").unwrap();
@@ -456,7 +457,7 @@ mod tests {
 
     #[test]
     fn locks_exclude_each_other() {
-        let dir = TempDir::new("cred-lock").unwrap();
+        let dir = TempDir::new("halti-lock").unwrap();
         let path = dir.0.join("x.lock");
         let first = lock(&path).unwrap().expect("free");
         assert!(lock(&path).unwrap().is_none(), "held");
@@ -466,7 +467,7 @@ mod tests {
 
     #[test]
     fn keeps_folders_private() {
-        let dir = TempDir::new("cred-private").unwrap();
+        let dir = TempDir::new("halti-private").unwrap();
         let layout = Layout::under(&dir.0).unwrap();
         layout.prepare().unwrap();
         for d in [&layout.root, &layout.open_dir(), &layout.sockets] {
@@ -484,7 +485,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
     fn stores_are_encrypted_and_open_only_with_the_key() {
-        let dir = TempDir::new("cred-store").unwrap();
+        let dir = TempDir::new("halti-store").unwrap();
         let layout = Layout::under(&dir.0).unwrap();
         let (key, other) = (new_key().unwrap(), new_key().unwrap());
         let bundle = layout.bundle("t");

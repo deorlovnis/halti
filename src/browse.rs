@@ -1,5 +1,5 @@
 //! The sandboxed browser: one headless Chromium per site, driven by the runner (a small,
-//! root-installed Playwright program) on cred's behalf. cred puts the site's session into
+//! root-installed Playwright program) on halti's behalf. halti puts the site's session into
 //! it (cookies and Local Storage from stored fields), hands it the site's rules, and answers
 //! its questions about writes with Touch ID. The agent only gets page text, masked.
 
@@ -26,19 +26,19 @@ use crate::{approve, keychain};
 const BLOCKED_LIMIT: usize = 50;
 
 /// Where install.sh puts the runner, owned by root so nothing running as the user can change it.
-const RUNNER_DIR: &str = "/usr/local/lib/cred/runner";
+const RUNNER_DIR: &str = "/usr/local/lib/halti/runner";
 
 fn runner_dir() -> PathBuf {
     // Tests run a checkout's runner. Release builds don't contain this.
     #[cfg(debug_assertions)]
-    if let Some(dir) = std::env::var_os("CRED_RUNNER_DIR") {
+    if let Some(dir) = std::env::var_os("HALTI_RUNNER_DIR") {
         return dir.into();
     }
     PathBuf::from(RUNNER_DIR)
 }
 
 /// What a box gives the browser tools: runners in its browser VM, and the sessions it keeps
-/// sealed. `cred mcp` outside a box has none and runs the browser on the Mac.
+/// sealed. `halti mcp` outside a box has none and runs the browser on the Mac.
 pub trait BoxBrowser: Send + Sync {
     /// Start a runner for the site in the box's browser VM (starting the VM if it isn't up),
     /// with the token the door will accept from it as that site (empty: this runner has no proxy,
@@ -56,7 +56,7 @@ pub trait BoxBrowser: Send + Sync {
 /// Where Chromium's traffic goes inside the browser VM: the shim's proxy.
 const BOX_PROXY: &str = "http://127.0.0.1:3128";
 
-/// The runner on the Mac, for `cred mcp` outside a box and for signing in by hand.
+/// The runner on the Mac, for `halti mcp` outside a box and for signing in by hand.
 pub fn mac_runner() -> Result<Child> {
     let script = runner_dir().join("runner.mjs");
     if !script.exists() {
@@ -320,11 +320,11 @@ pub fn sign_in(site: &str, policy: &Policy, start: &str, mut child: Child, heade
 }
 
 /// The command that types one of the site's stored fields into a page, as far as the approved
-/// policy lets cred. The runner only types it on the policy's own origins.
+/// policy lets halti. The runner only types it on the policy's own origins.
 pub fn fill_command(site: &str, approved: &Approved, element: &str, field: &str) -> Result<Value> {
     let allowed = approved.policy.browse.as_ref().is_some_and(|b| b.fill.iter().any(|f| f == field));
     if !allowed {
-        bail!("the policy for {site} doesn't let cred type {field} into pages (list it in [browse] fill)");
+        bail!("the policy for {site} doesn't let halti type {field} into pages (list it in [browse] fill)");
     }
     let value = keychain::get(site, field).ok_or_else(|| anyhow!("{site}/{field} isn't stored"))?;
     Ok(json!({ "cmd": "fill", "ref": element, "value": value }))
@@ -348,7 +348,7 @@ impl Drop for Session {
     }
 }
 
-/// A write that pages tried, kept so `cred info` can show what to put in `allow_writes`.
+/// A write that pages tried, kept so `halti info` can show what to put in `allow_writes`.
 #[derive(Serialize, Deserialize)]
 struct WriteSeen {
     count: u32,
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn remembers_writes_and_hides_allowed_ones() {
-        let dir = TempDir::new("cred-test").unwrap();
+        let dir = TempDir::new("halti-test").unwrap();
         let path = dir.0.join("blocked-writes/app.json");
         let telemetry = "POST https://app.example.com/api/telemetry";
         for entry in [telemetry, telemetry, "DELETE https://app.example.com/api/items/1"] {
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn stops_remembering_new_writes_at_the_limit() {
-        let dir = TempDir::new("cred-test").unwrap();
+        let dir = TempDir::new("halti-test").unwrap();
         let path = dir.0.join("app.json");
         for i in 0..BLOCKED_LIMIT + 5 {
             remember(&path, &format!("POST https://app.example.com/{i}")).unwrap();

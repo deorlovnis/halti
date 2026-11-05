@@ -3,7 +3,7 @@
 //! signed in, even after the site rotated its cookies.
 //!
 //! Each file is `seal(derive(box_key, "browser:<site>"), "browser:<site>", storageState)`: a file
-//! doesn't open as another site's, and nothing but cred can read it. No VM mounts the folder;
+//! doesn't open as another site's, and nothing but halti can read it. No VM mounts the folder;
 //! the state reaches a runner over its stdin and comes back over its stdout.
 
 use std::fs::{self, OpenOptions};
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn a_session_is_sealed_per_site_and_comes_back() {
-        let dir = TempDir::new("cred-sessions").unwrap();
+        let dir = TempDir::new("halti-sessions").unwrap();
         let s = sessions(&dir, "box key", true);
         assert_eq!(s.get("app").unwrap(), None);
 
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn a_session_sealed_for_one_site_does_not_open_as_another() {
-        let dir = TempDir::new("cred-sessions").unwrap();
+        let dir = TempDir::new("halti-sessions").unwrap();
         let s = sessions(&dir, "box key", true);
         s.put("app", "{\"cookies\":[]}").unwrap();
         // A file moved to another site's name is refused: the site is bound into it.
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn a_changed_or_cut_file_fails_cleanly() {
-        let dir = TempDir::new("cred-sessions").unwrap();
+        let dir = TempDir::new("halti-sessions").unwrap();
         let s = sessions(&dir, "box key", true);
         s.put("app", "{\"cookies\":[]}").unwrap();
         let file = dir.0.join("browser/app.sealed");
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn nothing_is_kept_when_the_box_does_not_keep_sessions() {
-        let dir = TempDir::new("cred-sessions").unwrap();
+        let dir = TempDir::new("halti-sessions").unwrap();
         let s = sessions(&dir, "box key", false);
         s.put("app", "{\"cookies\":[]}").unwrap();
         assert!(s.sites().is_empty() && fs::read_dir(dir.0.join("browser")).unwrap().next().is_none());
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn only_resource_names_become_file_names() {
-        let dir = TempDir::new("cred-sessions").unwrap();
+        let dir = TempDir::new("halti-sessions").unwrap();
         let s = sessions(&dir, "box key", true);
         for site in ["../x", "a/b", "", "A", "a.b", ".."] {
             assert!(s.put(site, "{}").is_err() && s.get(site).is_err(), "{site}");
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn nothing_is_written_outside_a_closed_store() {
-        let dir = TempDir::new("cred-sessions").unwrap();
+        let dir = TempDir::new("halti-sessions").unwrap();
         // No browser/ folder: the store is gone. The write fails and creates nothing.
         let s = Sessions::new(&dir.0, "box key", true);
         assert!(s.put("app", "{}").is_err());

@@ -1,6 +1,6 @@
-# cred
+# halti
 
-Keychain-backed secrets for humans and agents on macOS. Values live only in the login Keychain. Agents never get them: they work through `cred mcp`, where cred makes the requests and adds the credentials itself.
+Keychain-backed secrets for humans and agents on macOS. Values live only in the login Keychain. Agents never get them: they work through `halti mcp`, where halti makes the requests and adds the credentials itself.
 
 Secrets are grouped by **resource**, one thing you sign in to (`github`, `aws`, `app`). A resource has a link, a description and **fields** (`token`, `user`, `password`, `session`, …), each its own Keychain item. What may happen to them is decided by the resource's **policy**, which has no effect until you approve it with Touch ID.
 
@@ -9,60 +9,66 @@ Secrets are grouped by **resource**, one thing you sign in to (`github`, `aws`, 
 Requires macOS, Rust (`mise use -g rust@stable`, or rustup), and Node.js for the sandboxed browser.
 
 ```sh
-git clone https://github.com/deorlovnis/cred.git ~/Git/cred
-~/Git/cred/install.sh        # builds, signs, installs /usr/local/bin/cred and the browser runner (root-owned)
-cred --help
+git clone https://github.com/deorlovnis/halti.git ~/Git/halti
+~/Git/halti/install.sh       # builds, signs, installs /usr/local/bin/halti and the browser runner (root-owned)
+halti --help
 ```
 
 To update: `git pull && ./install.sh`. It ends by asking you to approve your policies again, with one Touch ID (see Signing). Never install a debug build: debug builds let tests answer approval prompts.
 
-Boxes (in progress) run agents in VMs made by Apple's [`container`](https://github.com/apple/container/releases) (macOS 26). If it's installed and running (`container system start`), `install.sh` also builds the agent image from `box/agent.Containerfile`, its JVM variant (a JDK and the Kotlin language server) from `box/agent-jvm.Containerfile`, and the browser image from `box/browser.Containerfile`; without it the rest of cred works as before. `mise run e2e-box` tests the VM engine against a real VM.
+Boxes (in progress) run agents in VMs made by Apple's [`container`](https://github.com/apple/container/releases) (macOS 26). If it's installed and running (`container system start`), `install.sh` also builds the agent image from `box/agent.Containerfile`, its JVM variant (a JDK and the Kotlin language server) from `box/agent-jvm.Containerfile`, and the browser image from `box/browser.Containerfile`; without it the rest of halti works as before. `mise run e2e-box` tests the VM engine against a real VM.
+
+### Renamed from cred
+
+halti was called cred. The binary is now `/usr/local/bin/halti`, with its runner in `/usr/local/lib/halti`; `install.sh` removes the old `/usr/local/bin/cred` and `/usr/local/lib/cred`. Register the MCP server again under the new name (see Agents), and change a `Bash(cred copy:*)` deny rule to `Bash(halti copy:*)` (see With Claude Code). Its tools on the Mac are now `mcp__halti__*`, so update permission rules that name `mcp__cred__*` (inside a box they stay `mcp__cred__*`, see below). `halti run` no longer reads a `.cred` file: name each resource with `-s`. Environment variables are `HALTI_*` now; the old `CRED_*` names are still read when the new one isn't set, and refresh scripts get both.
+
+Some names still say cred, because an existing install depends on them; `src/legacy.rs` lists each one and what depends on it. The Keychain items (`cred:…`), `~/.config/cred` and `~/Library/Application Support/cred` hold your secrets, approvals, policies and boxes, and the agent and browser images (`cred-agent`, `cred-agent-jvm`, `cred-agent-rust`, `cred-browser`) are pinned in approved box policies, along with what is inside them (`cred-shim`, `/run/cred`, the stand-in `cred-managed`, and the `cred` MCP server in a box, so the agent's tools there stay `mcp__cred__*`). These move to halti's names with a later migration. The codesign identifier `com.deorlovnis.cred` stays for good: Keychain items you allowed trust it, and changing it asks again for each. `install.sh` still signs with a "cred code signing" identity when there is no "halti code signing" one.
 
 ### Signing
 
 macOS asks before an app reads a Keychain item it didn't store, and remembers **Always Allow** per app identity. A plain Rust build is ad-hoc signed, so every rebuild counts as a new app and asks again. Sign with a stable self-signed identity once, and your Always Allow answers survive updates:
 
 ```sh
-cat > /tmp/cred-cert.cnf <<'CNF'
+cat > /tmp/halti-cert.cnf <<'CNF'
 [req]
 distinguished_name = dn
 x509_extensions = ext
 prompt = no
 [dn]
-CN = cred code signing
+CN = halti code signing
 [ext]
 basicConstraints = critical, CA:false
 keyUsage = critical, digitalSignature
 extendedKeyUsage = critical, codeSigning
 CNF
 cd "$(mktemp -d)"
-openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 -config /tmp/cred-cert.cnf -keyout key.pem -out cert.pem
-openssl pkcs12 -export -inkey key.pem -in cert.pem -name "cred code signing" -out cred.p12 -passout pass:tmp \
+openssl req -new -x509 -newkey rsa:2048 -nodes -days 3650 -config /tmp/halti-cert.cnf -keyout key.pem -out cert.pem
+openssl pkcs12 -export -inkey key.pem -in cert.pem -name "halti code signing" -out halti.p12 -passout pass:tmp \
   -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1   # algorithms the Keychain can import
-security import cred.p12 -k ~/Library/Keychains/login.keychain-db -P tmp   # no -T: signing must ask
-rm -f key.pem cert.pem cred.p12 /tmp/cred-cert.cnf
+security import halti.p12 -k ~/Library/Keychains/login.keychain-db -P tmp   # no -T: signing must ask
+rm -f key.pem cert.pem halti.p12 /tmp/halti-cert.cnf
 ```
 
-When `codesign` asks to use the key, choose **Allow**, never **Always Allow**: a key anything can use silently lets any program running as you sign a lookalike cred that the Keychain trusts. After switching identities, run `cred reseal` so each item trusts only the new cred, then approve your policies again.
+When `codesign` asks to use the key, choose **Allow**, never **Always Allow**: a key anything can use silently lets any program running as you sign a lookalike halti that the Keychain trusts. `install.sh` signs with `HALTI_SIGN_IDENTITY` (or `CRED_SIGN_IDENTITY`) if set, else "halti code signing", else an identity made before the rename, "cred code signing". After switching identities, run `halti reseal` so each item trusts only the new halti, then approve your policies again.
 
-Items cred writes itself, policy approvals included, stay tied to the exact build that wrote them: without an Apple Developer Team ID, macOS can't tie them to the signing identity. Approvals are read without allowing a prompt, so after an update they read as missing and every resource is blocked until you approve again. `install.sh` does that at the end. Keychain prompts take your login password; Touch ID only appears in cred's own approval prompts.
+Items halti writes itself, policy approvals included, stay tied to the exact build that wrote them: without an Apple Developer Team ID, macOS can't tie them to the signing identity. Approvals are read without allowing a prompt, so after an update they read as missing and every resource is blocked until you approve again. `install.sh` does that at the end. Keychain prompts take your login password; Touch ID only appears in halti's own approval prompts.
 
 ## Use
 
 ```sh
-cred set github token --expires 2027-01-31   # hidden prompt; asks for link/description
-cred update github token                     # rotate: copy the new token, run this
-cred policy edit github                      # write the policy; shows a diff against the approved one
-cred policy approve github                   # Touch ID; until then the policy has no effect
-cred policy approve                          # all policies, one Touch ID (install.sh runs this)
-cred run -s github -- gh api user            # if the policy allows: exported fields as env vars
-cred ls                                      # one row per resource, with a summary of its policy
-cred info github                             # fields, expiry, refresh, and what the approved policy allows
-cred check                                   # expired / expiring within 14 days
-cred audit                                   # what agents did through cred mcp (never values)
+halti set github token --expires 2027-01-31  # hidden prompt; asks for link/description
+halti update github token                    # rotate: copy the new token, run this
+halti policy edit github                     # write the policy; shows a diff against the approved one
+halti policy approve github                  # Touch ID; until then the policy has no effect
+halti policy approve                         # all policies, one Touch ID (install.sh runs this)
+halti run -s github -- gh api user           # if the policy allows: exported fields as env vars
+halti ls                                     # one row per resource, with a summary of its policy
+halti info github                            # fields, expiry, refresh, and what the approved policy allows
+halti check                                  # expired / expiring within 14 days
+halti audit                                  # what agents did through halti mcp (never values)
 ```
 
-`cred copy RES FIELD` asks for Touch ID. `cred describe RES` edits the link and description, and `cred rm RES [FIELD]` deletes. Put resource names (one per line) in a `.cred` file in a repo and `cred run -- CMD` loads them. `cred --help` lists everything.
+`halti copy RES FIELD` asks for Touch ID. `halti describe RES` edits the link and description, and `halti rm RES [FIELD]` deletes. `halti --help` lists everything.
 
 ## Policies
 
@@ -70,8 +76,8 @@ cred audit                                   # what agents did through cred mcp 
 
 ```toml
 [run]
-mode = "ask"                                   # cred run: allow | ask (Touch ID each time) | deny
-export = { token = "APP_TOKEN" }               # fields cred run exports, as env vars
+mode = "ask"                                   # halti run: allow | ask (Touch ID each time) | deny
+export = { token = "APP_TOKEN" }               # fields halti run exports, as env vars
 
 [refresh.session]
 from = "firefox:https://app.example.com#session_token"   # read from Firefox Local Storage
@@ -85,9 +91,9 @@ consent = "session"                            # Touch ID before an agent sessio
 consent_minutes = 240                          # ...and again after this long (0: only after a reconnect)
 
 [fetch]
-hosts = ["https://api.example.com"]            # the only hosts cred sends credentials to
+hosts = ["https://api.example.com"]            # the only hosts halti sends credentials to
 writes = "deny"                                # requests other than GET/HEAD: deny | ask | allow
-auth = "Bearer {token}"                        # header cred adds; the agent never sees it
+auth = "Bearer {token}"                        # header halti adds; the agent never sees it
 auth_header = "Authorization"                  # the default
 headers = { "x-client-id" = "web" }            # fixed, non-secret headers the site expects
 
@@ -97,24 +103,24 @@ about = "Get one item"
 request = "GET https://api.example.com/items/{id}"
 ```
 
-- `cred ls` and `cred info` show what the *approved* policy allows. In `ls`, `run:ask fetch browse:ask` means `cred run` asks, requests are allowed (writes denied), and pages may send writes after asking: a mode after a colon is the rule for writes, or for `cred run`. A policy that isn't approved, or changed since, shows as such instead, and none of it applies.
-- `cred policy edit` shows what your edit changed compared to the approved version (a colored diff in a terminal) and offers to approve it.
-- `cred policy approve` prints the policy and pins its sha256, and each refresh script's, in the Keychain. If the policy or a script changes afterwards, or the approval wasn't written by cred, the resource is blocked until you approve again.
-- Refresh scripts get the fields that aren't exported (login, session) as `CRED_<FIELD>`. They run from a private copy of the approved bytes.
-- A field refreshes in the last 5 minutes before its exact expiry, on its expiry date if only the date is known, or daily if its expiry is unknown. This happens before `cred run` or an agent uses it, and during `cred check`. JWT values get their exact expiry from the token.
-- `from` handles logins only a browser can do (Google sign-in, other SSO): sign in on the site in a browser, and cred reads the session it keeps. `firefox:ORIGIN#KEY` reads a Local Storage key, `firefox-cookie:ORIGIN#NAME` a cookie from Firefox (default profile; `CRED_FIREFOX_PROFILE` overrides), and `chrome-cookie:ORIGIN#NAME` a cookie from Chrome's Default profile (`CRED_CHROME_PROFILE` overrides). Chrome encrypts its cookies with a key kept in the Keychain as "Chrome Safe Storage", so macOS asks for your login password the first time cred reads it (Always Allow stops that).
+- `halti ls` and `halti info` show what the *approved* policy allows. In `ls`, `run:ask fetch browse:ask` means `halti run` asks, requests are allowed (writes denied), and pages may send writes after asking: a mode after a colon is the rule for writes, or for `halti run`. A policy that isn't approved, or changed since, shows as such instead, and none of it applies.
+- `halti policy edit` shows what your edit changed compared to the approved version (a colored diff in a terminal) and offers to approve it.
+- `halti policy approve` prints the policy and pins its sha256, and each refresh script's, in the Keychain. If the policy or a script changes afterwards, or the approval wasn't written by halti, the resource is blocked until you approve again.
+- Refresh scripts get the fields that aren't exported (login, session) as `HALTI_<FIELD>`, and as `CRED_<FIELD>` for scripts written before the rename. They run from a private copy of the approved bytes.
+- A field refreshes in the last 5 minutes before its exact expiry, on its expiry date if only the date is known, or daily if its expiry is unknown. This happens before `halti run` or an agent uses it, and during `halti check`. JWT values get their exact expiry from the token.
+- `from` handles logins only a browser can do (Google sign-in, other SSO): sign in on the site in a browser, and halti reads the session it keeps. `firefox:ORIGIN#KEY` reads a Local Storage key, `firefox-cookie:ORIGIN#NAME` a cookie from Firefox (default profile; `HALTI_FIREFOX_PROFILE` overrides), and `chrome-cookie:ORIGIN#NAME` a cookie from Chrome's Default profile (`HALTI_CHROME_PROFILE` overrides). Chrome encrypts its cookies with a key kept in the Keychain as "Chrome Safe Storage", so macOS asks for your login password the first time halti reads it (Always Allow stops that).
 
 ## Agents
 
 Register once:
 
 ```sh
-claude mcp add --scope user cred -- /usr/local/bin/cred mcp
+claude mcp add --scope user halti -- /usr/local/bin/halti mcp
 ```
 
 The agent gets these tools:
 - `sites`: lists what each approved site allows.
-- `fetch(site, method, url, body)`: a request to one of the site's hosts. cred adds the credentials and doesn't follow redirects.
+- `fetch(site, method, url, body)`: a request to one of the site's hosts. halti adds the credentials and doesn't follow redirects.
 - One tool per `[[tool]]` in the policies.
 - The `browse_*` tools, for sites whose policy has a `[browse]` section (see Browsing).
 
@@ -122,18 +128,18 @@ Results are masked: the resource's values, and anything shaped like a JWT. Write
 
 ### Audit log
 
-Every call an agent makes through `cred mcp` is appended to `~/.config/cred/audit.log` once it has run, before the agent gets the result. If the log can't be opened or written (say, its Keychain key is unreadable), the agent gets an error instead. One JSON line per call: time, site, tool, method, URL and decision: `allowed`, `asked:yes` or `asked:no` (you were asked, and answered), or `blocked` (refused by the policy, or failed before an answer). Never values, headers, bodies or typed text. URLs are masked like everything else the agent sees, and lose any user, password and `#fragment`; query values that look like secrets (keys like `token`, `key`, `code`, or long opaque strings) and opaque path segments become `********`.
+Every call an agent makes through `halti mcp` is appended to `~/.config/cred/audit.log` once it has run, before the agent gets the result. If the log can't be opened or written (say, its Keychain key is unreadable), the agent gets an error instead. One JSON line per call: time, site, tool, method, URL and decision: `allowed`, `asked:yes` or `asked:no` (you were asked, and answered), or `blocked` (refused by the policy, or failed before an answer). Never values, headers, bodies or typed text. URLs are masked like everything else the agent sees, and lose any user, password and `#fragment`; query values that look like secrets (keys like `token`, `key`, `code`, or long opaque strings) and opaque path segments become `********`.
 
-Each line carries an HMAC over its content and the previous line's, keyed by an item in the Keychain (`cred:_audit/hmac`, created on first use). `cred audit` shows the latest entries (`-n 50` for more); `cred audit --verify` reads the whole log and reports the first line where the chain breaks, so an edited, swapped or removed line shows. Cutting lines off the end can't be seen. Same-user limit: whoever can read the key from the Keychain (a program running as you, with your approval of a prompt) could forge a chain.
+Each line carries an HMAC over its content and the previous line's, keyed by an item in the Keychain (`cred:_audit/hmac`, created on first use). `halti audit` shows the latest entries (`-n 50` for more); `halti audit --verify` reads the whole log and reports the first line where the chain breaks, so an edited, swapped or removed line shows. Cutting lines off the end can't be seen. Same-user limit: whoever can read the key from the Keychain (a program running as you, with your approval of a prompt) could forge a chain.
 
 ## Browsing
 
-For sites an agent should use the way a person does, add a `[browse]` section. cred starts a headless Chromium (one per site, profile in memory only), puts the session into it from stored fields, and lets the agent steer it with `browse_open`, `browse_goto`, `browse_snapshot`, `browse_find`, `browse_click`, `browse_type`, `browse_press`, `browse_back`, `browse_requests`, `browse_screenshot` (if the policy allows it), `browse_fill_credential` (if the policy lists fields) and `browse_close`. The agent gets the page's accessibility tree with element refs, masked. It never gets the login, cookies, storage, request headers, or a way to run JavaScript.
+For sites an agent should use the way a person does, add a `[browse]` section. halti starts a headless Chromium (one per site, profile in memory only), puts the session into it from stored fields, and lets the agent steer it with `browse_open`, `browse_goto`, `browse_snapshot`, `browse_find`, `browse_click`, `browse_type`, `browse_press`, `browse_back`, `browse_requests`, `browse_screenshot` (if the policy allows it), `browse_fill_credential` (if the policy lists fields) and `browse_close`. The agent gets the page's accessibility tree with element refs, masked. It never gets the login, cookies, storage, request headers, or a way to run JavaScript.
 
 - Pages can be large: `browse_snapshot` takes `compact` (one short line per named element) or `ref` (just that element), and `browse_find(text)` returns only the elements whose name or text match, with their refs.
-- After a click (or Enter), cred waits up to 3 seconds for the URL or the page's text to change, so single-page apps return the new view.
+- After a click (or Enter), halti waits up to 3 seconds for the URL or the page's text to change, so single-page apps return the new view.
 - `browse_requests` lists the data requests (XHR/fetch: method and URL, never headers or bodies; query values over 16 characters left out) the pages made, so the agent can find the API behind a view and use `fetch` instead of scraping.
-- `browse_fill_credential(ref, field)` types a stored field into an input, for sites without a session to inject. cred does it itself, only for fields the policy lists in `fill`, and only when the page and the input's frame are on the policy's origins. The typed value is masked in everything returned.
+- `browse_fill_credential(ref, field)` types a stored field into an input, for sites without a session to inject. halti does it itself, only for fields the policy lists in `fill`, and only when the page and the input's frame are on the policy's origins. The typed value is masked in everything returned.
 
 ```toml
 [browse]
@@ -152,41 +158,41 @@ local_storage = [{ origin = "https://app.example.com", key = "jwt", field = "tok
 
 Sites can be exact (`https://app.example.com`), a domain with its subdomains (`https://*.example.com`), or `"*"` for any https site. Requests to other hosts are blocked, service workers are off, and downloads are refused. Cookies only go to the domain the policy names. The runner (`runner/`, pinned `playwright-core`) is installed root-owned by `install.sh`; it uses Playwright's Chromium headless shell from `~/Library/Caches/ms-playwright`.
 
-Writes that pages try without an `allow_writes` rule (a telemetry POST on every page load, say) are blocked or asked about, and remembered without their query or body: `cred info SITE` lists them, so you can add the harmless ones to `allow_writes`. The page tools mention this when a write was blocked.
+Writes that pages try without an `allow_writes` rule (a telemetry POST on every page load, say) are blocked or asked about, and remembered without their query or body: `halti info SITE` lists them, so you can add the harmless ones to `allow_writes`. The page tools mention this when a write was blocked.
 
 A browser closes by itself after `idle_minutes` without a call, and `max_minutes` after it opened; the agent then needs `browse_open` again. A `browse_open` waits for your Touch ID when the site's first use in a session needs consent, so it can take as long as you take to answer.
 
 ## Boxes
 
-A **box** is an isolated, encrypted place where an agent works: a Linux VM with no network of its own, whose only way out is a door cred keeps. The agent can do any work a person at a computer could (run code, install packages, keep files) but can't see your Mac, your Keychain or any credential. What it keeps is in an AES-256 store whose key lives in the Keychain; deleting the key destroys the box. The door sees every request the agent makes, so a box can read the open web while its writes stay under your rules. Sites that allow browsing get a sandboxed browser in a second VM of the box, with sessions cred keeps sealed in the box's store.
+A **box** is an isolated, encrypted place where an agent works: a Linux VM with no network of its own, whose only way out is a door halti keeps. The agent can do any work a person at a computer could (run code, install packages, keep files) but can't see your Mac, your Keychain or any credential. What it keeps is in an AES-256 store whose key lives in the Keychain; deleting the key destroys the box. The door sees every request the agent makes, so a box can read the open web while its writes stay under your rules. Sites that allow browsing get a sandboxed browser in a second VM of the box, with sessions halti keeps sealed in the box's store.
 
 ```sh
-cred box new research              # policy template in $EDITOR, a new key in the Keychain, an empty store
-cred box approve research          # Touch ID; until then the box can't open
-cred box run research              # Touch ID opens it; you're in Claude Code, inside the box
-cred box run research -- bash      # a shell in the same box (joins it if it's running)
-cred box run --temp research       # a throwaway box with research's policy, gone when it stops
-cred box ls                        # open or locked, policy status, size, sites, last used, sites with a sealed browser session
-cred box login research            # sign in to the box's sites by hand, in a window on the Mac (Touch ID, box stopped)
-cred box login research app        # just one site;  --all signs in again to sites that have a session already
-cred box log research              # what went through the door: a line per request, chained
-cred box log research --verify     # checks the chain; names the first line that was changed or removed
-cred box export research work/report.md --to ~/Desktop   # Touch ID; lists each file with size and sha256
-cred box import research ~/data.csv                      # copy a file or folder into work/ (box stopped)
-cred box stop research             # stop and lock; also happens when `run` ends or on Ctrl-C
-cred box rm research               # Touch ID; deletes the key, then the store
+halti box new research             # policy template in $EDITOR, a new key in the Keychain, an empty store
+halti box approve research         # Touch ID; until then the box can't open
+halti box run research             # Touch ID opens it; you're in Claude Code, inside the box
+halti box run research -- bash     # a shell in the same box (joins it if it's running)
+halti box run --temp research      # a throwaway box with research's policy, gone when it stops
+halti box ls                       # open or locked, policy status, size, sites, last used, sites with a sealed browser session
+halti box login research           # sign in to the box's sites by hand, in a window on the Mac (Touch ID, box stopped)
+halti box login research app       # just one site;  --all signs in again to sites that have a session already
+halti box log research             # what went through the door: a line per request, chained
+halti box log research --verify    # checks the chain; names the first line that was changed or removed
+halti box export research work/report.md --to ~/Desktop  # Touch ID; lists each file with size and sha256
+halti box import research ~/data.csv                     # copy a file or folder into work/ (box stopped)
+halti box stop research            # stop and lock; also happens when `run` ends or on Ctrl-C
+halti box rm research              # Touch ID; deletes the key, then the store
 ```
 
-`cred policy approve` with no names approves your boxes too, so `install.sh` still needs one Touch ID.
+`halti policy approve` with no names approves your boxes too, so `install.sh` still needs one Touch ID.
 
-`~/.config/cred/box/<name>.toml` (`CRED_BOX_DIR` overrides the folder):
+`~/.config/cred/box/<name>.toml` (`HALTI_BOX_DIR` overrides the folder):
 
 ```toml
 about = "Market research"
-run = ["claude"]                        # what `cred box run` starts; `-- CMD` replaces it
+run = ["claude"]                        # what `halti box run` starts; `-- CMD` replaces it
 image = "cred-agent@sha256:..."         # the system inside, pinned by digest: a new image is a policy change
-model = "anthropic"                     # resource whose key cred adds to the agent's model calls
-sites = ["github", "app"]               # resources the agent may use through cred; their policies apply
+model = "anthropic"                     # resource whose key halti adds to the agent's model calls
+sites = ["github", "app"]               # resources the agent may use through halti; their policies apply
 standins = ["GH_TOKEN"]                 # variables set to "cred-managed", for tools that won't start without a token
 keep = true                             # false: a new store every run, shredded when it stops, key never kept
 cpus = 4
@@ -206,27 +212,27 @@ path = "~/Git/project"
 mode = "clone"                          # clone: the agent works on its own copy in work/ | ro: read-only at /mnt/project
 ```
 
-- A box policy works like a resource policy: no effect until approved, a change blocks the box until approved again, and `cred box edit` shows a diff against the approved version. The approval is kept under the Keychain name `box.NAME` (resource names can't contain a dot, so it never collides with a resource).
-- One Touch ID at `run` opens the box and covers consent for its `sites`. Their own policies still decide hosts, writes and what may be browsed. `model` names a resource with a `[fetch]` policy: cred forwards the agent's model calls to its host with the real key, and the agent only has a stand-in. Joining a running box (`run NAME -- CMD` from another terminal) asks nothing more.
+- A box policy works like a resource policy: no effect until approved, a change blocks the box until approved again, and `halti box edit` shows a diff against the approved version. The approval is kept under the Keychain name `box.NAME` (resource names can't contain a dot, so it never collides with a resource).
+- One Touch ID at `run` opens the box and covers consent for its `sites`. Their own policies still decide hosts, writes and what may be browsed. `model` names a resource with a `[fetch]` policy: halti forwards the agent's model calls to its host with the real key, and the agent only has a stand-in. Joining a running box (`run NAME -- CMD` from another terminal) asks nothing more.
 - **Reads and writes.** The door ends TLS for the agent's connections, with a certificate authority made for that box and trusted only inside it (its key is sealed in the box's store, in a folder no VM mounts, and installed in the VM on each run), and judges each request. Sites are still verified against the usual public roots: one whose certificate doesn't check out gets a `502`. Reads (GET, HEAD, OPTIONS, and the POST that `git fetch` and `git clone` send to `.../git-upload-pack`) go to any site `allow` lets the box reach. Every other request is a write, and so is anything that asks to switch protocols (WebSocket). A write to a host no `sites` entry covers follows `[net] writes`; `allow_writes` lists URL prefixes that may receive writes whatever `writes` says (`https://api.example.com/search` covers `/search` and `/search/x`, not `/searching` or another host that starts alike; `/..` is resolved first). A refused request gets a `403` that says why, and the connection stays usable. With `ask`, a write waits for your Touch ID, which names the box, the method and the URL with secrets masked. A WebSocket can't be carried through the door yet, so it is refused even where writes are allowed. `rw` mounts aren't offered: files come in with `clone` or `import` and go out with `export`.
-- **Credentials for any tool.** On the hosts of a `sites` entry (its `[fetch] hosts`), the door adds the site's `auth` header and fixed `headers` to every request, whatever tool sent it, replacing anything the agent sent; the site's `writes` rule decides writes there instead of `[net]`. The agent never holds the token: `standins` sets variables such as `GH_TOKEN` to `cred-managed` so tools that insist on one start, and the door puts the real credential on the wire. The site's policy is read from its approved copy at each request: a policy that changed or was revoked gives no credentials, and its writes fall back to `[net]`. Answers from those hosts are masked with the site's stored values as they stream (a value split across reads is still found), are sent chunked because masking changes their length, and are asked for uncompressed; a site that compresses anyway is refused with a `502`, since cred can't mask what it can't read. Other hosts' answers pass as they are.
-- **The log.** `cred box log` shows one line per request (time, host, method, URL with tokens and long ids masked, status, bytes, decision: `allowed`, `asked:yes`, `asked:no`, `blocked:<why>`), never headers or bodies, along with a line per connection and per export and import. Each line carries an HMAC over itself and the line before, with a key derived from the box key, so `--verify` shows a line that was edited or taken out of the middle. Cutting off the end can't be seen. A log from before it was chained stays readable; its lines are reported as unchecked.
+- **Credentials for any tool.** On the hosts of a `sites` entry (its `[fetch] hosts`), the door adds the site's `auth` header and fixed `headers` to every request, whatever tool sent it, replacing anything the agent sent; the site's `writes` rule decides writes there instead of `[net]`. The agent never holds the token: `standins` sets variables such as `GH_TOKEN` to `cred-managed` so tools that insist on one start, and the door puts the real credential on the wire. The site's policy is read from its approved copy at each request: a policy that changed or was revoked gives no credentials, and its writes fall back to `[net]`. Answers from those hosts are masked with the site's stored values as they stream (a value split across reads is still found), are sent chunked because masking changes their length, and are asked for uncompressed; a site that compresses anyway is refused with a `502`, since halti can't mask what it can't read. Other hosts' answers pass as they are.
+- **The log.** `halti box log` shows one line per request (time, host, method, URL with tokens and long ids masked, status, bytes, decision: `allowed`, `asked:yes`, `asked:no`, `blocked:<why>`), never headers or bodies, along with a line per connection and per export and import. Each line carries an HMAC over itself and the line before, with a key derived from the box key, so `--verify` shows a line that was edited or taken out of the middle. Cutting off the end can't be seen. A log from before it was chained stays readable; its lines are reported as unchecked.
 - The `Host` header of every request must be the host the connection is for; otherwise the request is refused and the connection ends, so a connection to one allowed host can't be used to ask another.
-- **Browsing in a box.** A box's `sites` that have a `[browse]` section get the same `browse_*` tools as above, but the browser runs in a VM of the box, never on the Mac: it has no network either, and reaches only what the site's `[browse]` `origins` and `requests` allow, through the door. Each `browse_open` is a separate browser with its own profile, so sites never share cookies. The box's Touch ID at `run` is the consent. Outside a box `cred mcp` still runs the browser on the Mac.
-- **Downloads.** Pages can't download files unless the policy says `downloads = true`; then each file is saved on the Mac in `~/Library/Application Support/cred/downloads/<box>/<site>/`, outside every store, in a folder only the browser VM mounts. The agent never sees the file: the page tools name it (name, size, sha256), and `cred box import` brings one in on purpose.
-- **Sessions.** When a browser closes (`browse_close`, the idle or `max_minutes` limit, or the box stopping), cred takes the session it ends with (cookies and Local Storage, including the new values a site rotated) and seals it in the store's `browser/` folder, one file per site, encrypted with a key derived from the box key for that site alone: a file doesn't open as another site's, and no VM mounts the folder. The next `browse_open` starts from it instead of the Keychain fields, so a site that rotates its session cookie stays signed in across closes and box restarts. The session goes into the browser over a pipe and is masked in everything the agent reads, like the stored values. A file that doesn't open (changed or damaged) isn't used: the site's usual sources are, the audit log gets a `browse_session_unreadable` line, and `browse_open` tells the agent. `keep_sessions = false` writes and reads none. A session nobody signed in to (no cookies, no Local Storage) isn't sealed.
-- **`cred box login BOX [SITE]`.** For sites that need you: a visible Chromium on the Mac with an empty profile opens on the site's `start` page (or its one exact origin), you sign in by hand (SSO, two-factor), and closing the window, or Enter in the terminal, seals the session into the box. Touch ID first; the box must be stopped; the session is never printed. Without `SITE` it goes through the box's sites that have `[browse]` and no sealed session yet, one window after another (`signing in to docs (2 of 3)`), sealing each as it closes; Ctrl-C skips just that site, and so does closing a window before signing in. `--all` includes sites that already have a session. `cred box ls` shows which sites have one, by name only.
-- Mounts: `clone` copies the folder (with its `.git`) into the box's `work/` on the first run, and the agent keeps its own copy after. `ro` mounts the folder itself read-only. Folders that hold cred's own files, your home folder and `/` are refused.
-- **Images.** `cred-agent` has Claude Code, Node, Python, git, `gh` and `uv`, and sends `git@github.com:` remotes over HTTPS, the only way out of a box. `cred-agent-jvm` adds Temurin 25 and JetBrains' Kotlin language server: pin it as a box's `image` (`container image inspect cred-agent-jvm` gives the digest) for Kotlin and Gradle work, and run `claude plugin marketplace add anthropics/claude-plugins-official`, then `claude plugin install kotlin-lsp@claude-plugins-official`, once in the box for code intelligence (the first import of a large Gradle project takes minutes; until it ends the server only knows the file it has open). The JVM ignores the proxy variables, so cred also sets `JAVA_TOOL_OPTIONS` to the door's proxy; the image keeps Java's truststore in step with the box CA. `cred-agent-rust` adds a C toolchain and Rust 1.92 with clippy, rustfmt and rust-analyzer, pinned the same way. All three have Docker Engine, which runs only in a box whose policy says `docker = true`; Testcontainers then works as it does on a laptop. `rosetta = true` adds Rosetta to the VM, for x86-64 images with no arm64 build. Pulls go through the door, so allow the registry (`registry-1.docker.io`, `auth.docker.io`, `production.cloudfront.docker.com`). See [box-design.md](docs/box-design.md#development-tools).
-- Inside, `/home/agent`, `/work` and `/downloads` are folders of the store; `/tmp` is memory. The agent starts in `/work`. On each run cred makes sure Claude Code's settings skip the web-fetch check and know cred's tools (`cred-shim mcp`), keeping anything else the agent put in those files.
+- **Browsing in a box.** A box's `sites` that have a `[browse]` section get the same `browse_*` tools as above, but the browser runs in a VM of the box, never on the Mac: it has no network either, and reaches only what the site's `[browse]` `origins` and `requests` allow, through the door. Each `browse_open` is a separate browser with its own profile, so sites never share cookies. The box's Touch ID at `run` is the consent. Outside a box `halti mcp` still runs the browser on the Mac.
+- **Downloads.** Pages can't download files unless the policy says `downloads = true`; then each file is saved on the Mac in `~/Library/Application Support/cred/downloads/<box>/<site>/`, outside every store, in a folder only the browser VM mounts. The agent never sees the file: the page tools name it (name, size, sha256), and `halti box import` brings one in on purpose.
+- **Sessions.** When a browser closes (`browse_close`, the idle or `max_minutes` limit, or the box stopping), halti takes the session it ends with (cookies and Local Storage, including the new values a site rotated) and seals it in the store's `browser/` folder, one file per site, encrypted with a key derived from the box key for that site alone: a file doesn't open as another site's, and no VM mounts the folder. The next `browse_open` starts from it instead of the Keychain fields, so a site that rotates its session cookie stays signed in across closes and box restarts. The session goes into the browser over a pipe and is masked in everything the agent reads, like the stored values. A file that doesn't open (changed or damaged) isn't used: the site's usual sources are, the audit log gets a `browse_session_unreadable` line, and `browse_open` tells the agent. `keep_sessions = false` writes and reads none. A session nobody signed in to (no cookies, no Local Storage) isn't sealed.
+- **`halti box login BOX [SITE]`.** For sites that need you: a visible Chromium on the Mac with an empty profile opens on the site's `start` page (or its one exact origin), you sign in by hand (SSO, two-factor), and closing the window, or Enter in the terminal, seals the session into the box. Touch ID first; the box must be stopped; the session is never printed. Without `SITE` it goes through the box's sites that have `[browse]` and no sealed session yet, one window after another (`signing in to docs (2 of 3)`), sealing each as it closes; Ctrl-C skips just that site, and so does closing a window before signing in. `--all` includes sites that already have a session. `halti box ls` shows which sites have one, by name only.
+- Mounts: `clone` copies the folder (with its `.git`) into the box's `work/` on the first run, and the agent keeps its own copy after. `ro` mounts the folder itself read-only. Folders that hold halti's own files, your home folder and `/` are refused.
+- **Images.** `cred-agent` has Claude Code, Node, Python, git, `gh` and `uv`, and sends `git@github.com:` remotes over HTTPS, the only way out of a box. `cred-agent-jvm` adds Temurin 25 and JetBrains' Kotlin language server: pin it as a box's `image` (`container image inspect cred-agent-jvm` gives the digest) for Kotlin and Gradle work, and run `claude plugin marketplace add anthropics/claude-plugins-official`, then `claude plugin install kotlin-lsp@claude-plugins-official`, once in the box for code intelligence (the first import of a large Gradle project takes minutes; until it ends the server only knows the file it has open). The JVM ignores the proxy variables, so halti also sets `JAVA_TOOL_OPTIONS` to the door's proxy; the image keeps Java's truststore in step with the box CA. `cred-agent-rust` adds a C toolchain and Rust 1.92 with clippy, rustfmt and rust-analyzer, pinned the same way. All three have Docker Engine, which runs only in a box whose policy says `docker = true`; Testcontainers then works as it does on a laptop. `rosetta = true` adds Rosetta to the VM, for x86-64 images with no arm64 build. Pulls go through the door, so allow the registry (`registry-1.docker.io`, `auth.docker.io`, `production.cloudfront.docker.com`). See [box-design.md](docs/box-design.md#development-tools).
+- Inside, `/home/agent`, `/work` and `/downloads` are folders of the store; `/tmp` is memory. The agent starts in `/work`. On each run halti makes sure Claude Code's settings skip the web-fetch check and know halti's tools (`cred-shim mcp`), keeping anything else the agent put in those files.
 - The store is an APFS sparse bundle in `~/Library/Application Support/cred/box/`, opened with the key on `hdiutil`'s stdin into a private folder, hidden from Finder and Spotlight, and only while the box runs. A store never shrinks when files are deleted (`hdiutil compact` doesn't work on APFS images).
-- `export`, `import` and `rm` need the box stopped, because cred doesn't touch a folder a VM has mounted (and a running agent could swap a link in the folder while it is read). `export` copies regular files only, never follows links, and logs each file in the box's log. `log` reads an open box without asking.
-- `cred box rm` warns that Time Machine may still hold encrypted copies of the store; restored together with a Keychain from before the removal, which has the old key, they would open.
+- `export`, `import` and `rm` need the box stopped, because halti doesn't touch a folder a VM has mounted (and a running agent could swap a link in the folder while it is read). `export` copies regular files only, never follows links, and logs each file in the box's log. `log` reads an open box without asking.
+- `halti box rm` warns that Time Machine may still hold encrypted copies of the store; restored together with a Keychain from before the removal, which has the old key, they would open.
 - A crash leaves an attached store or a throwaway store behind; the next `run` or `stop` detaches and deletes them.
 
-## What cred protects, and what it doesn't
+## What halti protects, and what it doesn't
 
-- **Protected:** values never reach the agent through cred. They stay in the Keychain, are added to requests by cred, are masked in everything cred returns, and refresh scripts run from approved bytes. Nothing loosens a policy or releases a value without Touch ID.
+- **Protected:** values never reach the agent through halti. They stay in the Keychain, are added to requests by halti, are masked in everything halti returns, and refresh scripts run from approved bytes. Nothing loosens a policy or releases a value without Touch ID.
 - **Not protected:** whatever the agent reads (API responses, page text, screenshots) is in its context, and the agent's client may store it. Claude Code keeps tool results, screenshots included, in its session folder under `~/.claude/projects/`. Masking can't reach text inside a screenshot, so leave `screenshots` off for sites whose pages show secrets.
 - **Same-user limits:** the agent runs as you. It can't read values silently, but it can cause Keychain or Touch ID prompts. Approve only prompts you expect.
 
@@ -240,19 +246,19 @@ Deny direct Keychain and clipboard reads in `~/.claude/settings.json` too:
   "Bash(security find-internet-password:*)",
   "Bash(security dump-keychain:*)",
   "Bash(security export:*)",
-  "Bash(cred copy:*)",
+  "Bash(halti copy:*)",
   "Bash(pbpaste:*)"
 ] } }
 ```
 
-Metadata (never values) is kept in `~/.config/cred/index.json`; `CRED_INDEX` overrides it, and `CRED_POLICY_DIR` the policy folder, `CRED_BOX_DIR` the box policy folder. `CRED_WARN_DAYS` sets the warning window.
+Metadata (never values) is kept in `~/.config/cred/index.json`; `HALTI_INDEX` overrides it, and `HALTI_POLICY_DIR` the policy folder, `HALTI_BOX_DIR` the box policy folder. `HALTI_WARN_DAYS` sets the warning window. The old `CRED_` names of these still work.
 
 ## Development
 
 ```sh
 mise run check       # format, clippy, release check and all tests that need no human: run before pushing
-mise run e2e         # end-to-end tests: the built binary, a local test site, `cred run` and `cred mcp`
+mise run e2e         # end-to-end tests: the built binary, a local test site, `halti run` and `halti mcp`
 mise run e2e-opt-in  # also the sandboxed browser, and one real Touch ID approval (you tap)
 ```
 
-`cargo test` runs the unit tests and the same end-to-end tests. Debug builds keep Keychain items in a temp folder when `CRED_TEST_KEYCHAIN` is set and take `CRED_TEST_APPROVE=yes|no` as the Touch ID answer, so those tests need no human and never touch your Keychain; release builds contain neither. The opt-in tests are `#[ignore]`d (`CRED_E2E_BROWSER=1 cargo test -- --include-ignored` runs the ones that start the runner, including a session that a local site rotates on every visit surviving close and a box restart): the browser ones need `npm ci` in `runner/` and Playwright's Chromium (`install.sh` fetches it), and the Touch ID one uses the real Keychain with a throwaway resource name and removes it afterwards.
+`cargo test` runs the unit tests and the same end-to-end tests. Debug builds keep Keychain items in a temp folder when `HALTI_TEST_KEYCHAIN` is set and take `HALTI_TEST_APPROVE=yes|no` as the Touch ID answer, so those tests need no human and never touch your Keychain; release builds contain neither. The opt-in tests are `#[ignore]`d (`HALTI_E2E_BROWSER=1 cargo test -- --include-ignored` runs the ones that start the runner, including a session that a local site rotates on every visit surviving close and a box restart): the browser ones need `npm ci` in `runner/` and Playwright's Chromium (`install.sh` fetches it), and the Touch ID one uses the real Keychain with a throwaway resource name and removes it afterwards.

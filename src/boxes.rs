@@ -1,17 +1,17 @@
-//! Boxes: isolated, encrypted places where an agent works (`cred box`).
+//! Boxes: isolated, encrypted places where an agent works (`halti box`).
 //!
-//! A box has a policy, ~/.config/cred/box/<name>.toml, that counts only once approved with
+//! A box has a policy, box/<name>.toml in the config folder, that counts only once approved with
 //! Touch ID, exactly like a resource's policy (the same approval records, kept under the
 //! Keychain name `box.<name>`: resource names can't contain a dot, so the two never collide).
 //! Its data lives in an encrypted store (see `store`) whose key is one Keychain item,
-//! `cred:box.<name>/_key`, read only to open the store. `run` (see `run`) opens the store, starts
+//! `box.<name>/_key`, read only to open the store. `run` (see `run`) opens the store, starts
 //! the VM and the door, and tears it all down again.
 //!
 //! The door sees every request (see `door::inspect`): `[net] allow` says which hosts the box may
 //! reach, `writes` and `allow_writes` what it may send them besides reads, and `standins` which
 //! environment variables hold the stand-in for a site's credential. `[browser]` says whether a
 //! site's browser session is kept between runs: sealed in the store's `browser/` folder, which no
-//! VM mounts (see `sessions`; `cred box login` signs in by hand, see `login`).
+//! VM mounts (see `sessions`; `halti box login` signs in by hand, see `login`).
 
 pub mod browser_vm;
 mod login;
@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::{env, thread};
+use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
 use jiff::Timestamp;
@@ -34,8 +34,8 @@ use sha2::{Digest, Sha256};
 use crate::chain::{self, Chain};
 use crate::door::inspect::parse_prefix;
 use crate::policy::{self, Approval, Mode, Site, Status};
-use crate::util::{config_dir, expand_home, home};
-use crate::{approve, engine, keychain, parse_env, parse_resource};
+use crate::util::{config_dir, env_var, expand_home, home};
+use crate::{approve, engine, keychain, legacy, parse_env, parse_resource};
 pub use login::login;
 use store::Layout;
 
@@ -45,8 +45,8 @@ pub const KEY_PREFIX: &str = "box.";
 const KEY_FIELD: &str = "_key";
 /// The Keychain field of where the box's door log stood when it last stopped (`chain::Head`).
 pub const LOG_HEAD_FIELD: &str = "_loghead";
-/// The Keychain field with the names of the sites that have a sealed session, kept by the cred that
-/// sealed them so `cred box ls` can show them without opening the store.
+/// The Keychain field with the names of the sites that have a sealed session, kept by the halti that
+/// sealed them so `halti box ls` can show them without opening the store.
 const SESSIONS_FIELD: &str = "_sessions";
 /// A box's name also names its VM and its socket (104-byte limit), so it stays short.
 const MAX_NAME: usize = 32;
@@ -64,7 +64,7 @@ pub fn parse_name(s: &str) -> Result<String, String> {
 }
 
 pub fn dir() -> PathBuf {
-    env::var_os("CRED_BOX_DIR").map(PathBuf::from).unwrap_or_else(|| config_dir().join("box"))
+    env_var("BOX_DIR").map(PathBuf::from).unwrap_or_else(|| config_dir().join("box"))
 }
 
 pub fn path(name: &str) -> PathBuf {
@@ -90,17 +90,17 @@ pub fn names() -> Vec<String> {
 pub struct BoxPolicy {
     #[serde(default)]
     pub about: String,
-    /// What `cred box run` starts inside.
+    /// What `halti box run` starts inside.
     #[serde(default = "default_run")]
     pub run: Vec<String>,
     /// The system inside, pinned by digest: a new image is a policy change.
     pub image: Option<String>,
-    /// Resource whose key cred adds to the agent's model calls.
+    /// Resource whose key halti adds to the agent's model calls.
     pub model: Option<String>,
-    /// Resources the agent may use through cred; their own policies apply.
+    /// Resources the agent may use through halti; their own policies apply.
     #[serde(default)]
     pub sites: Vec<String>,
-    /// Environment variables set to the stand-in `cred-managed` for tools that refuse to start
+    /// Environment variables set to the stand-in (`legacy::STANDIN`) for tools that refuse to start
     /// without a token (`GH_TOKEN`). The door adds the real credential on the hosts of `sites`.
     #[serde(default)]
     pub standins: Vec<String>,
@@ -206,12 +206,12 @@ impl MountPolicy {
     }
 }
 
-/// Why a folder can't be handed to a box: it holds cred's own files, or everything.
+/// Why a folder can't be handed to a box: it holds halti's own files, or everything.
 pub fn mount_problem(path: &Path) -> Option<String> {
     if path == Path::new("/") || path == home() {
         return Some("is too broad".into());
     }
-    [config_dir(), home().join("Library/Application Support/cred")].iter().any(|own| path.starts_with(own) || own.starts_with(path)).then(|| "holds cred's own files".into())
+    [config_dir(), home().join(legacy::STORE_ROOT)].iter().any(|own| path.starts_with(own) || own.starts_with(path)).then(|| "holds halti's own files".into())
 }
 
 impl BoxPolicy {
@@ -238,7 +238,7 @@ impl BoxPolicy {
                     && digest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
             });
             if !pinned {
-                bail!("image must be pinned by digest, like cred-agent@sha256:<64 hex digits>");
+                bail!("image must be pinned by digest, like {}@sha256:<64 hex digits>", legacy::AGENT_IMAGE);
             }
         }
         if let Some(model) = &self.model {
@@ -255,7 +255,7 @@ impl BoxPolicy {
         for name in &self.standins {
             parse_env(name).map_err(|e| anyhow!("standins: '{name}': {e}"))?;
             if reserved.contains(name) {
-                bail!("standins: {name} is set by cred already");
+                bail!("standins: {name} is set by halti already");
             }
             if self.standins.iter().filter(|n| *n == name).count() > 1 {
                 bail!("standins lists {name} twice");
@@ -284,7 +284,7 @@ impl BoxPolicy {
         for m in &self.mounts {
             match m.mode.as_str() {
                 "clone" | "ro" => {}
-                "rw" => bail!("[[mount]] {}: rw isn't available, a box can't change your files; use clone and `cred box export`", m.path),
+                "rw" => bail!("[[mount]] {}: rw isn't available, a box can't change your files; use clone and `halti box export`", m.path),
                 other => bail!("[[mount]] {}: mode '{other}' isn't clone or ro", m.path),
             }
             let host = m.host();
@@ -308,17 +308,17 @@ impl BoxPolicy {
 
 fn template(name: &str, image: Option<&str>) -> String {
     let image = image.map_or_else(
-        || "# image = \"cred-agent@sha256:...\"       # the system inside, pinned: build it with install.sh, then paste its digest".to_string(),
+        || format!("# image = \"{}@sha256:...\"       # the system inside, pinned: build it with install.sh, then paste its digest", legacy::AGENT_IMAGE),
         |digest| format!("image = \"{digest}\"                  # the system inside, pinned: a new image is a policy change"),
     );
     format!(
-        r#"# cred box policy for {name}. It takes effect only once approved: cred box approve {name}
+        r#"# halti box policy for {name}. It takes effect only once approved: halti box approve {name}
 about = ""
-run = ["claude"]                        # what `cred box run {name}` starts
+run = ["claude"]                        # what `halti box run {name}` starts
 {image}
-model = "anthropic"                     # resource whose key cred adds to the agent's model calls
-sites = []                              # resources the agent may use through cred; their policies apply
-# standins = ["GH_TOKEN"]               # variables set to "cred-managed" for tools that insist on a token; cred adds the real credential on the hosts of `sites`
+model = "anthropic"                     # resource whose key halti adds to the agent's model calls
+sites = []                              # resources the agent may use through halti; their policies apply
+# standins = ["GH_TOKEN"]               # variables set to "{standin}" for tools that insist on a token; halti adds the real credential on the hosts of `sites`
 keep = true                            # false: the box is shredded when it stops
 # docker = true                         # Docker Engine in the VM; it makes the agent root in the VM, which stays the boundary
 # rosetta = true                        # Rosetta in the VM, for x86-64 images with no arm64 build
@@ -326,8 +326,8 @@ cpus = 4
 memory = "8G"
 
 [browser]                               # the sandboxed browser, for `sites` whose own policy has a [browse] section
-# keep_sessions = true                  # seal each site's session when its browser closes, so the next one starts signed in (`cred box login {name}` signs in by hand)
-# downloads = false                     # true: pages may download files, kept on the Mac outside the box (`cred box import` brings one in)
+# keep_sessions = true                  # seal each site's session when its browser closes, so the next one starts signed in (`halti box login {name}` signs in by hand)
+# downloads = false                     # true: pages may download files, kept on the Mac outside the box (`halti box import` brings one in)
 
 [net]                                   # where the agent's own requests may go; nothing else is reachable
 allow = ["*"]                           # any public https site, reads only (see writes); or a list like ["https://*.wikipedia.org"], or [] for nowhere
@@ -337,7 +337,8 @@ writes = "deny"                         # anything but a read (GET, HEAD, OPTION
 # [[mount]]                             # holes in the box: none unless listed
 # path = "~/Git/project"
 # mode = "clone"                        # clone: the agent works on its own copy in work/ | ro: read-only
-"#
+"#,
+        standin = legacy::STANDIN
     )
 }
 
@@ -353,9 +354,9 @@ fn load(name: &str) -> Result<(BoxPolicy, String)> {
 
 fn not_approved(name: &str, why: &Status) -> anyhow::Error {
     match why {
-        Status::Missing => anyhow!("there is no box {name} (create it with: cred box new {name})"),
-        Status::Unapproved => anyhow!("the policy for box {name} isn't approved (cred box approve {name})"),
-        Status::Changed => anyhow!("the policy for box {name} changed since it was approved (cred box approve {name})"),
+        Status::Missing => anyhow!("there is no box {name} (create it with: halti box new {name})"),
+        Status::Unapproved => anyhow!("the policy for box {name} isn't approved (halti box approve {name})"),
+        Status::Changed => anyhow!("the policy for box {name} changed since it was approved (halti box approve {name})"),
         Status::Approved => anyhow!("box {name} is approved"),
     }
 }
@@ -373,7 +374,7 @@ pub fn prepare(name: &str) -> Result<(String, Approval)> {
 pub fn approve(names_given: &[String]) -> Result<()> {
     let given = if names_given.is_empty() { names() } else { names_given.to_vec() };
     if given.is_empty() {
-        bail!("there are no boxes (create one with: cred box new NAME)");
+        bail!("there are no boxes (create one with: halti box new NAME)");
     }
     let prepared = given.iter().map(|n| prepare(n)).collect::<Result<_>>()?;
     policy::approve_prepared(prepared)
@@ -383,13 +384,13 @@ pub fn approve(names_given: &[String]) -> Result<()> {
 
 /// The box's store key, from the Keychain.
 fn box_key(name: &str) -> Result<String> {
-    keychain::get(&key(name), KEY_FIELD).ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (cred box rm {name})"))
+    keychain::get(&key(name), KEY_FIELD).ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (halti box rm {name})"))
 }
 
 // STUB: replaced at merge by seal::derive (one key per purpose, derived from the box key)
 fn derive(box_key: &[u8], purpose: &str) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"cred box key derivation stub\0");
+    hash.update(legacy::LOG_KEY_LABEL);
     hash.update(purpose.as_bytes());
     hash.update(b"\0");
     hash.update(box_key);
@@ -425,8 +426,8 @@ pub fn new(name: &str) -> Result<()> {
     let layout = Layout::real()?;
     let (p, bundle, k) = (path(name), layout.bundle(name), key(name));
     match (has_key(name), bundle.exists()) {
-        (true, true) => bail!("box {name} exists (cred box edit {name} changes its policy)"),
-        (false, true) => bail!("box {name} has a store but no key, so it can't be opened: remove it with cred box rm {name}"),
+        (true, true) => bail!("box {name} exists (halti box edit {name} changes its policy)"),
+        (false, true) => bail!("box {name} has a store but no key, so it can't be opened: remove it with halti box rm {name}"),
         _ => {}
     }
     if !p.exists() {
@@ -453,7 +454,7 @@ pub fn new(name: &str) -> Result<()> {
         println!("created box {name}: keep = false, so every run gets a new store that is shredded when it stops");
     }
     if edited || !matches!(policy::status_of(&k, &p), Status::Approved) {
-        policy::offer_approval(&p, &format!("cred box approve {name}"), || approve(&[name.to_string()]))?;
+        policy::offer_approval(&p, &format!("halti box approve {name}"), || approve(&[name.to_string()]))?;
     }
     Ok(())
 }
@@ -464,18 +465,18 @@ pub fn edit(name: &str) -> Result<()> {
         return Err(not_approved(name, &Status::Missing));
     }
     if policy::edit_file(&key(name), &p, |text| BoxPolicy::parse(text).map(drop))? {
-        policy::offer_approval(&p, &format!("cred box approve {name}"), || approve(&[name.to_string()]))?;
+        policy::offer_approval(&p, &format!("halti box approve {name}"), || approve(&[name.to_string()]))?;
     }
     Ok(())
 }
 
-/// `cred box run`: open the box (or join it if it runs), and work in it until it ends.
+/// `halti box run`: open the box (or join it if it runs), and work in it until it ends.
 pub fn run(name: &str, temp: bool, command: Vec<String>) -> Result<u8> {
     let (policy, text) = load(name)?;
     let layout = Layout::real()?;
     let persistent = policy.keep && !temp;
     if persistent && !layout.bundle(name).exists() {
-        bail!("box {name} has no store (create one with: cred box new {name})");
+        bail!("box {name} has no store (create one with: halti box new {name})");
     }
     let id = if temp { format!("{name}-tmp-{}", &store::new_key()?[..8]) } else { name.to_string() };
     if temp {
@@ -498,14 +499,15 @@ pub fn run(name: &str, temp: bool, command: Vec<String>) -> Result<u8> {
 
 pub fn stop(name: &str) -> Result<()> {
     let layout = Layout::real()?;
-    let vm = run::vm_name(name);
-    let was_running = engine::running(&vm);
-    if was_running {
-        engine::stop(&vm)?;
+    // Under its name from before the rename too, if the old binary started it.
+    let running: Vec<String> = run::vm_names(name).into_iter().filter(|vm| engine::running(vm)).collect();
+    for vm in &running {
+        engine::stop(vm)?;
     }
+    let was_running = !running.is_empty();
     let lock = layout.lock(name);
     if lock.exists() {
-        // The cred that runs the box shuts it down; when it lets go, nothing is left to clean.
+        // The halti that runs the box shuts it down; when it lets go, nothing is left to clean.
         // If it died, what it left (a mounted store) is cleaned here.
         for _ in 0..60 {
             if let Some(_held) = store::lock(&lock)? {
@@ -530,12 +532,12 @@ fn with_store<T>(name: &str, reason: &str, readonly: bool, f: impl FnOnce(&Path)
     layout.prepare()?;
     let bundle = layout.bundle(name);
     if !bundle.exists() {
-        bail!("box {name} has no store (cred box new {name})");
+        bail!("box {name} has no store (halti box new {name})");
     }
     let mnt = layout.mount_point(name);
     let Some(_lock) = store::lock(&layout.lock(name))? else {
         if !readonly {
-            bail!("box {name} is running: stop it first (cred box stop {name}), so nothing changes a folder its VM has mounted");
+            bail!("box {name} is running: stop it first (halti box stop {name}), so nothing changes a folder its VM has mounted");
         }
         if !store::is_mounted(&mnt) {
             bail!("box {name} is being opened or closed: try again in a moment");
@@ -548,7 +550,7 @@ fn with_store<T>(name: &str, reason: &str, readonly: bool, f: impl FnOnce(&Path)
     f(open.path())
 }
 
-/// What the door and cred did for a box, latest last. With `verify`, checks the whole log
+/// What the door and halti did for a box, latest last. With `verify`, checks the whole log
 /// against its chain instead, and fails naming the first line that was changed or removed.
 pub fn log(name: &str, last: usize, verify: bool) -> Result<()> {
     with_store(name, &format!("read the log of box {name}"), true, |mnt| {
@@ -670,7 +672,7 @@ pub fn rm(name: &str) -> Result<()> {
     let lock = layout.lock(name);
     layout.prepare()?;
     let Some(_held) = store::lock(&lock)? else {
-        bail!("box {name} is running: stop it first (cred box stop {name})");
+        bail!("box {name} is running: stop it first (halti box stop {name})");
     };
     approve::confirm(&format!("delete box {name}: its data can never be read again"))?;
     // The key goes first: without it the store is noise, whatever happens to the files.
@@ -682,7 +684,7 @@ pub fn rm(name: &str) -> Result<()> {
     run::sweep(&layout, name)?;
     println!("deleted box {name}: its key and its store");
     if p.exists() {
-        println!("kept its policy {} (cred box new {name} makes a fresh box from it)", p.display());
+        println!("kept its policy {} (halti box new {name} makes a fresh box from it)", p.display());
     }
     println!(
         "Time Machine may still hold encrypted copies of the store (and APFS local snapshots for about a day). \
@@ -740,7 +742,7 @@ pub fn ls() -> Result<()> {
         }
     }
     if shown.is_empty() {
-        println!("(no boxes: cred box new NAME)");
+        println!("(no boxes: halti box new NAME)");
     }
     Ok(())
 }
@@ -751,7 +753,7 @@ mod tests {
     use crate::parse_field;
     use crate::util::TempDir;
 
-    const DIGEST: &str = "cred-agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const DIGEST: &str = "agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     fn err(text: &str) -> String {
         format!("{:#}", BoxPolicy::parse(text).err().unwrap_or_else(|| panic!("accepted: {text}")))
@@ -778,7 +780,7 @@ mod tests {
             allow_writes = ["https://api.example.com/search", "https://docs.rs"]
 
             [[mount]]
-            path = "~/Git/cred"
+            path = "~/Git/halti"
 
             [[mount]]
             path = "/opt/data/"
@@ -792,7 +794,7 @@ mod tests {
         assert_eq!(p.allow(), ["*", "https://*.wikipedia.org", "https://docs.rs", "https://example.com"]);
         assert_eq!((p.net.writes, p.net.allow_writes.len(), p.standins.as_slice()), (Mode::Ask, 2, &["GH_TOKEN".to_string(), "NPM_TOKEN".to_string()][..]));
         assert_eq!(BoxPolicy::parse("[net]\nwrites = \"allow\"").unwrap().net.writes, Mode::Allow);
-        assert_eq!((p.mounts[0].name(), p.mounts[0].readonly()), ("cred".to_string(), false));
+        assert_eq!((p.mounts[0].name(), p.mounts[0].readonly()), ("halti".to_string(), false));
         assert_eq!((p.mounts[1].name(), p.mounts[1].readonly()), ("data".to_string(), true));
     }
 
@@ -824,8 +826,8 @@ mod tests {
             ("[net]\nalow = []", "unknown field"),
             ("run = []", "run must be"),
             ("run = [\"\"]", "run must be"),
-            ("image = \"cred-agent\"", "pinned by digest"),
-            ("image = \"cred-agent@sha256:abc\"", "pinned by digest"),
+            ("image = \"agent\"", "pinned by digest"),
+            ("image = \"agent@sha256:abc\"", "pinned by digest"),
             ("model = \"Bad Name\"", "model"),
             ("sites = [\"github\", \"github\"]", "twice"),
             ("sites = [\"../x\"]", "sites"),
@@ -841,9 +843,9 @@ mod tests {
             ("[net]\nallow_writes = [\"https://a.example.com:8443/x\"]", "allow_writes"),
             ("standins = [\"gh_token\"]", "standins"),
             ("standins = [\"GH TOKEN\"]", "standins"),
-            ("standins = [\"HTTPS_PROXY\"]", "set by cred already"),
-            ("standins = [\"ANTHROPIC_API_KEY\"]", "set by cred already"),
-            ("standins = [\"CLAUDE_CODE_OAUTH_TOKEN\"]", "set by cred already"),
+            ("standins = [\"HTTPS_PROXY\"]", "set by halti already"),
+            ("standins = [\"ANTHROPIC_API_KEY\"]", "set by halti already"),
+            ("standins = [\"CLAUDE_CODE_OAUTH_TOKEN\"]", "set by halti already"),
             ("standins = [\"GH_TOKEN\", \"GH_TOKEN\"]", "twice"),
             ("[net]\nallow = [\"http://a.example.com\"]", "https"),
             ("[net]\nallow = [\"http://localhost\"]", "https"),
@@ -864,18 +866,18 @@ mod tests {
     }
 
     #[test]
-    fn keeps_cred_s_own_folders_out_of_boxes() {
+    fn keeps_halti_s_own_folders_out_of_boxes() {
         for path in [
             home(),
             config_dir(),
             config_dir().join("policy"),
             home().join(".config"),
-            home().join("Library/Application Support/cred/box/open/x"),
+            home().join(legacy::STORE_ROOT).join("box/open/x"),
             home().join("Library/Application Support"),
         ] {
             let text = format!("[[mount]]\npath = \"{}\"", path.display());
             let e = err(&text);
-            assert!(e.contains("too broad") || e.contains("cred's own"), "{text}: {e}");
+            assert!(e.contains("too broad") || e.contains("halti's own"), "{text}: {e}");
         }
         assert!(BoxPolicy::parse(&format!("[[mount]]\npath = \"{}\"", home().join("Git/project").display())).is_ok());
     }
@@ -887,7 +889,7 @@ mod tests {
         assert_eq!((open.allow(), open.net.writes), (vec!["*".to_string()], Mode::Deny), "the open web, reads only");
         let p = BoxPolicy::parse(&template("research", Some(DIGEST))).unwrap();
         assert_eq!((p.image.as_deref(), p.model.as_deref(), p.keep), (Some(DIGEST), Some("anthropic"), true));
-        assert!(template("research", None).contains("cred box approve research"));
+        assert!(template("research", None).contains("halti box approve research"));
     }
 
     #[test]
@@ -903,8 +905,8 @@ mod tests {
     #[test]
     fn says_why_a_box_is_not_approved() {
         let say = |s: Status| not_approved("research", &s).to_string();
-        assert!(say(Status::Missing).contains("cred box new research"));
-        assert!(say(Status::Unapproved).contains("isn't approved") && say(Status::Unapproved).contains("cred box approve research"));
+        assert!(say(Status::Missing).contains("halti box new research"));
+        assert!(say(Status::Unapproved).contains("isn't approved") && say(Status::Unapproved).contains("halti box approve research"));
         assert!(say(Status::Changed).contains("changed since"));
     }
 
@@ -918,7 +920,7 @@ mod tests {
 
     #[test]
     fn exports_list_each_file_with_size_and_hash() {
-        let dir = TempDir::new("cred-export").unwrap();
+        let dir = TempDir::new("halti-export").unwrap();
         let (mnt, to) = (dir.0.join("mnt"), dir.0.join("to"));
         fs::create_dir_all(mnt.join("work/out")).unwrap();
         fs::create_dir_all(&to).unwrap();
@@ -942,7 +944,7 @@ mod tests {
 
     #[test]
     fn exports_never_leave_the_box() {
-        let dir = TempDir::new("cred-escape").unwrap();
+        let dir = TempDir::new("halti-escape").unwrap();
         let (mnt, to) = (dir.0.join("mnt"), dir.0.join("to"));
         fs::create_dir_all(mnt.join("work")).unwrap();
         fs::create_dir_all(&to).unwrap();

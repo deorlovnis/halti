@@ -1,14 +1,20 @@
-//! The VM engine and the agent image, end to end, with a stand-in for cred's door on the Mac.
+//! The VM engine and the agent image, end to end, with a stand-in for halti's door on the Mac.
 //!
 //! Needs Apple's `container` (running) and builds the agent image, so it only runs on request:
 //!
-//!     mise run e2e-box        # CRED_E2E_BOX=1 cargo test --test box_engine -- --ignored --nocapture
+//!     mise run e2e-box        # HALTI_E2E_BOX=1 cargo test --test box_engine -- --ignored --nocapture
 //!
 //! The test door does what the real one will: it dials the VM's published socket, reads the line
 //! that says which listener a connection came through, and answers.
 
 #[path = "../src/engine.rs"]
 mod engine;
+#[path = "../src/legacy.rs"]
+#[allow(dead_code)] // the engine uses a few
+mod legacy;
+#[path = "../box/shim/src/legacy.rs"]
+#[allow(dead_code)]
+mod shim_legacy;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -91,7 +97,7 @@ fn dial(socket: PathBuf, seen: Seen, stop: Arc<AtomicBool>) {
 fn answer(kind: &str, conn: &mut BufReader<UnixStream>, seen: &Seen) {
     let record = |line: String| seen.lock().unwrap().push((kind.to_string(), line));
     match kind {
-        "proxy" | "cred" => {
+        "proxy" | legacy::DOOR_KIND => {
             // the request head, up to the empty line
             let mut head = String::new();
             loop {
@@ -102,7 +108,7 @@ fn answer(kind: &str, conn: &mut BufReader<UnixStream>, seen: &Seen) {
                 head.push_str(&line);
             }
             record(head);
-            let reply = if kind == "cred" {
+            let reply = if kind == legacy::DOOR_KIND {
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
             } else {
                 "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -147,28 +153,37 @@ fn sh(vm: &str, env: &[(String, String)], script: &str) -> (bool, String) {
     (out.status.success(), text.trim().to_string())
 }
 
+/// The host and the shim keep separate copies of the guest names; they have to say the same.
+#[test]
+fn host_and_shim_agree_on_the_guest_names() {
+    assert_eq!(
+        (legacy::SHIM, legacy::DOOR_SOCKET, legacy::LOCAL_SOCKET, legacy::DOOR_KIND),
+        (shim_legacy::SHIM, shim_legacy::DOOR_SOCKET, shim_legacy::LOCAL_SOCKET, shim_legacy::DOOR_KIND)
+    );
+}
+
 #[test]
 #[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
 fn vm_has_only_the_door() {
-    if env::var_os("CRED_E2E_BOX").is_none() {
-        eprintln!("CRED_E2E_BOX isn't set: skipping");
+    if env::var_os("HALTI_E2E_BOX").is_none() {
+        eprintln!("HALTI_E2E_BOX isn't set: skipping");
         return;
     }
     engine::available().unwrap();
 
-    // CRED_E2E_AGENT_IMAGE: an image built already, under another name, so `cred-agent` stays as it is.
-    let image = match env::var("CRED_E2E_AGENT_IMAGE") {
+    // HALTI_E2E_AGENT_IMAGE: an image built already, under another name, so the agent image stays as it is.
+    let image = match env::var("HALTI_E2E_AGENT_IMAGE") {
         Ok(name) => engine::image_digest(&name).unwrap(),
         Err(_) => {
             let image = engine::build_agent_image(&Path::new(env!("CARGO_MANIFEST_DIR")).join("box")).unwrap();
-            assert!(image.starts_with("cred-agent@sha256:"), "{image}");
+            assert!(image.starts_with(&format!("{}@sha256:", legacy::AGENT_IMAGE)), "{image}");
             assert_eq!(engine::image_digest(engine::AGENT_IMAGE).unwrap(), image);
             image
         }
     };
 
     // a short path for the socket (macOS limits them), and folders to mount
-    let dir = PathBuf::from(format!("/tmp/cred-e2e-box-{}", process::id()));
+    let dir = PathBuf::from(format!("/tmp/halti-e2e-box-{}", process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let (home, ro) = (dir.join("home"), dir.join("ro"));
@@ -176,7 +191,7 @@ fn vm_has_only_the_door() {
     fs::create_dir(&ro).unwrap();
     fs::write(ro.join("note"), "read me\n").unwrap();
 
-    let name = format!("cred-e2e-box-{}", process::id());
+    let name = format!("halti-e2e-box-{}", process::id());
     let spec = engine::VmSpec {
         name: name.clone(),
         image,
@@ -206,13 +221,13 @@ fn vm_has_only_the_door() {
     assert!(!ok, "the test door refuses, so curl must fail: {out}");
     assert!(door.saw("proxy", "CONNECT example.com:443"), "{:?}", door.seen.lock().unwrap());
 
-    // cred itself, at 127.0.0.2, is not sent to the proxy even with the agent's environment
+    // halti itself, at 127.0.0.2, is not sent to the proxy even with the agent's environment
     let (ok, out) = sh(&name, &env, "curl -sS -m 10 http://127.0.0.2/model/x");
     assert!(ok && out == "ok", "{out}");
-    assert!(door.saw("cred", "GET /model/x"), "{:?}", door.seen.lock().unwrap());
+    assert!(door.saw(legacy::DOOR_KIND, "GET /model/x"), "{:?}", door.seen.lock().unwrap());
 
-    // cred-shim mcp: stdio in and out, paired with a connection of kind `mcp`
-    let mcp = ["cred-shim".to_string(), "mcp".to_string()];
+    // the shim's `mcp`: stdio in and out, paired with a connection of kind `mcp`
+    let mcp = [legacy::SHIM.to_string(), "mcp".to_string()];
     let mut child = engine::exec_command(&name, &[], &mcp, false).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -243,12 +258,15 @@ fn vm_has_only_the_door() {
     let (_, writable) = sh(
         &name,
         &[],
-        "find / -xdev \\( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path /home/agent \\) -prune -o -writable ! -type l ! -path /run/cred/local.sock -print 2>/dev/null",
+        &format!(
+            "find / -xdev \\( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path /home/agent \\) -prune -o -writable ! -type l ! -path {} -print 2>/dev/null",
+            legacy::LOCAL_SOCKET
+        ),
     );
     assert_eq!(writable, "", "the agent can write on the root filesystem");
     assert_eq!(sh(&name, &[], "find / -xdev -perm /6000 -type f 2>/dev/null").1, "", "setuid files");
     assert!(sh(&name, &[], "echo ok > /tmp/x && cat /tmp/x").0);
-    let (ok, out) = sh(&name, &[], "python3 -c \"import socket; s = socket.socket(socket.AF_UNIX); s.connect('/run/cred/door.sock')\"");
+    let (ok, out) = sh(&name, &[], &format!("python3 -c \"import socket; s = socket.socket(socket.AF_UNIX); s.connect('{}')\"", legacy::DOOR_SOCKET));
     assert!(!ok && out.contains("Permission denied"), "{out}");
 
     // the mounted folder is writable as the agent, and the Mac sees it; a read-only mount isn't
@@ -279,8 +297,8 @@ fn vm_has_only_the_door() {
 #[test]
 #[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
 fn browser_vm_has_only_the_door_and_runs_the_runner() {
-    if env::var_os("CRED_E2E_BOX").is_none() {
-        eprintln!("CRED_E2E_BOX isn't set: skipping");
+    if env::var_os("HALTI_E2E_BOX").is_none() {
+        eprintln!("HALTI_E2E_BOX isn't set: skipping");
         return;
     }
     engine::available().unwrap();
@@ -288,10 +306,10 @@ fn browser_vm_has_only_the_door_and_runs_the_runner() {
     let built = Instant::now();
     let image = engine::build_browser_image(&Path::new(env!("CARGO_MANIFEST_DIR")).join("box")).unwrap();
     println!("browser image built in {:?}: {image}", built.elapsed());
-    assert!(image.starts_with("cred-browser@sha256:"), "{image}");
+    assert!(image.starts_with(&format!("{}@sha256:", legacy::BROWSER_IMAGE)), "{image}");
     assert_eq!(engine::image_digest(engine::BROWSER_IMAGE).unwrap(), image);
 
-    let dir = PathBuf::from(format!("/tmp/cred-e2e-browser-{}", process::id()));
+    let dir = PathBuf::from(format!("/tmp/halti-e2e-browser-{}", process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let name = engine::browser_vm_name(&format!("e2e-{}", process::id()));
@@ -319,13 +337,16 @@ fn browser_vm_has_only_the_door_and_runs_the_runner() {
     let (_, writable) = sh(
         &name,
         &[],
-        "find / -xdev \\( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path /home/browser -o -path /downloads \\) -prune -o -writable ! -type l ! -path /run/cred/local.sock -print 2>/dev/null",
+        &format!(
+            "find / -xdev \\( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path /home/browser -o -path /downloads \\) -prune -o -writable ! -type l ! -path {} -print 2>/dev/null",
+            legacy::LOCAL_SOCKET
+        ),
     );
     assert_eq!(writable, "", "the browser's user can write on the root filesystem");
     let (ok, out) = sh(&name, &[], "node --version");
     assert!(ok && out.starts_with("v22."), "{out}");
-    let connect = r#"node -e "require('net').connect('/run/cred/door.sock').on('error', (e) => { console.log(e.code); process.exit(1) })""#;
-    let (ok, out) = sh(&name, &[], connect);
+    let connect = format!(r#"node -e "require('net').connect('{}').on('error', (e) => {{ console.log(e.code); process.exit(1) }})""#, legacy::DOOR_SOCKET);
+    let (ok, out) = sh(&name, &[], &connect);
     assert!(!ok && out.contains("EACCES"), "only root may dial the door socket: {out}");
 
     // the downloads folder is shared with the Mac, writable from the VM
@@ -338,7 +359,7 @@ fn browser_vm_has_only_the_door_and_runs_the_runner() {
     let ca = engine::install_browser_ca(&name, &ca_pem);
     assert!(ca.is_ok(), "{ca:?}");
     let (ok, out) = sh(&name, &env, "certutil -L -d sql:$HOME/.pki/nssdb");
-    assert!(ok && out.contains("cred-box") && out.contains("C,,"), "{out}");
+    assert!(ok && out.contains("halti-box") && out.contains("C,,"), "{out}");
     // repeatable
     engine::install_browser_ca(&name, &ca_pem).unwrap();
 

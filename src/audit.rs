@@ -1,10 +1,10 @@
-//! The audit log: an append-only record of every agent action through `cred mcp`, one JSON
-//! line each, in ~/.config/cred/audit.log. It holds time, site, tool, method, a masked URL
+//! The audit log: an append-only record of every agent action through `halti mcp`, one JSON
+//! line each, in audit.log in the config folder. It holds time, site, tool, method, a masked URL
 //! and the decision — never values, headers or bodies.
 //!
 //! Each line carries an HMAC-SHA256 over its content and the previous line's MAC, with a key
 //! kept in the Keychain (created on first use). Editing or removing a line other than the
-//! last breaks the chain from there on, which `cred audit --verify` reports. Cutting off the
+//! last breaks the chain from there on, which `halti audit --verify` reports. Cutting off the
 //! end of the log can't be seen: there is no later line to notice it.
 
 #[cfg(debug_assertions)]
@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::keychain;
 use crate::mask::{MASK, Masker};
 use crate::util::config_dir;
+use crate::{keychain, legacy};
 
 /// Keychain item of the HMAC key. Resource names can't start with "_".
 const KEY_RES: &str = "_audit";
@@ -35,7 +35,8 @@ const MAX_URL: usize = 300;
 /// Query values and path segments at least this long, made of token characters, look like secrets.
 const OPAQUE_LEN: usize = 20;
 /// Query keys containing one of these have their value masked whatever it looks like.
-const SENSITIVE_KEYS: [&str; 14] = ["token", "key", "secret", "pass", "pwd", "auth", "sig", "code", "session", "cred", "jwt", "bearer", "otp", "sid"];
+/// `legacy::MASK_KEYWORD` matches credential-like keys: a pattern, not the product's name.
+const SENSITIVE_KEYS: [&str; 14] = ["token", "key", "secret", "pass", "pwd", "auth", "sig", "code", "session", legacy::MASK_KEYWORD, "jwt", "bearer", "otp", "sid"];
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub enum Decision {
@@ -168,7 +169,7 @@ fn chain_mac(key: &[u8], prev: &str, body: &Body) -> Result<String> {
 fn keychain_key(create: bool) -> Result<Vec<u8>> {
     // Tests inject a key instead of touching the Keychain. Release builds don't contain this.
     #[cfg(debug_assertions)]
-    if let Ok(key) = env::var("CRED_AUDIT_KEY") {
+    if let Ok(key) = env::var("HALTI_AUDIT_KEY") {
         return Ok(key.into_bytes());
     }
     if keychain::exists(KEY_RES, KEY_FIELD) {
@@ -199,7 +200,7 @@ impl Log {
     pub fn standard(create_key: bool) -> Self {
         // Tests run with a log of their own. Release builds don't contain this.
         #[cfg(debug_assertions)]
-        if let Some(path) = env::var_os("CRED_AUDIT") {
+        if let Some(path) = env::var_os("HALTI_AUDIT") {
             return Self::new(path.into(), move || keychain_key(create_key));
         }
         Self::new(config_dir().join("audit.log"), move || keychain_key(create_key))
@@ -212,7 +213,7 @@ impl Log {
         Ok(self.key.clone().expect("just set"))
     }
 
-    /// Open the log for appending and take its lock, which other `cred mcp` processes wait on.
+    /// Open the log for appending and take its lock, which other `halti mcp` processes wait on.
     fn lock(&self) -> Result<File> {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir)?;
@@ -278,7 +279,7 @@ impl Log {
     }
 }
 
-/// `cred audit`: show the last `n` entries, or with `verify` check the whole chain.
+/// `halti audit`: show the last `n` entries, or with `verify` check the whole chain.
 pub fn show(n: usize, verify: bool) -> Result<()> {
     let mut log = Log::standard(false);
     if verify {
@@ -322,7 +323,7 @@ mod tests {
 
     #[test]
     fn chain_verifies_and_survives_reopening() {
-        let dir = TempDir::new("cred-audit").unwrap();
+        let dir = TempDir::new("halti-audit").unwrap();
         log(&dir).append(entry("one")).unwrap();
         log(&dir).append(entry("two")).unwrap();
         let mut l = log(&dir);
@@ -335,14 +336,14 @@ mod tests {
 
     #[test]
     fn empty_log_verifies() {
-        let dir = TempDir::new("cred-audit").unwrap();
+        let dir = TempDir::new("halti-audit").unwrap();
         assert_eq!(log(&dir).verify().unwrap(), 0);
         assert!(log(&dir).recent(5).unwrap().is_empty());
     }
 
     #[test]
     fn edits_and_removals_show() {
-        let dir = TempDir::new("cred-audit").unwrap();
+        let dir = TempDir::new("halti-audit").unwrap();
         let mut l = log(&dir);
         for tool in ["one", "two", "three", "four"] {
             l.append(entry(tool)).unwrap();
@@ -370,7 +371,7 @@ mod tests {
     fn key_is_fetched_once_and_only_when_needed() {
         use std::cell::Cell;
         use std::rc::Rc;
-        let dir = TempDir::new("cred-audit").unwrap();
+        let dir = TempDir::new("halti-audit").unwrap();
         let calls = Rc::new(Cell::new(0));
         let counter = Rc::clone(&calls);
         let mut l = Log::new(dir.0.join("audit.log"), move || {
@@ -388,14 +389,14 @@ mod tests {
 
     #[test]
     fn an_unavailable_key_stops_writing() {
-        let dir = TempDir::new("cred-audit").unwrap();
+        let dir = TempDir::new("halti-audit").unwrap();
         let mut l = Log::new(dir.0.join("audit.log"), || bail!("no key"));
         assert!(l.ready().is_err() && l.append(entry("one")).is_err());
     }
 
     #[test]
     fn lines_hold_no_values() {
-        let dir = TempDir::new("cred-audit").unwrap();
+        let dir = TempDir::new("halti-audit").unwrap();
         let masker = Masker::new(["s3cret-value".to_string()]);
         let url = "https://u:p@api.example.com/x?a=1&token=zqx-token&q=s3cret-value#frag";
         let body = Body::new("app", "fetch\u{1b}[2J", Some("post"), Some(url), Decision::AskedNo, &masker);

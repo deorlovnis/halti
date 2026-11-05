@@ -1,8 +1,8 @@
 //! A log of JSON lines chained with an HMAC, for the logs that live outside a box's reach (the
-//! door's, in the box's store). Each line gets a `mac` field: HMAC-SHA256, with a key only cred
+//! door's, in the box's store). Each line gets a `mac` field: HMAC-SHA256, with a key only halti
 //! holds, over the previous line's mac and this line's other fields. Editing a line, or taking
 //! one out of the middle, breaks the chain from there on, which `verify` reports. Cutting off the
-//! end can't be seen from the log alone; the `Head` that cred keeps elsewhere when a box stops
+//! end can't be seen from the log alone; the `Head` that halti keeps elsewhere when a box stops
 //! covers that up to the last stop. (The same scheme as `audit`.)
 
 use std::fs::{self, File, OpenOptions};
@@ -35,7 +35,7 @@ pub struct Verified {
     pub macs: Vec<String>,
 }
 
-/// Where a log's chain stood when cred last put it away: how many chained lines, and the mac of
+/// Where a log's chain stood when halti last put it away: how many chained lines, and the mac of
 /// the last. Kept outside the log (in the Keychain), it is what shows a log whose chain was
 /// stripped, or whose end was cut off before that point.
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -53,7 +53,7 @@ impl Verified {
     pub fn check(&self, head: &Head) -> Result<()> {
         match self.macs.get(head.lines.wrapping_sub(1)) {
             Some(mac) if *mac == head.mac => Ok(()),
-            Some(_) => bail!("line {} isn't the one cred recorded when the box last stopped: the log was replaced or rewritten", self.unchained + head.lines),
+            Some(_) => bail!("line {} isn't the one halti recorded when the box last stopped: the log was replaced or rewritten", self.unchained + head.lines),
             None => bail!("the log has {} chained lines, but had {} when the box last stopped: lines were cut off or their chain was stripped", self.macs.len(), head.lines),
         }
     }
@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn the_head_kept_elsewhere_shows_a_stripped_cut_or_replaced_log() {
-        let dir = TempDir::new("cred-chain").unwrap();
+        let dir = TempDir::new("halti-chain").unwrap();
         let c = chain(&dir);
         write(&c, 5);
         let head = c.verify().unwrap().head().unwrap();
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn a_chain_of_lines_verifies() {
-        let dir = TempDir::new("cred-chain").unwrap();
+        let dir = TempDir::new("halti-chain").unwrap();
         let c = chain(&dir);
         assert_eq!(counts(&c), (0, 0), "a log that doesn't exist is empty");
         write(&c, 5);
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn an_edited_line_is_found() {
-        let dir = TempDir::new("cred-chain").unwrap();
+        let dir = TempDir::new("halti-chain").unwrap();
         let c = chain(&dir);
         write(&c, 5);
         let mut l = lines(&c);
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn a_deleted_line_in_the_middle_is_found() {
-        let dir = TempDir::new("cred-chain").unwrap();
+        let dir = TempDir::new("halti-chain").unwrap();
         let c = chain(&dir);
         write(&c, 5);
         let mut l = lines(&c);
@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn a_stripped_mac_and_garbage_are_found_but_an_old_unchained_start_is_allowed() {
-        let dir = TempDir::new("cred-chain").unwrap();
+        let dir = TempDir::new("halti-chain").unwrap();
         let c = chain(&dir);
         write(&c, 3);
         let mut l = lines(&c);
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn only_objects_are_lines_and_a_mac_in_one_is_replaced() {
-        let dir = TempDir::new("cred-chain").unwrap();
+        let dir = TempDir::new("halti-chain").unwrap();
         let c = chain(&dir);
         c.create().unwrap();
         assert!(c.append(json!("text")).is_err());

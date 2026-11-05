@@ -4,7 +4,7 @@
 //
 // For signing in by hand (`config.login`), the start page picks what the "person" does:
 //   .../autoclose?site=x  closes the window at once, with a session for x
-//   .../wait?site=x       waits for cred to ask for the session (Enter in the terminal)
+//   .../wait?site=x       waits for halti to ask for the session (Enter in the terminal)
 //   .../nothing           closes the window without signing in
 //   .../fail              can't start
 // Every `open` config is appended to $FAKE_RUNNER_LOG, one JSON line each.

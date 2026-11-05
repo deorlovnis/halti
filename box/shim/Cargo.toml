@@ -1,8 +1,10 @@
 [package]
+# Keeps its name from before halti was renamed from cred: the binary is the entrypoint and MCP
+# command of every pinned agent image, until EMA-60 (see src/legacy.rs).
 name = "cred-shim"
 version = "0.1.0"
 edition = "2024"
-description = "Guest side of a cred box's door: pairs the box's connections with ones cred dials in"
+description = "Guest side of a halti box's door: pairs the box's connections with ones halti dials in"
 publish = false
 
 [dependencies]

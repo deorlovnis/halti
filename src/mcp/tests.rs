@@ -1,6 +1,6 @@
 //! The browser tools inside a box: sessions sealed when a browser closes, used when the next one
 //! opens, and kept out of the agent's sight. The box's browser is a stand-in that runs a runner
-//! on the Mac (the fake one in tests/fixtures, or with CRED_E2E_BROWSER=1 the real one), with the
+//! on the Mac (the fake one in tests/fixtures, or with HALTI_E2E_BROWSER=1 the real one), with the
 //! sealed sessions of a real store folder.
 //!
 //! Like the door's scenarios, this runs in a copy of the test program with a private
@@ -32,15 +32,15 @@ fn private_environment(test: &str, dir: &TempDir) -> Command {
     }
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", test, "--nocapture", "--test-threads=1", "--include-ignored"])
-        .env("CRED_MCP_CHILD", "1")
-        .env("CRED_MCP_DIR", &dir.0)
+        .env("HALTI_MCP_CHILD", "1")
+        .env("HALTI_MCP_DIR", &dir.0)
         .env("HOME", dir.0.join("home"))
-        .env("CRED_INDEX", dir.0.join("index.json"))
-        .env("CRED_POLICY_DIR", dir.0.join("policy"))
-        .env("CRED_TEST_KEYCHAIN", dir.0.join("keychain"))
-        .env("CRED_TEST_APPROVE", "yes")
-        .env("CRED_AUDIT", dir.0.join("audit.log"))
-        .env("CRED_AUDIT_KEY", "test-key")
+        .env("HALTI_INDEX", dir.0.join("index.json"))
+        .env("HALTI_POLICY_DIR", dir.0.join("policy"))
+        .env("HALTI_TEST_KEYCHAIN", dir.0.join("keychain"))
+        .env("HALTI_TEST_APPROVE", "yes")
+        .env("HALTI_AUDIT", dir.0.join("audit.log"))
+        .env("HALTI_AUDIT_KEY", "test-key")
         .env("FAKE_RUNNER_LOG", dir.0.join("runner.log"));
     cmd
 }
@@ -61,27 +61,27 @@ fn node_available() -> bool {
 
 #[test]
 fn the_fake_runner_scenario() {
-    if let Some(dir) = std::env::var_os("CRED_MCP_DIR") {
+    if let Some(dir) = std::env::var_os("HALTI_MCP_DIR") {
         return fake_scenario(Path::new(&dir));
     }
     if node_available() {
-        finished(&mut private_environment(FAKE, &TempDir::new("cred-mcp").unwrap()));
+        finished(&mut private_environment(FAKE, &TempDir::new("halti-mcp").unwrap()));
     }
 }
 
 #[test]
-#[ignore = "needs Node, the runner's dependencies and Chromium: CRED_E2E_BROWSER=1"]
+#[ignore = "needs Node, the runner's dependencies and Chromium: HALTI_E2E_BROWSER=1"]
 fn a_rotating_session_survives_with_the_real_runner() {
-    if let Some(dir) = std::env::var_os("CRED_MCP_DIR") {
+    if let Some(dir) = std::env::var_os("HALTI_MCP_DIR") {
         return real_scenario(Path::new(&dir));
     }
-    if std::env::var_os("CRED_E2E_BROWSER").is_none() {
-        return eprintln!("skipped: set CRED_E2E_BROWSER=1 to run this test");
+    if std::env::var_os("HALTI_E2E_BROWSER").is_none() {
+        return eprintln!("skipped: set HALTI_E2E_BROWSER=1 to run this test");
     }
-    let dir = TempDir::new("cred-mcp").unwrap();
+    let dir = TempDir::new("halti-mcp").unwrap();
     let browsers = std::env::var("PLAYWRIGHT_BROWSERS_PATH").unwrap_or_else(|_| format!("{}/Library/Caches/ms-playwright", std::env::var("HOME").unwrap()));
-    let runner = std::env::var("CRED_RUNNER_DIR").unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("runner").display().to_string());
-    finished(private_environment(REAL, &dir).env("PLAYWRIGHT_BROWSERS_PATH", browsers).env("CRED_RUNNER_DIR", runner));
+    let runner = std::env::var("HALTI_RUNNER_DIR").unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("runner").display().to_string());
+    finished(private_environment(REAL, &dir).env("PLAYWRIGHT_BROWSERS_PATH", browsers).env("HALTI_RUNNER_DIR", runner));
 }
 
 // --- the pieces ---

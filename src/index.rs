@@ -1,10 +1,10 @@
 //! The index: metadata about resources and their fields (link, description, expiry), kept in
-//! ~/.config/cred/index.json. Never values, and never rules: what may happen to a value is
+//! index.json in the config folder. Never values, and never rules: what may happen to a value is
 //! decided by the resource's approved policy.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::{env, fs, io};
+use std::{fs, io};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -16,7 +16,7 @@ use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 
 use crate::keychain;
-use crate::util::config_dir;
+use crate::util::{self, config_dir};
 
 /// Auto-refresh a field once it is this close to its exact expiry. Short: some tokens only
 /// live an hour, and a larger margin would renew them on every use.
@@ -100,7 +100,7 @@ pub struct Index {
 
 impl Index {
     pub fn load() -> Result<Self> {
-        let path = env::var_os("CRED_INDEX").map(PathBuf::from).unwrap_or_else(|| config_dir().join("index.json"));
+        let path = util::env_var("INDEX").map(PathBuf::from).unwrap_or_else(|| config_dir().join("index.json"));
         let map = match fs::read_to_string(&path) {
             Ok(s) => serde_json::from_str(&s).with_context(|| format!("reading {}", path.display()))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
@@ -121,7 +121,7 @@ impl Index {
     }
 
     pub fn get(&self, res: &str) -> Result<&Resource> {
-        self.map.get(res).with_context(|| format!("{res} doesn't exist (create it with: cred set {res} FIELD)"))
+        self.map.get(res).with_context(|| format!("{res} doesn't exist (create it with: halti set {res} FIELD)"))
     }
 
     /// The stored values of a resource's fields, for masking them in output.
@@ -160,7 +160,7 @@ pub fn jwt_exp(value: &str) -> Option<Timestamp> {
 }
 
 pub fn warn_days() -> i64 {
-    env::var("CRED_WARN_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(14)
+    util::env_var("WARN_DAYS").and_then(|v| v.to_str()?.parse().ok()).unwrap_or(14)
 }
 
 // --- storing ---

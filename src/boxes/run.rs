@@ -1,12 +1,12 @@
-//! `cred box run`: open the box, start its VM and door, work in it, and put everything away.
+//! `halti box run`: open the box, start its VM and door, work in it, and put everything away.
 //!
-//! The order is the point. Opening needs a lock (one cred per open box), Touch ID, the key and
+//! The order is the point. Opening needs a lock (one halti per open box), Touch ID, the key and
 //! the store; then the folders are set up while no VM has them mounted, then the VM and the door
 //! start. Ending runs the other way round: the VM stops first, then the door, then the store is
 //! detached (and deleted, for a box that isn't kept). Each step is held by a guard object, so an
 //! error, a panic or a signal (see `catch_signals`) unwinds the same way.
 //!
-//! Everything outside cred (Touch ID, the engine, the door) is reached through `World`, so the
+//! Everything outside halti (Touch ID, the engine, the door) is reached through `World`, so the
 //! sequence can be tested with fakes while the store is real.
 
 use std::any::Any;
@@ -30,7 +30,7 @@ use super::store::{self, Layout};
 use super::{BoxPolicy, MountPolicy, mount_problem};
 use crate::chain::{self, Chain};
 use crate::index::Index;
-use crate::{approve, door, engine, keychain, policy, seal};
+use crate::{approve, door, engine, keychain, legacy, policy, seal};
 
 /// Where the store's folders appear in the VM, and where `ro` folders go.
 const GUEST_HOME: &str = "/home/agent";
@@ -42,7 +42,7 @@ const SETTLE: Duration = Duration::from_secs(30);
 /// How often a stop request (a signal) is looked for while the agent works.
 const WATCH_EVERY: Duration = Duration::from_millis(100);
 
-/// What a run needs from outside cred.
+/// What a run needs from outside halti.
 pub trait World: Sync {
     fn confirm(&self, reason: &str) -> Result<()>;
     fn available(&self) -> Result<()>;
@@ -66,7 +66,7 @@ pub trait World: Sync {
     fn site_ready(&self, site: &str) -> Result<()>;
     /// The store key of a kept box.
     fn key(&self, name: &str) -> Result<String>;
-    /// Keep the names of the sites that have a sealed session, outside the store, for `cred box ls`.
+    /// Keep the names of the sites that have a sealed session, outside the store, for `halti box ls`.
     fn record_sessions(&self, name: &str, sites: &[String]) -> Result<()>;
     /// Keep where the box's log chain stands, outside the store.
     fn record_log_head(&self, name: &str, head: &chain::Head) -> Result<()>;
@@ -95,7 +95,7 @@ impl World for Real {
 
     fn stop_vm(&self, vm: &str) {
         if let Err(e) = engine::stop(vm) {
-            eprintln!("cred: stopping {vm}: {e:#}");
+            eprintln!("halti: stopping {vm}: {e:#}");
         }
     }
 
@@ -127,14 +127,14 @@ impl World for Real {
 
     fn site_ready(&self, site: &str) -> Result<()> {
         policy::load(site)?;
-        // A new cred build needs a Keychain prompt per item. It belongs here, while the box opens:
+        // A new halti build needs a Keychain prompt per item. It belongs here, while the box opens:
         // in the door it would hold an open connection until the site dropped it.
         let _ = Index::load().map(|index| index.values(site));
         Ok(())
     }
 
     fn key(&self, name: &str) -> Result<String> {
-        keychain::get(&super::key(name), super::KEY_FIELD).ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (cred box rm {name})"))
+        keychain::get(&super::key(name), super::KEY_FIELD).ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (halti box rm {name})"))
     }
 
     fn record_sessions(&self, name: &str, sites: &[String]) -> Result<()> {
@@ -173,7 +173,14 @@ pub struct Request<'a> {
 }
 
 pub fn vm_name(id: &str) -> String {
-    format!("cred-box-{id}")
+    format!("halti-box-{id}")
+}
+
+/// The names the agent's VM may run under: halti's, then its name from before the rename
+/// (`legacy::BOX_VM_PREFIX`), so a box the old binary started is joined or stopped, never started
+/// twice.
+pub fn vm_names(id: &str) -> [String; 2] {
+    [vm_name(id), format!("{}{id}", legacy::BOX_VM_PREFIX)]
 }
 
 /// Run the box. Returns the exit code of the command inside.
@@ -190,29 +197,32 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     };
     let command = guest_command(req.command.as_deref().unwrap_or(&policy.run));
 
-    // Another cred has the box open: work in the same VM, through the same door.
+    // Another halti has the box open: work in the same VM, through the same door.
     let Some(lock) = store::lock(&layout.lock(&req.id))? else {
-        if !world.running(&vm) {
-            bail!("box {} is being opened or closed by another cred: try again in a moment", req.name);
-        }
+        let Some(vm) = vm_names(&req.id).into_iter().find(|vm| world.running(vm)) else {
+            bail!("box {} is being opened or closed by another halti: try again in a moment", req.name);
+        };
         // The door of the open box keeps the rules it started with, so joining under a policy
         // approved since would promise rules nothing enforces.
         if fs::read_to_string(layout.opened_with(&req.id)).ok().as_deref() != Some(req.policy_sha.as_str()) {
-            bail!("box {} runs with the policy it was opened with, not the one approved since: stop it (cred box stop {}) and run it again", req.name, req.name);
+            bail!("box {} runs with the policy it was opened with, not the one approved since: stop it (halti box stop {}) and run it again", req.name, req.name);
         }
         return exit_code(world.exec(&vm, &agent_env()?, &command, req.tty)?);
     };
     fs::write(layout.opened_with(&req.id), &req.policy_sha).with_context(|| format!("noting the policy box {} opens with", req.name))?;
 
-    // Holding the lock, whatever a crashed run left is ours to clear.
+    // Holding the lock, whatever a crashed run left is ours to clear: its VMs too, under either name.
     sweep_temp(layout)?;
     sweep(layout, &req.id)?;
-    if world.running(&vm) {
-        world.stop_vm(&vm);
+    for leftover in vm_names(&req.id).into_iter().chain([engine::browser_vm_name(&req.id), engine::legacy_browser_vm_name(&req.id)]) {
+        if world.running(&leftover) {
+            world.stop_vm(&leftover);
+        }
     }
 
     world.available()?;
-    let image = policy.image.as_deref().ok_or_else(|| anyhow!("the policy of box {} names no image (set image = \"cred-agent@sha256:...\" and approve it)", req.name))?;
+    let image =
+        policy.image.as_deref().ok_or_else(|| anyhow!("the policy of box {} names no image (set image = \"{}@sha256:...\" and approve it)", req.name, legacy::AGENT_IMAGE))?;
     let env = agent_env()?;
     for site in policy.model.iter().chain(&policy.sites) {
         world.site_ready(site).with_context(|| format!("box {} uses {site}", req.name))?;
@@ -339,7 +349,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     drop(door);
     if req.persistent {
         if let Err(e) = world.record_sessions(req.name, &sealed_sites.sites()) {
-            eprintln!("cred: keeping which sites of box {} have a session: {e:#}", req.name);
+            eprintln!("halti: keeping which sites of box {} have a session: {e:#}", req.name);
         }
         record_head(world, req.name, &mnt, log_key);
     }
@@ -351,7 +361,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     exit_code(status?)
 }
 
-/// Note where the log's chain stands, so `cred box log --verify` can tell a log whose chain was
+/// Note where the log's chain stands, so `halti box log --verify` can tell a log whose chain was
 /// stripped or whose end was cut off. A log whose chain is already broken keeps the head it had.
 fn record_head(world: &dyn World, name: &str, mnt: &Path, log_key: [u8; 32]) {
     match Chain::new(&store::door_log(mnt), log_key).verify() {
@@ -359,10 +369,10 @@ fn record_head(world: &dyn World, name: &str, mnt: &Path, log_key: [u8; 32]) {
             if let Some(head) = found.head()
                 && let Err(e) = world.record_log_head(name, &head)
             {
-                eprintln!("cred: keeping where the log of box {name} stands: {e:#}");
+                eprintln!("halti: keeping where the log of box {name} stands: {e:#}");
             }
         }
-        Err(e) => eprintln!("cred: the log of box {name}: {e:#}"),
+        Err(e) => eprintln!("halti: the log of box {name}: {e:#}"),
     }
 }
 
@@ -453,7 +463,7 @@ fn clone_into(work: &Path, name: &str, host: &Path) -> Result<()> {
     match store::copy_tree(host, &dst) {
         Ok(copied) => {
             if copied.skipped > 0 {
-                eprintln!("cred: {} links and special files in {} weren't copied", copied.skipped, host.display());
+                eprintln!("halti: {} links and special files in {} weren't copied", copied.skipped, host.display());
             }
             Ok(())
         }
@@ -465,7 +475,7 @@ fn clone_into(work: &Path, name: &str, host: &Path) -> Result<()> {
 }
 
 /// What the agent needs in its home: Claude Code skips its web-fetch check (the door's rules take
-/// its place), knows cred's tools, and doesn't stop at first-run screens. Merged into what is
+/// its place), knows halti's tools, and doesn't stop at first-run screens. Merged into what is
 /// there, so what the agent keeps in these files stays.
 fn prepare_home(home: &Path, docker: bool) -> Result<()> {
     // The Docker CLI hands containers the door's proxy (they can't reach the agent's 127.0.0.1).
@@ -482,7 +492,7 @@ fn prepare_home(home: &Path, docker: bool) -> Result<()> {
         o.insert("hasCompletedOnboarding".into(), json!(true));
         let servers = o.entry("mcpServers").or_insert_with(|| json!({}));
         if let Some(servers) = servers.as_object_mut() {
-            servers.insert("cred".into(), json!({ "type": "stdio", "command": "cred-shim", "args": ["mcp"], "env": {} }));
+            servers.insert(legacy::MCP_SERVER_KEY.into(), json!({ "type": "stdio", "command": legacy::SHIM, "args": ["mcp"], "env": {} }));
         }
     })
 }
@@ -502,7 +512,7 @@ pub fn sweep(layout: &Layout, id: &str) -> Result<()> {
     store::shred(&layout.ephemeral_bundle(id))
 }
 
-/// Clear the leftovers of runs that ended without cleaning up (no cred holds their lock any more):
+/// Clear the leftovers of runs that ended without cleaning up (no halti holds their lock any more):
 /// stores made for one run have no key to open them again, so they go.
 fn sweep_temp(layout: &Layout) -> Result<()> {
     for entry in fs::read_dir(layout.root.join("temp")).into_iter().flatten().flatten() {
@@ -536,7 +546,7 @@ unsafe extern "C" {
     fn signal(signal: i32, handler: usize) -> usize;
 }
 
-/// Have the signals that end a terminal session set a flag instead of killing cred, so the
+/// Have the signals that end a terminal session set a flag instead of killing halti, so the
 /// box is put away properly. (A child gets the default again when it starts: a handler isn't
 /// inherited across exec, so Ctrl-C still reaches a command that isn't on a terminal.)
 pub fn catch_signals() {
@@ -558,7 +568,7 @@ mod tests {
     use crate::browse::BoxBrowser;
     use crate::util::TempDir;
 
-    const DIGEST: &str = "cred-agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const DIGEST: &str = "agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     type SpecSeen = (String, String, u32, String, PathBuf, Vec<(PathBuf, String, bool)>, bool);
     type DoorSeen = (Vec<String>, Option<String>, Vec<String>, PathBuf);
@@ -580,6 +590,8 @@ mod tests {
         /// The lines of the log head recorded when the box was put away.
         log_head: Option<usize>,
         exec: Option<ExecSeen>,
+        /// The VM `exec` ran in.
+        exec_vm: Option<String>,
         /// The names of the sites with a sealed session, as recorded when the box was put away.
         sessions: Option<Vec<String>>,
         /// What the door was given to run browsers with.
@@ -595,6 +607,8 @@ mod tests {
         seen: Mutex<Seen>,
         wake: Condvar,
         running: Mutex<bool>,
+        /// The name of the one VM that runs (when `running`); `None`: any name.
+        only: Option<String>,
         deny: bool,
         unavailable: bool,
         door_fails: bool,
@@ -627,8 +641,8 @@ mod tests {
             if self.unavailable { bail!("container isn't installed") } else { Ok(()) }
         }
 
-        fn running(&self, _vm: &str) -> bool {
-            *self.running.lock().unwrap()
+        fn running(&self, vm: &str) -> bool {
+            *self.running.lock().unwrap() && self.only.as_ref().is_none_or(|only| only == vm)
         }
 
         fn start_vm(&self, spec: &engine::VmSpec) -> Result<()> {
@@ -660,7 +674,7 @@ mod tests {
         }
 
         fn browser_image(&self) -> Result<String> {
-            Ok("cred-browser@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
+            Ok("browser@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
         }
 
         fn install_ca(&self, _vm: &str, pem: &str) -> Result<()> {
@@ -698,10 +712,11 @@ mod tests {
             Ok(())
         }
 
-        fn exec(&self, _vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus> {
+        fn exec(&self, vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus> {
             self.note("exec");
             let mut seen = self.seen.lock().unwrap();
             seen.exec = Some((env.to_vec(), cmd.to_vec(), tty));
+            seen.exec_vm = Some(vm.to_string());
             let mounts = seen.spec.as_ref().map(|s| s.5.clone()).unwrap_or_default();
             let host = |guest: &str| mounts.iter().find(|m| m.1 == guest).map(|m| m.0.clone());
             if let Some(home) = host(GUEST_HOME) {
@@ -742,7 +757,7 @@ mod tests {
     }
 
     fn setup() -> Setup {
-        let dir = TempDir::new("cred-run").unwrap();
+        let dir = TempDir::new("halti-run").unwrap();
         let layout = Layout::under(&dir.0).unwrap();
         Setup { dir, layout, stop: AtomicBool::new(false) }
     }
@@ -819,7 +834,7 @@ mod tests {
 
         let seen = fake.seen.lock().unwrap();
         let (name, image, cpus, memory, socket, mounts, docker) = seen.spec.clone().unwrap();
-        assert_eq!((name.as_str(), image.as_str(), cpus, memory.as_str(), docker), ("cred-box-r", DIGEST, 4, "8G", false));
+        assert_eq!((name.as_str(), image.as_str(), cpus, memory.as_str(), docker), ("halti-box-r", DIGEST, 4, "8G", false));
         assert_eq!(socket, s.layout.socket("r"));
         let guests: Vec<_> = mounts.iter().map(|m| (m.1.as_str(), m.2)).collect();
         assert_eq!(guests, [("/home/agent", false), ("/work", false), ("/downloads", false), ("/mnt/data", true)]);
@@ -829,14 +844,14 @@ mod tests {
         assert!(log.ends_with("log/door.log"), "{}", log.display());
 
         let (env, cmd, tty) = seen.exec.clone().unwrap();
-        assert!(env.contains(&("CLAUDE_CODE_OAUTH_TOKEN".into(), "cred-managed".into())), "the bearer stand-in: {env:?}");
+        assert!(env.contains(&("CLAUDE_CODE_OAUTH_TOKEN".into(), legacy::STANDIN.into())), "the bearer stand-in: {env:?}");
         let pem = seen.ca.clone().expect("the CA is installed in the VM");
         assert!(pem.starts_with("-----BEGIN CERTIFICATE-----") && !pem.contains("PRIVATE"), "{pem}");
         assert_eq!(seen.door_ca.as_deref(), Some(pem.as_str()), "the door ends TLS with the CA the VM trusts");
         for var in ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "PIP_CERT", "GIT_SSL_CAINFO"] {
             assert!(env.iter().any(|(k, v)| k == var && v.starts_with("/")), "{var} in {env:?}");
         }
-        assert!(env.contains(&("GH_TOKEN".into(), "cred-managed".into())), "the policy's stand-ins: {env:?}");
+        assert!(env.contains(&("GH_TOKEN".into(), legacy::STANDIN.into())), "the policy's stand-ins: {env:?}");
         let (writes, allow_writes, _) = seen.net.clone().unwrap();
         assert_eq!((writes, allow_writes), (policy::Mode::Ask, vec!["https://api.example.com/search".to_string()]));
         assert_eq!(&cmd[..2], ["sh", "-c"]);
@@ -847,7 +862,8 @@ mod tests {
         let settings: Value = serde_json::from_str(&seen.files[".claude/settings.json"]).unwrap();
         assert_eq!(settings["skipWebFetchPreflight"], json!(true));
         let claude: Value = serde_json::from_str(&seen.files[".claude.json"]).unwrap();
-        assert_eq!((claude["mcpServers"]["cred"]["command"].clone(), claude["mcpServers"]["cred"]["args"].clone()), (json!("cred-shim"), json!(["mcp"])));
+        let server = &claude["mcpServers"][legacy::MCP_SERVER_KEY];
+        assert_eq!((server["command"].clone(), server["args"].clone()), (json!(legacy::SHIM), json!(["mcp"])));
         assert!(seen.files.contains_key("work/proj"), "the clone: {:?}", seen.files.keys());
         assert_eq!(seen.files["work/proj/README"], "original");
         assert!(!seen.files.contains_key("work/data"), "ro folders are not copied");
@@ -918,14 +934,44 @@ mod tests {
         // Approved again since the box opened: joining would run under rules the door doesn't know.
         let changed = Fake { running: Mutex::new(true), ..Fake::default() };
         let e = run(&s.layout, &changed, &Request { policy_sha: "sha-2".into(), ..request(&s, &p, false) }).unwrap_err().to_string();
-        assert!(e.contains("cred box stop r"), "{e}");
+        assert!(e.contains("halti box stop r"), "{e}");
         assert!(changed.calls().is_empty(), "nothing runs: {:?}", changed.calls());
 
         let starting = Fake::default();
         let e = run(&s.layout, &starting, &request(&s, &p, false)).unwrap_err().to_string();
-        assert!(e.contains("another cred"), "{e}");
+        assert!(e.contains("another halti"), "{e}");
         assert!(starting.calls().is_empty());
         drop(held);
+    }
+
+    #[test]
+    fn joins_a_box_under_its_name_from_before_the_rename() {
+        let s = setup();
+        let p = policy(&s, "");
+        s.layout.prepare().unwrap();
+        let held = store::lock(&s.layout.lock("r")).unwrap().unwrap();
+        fs::write(s.layout.opened_with("r"), "sha-1").unwrap();
+
+        let old = format!("{}r", legacy::BOX_VM_PREFIX);
+        let fake = Fake { running: Mutex::new(true), only: Some(old.clone()), ..Fake::default() };
+        assert_eq!(run(&s.layout, &fake, &request(&s, &p, false)).unwrap(), 0);
+        assert_eq!(fake.calls(), ["bearer: anthropic", "exec"], "no second VM");
+        assert_eq!(fake.seen.lock().unwrap().exec_vm.as_deref(), Some(old.as_str()));
+        assert_eq!(vm_names("r"), ["halti-box-r".to_string(), old]);
+        // Joining doesn't install the CA again, so it's named where the old binary put it.
+        let (env, _, _) = fake.seen.lock().unwrap().exec.clone().unwrap();
+        assert!(env.contains(&("NODE_EXTRA_CA_CERTS".into(), legacy::CA_CERT.into())), "{env:?}");
+        drop(held);
+    }
+
+    #[test]
+    fn stops_a_browser_vm_left_under_its_name_from_before_the_rename() {
+        let s = setup();
+        let p = policy(&s, "");
+        let fake = Fake { running: Mutex::new(true), only: Some(engine::legacy_browser_vm_name("r")), unavailable: true, ..Fake::default() };
+        assert!(run(&s.layout, &fake, &request(&s, &p, false)).is_err());
+        assert_eq!(fake.calls(), ["stop_vm", "available"]);
+        assert_put_away(&s);
     }
 
     #[test]
@@ -1008,7 +1054,7 @@ mod tests {
         let fake = Fake::default();
         let id = "r-tmp-0a1b2c3d".to_string();
         run(&s.layout, &fake, &Request { id: id.clone(), unique: true, ..request(&s, &p, false) }).unwrap();
-        assert_eq!(fake.seen.lock().unwrap().spec.as_ref().unwrap().0, "cred-box-r-tmp-0a1b2c3d");
+        assert_eq!(fake.seen.lock().unwrap().spec.as_ref().unwrap().0, "halti-box-r-tmp-0a1b2c3d");
         assert_eq!(fake.seen.lock().unwrap().log_head, None, "a box that isn't kept keeps nothing");
         assert!(!s.layout.ephemeral_bundle(&id).exists() && !s.layout.lock(&id).exists());
     }
@@ -1133,21 +1179,21 @@ mod tests {
 
     #[test]
     fn keeps_what_the_agent_wrote_in_its_settings() {
-        let dir = TempDir::new("cred-home").unwrap();
+        let dir = TempDir::new("halti-home").unwrap();
         let home = dir.0.join("home");
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::write(home.join(".claude/settings.json"), r#"{"theme":"dark","skipWebFetchPreflight":false}"#).unwrap();
-        fs::write(home.join(".claude.json"), r#"{"mcpServers":{"mine":{"command":"x"}},"cred":1}"#).unwrap();
+        fs::write(home.join(".claude.json"), r#"{"mcpServers":{"mine":{"command":"x"}},"halti":1}"#).unwrap();
         prepare_home(&home, false).unwrap();
         let settings: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude/settings.json")).unwrap()).unwrap();
         assert_eq!((settings["theme"].clone(), settings["skipWebFetchPreflight"].clone()), (json!("dark"), json!(true)));
         let claude: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
-        assert_eq!((claude["mcpServers"]["mine"]["command"].clone(), claude["cred"].clone()), (json!("x"), json!(1)));
-        assert_eq!(claude["mcpServers"]["cred"]["command"], json!("cred-shim"));
+        assert_eq!((claude["mcpServers"]["mine"]["command"].clone(), claude["halti"].clone()), (json!("x"), json!(1)));
+        assert_eq!(claude["mcpServers"][legacy::MCP_SERVER_KEY]["command"], json!(legacy::SHIM));
 
         fs::write(home.join(".claude.json"), "not json").unwrap();
         prepare_home(&home, false).unwrap();
-        assert!(fs::read_to_string(home.join(".claude.json")).unwrap().contains("cred-shim"), "a broken file is replaced");
+        assert!(fs::read_to_string(home.join(".claude.json")).unwrap().contains(legacy::SHIM), "a broken file is replaced");
 
         assert!(!home.join(".docker").exists());
         fs::create_dir_all(home.join(".docker")).unwrap();

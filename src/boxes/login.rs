@@ -1,5 +1,5 @@
-//! `cred box login`: the person signs in to a box's sites by hand, in a visible browser on the
-//! Mac with an empty profile (SSO and two-factor work as they always do), and cred seals the
+//! `halti box login`: the person signs in to a box's sites by hand, in a visible browser on the
+//! Mac with an empty profile (SSO and two-factor work as they always do), and halti seals the
 //! session each one ends with into the box (see `sessions`). The session is never printed.
 //!
 //! One site after another: a window opens on the site's start page, and closing it (or pressing
@@ -79,13 +79,13 @@ fn pick(name: &str, box_policy: &BoxPolicy, only: Option<&str>, all: bool, have:
         match policy::load(site) {
             Ok(a) if a.policy.browse.is_some() && (all || !have.contains(site)) => sites.push((site.clone(), a.policy)),
             Ok(_) => {}
-            Err(e) => eprintln!("cred: skipping {site}: {e:#}"),
+            Err(e) => eprintln!("halti: skipping {site}: {e:#}"),
         }
     }
     Ok(sites)
 }
 
-/// `cred box login NAME [SITE] [--all]`: Touch ID, then the box's store (the box must be stopped).
+/// `halti box login NAME [SITE] [--all]`: Touch ID, then the box's store (the box must be stopped).
 pub fn login(name: &str, only: Option<&str>, all: bool) -> Result<()> {
     let (box_policy, _) = load(name)?;
     if !box_policy.browser.keep_sessions {
@@ -111,7 +111,7 @@ pub fn login(name: &str, only: Option<&str>, all: bool) -> Result<()> {
         let result = in_terminal(&sessions, &sites);
         // Whatever got sealed counts, even if a later site failed.
         if let Err(e) = super::keep_session_names(name, &sessions.sites()) {
-            eprintln!("cred: keeping which sites of box {name} have a session: {e:#}");
+            eprintln!("halti: keeping which sites of box {name} have a session: {e:#}");
         }
         let sealed = result?;
         println!("{} of {} sites signed in; their sessions are sealed in box {name}", sealed.len(), sites.len());
@@ -122,12 +122,12 @@ pub fn login(name: &str, only: Option<&str>, all: bool) -> Result<()> {
 /// A window on the Mac. Debug builds can name a stand-in program (without a window), so tests
 /// need no screen.
 fn headed() -> bool {
-    !(cfg!(debug_assertions) && std::env::var_os("CRED_TEST_LOGIN_RUNNER").is_some())
+    !(cfg!(debug_assertions) && std::env::var_os("HALTI_TEST_LOGIN_RUNNER").is_some())
 }
 
 fn spawn() -> Result<Child> {
     #[cfg(debug_assertions)]
-    if let Some(script) = std::env::var_os("CRED_TEST_LOGIN_RUNNER") {
+    if let Some(script) = std::env::var_os("HALTI_TEST_LOGIN_RUNNER") {
         return std::process::Command::new("node")
             .arg(script)
             .stdin(std::process::Stdio::piped())
@@ -213,7 +213,7 @@ mod tests {
         if !has_node() {
             return;
         }
-        let dir = TempDir::new("cred-login").unwrap();
+        let dir = TempDir::new("halti-login").unwrap();
         // app closes itself; docs waits until Enter; blank is closed without signing in.
         let (result, said, sessions) = go(&dir, &[("app", "autoclose?site=app"), ("docs", "wait?site=docs"), ("blank", "nothing")], vec![None, Some(Stop::Done)]);
         assert_eq!(result.unwrap(), ["app", "docs"]);
@@ -234,7 +234,7 @@ mod tests {
         if !has_node() {
             return;
         }
-        let dir = TempDir::new("cred-login").unwrap();
+        let dir = TempDir::new("halti-login").unwrap();
         let (result, said, sessions) = go(&dir, &[("one", "wait?site=one"), ("two", "autoclose?site=two")], vec![Some(Stop::Skip)]);
         assert_eq!(result.unwrap(), ["two"]);
         assert_eq!(sessions.sites(), ["two"], "the skipped site got nothing");
@@ -246,7 +246,7 @@ mod tests {
         if !has_node() {
             return;
         }
-        let dir = TempDir::new("cred-login").unwrap();
+        let dir = TempDir::new("halti-login").unwrap();
         let (result, said, sessions) = go(&dir, &[("bad", "fail"), ("good", "autoclose?site=good")], vec![]);
         assert!(result.unwrap_err().to_string().contains("1 of 2 sites didn't get a session"));
         assert_eq!(sessions.sites(), ["good"]);
@@ -256,10 +256,10 @@ mod tests {
     /// The real runner in login mode (without a window): a page that sets a cookie and Local Storage,
     /// then Enter. Opt-in, like the other tests that need Chromium.
     #[test]
-    #[ignore = "needs Node, the runner's dependencies and Chromium: CRED_E2E_BROWSER=1"]
+    #[ignore = "needs Node, the runner's dependencies and Chromium: HALTI_E2E_BROWSER=1"]
     fn the_real_runner_gives_back_what_the_page_set() {
-        if std::env::var_os("CRED_E2E_BROWSER").is_none() {
-            return eprintln!("skipped: set CRED_E2E_BROWSER=1 to run this test");
+        if std::env::var_os("HALTI_E2E_BROWSER").is_none() {
+            return eprintln!("skipped: set HALTI_E2E_BROWSER=1 to run this test");
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();

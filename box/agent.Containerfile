@@ -1,8 +1,11 @@
-# The agent's VM image for cred boxes. Build with the box/ folder as the context:
+# The agent's VM image for halti boxes. Build with the box/ folder as the context:
 #   container build -f box/agent.Containerfile -t cred-agent box
-# cred pins the result by digest (name@sha256:...); a box's policy keeps that pin.
+# halti pins the result by digest (name@sha256:...); a box's policy keeps that pin.
+# The image's name and the shim's (cred-shim, /usr/local/bin/cred-shim) are from before halti was
+# renamed from cred: box policies pin this image by digest, so they stay until the M1 workspace
+# migration (EMA-60). src/legacy.rs lists them.
 
-# cred-shim, the guest side of the door, built here: the Mac has no Linux target.
+# The shim, the guest side of the door, built here: the Mac has no Linux target.
 FROM rust:1.92-slim-bookworm AS shim
 WORKDIR /src
 COPY shim/ .
@@ -15,7 +18,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 ARG CLAUDE_CODE_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} && npm cache clean --force
-# Docker Engine, for boxes whose policy says `docker = true`: cred starts dockerd in those (see
+# Docker Engine, for boxes whose policy says `docker = true`: halti starts dockerd in those (see
 # engine.rs) and nothing of it runs in the others. Docker's static build (engine, CLI, containerd,
 # runc), checked against its pinned sha256; iptables for its bridge networks.
 RUN apt-get update \
@@ -72,7 +75,7 @@ COPY --from=shim /src/target/release/cred-shim /usr/local/bin/cred-shim
 # filesystem. So the system is made unwritable for the agent instead: no setuid programs (no
 # su, no mount) and no world-writable directory but the memory-backed ones (/tmp, /var/tmp).
 RUN chmod 755 /run/lock && find / -xdev -perm /6000 -type f -exec chmod a-s {} +
-# The VM starts `cred-shim serve` as its init process (see engine.rs); cred.internal is not
+# The VM starts the shim (`serve`) as its init process (see engine.rs); halti.internal is not
 # defined here because `container` rewrites /etc/hosts at every start.
 USER root
 WORKDIR /home/agent

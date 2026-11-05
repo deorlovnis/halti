@@ -1,11 +1,11 @@
-//! End-to-end tests: the built `cred` binary, driven the way a person and an agent drive it.
+//! End-to-end tests: the built `halti` binary, driven the way a person and an agent drive it.
 //!
-//! The debug binary keeps Keychain items in a temp folder (CRED_TEST_KEYCHAIN) and answers
-//! Touch ID prompts from CRED_TEST_APPROVE, so these tests need no human and never touch the
+//! The debug binary keeps Keychain items in a temp folder (HALTI_TEST_KEYCHAIN) and answers
+//! Touch ID prompts from HALTI_TEST_APPROVE, so these tests need no human and never touch the
 //! real Keychain. Run them with `mise run e2e`. Two groups need more, and are opt-in:
 //!
-//!   CRED_E2E_BROWSER=1       the sandboxed browser (needs `npm ci` in runner/ and Chromium)
-//!   CRED_E2E_INTERACTIVE=1   a real Touch ID approval in the real Keychain (a human taps)
+//!   HALTI_E2E_BROWSER=1      the sandboxed browser (needs `npm ci` in runner/ and Chromium)
+//!   HALTI_E2E_INTERACTIVE=1  a real Touch ID approval in the real Keychain (a human taps)
 //!
 //! Run those with `mise run e2e-opt-in`; they are #[ignore]d otherwise.
 
@@ -20,7 +20,11 @@ use std::{env, fs, thread};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-const CRED: &str = env!("CARGO_BIN_EXE_cred");
+#[path = "../src/legacy.rs"]
+#[allow(dead_code)] // the tests use a few
+mod legacy;
+
+const HALTI: &str = env!("CARGO_BIN_EXE_halti");
 const TOKEN: &str = "s3cret-token-value";
 
 /// A private home for one test: index, policies and fake Keychain, removed when dropped.
@@ -35,7 +39,7 @@ impl Env {
             panic!("run the e2e tests with a debug build (no --release)");
         }
         static COUNT: AtomicUsize = AtomicUsize::new(0);
-        let dir = env::temp_dir().join(format!("cred-e2e-{}-{}", std::process::id(), COUNT.fetch_add(1, Ordering::Relaxed)));
+        let dir = env::temp_dir().join(format!("halti-e2e-{}-{}", std::process::id(), COUNT.fetch_add(1, Ordering::Relaxed)));
         let _ = fs::remove_dir_all(&dir);
         for sub in ["keychain", "policy", "box", "home"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
@@ -43,26 +47,27 @@ impl Env {
         Self { dir }
     }
 
-    /// `cred ARGS` with every path pointing into this test's folder; Touch ID answers yes.
+    /// `halti ARGS` with every path pointing into this test's folder; Touch ID answers yes.
     fn command(&self) -> Command {
-        let mut cmd = Command::new(CRED);
+        let mut cmd = Command::new(HALTI);
         cmd.env("HOME", self.dir.join("home"))
-            .env("CRED_INDEX", self.dir.join("index.json"))
-            .env("CRED_POLICY_DIR", self.dir.join("policy"))
-            .env("CRED_BOX_DIR", self.dir.join("box"))
-            .env("CRED_TEST_KEYCHAIN", self.dir.join("keychain"))
-            .env("CRED_TEST_APPROVE", "yes")
-            .env_remove("CRED_REFRESHING")
+            .env("HALTI_INDEX", self.dir.join("index.json"))
+            .env("HALTI_POLICY_DIR", self.dir.join("policy"))
+            .env("HALTI_BOX_DIR", self.dir.join("box"))
+            .env("HALTI_TEST_KEYCHAIN", self.dir.join("keychain"))
+            .env("HALTI_TEST_APPROVE", "yes")
+            .env_remove("HALTI_REFRESHING")
+            .env_remove(format!("{}REFRESHING", legacy::ENV_PREFIX))
             .current_dir(&self.dir)
             .stdin(Stdio::null());
         cmd
     }
 
-    fn cred(&self, args: &[&str]) -> Output {
+    fn halti(&self, args: &[&str]) -> Output {
         self.command().args(args).output().unwrap()
     }
 
-    /// Store a field as `cred set` would (which needs a terminal for the hidden prompt).
+    /// Store a field as `halti set` would (which needs a terminal for the hidden prompt).
     fn store(&self, res: &str, field: &str, value: &str) {
         fs::write(self.dir.join("keychain").join(format!("{res}.{field}")), value).unwrap();
         let index = self.dir.join("index.json");
@@ -76,10 +81,10 @@ impl Env {
         fs::write(self.dir.join("policy").join(format!("{res}.toml")), toml).unwrap();
     }
 
-    /// Write a policy and approve it through `cred policy approve`.
+    /// Write a policy and approve it through `halti policy approve`.
     fn policy(&self, res: &str, toml: &str) {
         self.write_policy(res, toml);
-        let out = self.cred(&["policy", "approve", res]);
+        let out = self.halti(&["policy", "approve", res]);
         assert!(out.status.success(), "approve failed: {}", text(&out.stderr));
     }
 
@@ -111,7 +116,7 @@ fn stderr(out: &Output) -> String {
     text(&out.stderr)
 }
 
-// --- an MCP client, as an agent's would talk to `cred mcp` ---
+// --- an MCP client, as an agent's would talk to `halti mcp` ---
 
 struct Mcp {
     child: Child,
@@ -163,7 +168,7 @@ impl Mcp {
 
 impl Drop for Mcp {
     fn drop(&mut self) {
-        // Closing stdin lets cred exit on its own and close any browser it started.
+        // Closing stdin lets halti exit on its own and close any browser it started.
         drop(self.stdin.take());
         let _ = self.child.wait();
     }
@@ -259,40 +264,30 @@ fn fetch_policy(site: &Site) -> String {
     )
 }
 
-// --- cred run ---
+// --- halti run ---
 
 #[test]
 fn run_exports_fields_and_masks_them_in_output() {
     let env = Env::new();
     env.store("app", "token", TOKEN);
     env.policy("app", "[run]\nmode = \"allow\"\nexport = { token = \"APP_TOKEN\" }\n");
-    let out = env.cred(&["run", "-s", "app", "--", "sh", "-c", "echo \"out=$APP_TOKEN\"; echo \"err=$APP_TOKEN\" >&2; exit 3"]);
+    let out = env.halti(&["run", "-s", "app", "--", "sh", "-c", "echo \"out=$APP_TOKEN\"; echo \"err=$APP_TOKEN\" >&2; exit 3"]);
     assert_eq!(out.status.code(), Some(3), "the command's exit code is passed on");
     assert_eq!(stdout(&out), "out=********\n");
     assert_eq!(stderr(&out), "err=********\n");
 }
 
 #[test]
-fn run_loads_resources_from_a_credfile() {
-    let env = Env::new();
-    env.store("app", "token", TOKEN);
-    env.policy("app", "[run]\nmode = \"allow\"\nexport = { token = \"APP_TOKEN\" }\n");
-    fs::write(env.dir.join(".cred"), "# resources for this repo\napp\n").unwrap();
-    let out = env.cred(&["run", "--", "sh", "-c", "echo $APP_TOKEN"]);
-    assert_eq!(stdout(&out), "********\n", "{}", stderr(&out));
-}
-
-#[test]
 fn run_refuses_policies_that_are_not_approved_or_not_permissive() {
     let env = Env::new();
     env.store("app", "token", TOKEN);
-    let run = |env: &Env| env.cred(&["run", "-s", "app", "--", "true"]);
+    let run = |env: &Env| env.halti(&["run", "-s", "app", "--", "true"]);
 
     env.write_policy("app", "[run]\nmode = \"allow\"\nexport = { token = \"APP_TOKEN\" }\n");
     let out = run(&env);
     assert!(!out.status.success() && stderr(&out).contains("isn't approved"), "{}", stderr(&out));
 
-    env.cred(&["policy", "approve", "app"]);
+    env.halti(&["policy", "approve", "app"]);
     assert!(run(&env).status.success());
 
     env.write_policy("app", "[run]\nmode = \"allow\"\nexport = { token = \"OTHER_VAR\" }\n");
@@ -301,7 +296,7 @@ fn run_refuses_policies_that_are_not_approved_or_not_permissive() {
 
     env.policy("app", "[run]\nmode = \"deny\"\nexport = { token = \"APP_TOKEN\" }\n");
     let out = run(&env);
-    assert!(!out.status.success() && stderr(&out).contains("doesn't allow cred run"), "{}", stderr(&out));
+    assert!(!out.status.success() && stderr(&out).contains("doesn't allow halti run"), "{}", stderr(&out));
 }
 
 #[test]
@@ -310,9 +305,47 @@ fn run_in_ask_mode_follows_the_touch_id_answer() {
     env.store("app", "token", TOKEN);
     env.policy("app", "[run]\nmode = \"ask\"\nexport = { token = \"APP_TOKEN\" }\n");
     let args = ["run", "-s", "app", "--", "sh", "-c", "echo $APP_TOKEN"];
-    assert!(env.cred(&args).status.success());
-    let out = env.command().args(args).env("CRED_TEST_APPROVE", "no").output().unwrap();
+    assert!(env.halti(&args).status.success());
+    let out = env.command().args(args).env("HALTI_TEST_APPROVE", "no").output().unwrap();
     assert!(!out.status.success() && stdout(&out).is_empty(), "nothing runs when Touch ID is refused");
+}
+
+#[test]
+fn run_needs_a_resource_and_ignores_a_cred_file() {
+    let env = Env::new();
+    env.store("app", "token", TOKEN);
+    env.policy("app", "[run]\nmode = \"allow\"\nexport = { token = \"APP_TOKEN\" }\n");
+    // A repo file named resources for `run` before the rename; it's read no more.
+    fs::write(env.dir.join(".cred"), "app\n").unwrap();
+    let out = env.halti(&["run", "--", "sh", "-c", "echo $APP_TOKEN"]);
+    assert!(!out.status.success() && stderr(&out).contains("--secret <RESOURCE>"), "{}", stderr(&out));
+    assert!(stdout(&out).is_empty());
+}
+
+// --- halti refresh ---
+
+#[test]
+fn refresh_scripts_get_the_fields_under_both_names() {
+    let env = Env::new();
+    env.store("app", "login", "someone");
+    env.store("app", "token", "old");
+    // Scripts approved before the rename read the old names; their bytes are pinned.
+    let old = |suffix: &str| format!("{}{suffix}", legacy::ENV_PREFIX);
+    let script = env.dir.join("refresh.sh");
+    fs::write(&script, format!("#!/bin/sh\nprintf '%s-%s-%s-%s' \"$HALTI_LOGIN\" \"${}\" \"$HALTI_REFRESHING\" \"${}\"\n", old("LOGIN"), old("REFRESHING"))).unwrap();
+    env.policy("app", &format!("[refresh.token]\nrun = \"{}\"\n", script.display()));
+    let token = || fs::read_to_string(env.dir.join("keychain/app.token")).unwrap();
+
+    // A halti inside a refresh script refreshes nothing, whichever name says so.
+    for var in ["HALTI_REFRESHING".to_string(), old("REFRESHING")] {
+        let out = env.command().args(["refresh", "app", "--force"]).env(&var, "app").output().unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(token(), "old", "refreshed inside {var}");
+    }
+
+    let out = env.halti(&["refresh", "app", "--force"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(token(), "someone-someone-app-app");
 }
 
 // --- info, ls and policy edit ---
@@ -326,13 +359,13 @@ fn info_and_ls_show_the_approved_rules() {
                 [browse]\norigins = [\"https://app.example.com\"]\nscreenshots = true\n";
     env.write_policy("app", toml);
 
-    let info = stdout(&env.cred(&["info", "app"]));
+    let info = stdout(&env.halti(&["info", "app"]));
     assert!(info.contains("not approved") && info.contains("nothing in it applies until approved"), "{info}");
     assert!(!info.contains("api.example.com"), "unapproved rules aren't shown:\n{info}");
-    assert!(stdout(&env.cred(&["ls"])).contains("not approved"));
+    assert!(stdout(&env.halti(&["ls"])).contains("not approved"));
 
-    env.cred(&["policy", "approve", "app"]);
-    let info = stdout(&env.cred(&["info", "app"]));
+    env.halti(&["policy", "approve", "app"]);
+    let info = stdout(&env.halti(&["info", "app"]));
     for expected in [
         "approved",
         "hosts https://api.example.com; writes ask; auth in Authorization",
@@ -343,13 +376,13 @@ fn info_and_ls_show_the_approved_rules() {
         assert!(info.contains(expected), "missing {expected:?}:\n{info}");
     }
     assert!(!info.contains(TOKEN));
-    let ls = stdout(&env.cred(&["ls"]));
+    let ls = stdout(&env.halti(&["ls"]));
     assert!(ls.contains("run:ask fetch:ask browse"), "{ls}");
 
     env.write_policy("app", &format!("{toml}\n# edited\n"));
-    let info = stdout(&env.cred(&["info", "app"]));
+    let info = stdout(&env.halti(&["info", "app"]));
     assert!(info.contains("changed since approval") && !info.contains("api.example.com"), "{info}");
-    assert!(stdout(&env.cred(&["ls"])).contains("changed since approval"));
+    assert!(stdout(&env.halti(&["ls"])).contains("changed since approval"));
 }
 
 #[test]
@@ -367,13 +400,26 @@ fn policy_edit_shows_a_diff_against_the_approved_version() {
     assert!(shown.contains("-mode = \"ask\"\n+mode = \"allow\"\n"), "{shown}");
     assert!(!shown.contains('\x1b'), "no colors when stdout isn't a terminal");
     assert!(shown.contains("takes effect once approved"), "{shown}");
-    assert!(stdout(&env.cred(&["policy", "show", "app"])).contains("changed since approval"));
+    assert!(stdout(&env.halti(&["policy", "show", "app"])).contains("changed since approval"));
 
-    env.cred(&["policy", "approve", "app"]);
+    env.halti(&["policy", "approve", "app"]);
     assert!(stdout(&edit(&env)).contains("no change from the approved policy"));
 }
 
-// --- cred mcp ---
+#[test]
+fn the_old_variable_names_still_point_at_the_index_and_policies() {
+    // Read when the HALTI_ one isn't set, so a shell that sets them from before the rename works.
+    let env = Env::new();
+    env.store("app", "token", TOKEN);
+    env.policy("app", "[run]\nmode = \"allow\"\nexport = { token = \"APP_TOKEN\" }\n");
+    let old = |suffix: &str| format!("{}{suffix}", legacy::ENV_PREFIX);
+    let mut cmd = env.command();
+    cmd.env_remove("HALTI_INDEX").env_remove("HALTI_POLICY_DIR").env(old("INDEX"), env.dir.join("index.json")).env(old("POLICY_DIR"), env.dir.join("policy"));
+    let ls = stdout(&cmd.arg("ls").output().unwrap());
+    assert!(ls.contains("app") && ls.contains("run:allow"), "{ls}");
+}
+
+// --- halti mcp ---
 
 #[test]
 fn mcp_handshake_and_tool_list() {
@@ -386,7 +432,7 @@ fn mcp_handshake_and_tool_list() {
 
     let mut mcp = env.mcp();
     let init = mcp.handshake();
-    assert_eq!(init["serverInfo"]["name"], "cred");
+    assert_eq!(init["serverInfo"]["name"], "halti");
     assert_eq!(init["protocolVersion"], "2025-06-18");
     assert!(init["instructions"].as_str().unwrap().contains("without ever revealing"));
     assert_eq!(mcp.rpc("ping", json!({})), json!({}));
@@ -455,7 +501,7 @@ fn mcp_asks_for_consent_and_for_writes() {
     let get = json!({ "site": "app", "method": "GET", "url": site.url("/echo") });
 
     // The default policy asks for Touch ID when an agent first uses the site; refused here.
-    let mut mcp = Mcp::start(env.command().arg("mcp").env("CRED_TEST_APPROVE", "no"));
+    let mut mcp = Mcp::start(env.command().arg("mcp").env("HALTI_TEST_APPROVE", "no"));
     mcp.handshake();
     let (is_error, reply) = mcp.call("fetch", get.clone());
     assert!(is_error && reply.contains("not approved"), "{reply}");
@@ -464,7 +510,7 @@ fn mcp_asks_for_consent_and_for_writes() {
     let policy = format!("[agent]\nconsent = \"none\"\n[fetch]\nhosts = [\"{}\"]\nwrites = \"ask\"\n", site.origin());
     env.policy("app", &policy);
     let post = json!({ "site": "app", "method": "POST", "url": site.url("/echo"), "body": "{}" });
-    let mut refused = Mcp::start(env.command().arg("mcp").env("CRED_TEST_APPROVE", "no"));
+    let mut refused = Mcp::start(env.command().arg("mcp").env("HALTI_TEST_APPROVE", "no"));
     refused.handshake();
     assert!(!refused.call("fetch", get).0, "reads need no consent here");
     let (is_error, reply) = refused.call("fetch", post.clone());
@@ -475,10 +521,10 @@ fn mcp_asks_for_consent_and_for_writes() {
     assert!(!is_error && reply.contains("HTTP 200"), "{reply}");
 }
 
-// --- cred box (the parts that need no VM) ---
+// --- halti box (the parts that need no VM) ---
 
 impl Env {
-    /// `cred box ARGS`, with `editor` as $EDITOR.
+    /// `halti box ARGS`, with `editor` as $EDITOR.
     fn boxed(&self, editor: &str, args: &[&str]) -> Output {
         self.command().arg("box").args(args).env("EDITOR", editor).output().unwrap()
     }
@@ -493,7 +539,7 @@ impl Env {
 
     /// The store of a box; the test's HOME holds it, so nothing lands in the real Library.
     fn box_store(&self, name: &str) -> PathBuf {
-        self.dir.join("home/Library/Application Support/cred/box").join(format!("{name}.sparsebundle"))
+        self.dir.join("home").join(legacy::STORE_ROOT).join("box").join(format!("{name}.sparsebundle"))
     }
 
     /// An "editor" that replaces the policy with `toml`.
@@ -521,7 +567,7 @@ fn box_new_makes_a_policy_a_key_and_an_encrypted_store() {
     assert!(stdout(&out).contains("takes effect once approved"), "{}", stdout(&out));
 
     let policy = fs::read_to_string(env.box_policy_path("research")).unwrap();
-    assert!(policy.contains("cred box approve research"), "{policy}");
+    assert!(policy.contains("halti box approve research"), "{policy}");
     let key = fs::read_to_string(env.box_key_path("research")).unwrap();
     assert!(key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()), "256 random bits as hex");
     let store = env.box_store("research");
@@ -566,7 +612,7 @@ fn box_policy_approve_with_no_names_covers_boxes_too() {
     env.policy("app", "[run]\nmode = \"deny\"\n");
     fs::write(env.box_policy_path("app-box"), "").unwrap();
 
-    let out = env.cred(&["policy", "approve"]);
+    let out = env.halti(&["policy", "approve"]);
     let shown = stdout(&out);
     assert!(out.status.success(), "{}", stderr(&out));
     for expected in ["approved the policy for app\n", "approved the policy for box alpha", "approved the policy for box beta", "approved the policy for box app-box"] {
@@ -575,9 +621,9 @@ fn box_policy_approve_with_no_names_covers_boxes_too() {
     let ls = stdout(&env.boxed("true", &["ls"]));
     assert!(!ls.contains("not approved"), "{ls}");
     // Resource names and box names don't collide: the resource list has no boxes in it.
-    assert!(!stdout(&env.cred(&["ls"])).contains("alpha"));
+    assert!(!stdout(&env.halti(&["ls"])).contains("alpha"));
 
-    let out = env.command().args(["policy", "approve"]).env("CRED_TEST_APPROVE", "no").output().unwrap();
+    let out = env.command().args(["policy", "approve"]).env("HALTI_TEST_APPROVE", "no").output().unwrap();
     assert!(!out.status.success());
 }
 
@@ -586,7 +632,7 @@ fn box_new_refuses_policies_the_door_cannot_keep() {
     let env = Env::new();
     for (toml, why) in [
         ("[net]\nallow_writes = [\"http://a.example.com/x\"]\n", "allow_writes"),
-        ("standins = [\"HTTPS_PROXY\"]\n", "set by cred already"),
+        ("standins = [\"HTTPS_PROXY\"]\n", "set by halti already"),
         ("[browser]\nkeep_session = true\n", "unknown field"),
         ("[[mount]]\npath = \"/opt/data\"\nmode = \"rw\"\n", "rw isn't available"),
         ("nope = 1\n", "unknown field"),
@@ -598,12 +644,12 @@ fn box_new_refuses_policies_the_door_cannot_keep() {
     }
 }
 
-/// `cred box login` with a stand-in for the window (see tests/fixtures/fake-runner.mjs). `enter_at`
+/// `halti box login` with a stand-in for the window (see tests/fixtures/fake-runner.mjs). `enter_at`
 /// is a line of its output after which the "person" presses Enter in the terminal.
 fn box_login(env: &Env, args: &[&str], enter_at: Option<&str>) -> (Output, String) {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-runner.mjs");
     let mut child =
-        env.command().args(["box", "login"]).args(args).env("CRED_TEST_LOGIN_RUNNER", script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        env.command().args(["box", "login"]).args(args).env("HALTI_TEST_LOGIN_RUNNER", script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut shown = String::new();
     let mut lines = BufReader::new(child.stdout.take().unwrap());
@@ -641,12 +687,12 @@ fn box_login_signs_in_site_by_site_and_seals_each_session_in_the_box() {
     assert!(env.boxed("true", &["approve", "research"]).status.success());
 
     // Touch ID is asked first, and a refusal opens nothing.
-    let out = env.command().args(["box", "login", "research"]).env("CRED_TEST_APPROVE", "no").output().unwrap();
+    let out = env.command().args(["box", "login", "research"]).env("HALTI_TEST_APPROVE", "no").output().unwrap();
     assert!(!out.status.success() && stderr(&out).contains("not approved"), "{}", stderr(&out));
     assert!(!stdout(&out).contains("signing in"));
 
     // A running box can't be signed in to: nothing may change a folder its VM has mounted.
-    let open_dir = env.dir.join("home/Library/Application Support/cred/box/open");
+    let open_dir = env.dir.join("home").join(legacy::STORE_ROOT).join("box/open");
     fs::create_dir_all(&open_dir).unwrap();
     let held = fs::OpenOptions::new().create(true).truncate(false).write(true).open(open_dir.join("research.lock")).unwrap();
     held.lock().unwrap();
@@ -729,7 +775,7 @@ fn box_import_export_and_log_go_through_touch_id_and_stay_in_the_box() {
     let out = env.boxed("true", &["import", "research", note.to_str().unwrap()]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("work/note.txt"), "{}", stdout(&out));
-    assert!(!env.dir.join("home/Library/Application Support/cred/box/open/research").exists(), "the store is closed again");
+    assert!(!env.dir.join("home").join(legacy::STORE_ROOT).join("box/open/research").exists(), "the store is closed again");
     assert!(
         !fs::read_dir(env.box_store("research").join("bands")).unwrap().any(|b| fs::read(b.unwrap().path()).unwrap().windows(9).any(|w| w == b"hello box")),
         "ciphertext at rest"
@@ -754,12 +800,12 @@ fn box_import_export_and_log_go_through_touch_id_and_stay_in_the_box() {
         assert!(!out.status.success(), "exported {bad}");
     }
     fs::remove_file(out_dir.join("note.txt")).unwrap();
-    let out = env.command().args(["box", "export", "research", "work/note.txt", "--to"]).arg(&out_dir).env("CRED_TEST_APPROVE", "no").output().unwrap();
+    let out = env.command().args(["box", "export", "research", "work/note.txt", "--to"]).arg(&out_dir).env("HALTI_TEST_APPROVE", "no").output().unwrap();
     assert!(!out.status.success() && !out_dir.join("note.txt").exists());
 }
 
 impl Env {
-    /// Open the box's store as cred does (the key from the test Keychain on hdiutil's stdin), change
+    /// Open the box's store as halti does (the key from the test Keychain on hdiutil's stdin), change
     /// its log the way someone with the store open could, and close it again.
     fn tamper_with_log(&self, name: &str, change: impl FnOnce(&str) -> String) {
         struct Detach(PathBuf);
@@ -834,7 +880,7 @@ fn box_rm_deletes_the_key_then_the_store_and_warns_about_backups() {
     let store = env.box_store("research");
     assert!(store.exists() && env.box_key_path("research").exists());
 
-    let out = env.command().args(["box", "rm", "research"]).env("CRED_TEST_APPROVE", "no").output().unwrap();
+    let out = env.command().args(["box", "rm", "research"]).env("HALTI_TEST_APPROVE", "no").output().unwrap();
     assert!(!out.status.success());
     assert!(store.exists() && env.box_key_path("research").exists(), "nothing is deleted without Touch ID");
 
@@ -862,9 +908,9 @@ fn opt_in(name: &str) -> bool {
 }
 
 #[test]
-#[ignore = "needs Node, the runner's dependencies and Chromium: CRED_E2E_BROWSER=1"]
+#[ignore = "needs Node, the runner's dependencies and Chromium: HALTI_E2E_BROWSER=1"]
 fn browser_opens_a_page_signed_in_and_masks_it() {
-    if !opt_in("CRED_E2E_BROWSER") {
+    if !opt_in("HALTI_E2E_BROWSER") {
         return;
     }
     let env = Env::new();
@@ -877,10 +923,10 @@ fn browser_opens_a_page_signed_in_and_masks_it() {
             site.origin()
         ),
     );
-    let runner = env::var("CRED_RUNNER_DIR").unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("runner").display().to_string());
+    let runner = env::var("HALTI_RUNNER_DIR").unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("runner").display().to_string());
     // The test's HOME is empty, so Playwright must be told where the real one keeps Chromium.
     let browsers = env::var("PLAYWRIGHT_BROWSERS_PATH").unwrap_or_else(|_| format!("{}/Library/Caches/ms-playwright", env::var("HOME").unwrap()));
-    let mut mcp = Mcp::start(env.command().arg("mcp").env("CRED_RUNNER_DIR", runner).env("PLAYWRIGHT_BROWSERS_PATH", browsers));
+    let mut mcp = Mcp::start(env.command().arg("mcp").env("HALTI_RUNNER_DIR", runner).env("PLAYWRIGHT_BROWSERS_PATH", browsers));
     mcp.handshake();
     assert!(mcp.tool_names().contains(&"browse_open".to_string()));
 
@@ -897,9 +943,9 @@ fn browser_opens_a_page_signed_in_and_masks_it() {
 }
 
 #[test]
-#[ignore = "asks a human for Touch ID and uses the real Keychain: CRED_E2E_INTERACTIVE=1"]
+#[ignore = "asks a human for Touch ID and uses the real Keychain: HALTI_E2E_INTERACTIVE=1"]
 fn touch_id_approval_pins_the_policy_in_the_real_keychain() {
-    if !opt_in("CRED_E2E_INTERACTIVE") {
+    if !opt_in("HALTI_E2E_INTERACTIVE") {
         return;
     }
     let env = Env::new();
@@ -909,7 +955,7 @@ fn touch_id_approval_pins_the_policy_in_the_real_keychain() {
     env.write_policy(&res, "[run]\nmode = \"deny\"\n");
     let real = || {
         let mut cmd = env.command();
-        cmd.env("HOME", env::var("HOME").unwrap()).env_remove("CRED_TEST_KEYCHAIN").env_remove("CRED_TEST_APPROVE");
+        cmd.env("HOME", env::var("HOME").unwrap()).env_remove("HALTI_TEST_KEYCHAIN").env_remove("HALTI_TEST_APPROVE");
         cmd
     };
 

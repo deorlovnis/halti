@@ -1,6 +1,6 @@
 //! Pages in the box's browser VM, at the door. Every page there belongs to one site and is
 //! driven by one runner, which launches Chromium with a proxy identity: the site's name as the
-//! user and a token cred gave that runner alone as the password. So a connection from the
+//! user and a token halti gave that runner alone as the password. So a connection from the
 //! browser VM is accepted only when it says (in `Proxy-Authorization`) which site it is for, and
 //! proves it with the token; one runner can't speak as another site, and whatever runs in the
 //! agent's VM can't speak as any, since its connections arrive on another socket.
