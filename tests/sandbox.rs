@@ -9,7 +9,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::{fs, process};
 
@@ -43,6 +43,25 @@ fn bash(script: &str) -> String {
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// A folder of the host's outside the bind set, with a file `secret` in it; removed when dropped,
+/// so also when a test fails.
+struct Fixture(PathBuf);
+
+impl Fixture {
+    fn new(name: &str) -> Self {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sandbox-{name}-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("secret"), "planted").unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 /// The fields of /proc/self/mountinfo's lines that matter here: device, root in its file system,
@@ -114,14 +133,57 @@ fn a_file_outside_the_bind_set_is_missing() {
     if !can_sandbox("planted file missing") {
         return;
     }
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sandbox-fixture-{}", process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let secret = dir.join("secret");
-    fs::write(&secret, "planted").unwrap();
-    let said = bash(&format!("test -e '{}' && echo visible; test -e '{}' && echo dir visible; test -x /usr/bin/env && echo usr; echo done", secret.display(), dir.display()));
-    fs::remove_dir_all(&dir).unwrap();
+    let fixture = Fixture::new("fixture");
+    let (dir, secret) = (fixture.0.display(), fixture.0.join("secret"));
+    let said = bash(&format!("test -e '{}' && echo visible; test -e '{dir}' && echo dir visible; test -x /usr/bin/env && echo usr; echo done", secret.display()));
     assert_eq!(said, "usr\ndone\n");
     ran("planted file missing");
+}
+
+#[test]
+fn the_callers_folder_is_out_of_reach() {
+    if !can_sandbox("caller's folder out of reach") {
+        return;
+    }
+    // Started from a folder outside the bind set, no process the box can see has it as its folder.
+    let fixture = Fixture::new("cwd");
+    let script = "for p in /proc/[0-9]*; do cat $p/cwd/secret 2>/dev/null && echo \" in $p\"; done; echo done";
+    let out = in_box(&["bash", "-c", script]).current_dir(&fixture.0).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "done\n");
+    ran("caller's folder out of reach");
+}
+
+#[test]
+fn the_callers_environment_stays_out() {
+    if !can_sandbox("caller's environment out") {
+        return;
+    }
+    let marker = format!("planted-{}", process::id());
+    let out = in_box(&["bash", "-c", &format!("grep -l '{marker}' /proc/[0-9]*/environ 2>/dev/null; echo done")]).env("SANDBOX_TEST_MARKER", &marker).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "done\n");
+    ran("caller's environment out");
+}
+
+#[test]
+fn the_callers_fds_stay_out() {
+    if !can_sandbox("caller's fds out") {
+        return;
+    }
+    // bash opens fd 7 on a folder outside the bind set and runs the box with it.
+    let fixture = Fixture::new("fd");
+    let inside = "ls /proc/self/fd/7/ 2>/dev/null; test -e /proc/self/fd/7 && echo fd 7; echo done";
+    let out = Command::new("bash")
+        .args(["-c", "exec 7<\"$1\"; shift; exec \"$@\"", "bash"])
+        .arg(&fixture.0)
+        .args([HALTI, "box", "sh", "--engine", "sandbox", "--", "bash", "-c", inside])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "done\n");
+    ran("caller's fds out");
 }
 
 #[test]
@@ -181,12 +243,16 @@ fn nothing_is_left_after_exit() {
 }
 
 #[test]
-fn a_missing_command_says_so() {
+fn a_missing_or_unrunnable_command_says_so() {
     if !can_sandbox("missing command") {
         return;
     }
     let out = in_box(&["no-such-command"]).output().unwrap();
     assert_eq!(out.status.code(), Some(127));
     assert!(text(&out.stderr).contains("halti: no-such-command:"), "{}", text(&out.stderr));
+    // A file that isn't a program, as a shell says it.
+    let out = in_box(&["/etc/passwd"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(126), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("halti: /etc/passwd:"), "{}", text(&out.stderr));
     ran("missing command");
 }

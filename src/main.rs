@@ -170,6 +170,9 @@ enum Cmd {
     #[cfg(all(halti_dev, target_os = "linux"))]
     #[command(name = "__sandbox-init", hide = true)]
     SandboxInit {
+        /// The pid of the `box sh` that started it
+        #[arg(long)]
+        parent: libc::pid_t,
         #[arg(long = "tool", value_name = "PATH")]
         tools: Vec<PathBuf>,
         #[arg(last = true, required = true, value_name = "CMD")]
@@ -743,7 +746,7 @@ fn main() -> ExitCode {
             Ok(0)
         }
         #[cfg(all(halti_dev, target_os = "linux"))]
-        Cmd::SandboxInit { tools, command } => sandbox::init(&tools, &command),
+        Cmd::SandboxInit { parent, tools, command } => sandbox::init(parent, &tools, &command),
     };
     match result {
         Ok(code) => ExitCode::from(code),

@@ -12,9 +12,15 @@
 //! runs in it, and when it ends the box ends: the kernel kills whatever it left running, and its
 //! mounts go with its mount namespace.
 //!
+//! Both inits start in the host's root, which `pivot_root` moves, with no environment but `TERM`
+//! and no fd of the caller's but stdio, and are non-dumpable, so the box can't read their
+//! memory, fds, folder or environment through `/proc`.
+//!
 //! These are the box's walls, not yet its locks. The command runs as namespace root, which can
-//! remount what is read-only here, and Landlock and seccomp aren't applied yet (vsock still
-//! reaches the hypervisor). Nothing here parses what the box writes.
+//! remount what is read-only here: a tool you own, such as the native installer's `claude`, can
+//! be rewritten from the box until the command gets a nested user namespace of its own. Landlock
+//! and seccomp aren't applied yet (vsock still reaches the hypervisor). Nothing here parses what
+//! the box writes.
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -67,7 +73,12 @@ pub fn sh(mut tools: Vec<PathBuf>, command: Vec<String>) -> Result<u8> {
     let command = if command.is_empty() { vec!["bash".to_string()] } else { command };
     let exe = std::env::current_exe().context("finding halti's own binary")?;
     let mut init = Command::new(exe);
-    init.arg("__sandbox-init");
+    // The box can see its inits: they get none of your environment, and start in the host's root,
+    // which pivot_root moves, rather than in your folder.
+    init.arg("__sandbox-init").arg("--parent").arg(std::process::id().to_string()).current_dir("/").env_clear();
+    if let Some(term) = std::env::var_os("TERM") {
+        init.env("TERM", term);
+    }
     for tool in &tools {
         init.arg("--tool").arg(tool);
     }
@@ -80,30 +91,47 @@ fn exit_code(status: ExitStatus) -> u8 {
 }
 
 /// `halti __sandbox-init`: makes the namespaces and waits for the box's init, whose exit code it
-/// returns. The arguments come from `sh`, never from a box.
-pub fn init(tools: &[PathBuf], command: &[String]) -> Result<u8> {
+/// returns. The arguments come from `sh` (`parent` is its pid), never from a box.
+pub fn init(parent: libc::pid_t, tools: &[PathBuf], command: &[String]) -> Result<u8> {
+    // If `box sh` goes, the box goes with it; if it went already, the signal never comes.
+    check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) }.into())?;
+    if unsafe { libc::getppid() } != parent {
+        bail!("halti box sh ended before the sandbox started");
+    }
+    // No fd of the caller's but stdio reaches the box, nor stays open here, where the box could
+    // find it.
+    check(unsafe { libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0) }).context("closing inherited fds")?;
     let tools = tools.iter().map(|t| Tool::resolve(t)).collect::<Result<Vec<_>>>()?;
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    // If `box sh` goes, the box goes with it.
-    check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) }.into())?;
     let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWNET | libc::CLONE_NEWPID | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS;
     check(unsafe { libc::unshare(flags) }.into()).context("making the box's namespaces (does this kernel allow user namespaces?)")?;
     // Your uid and gid, and only them, are root in the box's user namespace.
     write_proc("setgroups", "deny")?;
     write_proc("uid_map", &format!("0 {uid} 1"))?;
     write_proc("gid_map", &format!("0 {gid} 1"))?;
+    // Neither init's memory, fds, folder or environment can be read through /proc from here on;
+    // that includes this process's own /proc/self, so it comes after the maps. The fork keeps it.
+    check(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) }.into())?;
+    // The box's init watches `watch`: it hangs up when this process ends, `alive` with it.
+    let mut ends = [0; 2];
+    check(unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) }.into())?;
+    let (watch, alive) = unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
     // The first child is the new PID namespace's init. Nothing here has started a thread.
     match unsafe { libc::fork() } {
         -1 => Err(io::Error::last_os_error()).context("starting the box's init"),
         0 => {
-            let code = box_init(&tools, command).unwrap_or_else(|e| {
+            drop(alive);
+            let code = box_init(watch, &tools, command).unwrap_or_else(|e| {
                 eprintln!("halti: sandbox: {e:#}");
                 125
             });
             let _ = io::stderr().flush();
             unsafe { libc::_exit(code.into()) }
         }
-        pid => wait_for(pid),
+        pid => {
+            drop(watch);
+            wait_for(pid)
+        }
     }
 }
 
@@ -113,15 +141,22 @@ fn write_proc(file: &str, text: &str) -> Result<()> {
 }
 
 /// PID 1 of the box: builds the root, then runs the command and reaps every orphan until it ends.
-fn box_init(tools: &[Tool], command: &[String]) -> Result<u8> {
+fn box_init(watch: OwnedFd, tools: &[Tool], command: &[String]) -> Result<u8> {
     check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) }.into())?;
+    // Its parent is outside the PID namespace, so getppid() can't say whether it went already.
+    let mut hangup = libc::pollfd { fd: watch.as_raw_fd(), events: 0, revents: 0 };
+    check(unsafe { libc::poll(&mut hangup, 1, 0) }.into())?;
+    if hangup.revents & libc::POLLHUP != 0 {
+        bail!("the sandbox's init ended before the box started");
+    }
+    drop(watch);
     loopback_up().context("bringing up lo")?;
     check(unsafe { libc::sethostname(HOSTNAME.as_ptr().cast(), HOSTNAME.len()) }.into()).context("naming the box")?;
     if build_root(tools)? == Proc::Host {
         eprintln!("halti: sandbox: this kernel won't give the box a /proc of its own, so it sees the host's, read-only (host /proc visible)");
     }
     let mut cmd = Command::new(&command[0]);
-    cmd.args(&command[1..]).env_clear().env("PATH", PATH).env("HOME", HOME).env("USER", "root").env("LANG", "C.UTF-8").current_dir(HOME);
+    cmd.args(&command[1..]).env_clear().env("PATH", search_path(tools)).env("HOME", HOME).env("USER", "root").env("LANG", "C.UTF-8").current_dir(HOME);
     if let Some(term) = std::env::var_os("TERM") {
         cmd.env("TERM", term);
     }
@@ -129,7 +164,8 @@ fn box_init(tools: &[Tool], command: &[String]) -> Result<u8> {
         Ok(child) => child,
         Err(e) => {
             eprintln!("halti: {}: {e}", command[0]);
-            return Ok(127);
+            // As a shell says it: 127 for a command not found, 126 for one that can't run.
+            return Ok(if e.kind() == io::ErrorKind::NotFound { 127 } else { 126 });
         }
     };
     let pid = child.id() as libc::pid_t;
@@ -141,6 +177,19 @@ fn box_init(tools: &[Tool], command: &[String]) -> Result<u8> {
             _ => {}
         }
     }
+}
+
+/// The command's PATH: the system folders, then the folder each tool file is named in, so
+/// `claude` from the native installer (`~/.local/bin/claude`) runs by name.
+fn search_path(tools: &[Tool]) -> String {
+    let mut path = PATH.to_string();
+    for dir in tools.iter().filter(|t| !t.real.is_dir()).filter_map(|t| t.named.parent()) {
+        if !path.split(':').any(|p| Path::new(p) == dir) {
+            path.push(':');
+            path.push_str(&dir.to_string_lossy());
+        }
+    }
+    path
 }
 
 fn wait_for(pid: libc::pid_t) -> Result<u8> {
@@ -382,7 +431,7 @@ mod tests {
     use std::io;
     use std::path::{Path, PathBuf};
 
-    use super::{Proc, Tool, proc_choice};
+    use super::{PATH, Proc, Tool, proc_choice, search_path};
 
     #[test]
     fn a_refused_private_proc_falls_back_to_the_hosts_and_other_errors_fail() {
@@ -407,6 +456,16 @@ mod tests {
         // Named through a shown folder, resolving outside it: bound, and the link is there already.
         let shown = tool("/usr/bin/x", "/opt/x");
         assert_eq!(shown.needs(), (Some(Path::new("/opt/x")), None));
+    }
+
+    #[test]
+    fn the_folder_a_tool_is_named_in_is_on_the_path() {
+        let tool = |named: &str, real: &str| Tool { named: PathBuf::from(named), real: PathBuf::from(real) };
+        let native = tool("/home/u/.local/bin/claude", "/home/u/.local/share/claude/versions/2.1.0");
+        let beside = tool("/home/u/.local/bin/other", "/home/u/.local/bin/other");
+        let npm = tool("/usr/local/bin/claude", "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe");
+        assert_eq!(search_path(&[native, beside, npm]), format!("{PATH}:/home/u/.local/bin"));
+        assert_eq!(search_path(&[]), PATH);
     }
 
     #[test]
