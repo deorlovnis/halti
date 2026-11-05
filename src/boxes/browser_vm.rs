@@ -29,7 +29,7 @@ pub struct BrowserVm {
 
 impl BrowserVm {
     /// A browser VM for the box `box_id`, not started yet. `image` is a pinned
-    /// "cred-browser@sha256:..."; `downloads` the Mac folder for downloads, or `None` when the
+    /// "name@sha256:..."; `downloads` the Mac folder for downloads, or `None` when the
     /// policy doesn't allow them; `tokens` the list the box's door checks.
     pub fn new(box_id: &str, image: &str, socket: PathBuf, downloads: Option<PathBuf>, ca_pem: String, tokens: door::Tokens) -> Self {
         let spec = engine::BrowserSpec { name: engine::browser_vm_name(box_id), image: image.to_string(), socket, downloads };
@@ -43,7 +43,7 @@ impl BrowserVm {
         }
     }
 
-    /// Give the runners started from now on these variables (the `CRED_RUNNER_DEBUG_*` ones
+    /// Give the runners started from now on these variables (the `HALTI_RUNNER_DEBUG_*` ones
     /// switch protections off; release builds refuse them).
     #[cfg(debug_assertions)]
     pub fn set_runner_env(&self, env: Vec<(String, String)>) {
@@ -87,7 +87,7 @@ impl BrowserVm {
         if std::mem::take(&mut *up)
             && let Err(e) = engine::stop(&self.spec.name)
         {
-            eprintln!("cred: stopping {}: {e:#}", self.spec.name);
+            eprintln!("halti: stopping {}: {e:#}", self.spec.name);
         }
         let _ = std::fs::remove_file(&self.spec.socket);
     }

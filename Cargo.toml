@@ -1,5 +1,5 @@
 [package]
-name = "cred"
+name = "halti"
 version = "0.5.1"
 edition = "2024"
 description = "macOS Keychain-backed secrets for humans and agents"
@@ -31,7 +31,7 @@ ureq = "3.5"
 url = "2.5"
 webpki-roots = "1"
 
-# Touch ID and the Keychain. Elsewhere (a box's Linux) cred builds and its tests run, but there's
+# Touch ID and the Keychain. Elsewhere (a box's Linux) halti builds and its tests run, but there's
 # nothing to keep secrets in: see `keychain::backend` and `approve`.
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

@@ -22,9 +22,9 @@ use serde_json::{Value, json};
 
 use super::addr::Net;
 use super::http::{self, Head};
-use super::{Config, Door};
+use super::{Config, Door, STANDIN};
 use crate::util::TempDir;
-use crate::{approve, keychain, policy};
+use crate::{approve, keychain, legacy, policy};
 
 const REAL_KEY: &str = "sk-ant-REAL-0123456789abcdef";
 const PUBLIC_IP: &str = "93.184.216.34";
@@ -37,28 +37,28 @@ const SCENARIO: &str = "door::tests::a_fake_guest_uses_all_three_kinds_of_connec
 
 #[test]
 fn a_fake_guest_uses_all_three_kinds_of_connection() {
-    if std::env::var_os("CRED_DOOR_CHILD").is_none() {
+    if std::env::var_os("HALTI_DOOR_CHILD").is_none() {
         return rerun_with_private_environment();
     }
-    scenario(Path::new(&std::env::var("CRED_DOOR_DIR").unwrap()));
+    scenario(Path::new(&std::env::var("HALTI_DOOR_DIR").unwrap()));
 }
 
 fn rerun_with_private_environment() {
-    let dir = TempDir::new("cred-door").unwrap();
+    let dir = TempDir::new("halti-door").unwrap();
     for sub in ["keychain", "policy", "home"] {
         fs::create_dir(dir.0.join(sub)).unwrap();
     }
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", SCENARIO, "--nocapture", "--test-threads=1"])
-        .env("CRED_DOOR_CHILD", "1")
-        .env("CRED_DOOR_DIR", &dir.0)
+        .env("HALTI_DOOR_CHILD", "1")
+        .env("HALTI_DOOR_DIR", &dir.0)
         .env("HOME", dir.0.join("home"))
-        .env("CRED_INDEX", dir.0.join("index.json"))
-        .env("CRED_POLICY_DIR", dir.0.join("policy"))
-        .env("CRED_TEST_KEYCHAIN", dir.0.join("keychain"))
-        .env("CRED_TEST_APPROVE", "yes")
-        .env("CRED_AUDIT", dir.0.join("audit.log"))
-        .env("CRED_AUDIT_KEY", "test-key");
+        .env("HALTI_INDEX", dir.0.join("index.json"))
+        .env("HALTI_POLICY_DIR", dir.0.join("policy"))
+        .env("HALTI_TEST_KEYCHAIN", dir.0.join("keychain"))
+        .env("HALTI_TEST_APPROVE", "yes")
+        .env("HALTI_AUDIT", dir.0.join("audit.log"))
+        .env("HALTI_AUDIT_KEY", "test-key");
     for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
         cmd.env_remove(var);
     }
@@ -245,7 +245,7 @@ impl Conn {
 
 fn post(path: &str, headers: &[(&str, &str)], body: &str) -> String {
     let headers: String = headers.iter().map(|(n, v)| format!("{n}: {v}\r\n")).collect();
-    format!("POST {path} HTTP/1.1\r\nHost: cred.internal\r\n{headers}Content-Length: {}\r\n\r\n{body}", body.len())
+    format!("POST {path} HTTP/1.1\r\nHost: halti.internal\r\n{headers}Content-Length: {}\r\n\r\n{body}", body.len())
 }
 
 // --- the scenario ---
@@ -346,7 +346,7 @@ fn scenario(dir: &Path) {
     drop(conn);
     thread::sleep(Duration::from_millis(300));
     let log = fs::read_to_string(&log_path).unwrap();
-    assert!(!log.contains(REAL_KEY) && !log.contains("cred-managed") && !log.to_lowercase().contains("authorization"), "{log}");
+    assert!(!log.contains(REAL_KEY) && !log.contains(STANDIN) && !log.to_lowercase().contains("authorization"), "{log}");
     let lines: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     let find = |kind: &str, decision: &str| lines.iter().find(|l| l["kind"] == kind && l["decision"] == decision).unwrap_or_else(|| panic!("no {kind} {decision} in {log}"));
     assert!(find("proxy", "allowed")["time"].is_string());
@@ -420,14 +420,14 @@ fn proxy(conn: &mut Conn, guest: &Guest, dialed: &Arc<Mutex<Vec<SocketAddr>>>) {
 }
 
 fn gateway(guest: &Guest, upstream: &Upstream) {
-    let mut conn = guest.connection("cred");
+    let mut conn = guest.connection(legacy::DOOR_KIND);
     let calls = upstream.seen.lock().unwrap().len();
 
     // A streamed answer arrives event by event, before the upstream has finished it.
     let stream_request = post(
         "/model/v1/messages?stream",
         &[
-            ("x-api-key", "cred-managed"),
+            ("x-api-key", STANDIN),
             ("anthropic-version", "1999-01-01"),
             ("accept-encoding", "gzip"),
             ("connection", "keep-alive"),
@@ -456,11 +456,11 @@ fn gateway(guest: &Guest, upstream: &Upstream) {
         assert_eq!(call.header("user-agent"), Some("claude-cli/1"));
         assert_eq!(call.header("accept-encoding"), Some("identity"));
         assert_eq!(call.body, br#"{"stream":true}"#);
-        assert!(call.headers.iter().all(|(_, v)| !v.contains("cred-managed")));
+        assert!(call.headers.iter().all(|(_, v)| !v.contains(STANDIN)));
     }
 
     // The same connection serves more requests, and a plain answer is passed on whole.
-    conn.send(&post("/model/v1/messages", &[("authorization", "Bearer cred-managed")], "{}"));
+    conn.send(&post("/model/v1/messages", &[("authorization", &format!("Bearer {STANDIN}"))], "{}"));
     let reply = conn.head();
     assert_eq!(reply.status, 200);
     assert_eq!(conn.body(&reply), json!({ "type": "message", "content": "hi" }).to_string().into_bytes());
@@ -471,8 +471,8 @@ fn gateway(guest: &Guest, upstream: &Upstream) {
     for (request, status, kind) in [
         (post("/model/v1/messages", &[("x-api-key", "sk-ant-the-agents-own-guess")], "{}"), 401, "authentication_error"),
         (post("/model/v1/messages", &[], "{}"), 401, "authentication_error"),
-        (post("/elsewhere", &[("x-api-key", "cred-managed")], "{}"), 404, "not_found_error"),
-        ("GET /model HTTP/1.1\r\nx-api-key: cred-managed\r\n\r\n".to_string(), 404, "not_found_error"),
+        (post("/elsewhere", &[("x-api-key", STANDIN)], "{}"), 404, "not_found_error"),
+        (format!("GET /model HTTP/1.1\r\nx-api-key: {STANDIN}\r\n\r\n"), 404, "not_found_error"),
     ] {
         conn.send(&request);
         let reply = conn.head();
@@ -484,14 +484,14 @@ fn gateway(guest: &Guest, upstream: &Upstream) {
     assert_eq!(upstream.seen.lock().unwrap().len(), calls);
 
     // A chunked request body, as some HTTP clients send.
-    conn.send("POST /model/v1/messages HTTP/1.1\r\nx-api-key: cred-managed\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n");
+    conn.send(&format!("POST /model/v1/messages HTTP/1.1\r\nx-api-key: {STANDIN}\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"));
     let reply = conn.head();
     assert_eq!(reply.status, 200);
     conn.body(&reply);
     assert_eq!(upstream.seen.lock().unwrap().last().unwrap().body, b"abcde");
 
     // Connection: close ends the connection after the answer.
-    conn.send(&post("/model/v1/messages", &[("x-api-key", "cred-managed"), ("connection", "close")], "{}"));
+    conn.send(&post("/model/v1/messages", &[("x-api-key", STANDIN), ("connection", "close")], "{}"));
     let reply = conn.head();
     assert_eq!(reply.head.header("connection"), Some("close"));
     conn.body(&reply);
@@ -522,8 +522,8 @@ fn model_refusals(dir: &Path) {
             browser: None,
         };
         let door = Door::start_with(config, Net::system()).unwrap();
-        let mut conn = guest.connection("cred");
-        conn.send(&post("/model/v1/messages", &[("x-api-key", "cred-managed")], "{}"));
+        let mut conn = guest.connection(legacy::DOOR_KIND);
+        conn.send(&post("/model/v1/messages", &[("x-api-key", STANDIN)], "{}"));
         let reply = conn.head();
         assert_eq!(reply.status, status);
         let body: Value = serde_json::from_slice(&conn.body(&reply)).unwrap();
@@ -545,7 +545,7 @@ fn mcp(guest: &Guest, upstream: &Upstream, dir: &Path) {
         reply["result"].clone()
     };
     let init = call(1, "initialize", json!({ "protocolVersion": "2025-06-18" }));
-    assert_eq!(init["serverInfo"]["name"], "cred");
+    assert_eq!(init["serverInfo"]["name"], "halti");
     let tools = call(2, "tools/list", json!({}));
     let names: Vec<&str> = tools["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"fetch") && names.contains(&"sites"), "{names:?}");
@@ -575,15 +575,15 @@ fn mcp(guest: &Guest, upstream: &Upstream, dir: &Path) {
 }
 
 /// Run a real door against a socket published by a VM, for checking by hand:
-/// `CRED_DOOR_LIVE=/tmp/cred-501/x.sock CRED_DOOR_ALLOW=https://example.com,... cargo test live_door -- --ignored`
-/// then use the box (e.g. curl through the proxy) for CRED_DOOR_SECONDS (default 60).
+/// `HALTI_DOOR_LIVE=/tmp/halti-501/x.sock HALTI_DOOR_ALLOW=https://example.com,... cargo test live_door -- --ignored`
+/// then use the box (e.g. curl through the proxy) for HALTI_DOOR_SECONDS (default 60).
 #[test]
-#[ignore = "needs a VM publishing a door socket: CRED_DOOR_LIVE=<socket>"]
+#[ignore = "needs a VM publishing a door socket: HALTI_DOOR_LIVE=<socket>"]
 fn live_door() {
-    let Some(socket) = std::env::var_os("CRED_DOOR_LIVE") else { return };
-    let allow = std::env::var("CRED_DOOR_ALLOW").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(String::from).collect();
-    let seconds = std::env::var("CRED_DOOR_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
-    let log = std::env::temp_dir().join(format!("cred-door-live-{}.log", std::process::id()));
+    let Some(socket) = std::env::var_os("HALTI_DOOR_LIVE") else { return };
+    let allow = std::env::var("HALTI_DOOR_ALLOW").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+    let seconds = std::env::var("HALTI_DOOR_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+    let log = std::env::temp_dir().join(format!("halti-door-live-{}.log", std::process::id()));
     let door = Door::start(Config {
         name: "live".into(),
         socket: socket.into(),
@@ -607,7 +607,7 @@ fn live_door() {
 #[test]
 fn bad_allow_patterns_stop_the_door_from_starting() {
     static N: AtomicUsize = AtomicUsize::new(0);
-    let dir = TempDir::new(&format!("cred-door-bad{}", N.fetch_add(1, Ordering::Relaxed))).unwrap();
+    let dir = TempDir::new(&format!("halti-door-bad{}", N.fetch_add(1, Ordering::Relaxed))).unwrap();
     let cfg = Config {
         name: "x".into(),
         socket: dir.0.join("s"),

@@ -27,6 +27,7 @@ use super::http;
 use super::intercept_tests::{Guest, Shim, client, log_lines, wait_for};
 use super::tls::{BoxCa, trust_only};
 use super::{Config, Door, Tokens};
+use crate::legacy;
 use crate::util::TempDir;
 use crate::{approve, keychain, policy};
 
@@ -47,23 +48,23 @@ fn pages_speak_for_their_site_and_nobody_else_touch_id_says_no() {
 }
 
 fn run_scenario(name: &str, answer: &str) {
-    if let Some(dir) = std::env::var_os("CRED_PAGE_DIR") {
+    if let Some(dir) = std::env::var_os("HALTI_PAGE_DIR") {
         return scenario(Path::new(&dir), answer == "yes");
     }
-    let dir = TempDir::new("cred-page").unwrap();
+    let dir = TempDir::new("halti-page").unwrap();
     for sub in ["keychain", "policy", "home"] {
         fs::create_dir(dir.0.join(sub)).unwrap();
     }
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .env("CRED_PAGE_DIR", &dir.0)
+        .env("HALTI_PAGE_DIR", &dir.0)
         .env("HOME", dir.0.join("home"))
-        .env("CRED_INDEX", dir.0.join("index.json"))
-        .env("CRED_POLICY_DIR", dir.0.join("policy"))
-        .env("CRED_TEST_KEYCHAIN", dir.0.join("keychain"))
-        .env("CRED_TEST_APPROVE", "yes")
-        .env("CRED_AUDIT", dir.0.join("audit.log"))
-        .env("CRED_AUDIT_KEY", "test-key");
+        .env("HALTI_INDEX", dir.0.join("index.json"))
+        .env("HALTI_POLICY_DIR", dir.0.join("policy"))
+        .env("HALTI_TEST_KEYCHAIN", dir.0.join("keychain"))
+        .env("HALTI_TEST_APPROVE", "yes")
+        .env("HALTI_AUDIT", dir.0.join("audit.log"))
+        .env("HALTI_AUDIT_KEY", "test-key");
     for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
         cmd.env_remove(var);
     }
@@ -142,7 +143,7 @@ fn scenario(dir: &Path, yes: bool) {
     approve::take_answers();
     // The policies are approved; from here Touch ID answers as this scenario says.
     // SAFETY: no other thread is running yet; the door's threads start later.
-    unsafe { std::env::set_var("CRED_TEST_APPROVE", if yes { "yes" } else { "no" }) };
+    unsafe { std::env::set_var("HALTI_TEST_APPROVE", if yes { "yes" } else { "no" }) };
 
     let box_ca = Arc::new(BoxCa::generate("pagebox").unwrap());
     let signer = BoxCa::generate("sites").unwrap();
@@ -294,10 +295,10 @@ fn scenario(dir: &Path, yes: bool) {
     );
     drop(as_agent);
 
-    // The browser's VM has no business with cred itself or MCP.
-    for kind in ["cred", "mcp"] {
+    // The browser's VM has no business with halti itself or MCP.
+    for kind in [legacy::DOOR_KIND, "mcp"] {
         let mut io = browser.take();
-        write!(io.writer, "{kind}\nGET /model/v1/messages HTTP/1.1\r\nHost: cred.internal\r\n\r\n").unwrap();
+        write!(io.writer, "{kind}\nGET /model/v1/messages HTTP/1.1\r\nHost: halti.internal\r\n\r\n").unwrap();
         let mut rest = Vec::new();
         assert!(io.read_to_end(&mut rest).map(|_| rest.is_empty()).unwrap_or(true), "{kind} got an answer");
     }

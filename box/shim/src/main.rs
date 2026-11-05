@@ -1,14 +1,15 @@
-//! cred-shim: the guest side of a box's door.
+//! The shim: the guest side of a halti box's door. Its names, in the VM and on the Mac's command
+//! line, are the old images' (see `legacy`).
 //!
-//! A box has no network. cred, on the Mac, dials connections into the Unix socket this daemon
+//! A box has no network. halti, on the Mac, dials connections into the Unix socket this daemon
 //! listens on (`serve`, the VM's init process); programs in the box talk to local listeners
 //! instead, and each of their connections is paired with one of those idle connections from the
 //! Mac. The first line sent to the Mac says which listener the program came to:
 //!
 //! - `proxy`: TCP 127.0.0.1:3128, the HTTP proxy (`serve --bridges`: port 3128 on every address,
 //!   so Docker's containers reach it at their bridge's gateway)
-//! - `cred`:  TCP 127.0.0.2:80, `cred.internal`
-//! - `mcp`:   /run/cred/local.sock, which `cred-shim mcp` (cred's MCP server over stdio) dials
+//! - `legacy::DOOR_KIND`: TCP 127.0.0.2:80, `halti.internal` (halti itself)
+//! - `mcp`:   `LOCAL_SOCK`, which the shim's `mcp` command (halti's MCP server over stdio) dials
 //!
 //! After that line the bytes go both ways until both sides are done (half-close aware).
 
@@ -21,15 +22,17 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use std::{env, fs, process, thread};
 
-const RUN_DIR: &str = "/run/cred";
-const DOOR_SOCK: &str = "/run/cred/door.sock";
-const LOCAL_SOCK: &str = "/run/cred/local.sock";
+mod legacy;
+
+const RUN_DIR: &str = legacy::RUN_DIR;
+const DOOR_SOCK: &str = legacy::DOOR_SOCKET;
+const LOCAL_SOCK: &str = legacy::LOCAL_SOCKET;
 const PROXY_ADDR: (&str, u16) = ("127.0.0.1", 3128);
 /// The proxy for a box with Docker: a container has a network namespace of its own, where
 /// 127.0.0.1 is the container itself, so it can only reach the proxy at an address of the VM on
 /// its bridge. The VM has no network device, so every address is still inside it.
 const PROXY_ALL: (&str, u16) = ("0.0.0.0", 3128);
-const CRED_ADDR: (&str, u16) = ("127.0.0.2", 80);
+const HALTI_ADDR: (&str, u16) = ("127.0.0.2", 80);
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -41,12 +44,12 @@ fn main() {
             .map_err(|e| io::Error::new(e.kind(), format!("connecting to {LOCAL_SOCK}: {e}")))
             .and_then(|sock| relay(sock, io::stdin(), io::stdout())),
         _ => {
-            eprintln!("usage: cred-shim serve [--bridges] | mcp");
+            eprintln!("usage: {} serve [--bridges] | mcp", legacy::SHIM);
             process::exit(2);
         }
     };
     if let Err(e) = result {
-        eprintln!("cred-shim: {e}");
+        eprintln!("{}: {e}", legacy::SHIM);
         process::exit(1);
     }
 }
@@ -190,7 +193,7 @@ fn serve(proxy: (&str, u16)) -> io::Result<()> {
     let door = bind_unix(DOOR_SOCK, 0o600)?;
     let local = bind_unix(LOCAL_SOCK, 0o666)?;
     let proxy = bind_tcp(proxy)?;
-    let cred = bind_tcp(CRED_ADDR)?;
+    let halti = bind_tcp(HALTI_ADDR)?;
 
     let p = pool.clone();
     thread::spawn(move || collect_hosts(door, p));
@@ -198,12 +201,12 @@ fn serve(proxy: (&str, u16)) -> io::Result<()> {
     thread::spawn(move || accept_loop(local.incoming(), "mcp", p));
     let p = pool.clone();
     thread::spawn(move || accept_loop(proxy.incoming(), "proxy", p));
-    accept_loop(cred.incoming(), "cred", pool);
+    accept_loop(halti.incoming(), legacy::DOOR_KIND, pool);
     Ok(())
 }
 
-/// `cred-shim mcp`: carry `input` and `output` (an MCP client's stdio) over `sock`, which the
-/// daemon pairs with cred's MCP server. Ends when the server hangs up.
+/// `mcp`: carry `input` and `output` (an MCP client's stdio) over `sock`, which the
+/// daemon pairs with halti's MCP server. Ends when the server hangs up.
 fn relay(sock: UnixStream, mut input: impl Read + Send + 'static, mut output: impl Write) -> io::Result<()> {
     let mut up = sock.try_clone()?;
     thread::spawn(move || {
@@ -231,7 +234,7 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
 
-    /// A connected pair standing in for (cred's end, the pool's end) of a dialed-in connection.
+    /// A connected pair standing in for (halti's end, the pool's end) of a dialed-in connection.
     fn dialed() -> (UnixStream, UnixStream) {
         UnixStream::pair().unwrap()
     }
@@ -276,7 +279,7 @@ mod tests {
         let (mac, shim_end) = dialed();
         pool.put(shim_end);
         let (mut program, client) = tcp_pair();
-        thread::spawn(move || serve_client(client, "cred", &pool));
+        thread::spawn(move || serve_client(client, legacy::DOOR_KIND, &pool));
 
         program.write_all(b"request").unwrap();
         program.shutdown(Shutdown::Write).unwrap();
@@ -285,7 +288,7 @@ mod tests {
         let mut mac = mac;
         let mut got = String::new();
         mac.read_to_string(&mut got).unwrap();
-        assert_eq!(got, "cred\nrequest");
+        assert_eq!(got, format!("{}\nrequest", legacy::DOOR_KIND));
         mac.write_all(b"response").unwrap();
         mac.shutdown(Shutdown::Write).unwrap();
 

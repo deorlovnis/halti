@@ -167,7 +167,7 @@ pub(super) fn wait_for<T>(mut found: impl FnMut() -> Option<T>) -> T {
 
 #[test]
 fn the_door_ends_tls_for_a_guest_that_trusts_only_the_box_ca() {
-    let dir = TempDir::new("cred-tls-door").unwrap();
+    let dir = TempDir::new("halti-tls-door").unwrap();
     let box_ca = Arc::new(BoxCa::generate("testbox").unwrap());
     let sites = BoxCa::generate("sites").unwrap();
     let rogue = BoxCa::generate("rogue").unwrap();
@@ -291,16 +291,16 @@ impl Drop for Vm {
 
 /// The tools in a real agent VM trust the box CA, with the real door ending TLS between them
 /// and the real internet (so it needs the network, and Apple's `container` with the
-/// `cred-agent` image built: `container build -f box/agent.Containerfile -t cred-agent box`).
+/// agent image built under `engine::AGENT_IMAGE`, as install.sh builds it).
 /// The door doesn't weaken verification: a site with a bad certificate is a 502.
 ///
 ///     mise run e2e-box        # includes this
 #[test]
-#[ignore = "needs Apple's `container`, the cred-agent image and the internet; run with `mise run e2e-box`"]
+#[ignore = "needs Apple's `container`, the agent image and the internet; run with `mise run e2e-box`"]
 fn real_vm_tools_trust_the_door_and_only_the_door() {
     use crate::engine;
-    if std::env::var_os("CRED_E2E_BOX").is_none() {
-        eprintln!("CRED_E2E_BOX isn't set: skipping");
+    if std::env::var_os("HALTI_E2E_BOX").is_none() {
+        eprintln!("HALTI_E2E_BOX isn't set: skipping");
         return;
     }
     engine::available().unwrap();
@@ -357,7 +357,7 @@ fn real_vm_tools_trust_the_door_and_only_the_door() {
 
     // The certificate the tools see is the door's, issued by this box's CA.
     let seen = ok("who issues", "curl -sv -m 60 -o /dev/null https://example.com 2>&1 | grep -i 'issuer'");
-    assert!(seen.contains("cred box e2e"), "{seen}");
+    assert!(seen.contains("halti box e2e"), "{seen}");
     ok("curl", "curl -sS -m 60 -o /dev/null -w '%{http_code}\\n' https://example.com | grep -q 200");
     ok("git clone", "rm -rf /tmp/hw && timeout 180 git clone --depth 1 https://github.com/octocat/Hello-World /tmp/hw && test -f /tmp/hw/README");
     ok("node fetch", "node -e \"fetch('https://example.com').then(r => { console.log(r.status); process.exit(r.status === 200 ? 0 : 1) })\"");

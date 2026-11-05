@@ -1,14 +1,14 @@
-//! The door: cred's side of the one connection a box has to the outside. A box's VMs have no
-//! network; each has a socket cred published into it. cred dials into that socket and keeps a
+//! The door: halti's side of the one connection a box has to the outside. A box's VMs have no
+//! network; each has a socket halti published into it. halti dials into that socket and keeps a
 //! few idle connections ready (the pool). When the guest takes one it first says what it
 //! wants, one line `<kind>\n`, and then the connection carries that service:
 //!
 //! - `proxy`: an HTTP proxy that does CONNECT to port 443 of the hosts the box may reach, at
-//!   public addresses cred resolved and checked itself (see `proxy`, `addr`). With a box CA the
+//!   public addresses halti resolved and checked itself (see `proxy`, `addr`). With a box CA the
 //!   door ends the TLS inside the tunnel, so it can read the requests (see `tls`);
-//! - `cred`: plain HTTP to cred itself, where `/model/...` is the model gateway that swaps in
+//! - `legacy::DOOR_KIND`: plain HTTP to halti itself, where `/model/...` is the model gateway that swaps in
 //!   the real key (see `gateway`);
-//! - `mcp`: cred's MCP server for the box, limited to its sites.
+//! - `mcp`: halti's MCP server for the box, limited to its sites.
 //!
 //! The box's browser VM has a socket of its own, and only `proxy` connections through it are
 //! served. They are not the agent's: each one says which site's page it carries (a runner's
@@ -44,6 +44,7 @@ use serde::Serialize;
 
 use crate::browse::BoxBrowser;
 use crate::chain::Chain;
+use crate::legacy;
 use crate::mcp::{self, Scope};
 use crate::policy;
 use addr::{Allow, Net};
@@ -51,7 +52,7 @@ pub use page::Tokens;
 pub use tls::{BoxCa, PURPOSE as CA_PURPOSE};
 
 /// What the box holds in place of the model key. Worthless anywhere but at the gateway.
-pub const STANDIN: &str = "cred-managed";
+pub const STANDIN: &str = legacy::STANDIN;
 
 /// Idle connections kept dialed in; a new one is dialed when one is taken.
 const POOL: usize = 8;
@@ -269,8 +270,8 @@ fn serve(sh: &Shared, mut reader: BufReader<UnixStream>, writer: Option<UnixStre
     }
     match (origin, kind.trim_end()) {
         (_, "proxy") => proxy::serve(sh, reader, writer, origin),
-        // The browser VM has no business with cred itself.
-        (Origin::Agent, "cred") => gateway::serve(sh, reader, writer),
+        // The browser VM has no business with halti itself.
+        (Origin::Agent, legacy::DOOR_KIND) => gateway::serve(sh, reader, writer),
         (Origin::Agent, "mcp") => serve_mcp(sh, reader, writer),
         (Origin::Browser, other) => {
             let other: String = other.chars().filter(|c| c.is_ascii_graphic()).take(MAX_KIND as usize).collect();

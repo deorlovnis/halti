@@ -21,7 +21,7 @@
 //!   one allowed host and ask for another.
 //! - **Pages.** A request from a page in the box's browser VM (see `page`) is judged by its
 //!   site's `[browse]` rules, not the box's: `writes` and `allow_writes` instead of `[net]`.
-//!   No credentials are added to it, and its answer is not masked here (cred masks what the
+//!   No credentials are added to it, and its answer is not masked here (halti masks what the
 //!   runner reports): the session is in the browser already.
 //! - **The log:** one chained line per request, with the method and the masked URL, never
 //!   headers or bodies.
@@ -231,12 +231,12 @@ fn site_for(sh: &Shared, host: &str) -> Result<Option<Site>> {
 }
 
 fn site_of(name: &str, fetch: &Fetch) -> Result<Site> {
-    // Fields that expire are renewed first, as cred's own fetch does.
+    // Fields that expire are renewed first, as halti's own fetch does.
     crate::refresh::refresh_due(&[name.to_string()], false, false);
     let mut secrets = Index::load().map(|index| index.values(name)).unwrap_or_default();
     let mut headers: Vec<(String, String)> = fetch.headers.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
     if let Some(template) = &fetch.auth {
-        let auth = policy::fill(template, |field| keychain::get(name, field).ok_or_else(|| anyhow!("{name}/{field} isn't stored (cred set {name} {field})")))?;
+        let auth = policy::fill(template, |field| keychain::get(name, field).ok_or_else(|| anyhow!("{name}/{field} isn't stored (halti set {name} {field})")))?;
         // The assembled header may hold the secret in a form no field has ("Basic <base64>").
         secrets.extend(auth.split_whitespace().map(str::to_string));
         secrets.push(auth.clone());
@@ -406,7 +406,7 @@ fn exchange<G: Read + Write, U: Read + Write>(
     let encoded = answer.header("content-encoding").is_some_and(|e| !e.trim().eq_ignore_ascii_case("identity"));
     if masker.is_some() && encoded && answer_framing != Framing::None {
         sh.log.write(&entry(&method_shown, &url, Some(502), "blocked:encoded", counts));
-        return end_with_message(guest, 502, "the site compressed its answer, so cred can't mask it");
+        return end_with_message(guest, 502, "the site compressed its answer, so halti can't mask it");
     }
 
     let shape = shape_of(answer_framing, masker.is_some(), version == "HTTP/1.1");
@@ -432,7 +432,7 @@ fn end_with(sh: &Shared, guest: &mut BufReader<impl Read + Write>, entry: Entry,
 }
 
 fn end_with_message(guest: &mut BufReader<impl Read + Write>, status: u16, message: &str) -> io::Result<bool> {
-    http::respond(guest.get_mut(), status, "text/plain", format!("cred: {message}\n").as_bytes(), false).map(|()| false)
+    http::respond(guest.get_mut(), status, "text/plain", format!("halti: {message}\n").as_bytes(), false).map(|()| false)
 }
 
 /// Answer a refused request. The connection goes on if the request's body can be read past.
@@ -440,7 +440,7 @@ fn refuse<G: Read + Write>(guest: &mut BufReader<G>, head: &Head, framing: Frami
     // A client that waits for 100 Continue won't send the body of a refused request.
     let waits = head.header("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
     let keep = keep && !waits;
-    http::respond(guest.get_mut(), r.status, "text/plain", format!("cred: {}\n", r.message).as_bytes(), keep)?;
+    http::respond(guest.get_mut(), r.status, "text/plain", format!("halti: {}\n", r.message).as_bytes(), keep)?;
     if !keep {
         return Ok(false);
     }
@@ -562,7 +562,7 @@ fn call_site<G: Read + Write, U: Read + Write>(
             *upstream = Some(BufReader::new(stream));
             Ok(())
         }
-        Err(_) => Err(site_failure("failed:connect", "cred couldn't connect to the site")),
+        Err(_) => Err(site_failure("failed:connect", "halti couldn't connect to the site")),
     };
     let reused = upstream.is_some();
     if !reused {
@@ -576,7 +576,7 @@ fn call_site<G: Read + Write, U: Read + Write>(
         Answer::Head(answer) => return Ok(answer),
         Answer::Gone if reused && !kept.overflow => {}
         Answer::Gone | Answer::Broken => {
-            let message = if delivered { "the site gave no usable answer" } else { "cred couldn't send the request to the site" };
+            let message = if delivered { "the site gave no usable answer" } else { "halti couldn't send the request to the site" };
             return Err(site_failure("failed:upstream", message));
         }
     }
@@ -589,7 +589,7 @@ fn call_site<G: Read + Write, U: Read + Write>(
             Answer::Head(answer) => Ok(answer),
             _ => Err(site_failure("failed:upstream", "the site gave no usable answer")),
         },
-        Err(_) => Err(site_failure("failed:upstream", "cred couldn't send the request to the site")),
+        Err(_) => Err(site_failure("failed:upstream", "halti couldn't send the request to the site")),
     }
 }
 

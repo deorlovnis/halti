@@ -1,10 +1,10 @@
-// cred browser runner: drives one headless Chromium for one site, on cred's behalf.
+// halti browser runner: drives one headless Chromium for one site, on halti's behalf.
 //
-// It talks JSON lines with cred over stdin/stdout (stdout carries only protocol messages).
+// It talks JSON lines with halti over stdin/stdout (stdout carries only protocol messages).
 // The browser profile lives in memory only. Every request is checked against the site's
-// rules from cred: pages only from `origins`, other requests also to `requests`, and anything
-// but GET/HEAD/OPTIONS follows `writes` (deny, ask cred, or allow). The agent never talks to
-// this process; cred relays a narrow set of commands and masks what comes back.
+// rules from halti: pages only from `origins`, other requests also to `requests`, and anything
+// but GET/HEAD/OPTIONS follows `writes` (deny, ask halti, or allow). The agent never talks to
+// this process; halti relays a narrow set of commands and masks what comes back.
 
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
@@ -25,7 +25,7 @@ const DOWNLOAD_WAIT = 120_000;
 const DOWNLOAD_MAX = 512 * 1024 * 1024;
 let config, browser, context, page;
 // The newest storage state seen while a person signs in by hand (`config.login`): the window can
-// be closed before cred asks for it.
+// be closed before halti asks for it.
 let lastState = null;
 let closing = false;
 const notes = [];
@@ -37,7 +37,7 @@ const downloading = new Set();
 // Only for tests of the door (the browser VM's CONNECT checks): the page's requests are not
 // checked here, so only the door stops them. It is refused unless a proxy is set, because the
 // door is what enforces the same rules there.
-const NO_ROUTING = process.env.CRED_RUNNER_DEBUG_NO_ROUTING === '1';
+const NO_ROUTING = process.env.HALTI_RUNNER_DEBUG_NO_ROUTING === '1';
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\n');
 
@@ -67,7 +67,7 @@ function note(text) {
   if (notes.length < 30 && !notes.includes(text)) notes.push(text);
 }
 
-// Ask cred (which asks the user) whether a page may send a write request.
+// Ask halti (which asks the user) whether a page may send a write request.
 function ask(method, url) {
   const id = ++asks;
   send({ ask: id, method, url });
@@ -88,7 +88,7 @@ async function guard(route) {
   if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return route.continue();
   if (config.allow_writes.some((prefix) => url.startsWith(prefix))) return route.continue();
   if (config.writes === 'allow') return route.continue();
-  // cred lists these in `cred info`, so the user can add the harmless ones to allow_writes.
+  // halti lists these in `halti info`, so the user can add the harmless ones to allow_writes.
   send({ write: { method, url } });
   if (config.writes === 'ask' && (await ask(method, url))) return route.continue();
   note(`blocked ${method} ${url.slice(0, 120)} (writes aren't allowed)`);
@@ -131,7 +131,7 @@ async function describe({ ref, compact } = {}) {
   if (snap.length > SNAPSHOT_LIMIT) snap = snap.slice(0, SNAPSHOT_LIMIT) + '\n(cut off)';
   const blocked = notes.splice(0).map((n) => `note: ${n}\n`).join('');
   const hint = blockedWrites
-    ? "note: the user can allow blocked writes by adding their URL prefixes to allow_writes in the site's [browse] policy (cred info lists them)\n"
+    ? "note: the user can allow blocked writes by adding their URL prefixes to allow_writes in the site's [browse] policy (halti info lists them)\n"
     : '';
   blockedWrites = false;
   return `URL: ${page.url()}\nTitle: ${await page.title()}\n${blocked}${hint}\n${snap}`;
@@ -199,7 +199,7 @@ async function sha256(file) {
   return hash.digest('hex');
 }
 
-// Save a download to the folder cred gave (the browser VM mounts it from the Mac) and say what
+// Save a download to the folder halti gave (the browser VM mounts it from the Mac) and say what
 // was saved in the next snapshot. Without a folder the download is refused.
 function onDownload(download) {
   const saving = (async () => {
@@ -237,7 +237,7 @@ const locate = (ref) => {
   return page.locator(`aria-ref=${ref}`);
 };
 
-// While a person signs in: keep the latest storage state, and tell cred when the last window
+// While a person signs in: keep the latest storage state, and tell halti when the last window
 // closes, with what was kept.
 function watchLogin() {
   const timer = setInterval(() => context.storageState().then((s) => { lastState = s; }, () => {}), 250);
@@ -258,9 +258,9 @@ const commands = {
     config = msg.config;
     if (NO_ROUTING && !config.proxy) throw new Error('request routing can only be switched off behind a proxy');
     // Playwright passes --no-sandbox unless asked for Chromium's own sandbox. In the browser VM
-    // every connection goes to the door, as the site named in `proxy` (cred's identity for it).
+    // every connection goes to the door, as the site named in `proxy` (halti's identity for it).
     // `login` is a person signing in by hand (`headed`: in a window): no rules apply to what
-    // they do, and cred takes the session they end up with.
+    // they do, and halti takes the session they end up with.
     browser = await chromium.launch({ headless: config.headed !== true, chromiumSandbox: true, ...(config.proxy ? { proxy: config.proxy } : {}) });
     context = await browser.newContext({
       serviceWorkers: 'block',
@@ -287,7 +287,7 @@ const commands = {
         for (const e of entries) {
           if (location.origin !== e.origin) continue;
           try {
-            const seeded = `__cred_seeded:${e.key}`;
+            const seeded = `__halti_seeded:${e.key}`;
             if (sessionStorage.getItem(seeded) === null) {
               sessionStorage.setItem(seeded, '1');
               localStorage.setItem(e.key, e.value);
@@ -309,7 +309,7 @@ const commands = {
   snapshot: ({ ref, compact }) => describe({ ref, compact }),
   find: ({ text }) => find(text),
   requests: () => `Data requests the page made (method and URL; query values over 16 characters left out):\n${[...requests].join('\n') || 'none yet'}`,
-  // The image goes back to cred in memory; nothing is written to disk.
+  // The image goes back to halti in memory; nothing is written to disk.
   async screenshot({ full_page }) {
     if (!config.screenshots) throw new Error("this site's policy doesn't allow screenshots");
     await settle();
@@ -323,13 +323,13 @@ const commands = {
   },
   // Enter can submit a form or follow a link; other keys rarely change what the page says.
   press: ({ key }) => (/(^|\+)Enter$/.test(key) ? acting(() => page.keyboard.press(key)) : page.keyboard.press(key).then(() => describe())),
-  // Types a stored credential (cred sends it as `value`) into a field. The page, and the frame
+  // Types a stored credential (halti sends it as `value`) into a field. The page, and the frame
   // holding the field, must be on one of the policy's origins.
   async fill({ ref, value }) {
     const target = locate(ref);
     const frame = await (await target.elementHandle({ timeout: 5_000 })).ownerFrame();
     for (const f of [page.mainFrame(), frame]) {
-      if (!allowed(config.origins, originOf(f?.url() ?? ''))) throw new Error("this page isn't on the site's own origin, so cred won't type a credential into it");
+      if (!allowed(config.origins, originOf(f?.url() ?? ''))) throw new Error("this page isn't on the site's own origin, so halti won't type a credential into it");
     }
     await target.fill(value, { timeout: 10_000 });
     return describe();
@@ -338,7 +338,7 @@ const commands = {
     await page.goBack({ timeout: 15_000 });
     return describe();
   },
-  // Hands the session (cookies and Local Storage, as Playwright's storageState) back to cred,
+  // Hands the session (cookies and Local Storage, as Playwright's storageState) back to halti,
   // which seals it; nothing is kept here.
   async close() {
     closing = true;
@@ -369,7 +369,7 @@ rl.on('line', async (line) => {
   } catch (e) {
     // Playwright errors carry terminal colors and long call logs; keep the gist.
     let text = String(e?.message ?? e).replace(/\u001b\[[0-9;]*m/g, '');
-    // A credential cred was asked to type must not come back in an error.
+    // A credential halti was asked to type must not come back in an error.
     if (msg.value) text = text.replaceAll(msg.value, '********');
     send({ id: msg.id, ok: false, error: text.split('\n').slice(0, 3).join('\n') });
   }

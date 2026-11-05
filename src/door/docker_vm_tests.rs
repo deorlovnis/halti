@@ -1,7 +1,7 @@
 //! Docker in a real agent VM, behind the real door: what a box with `docker = true` can do, and
 //! that its containers get no further than the box. Needs the network and Apple's `container`
 //! with an agent image that has Docker Engine (box/agent.Containerfile); set
-//! `CRED_E2E_AGENT_IMAGE` to test an image built under another name, and `CRED_E2E_JVM_IMAGE` to
+//! `HALTI_E2E_AGENT_IMAGE` to test an image built under another name, and `HALTI_E2E_JVM_IMAGE` to
 //! say which image to run Testcontainers in (without it that test is skipped).
 //!
 //!     mise run e2e-box        # includes this
@@ -22,7 +22,7 @@ fn bounding_caps(vm: &str) -> u64 {
 }
 
 /// A box with Docker: the real door with these `allow` rules, the VM, the CA, dockerd. The home
-/// folder has what `cred box run` writes there.
+/// folder has what `halti box run` writes there.
 struct DockerBox {
     log: PathBuf,
     // Dropped in this order: the VM, then the door.
@@ -61,7 +61,7 @@ impl DockerBox {
     }
 }
 
-/// A fresh folder for the box, with the home `cred box run` would prepare.
+/// A fresh folder for the box, with the home `halti box run` would prepare.
 fn box_dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(format!("/tmp/{name}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -90,12 +90,12 @@ const CAP_SYS_ADMIN: u64 = 1 << 21;
 #[test]
 #[ignore = "needs Apple's `container`, an agent image with Docker and the internet; run with `mise run e2e-box`"]
 fn real_vm_docker_works_through_the_door_and_only_there() {
-    if std::env::var_os("CRED_E2E_BOX").is_none() {
-        eprintln!("CRED_E2E_BOX isn't set: skipping");
+    if std::env::var_os("HALTI_E2E_BOX").is_none() {
+        eprintln!("HALTI_E2E_BOX isn't set: skipping");
         return;
     }
     engine::available().unwrap();
-    let image = engine::image_digest(&std::env::var("CRED_E2E_AGENT_IMAGE").unwrap_or(engine::AGENT_IMAGE.into())).unwrap();
+    let image = engine::image_digest(&std::env::var("HALTI_E2E_AGENT_IMAGE").unwrap_or(engine::AGENT_IMAGE.into())).unwrap();
     let name = format!("dkr-{}", std::process::id());
     let dir = box_dir(&name);
 
@@ -147,7 +147,7 @@ fn real_vm_docker_works_through_the_door_and_only_there() {
     assert!(answer == "b'N'" || answer == "b'S'", "{answer}");
 
     // Containers get the door's proxy from the Docker CLI, and nothing else.
-    let on = |network: &str| format!("docker run --rm --network {network} -v /usr/local/share/ca-certificates/cred-box.crt:/ca.crt:ro curlimages/curl -sS -m 30 --cacert /ca.crt");
+    let on = |network: &str| format!("docker run --rm --network {network} -v {}:/ca.crt:ro curlimages/curl -sS -m 30 --cacert /ca.crt", engine::CA_CERT);
     let curl = on("bridge");
     ok("container through the door", &format!("{curl} -o /dev/null -w '%{{http_code}}\\n' https://example.com | grep 200"));
     // a user-defined network (Testcontainers and compose make them) reaches the proxy too
@@ -187,8 +187,8 @@ fn real_vm_docker_works_through_the_door_and_only_there() {
 #[test]
 #[ignore = "needs Apple's `container`, a JVM agent image with Docker and the internet; run with `mise run e2e-box`"]
 fn real_vm_testcontainers_run_a_database_and_clean_up() {
-    let Some(image) = std::env::var_os("CRED_E2E_BOX").and(std::env::var("CRED_E2E_JVM_IMAGE").ok()) else {
-        eprintln!("CRED_E2E_BOX or CRED_E2E_JVM_IMAGE isn't set: skipping");
+    let Some(image) = std::env::var_os("HALTI_E2E_BOX").and(std::env::var("HALTI_E2E_JVM_IMAGE").ok()) else {
+        eprintln!("HALTI_E2E_BOX or HALTI_E2E_JVM_IMAGE isn't set: skipping");
         return;
     };
     engine::available().unwrap();

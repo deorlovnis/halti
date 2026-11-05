@@ -1,4 +1,4 @@
-//! Sealing: authenticated encryption of small secrets that cred keeps inside a box's store (the
+//! Sealing: authenticated encryption of small secrets that halti keeps inside a box's store (the
 //! CA's key, sealed sessions), so they stay ciphertext even while the store is open.
 //!
 //! XChaCha20-Poly1305 with a random 192-bit nonce. The key is derived from the box key for one
@@ -13,8 +13,10 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use sha2::{Digest, Sha256};
 
+use crate::legacy;
+
 const NONCE: usize = 24;
-const LABEL: &[u8] = b"cred box key v1";
+const LABEL: &[u8] = legacy::SEAL_LABEL;
 
 /// A key for one purpose (`"ca"`, `"log"`, ...), derived from the box key. Different purposes
 /// give unrelated keys.

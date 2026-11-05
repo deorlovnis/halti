@@ -1,5 +1,6 @@
 //! Small helpers shared by several commands.
 
+use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,6 +8,8 @@ use std::{env, fs, process};
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
+
+use crate::legacy;
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
@@ -17,7 +20,18 @@ pub fn home() -> PathBuf {
 }
 
 pub fn config_dir() -> PathBuf {
-    home().join(".config/cred")
+    home().join(legacy::CONFIG_DIR)
+}
+
+/// The two names of a user-facing environment variable: `HALTI_<suffix>`, then the old
+/// `CRED_<suffix>`. Refresh scripts get both, since their bytes are pinned.
+pub fn env_names(suffix: &str) -> [String; 2] {
+    [format!("HALTI_{suffix}"), format!("{}{suffix}", legacy::ENV_PREFIX)]
+}
+
+/// A user-facing environment variable: `HALTI_<suffix>`, or else the old `CRED_<suffix>`.
+pub fn env_var(suffix: &str) -> Option<OsString> {
+    env_names(suffix).iter().find_map(env::var_os)
 }
 
 /// Expand a leading "~/" to the home directory.
@@ -84,6 +98,11 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
+
+    #[test]
+    fn environment_variables_have_the_new_name_first() {
+        assert_eq!(super::env_names("WARN_DAYS"), ["HALTI_WARN_DAYS".to_string(), format!("{}WARN_DAYS", crate::legacy::ENV_PREFIX)]);
+    }
 
     #[test]
     fn a_non_blocking_descriptor_blocks_again() {

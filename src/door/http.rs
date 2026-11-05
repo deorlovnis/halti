@@ -324,6 +324,7 @@ pub fn reason(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::door::STANDIN;
     use std::io::Cursor;
 
     fn head(text: &str) -> io::Result<Option<Head>> {
@@ -332,10 +333,10 @@ mod tests {
 
     #[test]
     fn reads_a_head() {
-        let h = head("POST /model/v1/messages?x=1 HTTP/1.1\r\nHost: cred.internal\r\nX-Api-Key:  cred-managed \r\n\r\nbody").unwrap().unwrap();
+        let h = head(&format!("POST /model/v1/messages?x=1 HTTP/1.1\r\nHost: halti.internal\r\nX-Api-Key:  {STANDIN} \r\n\r\nbody")).unwrap().unwrap();
         assert_eq!(h.parts(), Some(("POST", "/model/v1/messages?x=1", "HTTP/1.1")));
-        assert_eq!(h.header("x-api-key"), Some("cred-managed"));
-        assert_eq!(h.header("HOST"), Some("cred.internal"));
+        assert_eq!(h.header("x-api-key"), Some(STANDIN));
+        assert_eq!(h.header("HOST"), Some("halti.internal"));
         assert!(h.keep_alive());
     }
 

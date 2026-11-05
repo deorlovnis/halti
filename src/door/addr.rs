@@ -1,5 +1,5 @@
 //! Where the proxy may connect: which names the box's policy allows, and which addresses are
-//! public. cred resolves names itself and connects only to a public address it has checked,
+//! public. halti resolves names itself and connects only to a public address it has checked,
 //! so a name that points at the router, this Mac or a cloud metadata service leads nowhere.
 
 use std::io;
@@ -38,7 +38,7 @@ const NON_PUBLIC_V4: [([u8; 4], u8); 15] = [
     ([240, 0, 0, 0], 4),     // reserved, and the broadcast address
 ];
 
-/// Whether cred may connect to the address on a box's behalf. Only global unicast addresses
+/// Whether halti may connect to the address on a box's behalf. Only global unicast addresses
 /// pass, so every IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d) form is refused
 /// along with loopback, unique-local, link-local and multicast IPv6. The one translation
 /// prefix let through is NAT64's 64:ff9b::/96, and only for a public IPv4 address inside it.

@@ -1,9 +1,12 @@
-# The browser VM's image for cred boxes: cred's runner and Chromium, and cred-shim to reach the
+# The browser VM's image for halti boxes: halti's runner and Chromium, and the shim to reach the
 # door. Build with the repo root as the context (.dockerignore keeps the rest out):
 #   container build -f box/browser.Containerfile -t cred-browser .
-# cred pins the result by digest (name@sha256:...), like the agent image.
+# halti pins the result by digest (name@sha256:...), like the agent image.
+# The image's name and the shim's (cred-shim, /usr/local/bin/cred-shim) are from before halti was
+# renamed from cred: the shim is the one the agent images carry, which box policies pin by
+# digest, so they stay until the M1 workspace migration (EMA-60). src/legacy.rs lists them.
 
-# cred-shim, the guest side of the door, built here: the Mac has no Linux target.
+# The shim, the guest side of the door, built here: the Mac has no Linux target.
 FROM rust:1.92-slim-bookworm AS shim
 WORKDIR /src
 COPY box/shim/ .
@@ -28,6 +31,6 @@ COPY --from=shim /src/target/release/cred-shim /usr/local/bin/cred-shim
 # As in the agent image: the VM can't run with a read-only root, so nothing in it may be setuid
 # and nothing outside /tmp, /var/tmp and the browser's home may be writable by it.
 RUN chmod 755 /run/lock && find / -xdev -perm /6000 -type f -exec chmod a-s {} +
-# The VM starts `cred-shim serve` as its init process (see engine.rs); runners are `exec`ed in it.
+# The VM starts the shim (`serve`) as its init process (see engine.rs); runners are `exec`ed in it.
 USER root
 WORKDIR /home/browser

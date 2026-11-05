@@ -70,7 +70,7 @@ fn ca_params(box_name: &str) -> Result<CertificateParams> {
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, format!("cred box {box_name}"));
+    dn.push(DnType::CommonName, format!("halti box {box_name}"));
     params.distinguished_name = dn;
     Ok(params)
 }
@@ -80,7 +80,7 @@ fn days_from_now(days: i64) -> OffsetDateTime {
 }
 
 impl BoxCa {
-    /// A new CA for the box: EC P-256, valid ten years, `CN = cred box <name>`.
+    /// A new CA for the box: EC P-256, valid ten years, `CN = halti box <name>`.
     pub fn generate(box_name: &str) -> Result<BoxCa> {
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).context("making the box CA's key")?;
         let mut params = ca_params(box_name)?;

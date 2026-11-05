@@ -1,10 +1,10 @@
-//! A real browser VM behind the real door: Chromium in the `cred-browser` image, driven by the
+//! A real browser VM behind the real door: Chromium in the browser image (`engine::BROWSER_IMAGE`), driven by the
 //! runner, with every byte it sends going through the door's browser socket.
 //!
 //! Needs Apple's `container`, the internet (https://example.com) and a few minutes the first time
 //! (it builds the image). Run with `mise run e2e-box`. The scenario runs in a copy of this test
 //! binary with a private environment (policies and a fake Keychain), like the door's other
-//! scenarios; the VMs it creates are named `cred-browser-p3v-<pid>`.
+//! scenarios; the VMs it creates are named `halti-browser-p3v-<pid>`.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -42,27 +42,27 @@ const SCENARIO: &str = "door::page_vm_tests::real_vm_pages_browse_only_through_t
 #[test]
 #[ignore = "needs Apple's `container` and the internet; run with `mise run e2e-box`"]
 fn real_vm_pages_browse_only_through_the_door() {
-    if std::env::var_os("CRED_E2E_BOX").is_none() {
-        eprintln!("CRED_E2E_BOX isn't set: skipping");
+    if std::env::var_os("HALTI_E2E_BOX").is_none() {
+        eprintln!("HALTI_E2E_BOX isn't set: skipping");
         return;
     }
-    if std::env::var_os("CRED_PAGE_VM_DIR").is_some() {
+    if std::env::var_os("HALTI_PAGE_VM_DIR").is_some() {
         return scenario();
     }
-    let dir = TempDir::new("cred-page-vm").unwrap();
+    let dir = TempDir::new("halti-page-vm").unwrap();
     for sub in ["keychain", "policy", "home"] {
         fs::create_dir(dir.0.join(sub)).unwrap();
     }
     let status = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", SCENARIO, "--nocapture", "--test-threads=1"])
-        .env("CRED_PAGE_VM_DIR", &dir.0)
+        .env("HALTI_PAGE_VM_DIR", &dir.0)
         .env("HOME", dir.0.join("home"))
-        .env("CRED_INDEX", dir.0.join("index.json"))
-        .env("CRED_POLICY_DIR", dir.0.join("policy"))
-        .env("CRED_TEST_KEYCHAIN", dir.0.join("keychain"))
-        .env("CRED_TEST_APPROVE", "yes")
-        .env("CRED_AUDIT", dir.0.join("audit.log"))
-        .env("CRED_AUDIT_KEY", "test-key")
+        .env("HALTI_INDEX", dir.0.join("index.json"))
+        .env("HALTI_POLICY_DIR", dir.0.join("policy"))
+        .env("HALTI_TEST_KEYCHAIN", dir.0.join("keychain"))
+        .env("HALTI_TEST_APPROVE", "yes")
+        .env("HALTI_AUDIT", dir.0.join("audit.log"))
+        .env("HALTI_AUDIT_KEY", "test-key")
         .env_remove("HTTP_PROXY")
         .env_remove("HTTPS_PROXY")
         .env_remove("http_proxy")
@@ -300,7 +300,7 @@ fn scenario() {
     assert!(session["cookies"].is_array() && session["origins"].is_array(), "storageState comes back: {session}");
 
     // ... and with that routing turned off the door still does.
-    vm.set_runner_env(vec![("CRED_RUNNER_DEBUG_NO_ROUTING".into(), "1".into())]);
+    vm.set_runner_env(vec![("HALTI_RUNNER_DEBUG_NO_ROUTING".into(), "1".into())]);
     let (mut bare, token) = Runner::start(&vm, "example");
     bare.open("example", &token, browse_config(&["https://example.com"], "https://example.com")).unwrap();
     let error = bare.call(json!({ "cmd": "goto", "url": "https://example.org/" })).unwrap_err();
@@ -387,7 +387,7 @@ impl Drop for Cleanup {
     }
 }
 
-// --- a session the site rotates, through cred's browser tools ---
+// --- a session the site rotates, through halti's browser tools ---
 
 const SESSION_SCENARIO: &str = "door::page_vm_tests::real_vm_session_the_site_rotates_survives_close_and_restart";
 
@@ -397,27 +397,27 @@ const SESSION_SCENARIO: &str = "door::page_vm_tests::real_vm_session_the_site_ro
 #[test]
 #[ignore = "needs Apple's `container` and the internet; run with `mise run e2e-box`"]
 fn real_vm_session_the_site_rotates_survives_close_and_restart() {
-    if std::env::var_os("CRED_E2E_BOX").is_none() {
-        eprintln!("CRED_E2E_BOX isn't set: skipping");
+    if std::env::var_os("HALTI_E2E_BOX").is_none() {
+        eprintln!("HALTI_E2E_BOX isn't set: skipping");
         return;
     }
-    if std::env::var_os("CRED_PAGE_VM_DIR").is_some() {
+    if std::env::var_os("HALTI_PAGE_VM_DIR").is_some() {
         return session_scenario();
     }
-    let dir = TempDir::new("cred-page-vm").unwrap();
+    let dir = TempDir::new("halti-page-vm").unwrap();
     for sub in ["keychain", "policy", "home"] {
         fs::create_dir(dir.0.join(sub)).unwrap();
     }
     let status = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", SESSION_SCENARIO, "--nocapture", "--test-threads=1"])
-        .env("CRED_PAGE_VM_DIR", &dir.0)
+        .env("HALTI_PAGE_VM_DIR", &dir.0)
         .env("HOME", dir.0.join("home"))
-        .env("CRED_INDEX", dir.0.join("index.json"))
-        .env("CRED_POLICY_DIR", dir.0.join("policy"))
-        .env("CRED_TEST_KEYCHAIN", dir.0.join("keychain"))
-        .env("CRED_TEST_APPROVE", "yes")
-        .env("CRED_AUDIT", dir.0.join("audit.log"))
-        .env("CRED_AUDIT_KEY", "test-key")
+        .env("HALTI_INDEX", dir.0.join("index.json"))
+        .env("HALTI_POLICY_DIR", dir.0.join("policy"))
+        .env("HALTI_TEST_KEYCHAIN", dir.0.join("keychain"))
+        .env("HALTI_TEST_APPROVE", "yes")
+        .env("HALTI_AUDIT", dir.0.join("audit.log"))
+        .env("HALTI_AUDIT_KEY", "test-key")
         .env_remove("HTTP_PROXY")
         .env_remove("HTTPS_PROXY")
         .env_remove("http_proxy")
@@ -479,7 +479,7 @@ fn session_scenario() {
     engine::available().unwrap();
     let image = engine::build_browser_image(&Path::new(env!("CARGO_MANIFEST_DIR")).join("box")).unwrap();
     fs::write(policy::path("files"), format!("[browse]\norigins = [\"https://{FILES_HOST}\"]\nstart = \"https://{FILES_HOST}/\"\n")).unwrap();
-    fs::write(std::env::var("CRED_INDEX").unwrap(), json!({ "files": { "fields": {} } }).to_string()).unwrap();
+    fs::write(std::env::var("HALTI_INDEX").unwrap(), json!({ "files": { "fields": {} } }).to_string()).unwrap();
     policy::approve(&["files".into()]).unwrap();
     approve::take_answers();
 

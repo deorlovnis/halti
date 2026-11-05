@@ -1,9 +1,9 @@
-//! Per-resource policies: what cred may do with a resource's secrets.
+//! Per-resource policies: what halti may do with a resource's secrets.
 //!
-//! A policy is a TOML file, ~/.config/cred/policy/<resource>.toml. It counts only once the user
-//! approves it with Touch ID: the approval pins the file's sha256, and the sha256 of every
-//! refresh script it names, in a Keychain item that cred reads without UI. A policy or script
-//! changed afterwards, or an approval cred can't read silently (e.g. one planted by another
+//! A policy is a TOML file, policy/<resource>.toml in the config folder. It counts only once the
+//! user approves it with Touch ID: the approval pins the file's sha256, and the sha256 of every
+//! refresh script it names, in a Keychain item that halti reads without UI. A policy or script
+//! changed afterwards, or an approval halti can't read silently (e.g. one planted by another
 //! program), blocks the resource until it is approved again.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,8 +19,8 @@ use serde_json::{Map, Value};
 use similar::TextDiff;
 use url::{Host, Url};
 
-use crate::util::{config_dir, expand_home, sha256_hex};
-use crate::{approve, ask, boxes, browser, interactive, keychain, parse_env, parse_field, parse_resource};
+use crate::util::{self, config_dir, expand_home, sha256_hex};
+use crate::{approve, ask, boxes, browser, interactive, keychain, legacy, parse_env, parse_field, parse_resource};
 
 /// Keychain field of a resource's approval record. Field names can't start with "_".
 const APPROVAL: &str = "_policy";
@@ -43,7 +43,7 @@ pub struct Policy {
     pub browse: Option<Browse>,
 }
 
-/// What `cred run` may do.
+/// What `halti run` may do.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Run {
@@ -111,7 +111,7 @@ pub enum Consent {
     None,
 }
 
-/// Requests cred makes for an agent, adding the resource's credentials itself.
+/// Requests halti makes for an agent, adding the resource's credentials itself.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fetch {
@@ -133,7 +133,7 @@ fn default_auth_header() -> String {
 }
 
 /// The sandboxed browser an agent may steer: which pages it may open, where those pages may
-/// send requests, and the session cred puts into it.
+/// send requests, and the session halti puts into it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Browse {
@@ -163,7 +163,7 @@ pub struct Browse {
     /// The browser closes this long after it opened, however busy. 0: never.
     #[serde(default = "default_max_minutes")]
     pub max_minutes: u64,
-    /// Fields (a login's user and password) cred may type into pages on the origins, for
+    /// Fields (a login's user and password) halti may type into pages on the origins, for
     /// sites without a session to inject. Off unless listed.
     #[serde(default)]
     pub fill: Vec<String>,
@@ -298,7 +298,7 @@ impl Browse {
             parse_field(field).map_err(|e| anyhow!("[browse] fill '{field}': {e}"))?;
         }
         if !self.fill.is_empty() && origins.iter().any(|s| matches!(s, Site::Any)) {
-            bail!("[browse] fill can't be used with origins = [\"*\"]: name the sites cred may type credentials into");
+            bail!("[browse] fill can't be used with origins = [\"*\"]: name the sites halti may type credentials into");
         }
         for s in &self.local_storage {
             parse_field(&s.field).map_err(|e| anyhow!("[browse] local_storage {}: field: {e}", s.key))?;
@@ -322,7 +322,7 @@ pub struct Tool {
 
 impl Policy {
     /// What the policy allows in a few words, for listings: `run:ask fetch browse:ask`. The word
-    /// after a colon is the mode of `cred run`, or of writes where requests can also be sent.
+    /// after a colon is the mode of `halti run`, or of writes where requests can also be sent.
     pub fn summary(&self) -> String {
         let with_writes = |name: &str, writes: Mode| if writes == Mode::Deny { name.to_string() } else { format!("{name}:{}", writes.text()) };
         let mut parts = Vec::new();
@@ -334,7 +334,7 @@ impl Policy {
         if parts.is_empty() { "-".into() } else { parts.join(" ") }
     }
 
-    /// What agents may do, as (label, text) lines for `cred info`.
+    /// What agents may do, as (label, text) lines for `halti info`.
     pub fn rules(&self) -> Vec<(&'static str, String)> {
         let consent = match (self.agent.consent, self.agent.consent_minutes) {
             (Consent::Session, 0) => "session (Touch ID on first use)".to_string(),
@@ -360,7 +360,7 @@ impl Policy {
             }
             text += if b.screenshots { "; screenshots" } else { "; no screenshots" };
             if !b.fill.is_empty() {
-                text += &format!("; cred types {}", b.fill.join(", "));
+                text += &format!("; halti types {}", b.fill.join(", "));
             }
             let limit = |m: u64| if m == 0 { "none".to_string() } else { format!("{m} min") };
             text += &format!("; closes when idle {}, at most {}", limit(b.idle_minutes), limit(b.max_minutes));
@@ -601,7 +601,7 @@ impl Status {
 }
 
 pub fn dir() -> PathBuf {
-    env::var_os("CRED_POLICY_DIR").map(PathBuf::from).unwrap_or_else(|| config_dir().join("policy"))
+    util::env_var("POLICY_DIR").map(PathBuf::from).unwrap_or_else(|| config_dir().join("policy"))
 }
 
 pub fn path(res: &str) -> PathBuf {
@@ -651,10 +651,10 @@ pub fn approved_at(key: &str, file: &Path) -> Result<String, Status> {
 
 pub fn load(res: &str) -> Result<Approved> {
     let p = path(res);
-    let text = fs::read(&p).map_err(|_| anyhow!("{res} has no policy (write one with: cred policy edit {res})"))?;
-    let record = record(res).ok_or_else(|| anyhow!("the policy for {res} isn't approved (cred policy approve {res})"))?;
+    let text = fs::read(&p).map_err(|_| anyhow!("{res} has no policy (write one with: halti policy edit {res})"))?;
+    let record = record(res).ok_or_else(|| anyhow!("the policy for {res} isn't approved (halti policy approve {res})"))?;
     if record.policy != sha256_hex(&text) {
-        bail!("the policy for {res} changed since it was approved (cred policy approve {res})");
+        bail!("the policy for {res} changed since it was approved (halti policy approve {res})");
     }
     let text = String::from_utf8(text).with_context(|| format!("{} isn't UTF-8", p.display()))?;
     let policy = Policy::parse(&text).with_context(|| p.display().to_string())?;
@@ -668,7 +668,7 @@ impl Approved {
         let p = expand_home(run.ok_or_else(|| anyhow!("{res}/{field} has no refresh script"))?);
         let bytes = fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
         if self.scripts.get(&p.display().to_string()) != Some(&sha256_hex(&bytes)) {
-            bail!("{} changed since the policy for {res} was approved (cred policy approve {res})", p.display());
+            bail!("{} changed since the policy for {res} was approved (halti policy approve {res})", p.display());
         }
         Ok(bytes)
     }
@@ -693,7 +693,7 @@ fn label(key: &str) -> String {
 /// Read, check and print a policy for approval; what is printed is exactly what gets pinned.
 fn prepare(res: &str) -> Result<Approval> {
     let p = path(res);
-    let text = fs::read_to_string(&p).map_err(|_| anyhow!("{res} has no policy (write one with: cred policy edit {res})"))?;
+    let text = fs::read_to_string(&p).map_err(|_| anyhow!("{res} has no policy (write one with: halti policy edit {res})"))?;
     let policy = Policy::parse(&text).with_context(|| p.display().to_string())?;
     let mut scripts = BTreeMap::new();
     for (field, r) in &policy.refresh {
@@ -729,7 +729,7 @@ pub fn approve(resources: &[String]) -> Result<()> {
         }
     }
     if prepared.is_empty() {
-        bail!("there are no policies (write one with: cred policy edit RESOURCE)");
+        bail!("there are no policies (write one with: halti policy edit RESOURCE)");
     }
     approve_prepared(prepared)
 }
@@ -738,7 +738,7 @@ pub fn approve(resources: &[String]) -> Result<()> {
 pub fn approve_prepared(prepared: Vec<(String, Approval)>) -> Result<()> {
     let list: Vec<String> = prepared.iter().map(|(key, a)| format!("{} (sha256 {})", label(key), a.short())).collect();
     let what = if list.len() == 1 { "policy" } else { "policies" };
-    approve::confirm(&format!("approve the cred {what} for {}", list.join(", ")))?;
+    approve::confirm(&format!("approve the halti {what} for {}", list.join(", ")))?;
     for (key, approval) in prepared {
         keychain::replace(&key, APPROVAL, &serde_json::to_string(&approval)?)?;
         println!("approved the policy for {}", label(&key));
@@ -751,7 +751,7 @@ pub fn show(res: &str) -> Result<()> {
     println!("{} ({})", p.display(), status(res).text());
     match fs::read_to_string(&p) {
         Ok(text) => println!("\n{}", text.trim_end()),
-        Err(_) => println!("\nno policy yet (write one with: cred policy edit {res})"),
+        Err(_) => println!("\nno policy yet (write one with: halti policy edit {res})"),
     }
     Ok(())
 }
@@ -780,10 +780,10 @@ pub fn edit(res: &str) -> Result<()> {
     let p = path(res);
     if !p.exists() {
         fs::create_dir_all(dir())?;
-        fs::write(&p, TEMPLATE.replace("RES", res))?;
+        fs::write(&p, TEMPLATE.replace("CONFIG", legacy::CONFIG_DIR).replace("RES", res))?;
     }
     if edit_file(res, &p, |text| Policy::parse(text).map(drop))? {
-        offer_approval(&p, &format!("cred policy approve {res}"), || approve(&[res.to_string()]))?;
+        offer_approval(&p, &format!("halti policy approve {res}"), || approve(&[res.to_string()]))?;
     }
     Ok(())
 }
@@ -817,10 +817,11 @@ pub fn offer_approval(p: &Path, approve_cmd: &str, approve_now: impl FnOnce() ->
     Ok(())
 }
 
-const TEMPLATE: &str = r#"# cred policy for RES. It takes effect only once approved: cred policy approve RES
+/// The policy `policy edit` starts from. CONFIG becomes the config folder, RES the resource.
+const TEMPLATE: &str = r#"# halti policy for RES. It takes effect only once approved: halti policy approve RES
 
 [run]
-mode = "deny"          # cred run: allow | ask (Touch ID each time) | deny
+mode = "deny"          # halti run: allow | ask (Touch ID each time) | deny
 export = {}            # field = "ENV_VAR", e.g. { token = "RES_TOKEN" }
 
 [agent]
@@ -828,8 +829,8 @@ consent = "session"    # session: Touch ID once per agent session | none
 consent_minutes = 240  # a session consent lapses after this long (0: only when the agent disconnects)
 
 # [refresh.token]
-# run = "~/.config/cred/refresh/RES.sh"     # prints a fresh value; gets the fields that
-#                                           # aren't exported as CRED_<FIELD>
+# run = "~/CONFIG/refresh/RES.sh"           # prints a fresh value; gets the fields that
+#                                           # aren't exported as HALTI_<FIELD>
 # from = "firefox:https://example.com#key"  # or: read it from Firefox Local Storage
 #                                           # (firefox-cookie:… and chrome-cookie:… read a cookie)
 
@@ -859,7 +860,7 @@ mod tests {
         from = "firefox:https://app.example.com#session_token"
 
         [refresh.token]
-        run = "~/.config/cred/refresh/app.sh"
+        run = "~/refresh/app.sh"
 
         [fetch]
         hosts = ["https://api.example.com", "http://127.0.0.1:8080"]

@@ -1,5 +1,5 @@
 //! Read one value a browser keeps for a site, so a login only the browser can do (e.g. Google
-//! sign-in) can feed cred: a Local Storage key or a cookie from Firefox, or a cookie from Chrome.
+//! sign-in) can feed halti: a Local Storage key or a cookie from Firefox, or a cookie from Chrome.
 //!
 //! Firefox keeps each site's Local Storage in
 //! <profile>/storage/default/<scheme>+++<host>[+port][^userContextId=N]/ls/data.sqlite and its
@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::keychain;
-use crate::util::{TempDir, home};
+use crate::util::{self, TempDir, home};
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -59,7 +59,7 @@ impl Source {
             Kind::FirefoxStorage => return self.read_local_storage(),
             Kind::FirefoxCookie => ("Firefox", firefox_cookies(&firefox_profile()?.join("cookies.sqlite"), &self.key)?),
             Kind::ChromeCookie => {
-                // macOS asks the user before cred may read this item.
+                // macOS asks the user before halti may read this item.
                 let password = keychain::get_app_password("Chrome Safe Storage", "Chrome").context("reading the Chrome Safe Storage password from the Keychain")?;
                 ("Chrome", chrome_cookies(&chrome_cookie_db()?, &self.key, &chrome_key(&password))?)
             }
@@ -99,9 +99,10 @@ impl Source {
     }
 }
 
-/// The profile Firefox opens by default, from profiles.ini; CRED_FIREFOX_PROFILE overrides it.
+/// The profile Firefox opens by default, from profiles.ini; HALTI_FIREFOX_PROFILE (or the old
+/// CRED_FIREFOX_PROFILE) overrides it.
 fn firefox_profile() -> Result<PathBuf> {
-    if let Some(p) = env::var_os("CRED_FIREFOX_PROFILE") {
+    if let Some(p) = util::env_var("FIREFOX_PROFILE") {
         return Ok(p.into());
     }
     let root = PathBuf::from(env::var_os("HOME").unwrap_or_default()).join("Library/Application Support/Firefox");
@@ -141,7 +142,7 @@ enum Lookup {
 /// Open a copy of a browser's database: the browser keeps it open, and recent writes may still
 /// sit in the -wal file. The copy is private and removed when the returned directory is dropped.
 fn open_copy(db: &Path) -> Result<(Connection, TempDir)> {
-    let tmp = TempDir::new("cred-browser")?;
+    let tmp = TempDir::new("halti-browser")?;
     let name = db.file_name().context("not a database file")?.to_string_lossy().into_owned();
     for suffix in ["", "-wal"] {
         let src = PathBuf::from(format!("{}{suffix}", db.display()));
@@ -228,9 +229,10 @@ fn firefox_cookies(db: &Path, name: &str) -> Result<Vec<Cookie>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Chrome's cookie database; CRED_CHROME_PROFILE overrides the default profile folder.
+/// Chrome's cookie database; HALTI_CHROME_PROFILE (or the old CRED_CHROME_PROFILE) overrides the
+/// default profile folder.
 fn chrome_cookie_db() -> Result<PathBuf> {
-    let profile = env::var_os("CRED_CHROME_PROFILE").map_or_else(|| home().join("Library/Application Support/Google/Chrome/Default"), PathBuf::from);
+    let profile = util::env_var("CHROME_PROFILE").map_or_else(|| home().join("Library/Application Support/Google/Chrome/Default"), PathBuf::from);
     ["Network/Cookies", "Cookies"].iter().map(|p| profile.join(p)).find(|p| p.is_file()).ok_or_else(|| anyhow!("Chrome has no Cookies database in {}", profile.display()))
 }
 
@@ -333,7 +335,7 @@ mod tests {
 
     /// A database in a private folder, built with `setup`.
     fn fixture(name: &str, setup: impl FnOnce(&Connection)) -> (PathBuf, TempDir) {
-        let dir = TempDir::new("cred-test").unwrap();
+        let dir = TempDir::new("halti-test").unwrap();
         let db = dir.0.join(name);
         setup(&Connection::open(&db).unwrap());
         (db, dir)

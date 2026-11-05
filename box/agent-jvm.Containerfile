@@ -1,9 +1,11 @@
-# The agent's VM image for JVM work (Kotlin, Gradle): cred-agent plus a JDK and the Kotlin
+# The agent's VM image for JVM work (Kotlin, Gradle): the agent image plus a JDK and the Kotlin
 # language server, which Claude Code's kotlin-lsp plugin runs. Build it from the digest of the
-# cred-agent build, so it can't start from another image of that name (install.sh does this):
+# agent image's build, so it can't start from another image of that name (install.sh does this):
 #   container build -f box/agent-jvm.Containerfile -t cred-agent-jvm \
 #     --build-arg AGENT=cred-agent@sha256:<digest> box
 # A box uses it by pinning cred-agent-jvm@sha256:... as its `image`.
+# The image names are from before halti was renamed from cred: box policies pin them by digest,
+# so they stay until the M1 workspace migration (EMA-60). src/legacy.rs lists them.
 
 ARG AGENT
 FROM ${AGENT}
@@ -51,7 +53,7 @@ RUN mkdir -p /etc/ssl/certs/java \
     && ln -sf /etc/ssl/certs/java/cacerts /opt/jdk/lib/security/cacerts \
     && ln -sf /etc/ssl/certs/java/cacerts /opt/kotlin-lsp/jbr/lib/security/cacerts
 
-# As in cred-agent: nothing setuid in a system the agent can't write to.
+# As in the agent image: nothing setuid in a system the agent can't write to.
 RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} +
 USER root
 WORKDIR /home/agent

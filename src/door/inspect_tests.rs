@@ -50,23 +50,23 @@ fn the_requests_of_a_box_are_judged_and_touch_id_says_no() {
 }
 
 fn run_scenario(name: &str, answer: &str) {
-    if let Some(dir) = std::env::var_os("CRED_INSPECT_DIR") {
+    if let Some(dir) = std::env::var_os("HALTI_INSPECT_DIR") {
         return scenario(Path::new(&dir), answer == "yes");
     }
-    let dir = TempDir::new("cred-inspect").unwrap();
+    let dir = TempDir::new("halti-inspect").unwrap();
     for sub in ["keychain", "policy", "home"] {
         fs::create_dir(dir.0.join(sub)).unwrap();
     }
     let mut cmd = Command::new(std::env::current_exe().unwrap());
     cmd.args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .env("CRED_INSPECT_DIR", &dir.0)
+        .env("HALTI_INSPECT_DIR", &dir.0)
         .env("HOME", dir.0.join("home"))
-        .env("CRED_INDEX", dir.0.join("index.json"))
-        .env("CRED_POLICY_DIR", dir.0.join("policy"))
-        .env("CRED_TEST_KEYCHAIN", dir.0.join("keychain"))
-        .env("CRED_TEST_APPROVE", "yes")
-        .env("CRED_AUDIT", dir.0.join("audit.log"))
-        .env("CRED_AUDIT_KEY", "test-key");
+        .env("HALTI_INDEX", dir.0.join("index.json"))
+        .env("HALTI_POLICY_DIR", dir.0.join("policy"))
+        .env("HALTI_TEST_KEYCHAIN", dir.0.join("keychain"))
+        .env("HALTI_TEST_APPROVE", "yes")
+        .env("HALTI_AUDIT", dir.0.join("audit.log"))
+        .env("HALTI_AUDIT_KEY", "test-key");
     let out = cmd.output().unwrap();
     assert!(out.status.success(), "scenario failed:\n{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 }
@@ -340,7 +340,7 @@ fn scenario(dir: &Path, yes: bool) {
     // The box's sites: one that may write, one read-only, one that asks, one never approved.
     let hosts = [("app", "app.example.com", "writes = \"allow\"\n"), ("readonly", "ro.example.com", ""), ("askme", "ask.example.com", "writes = \"ask\"\n")];
     for (res, host, writes) in hosts {
-        write_policy(res, &format!("[fetch]\nhosts = [\"https://{host}\"]\n{writes}auth = \"Bearer {{token}}\"\nheaders = {{ x-client = \"cred\" }}\n"));
+        write_policy(res, &format!("[fetch]\nhosts = [\"https://{host}\"]\n{writes}auth = \"Bearer {{token}}\"\nheaders = {{ x-client = \"halti\" }}\n"));
         store(res, "token", SECRET);
     }
     write_policy("pending", "[fetch]\nhosts = [\"https://pending.example.com\"]\nwrites = \"allow\"\nauth = \"Bearer {token}\"\n");
@@ -350,7 +350,7 @@ fn scenario(dir: &Path, yes: bool) {
     approve::take_answers();
     // The policies are approved; from here Touch ID answers as this scenario says.
     // SAFETY: no other thread is running yet; the doors' threads start later.
-    unsafe { std::env::set_var("CRED_TEST_APPROVE", if yes { "yes" } else { "no" }) };
+    unsafe { std::env::set_var("HALTI_TEST_APPROVE", if yes { "yes" } else { "no" }) };
 
     let deny = shared(dir, "deny", Mode::Deny, &["https://free.example.com/hook"]);
     other_hosts(&deny);
@@ -494,7 +494,7 @@ fn site_hosts(sh: &Arc<Shared>, yes: bool) {
     assert_eq!(seen.count("authorization"), 1);
     assert_eq!(
         (seen.header("authorization"), seen.header("x-client"), seen.header("accept-encoding")),
-        (Some(format!("Bearer {SECRET}").as_str()), Some("cred"), Some("identity"))
+        (Some(format!("Bearer {SECRET}").as_str()), Some("halti"), Some("identity"))
     );
     assert_eq!(seen.count("x-client"), 1);
 
