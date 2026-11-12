@@ -1,0 +1,24 @@
+# Core reaches the outside only through the traits it is handed. tests/source.rs checks the same
+# by reading the source.
+disallowed-methods = [
+  { path = "std::env::var", reason = "core takes its inputs as arguments" },
+  { path = "std::env::var_os", reason = "core takes its inputs as arguments" },
+  { path = "std::env::vars", reason = "core takes its inputs as arguments" },
+  { path = "std::env::args", reason = "core takes its inputs as arguments" },
+  { path = "std::env::current_dir", reason = "no folder ever picks a workspace" },
+  { path = "std::fs::read", reason = "files go through the Files trait" },
+  { path = "std::fs::read_to_string", reason = "files go through the Files trait" },
+  { path = "std::fs::write", reason = "files go through the Files trait" },
+  { path = "std::fs::read_dir", reason = "files go through the Files trait" },
+  { path = "std::time::SystemTime::now", reason = "the time is an argument" },
+  { path = "std::time::Instant::now", reason = "the time is an argument" },
+  { path = "std::thread::sleep", reason = "core never waits" },
+]
+disallowed-types = [
+  "std::fs::File",
+  "std::fs::OpenOptions",
+  "std::process::Command",
+  "std::net::TcpStream",
+  "std::net::TcpListener",
+  "std::net::UdpSocket",
+]
