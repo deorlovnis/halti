@@ -14,7 +14,7 @@ git clone https://github.com/deorlovnis/halti.git ~/Git/halti
 halti --help
 ```
 
-To update: `git pull && ./install.sh`. It ends by asking you to approve your policies again, with one Touch ID (see Signing). Never install a debug build: debug builds let tests answer approval prompts.
+`./install.sh --dry-run` lists everything an install would write, build and name, and changes nothing. To update: `git pull && ./install.sh`. It ends by asking you to approve your policies again, with one Touch ID (see Signing). Never install a debug build: debug builds let tests answer approval prompts.
 
 Boxes (in progress) run agents in VMs made by Apple's [`container`](https://github.com/apple/container/releases) (macOS 26). If it's installed and running (`container system start`), `install.sh` also builds the agent image from `box/agent.Containerfile`, its JVM variant (a JDK and the Kotlin language server) from `box/agent-jvm.Containerfile`, and the browser image from `box/browser.Containerfile`; without it the rest of halti works as before. `mise run e2e-box` tests the VM engine against a real VM.
 
@@ -261,7 +261,10 @@ Metadata (never values) is kept in `~/.config/halti/index.json`. `HALTI_WARN_DAY
 mise run check       # the same
 mise run e2e         # end-to-end tests: the built binary, a local test site, `halti run` and `halti mcp`
 mise run e2e-opt-in  # also the sandboxed browser, and one real Touch ID approval (you tap)
+mise run macos-check # on a Mac: all a Mac alone can check, with one report
 ```
+
+`mise run macos-check [--no-vm] [BRANCH]` (`./macos-check.sh`) is the check to run on a Mac for code written elsewhere. It checks out BRANCH from origin if one is named, then runs `check.sh`, the box store tests against real `hdiutil`, and the engine and door tests in real VMs (not with `--no-vm`, or without Apple's `container` running). It asks once, at the start, whether to run the steps that need a finger, and skips them in a VM, without an enrolled Touch ID or outside a terminal. Every step runs whatever failed before it. The report gives the commit, the versions, each step's result and a failed step's output in full; it is printed and saved in `~/Library/Application Support/halti/checks/`. If an install made by cred is on the Mac, the check lists its boxes, VMs and images before and after, and fails if they differ.
 
 This repo is public, so `check.sh` first refuses any tracked file, and `./check.sh refs A..B` any commit message in a range, that cites private planning: issue tracker IDs, milestone and plan codes, local design notes or decision records. Those stay in the tracker. `docs/` is ignored for the same reason.
 

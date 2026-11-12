@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build, sign and install halti as /usr/local/bin/halti, and its browser runner in
 # /usr/local/lib/halti/runner, owned by root so nothing running as you can replace them.
-# `./install.sh --dry-run` only says what it would do.
+# `./install.sh --dry-run` only says what it would do: every path, image and name.
 #
 # The signing key asks before every signing: choose "Allow", never "Always Allow". Otherwise
 # any program running as you could sign a lookalike halti that the Keychain trusts. Without the
@@ -15,20 +15,36 @@ identifier=com.deorlovnis.halti
 agent=halti-agent
 browser=halti-browser
 config="$HOME/.config/halti"
+store="$HOME/Library/Application Support/halti"
 dest=/usr/local/bin/halti
 runner=/usr/local/lib/halti/runner
+# Playwright's own cache, which other Playwright installs on this Mac share.
+browsers="$HOME/Library/Caches/ms-playwright"
 
 # HALTI_SIGN_IDENTITY, else "halti code signing".
 identity="${HALTI_SIGN_IDENTITY:-halti code signing}"
 
-# --dry-run: say what would be written, signed and built, and stop.
+# --dry-run: say everything that would be written, signed and built, and stop.
 case "${1:-}" in
   --dry-run)
     cat <<DRY
 would build target/release/halti and sign it as $identifier with the "$identity" identity (ad hoc without it)
-would install $dest and $runner, owned by root
-would build the images $agent, $agent-jvm, $agent-rust and $browser with Apple's container
+would write, owned by root:
+  $dest
+  $runner
+would add the runner's Chromium to $browsers if it isn't there, and remove nothing from it
+would build these images with Apple's container, and tag the first by its digest:
+  $agent
+  $agent-jvm
+  $agent-rust
+  $browser
 would ask to approve the policies in $config/policy and $config/box, if any
+the installed halti keeps its own, and no others:
+  files in $config
+  files in $store
+  sockets in /tmp/halti-$(id -u)
+  Keychain items named halti:...
+  VMs named halti-box-... and halti-browser-...
 would not read or change anything of an install made by cred
 DRY
     exit 0
@@ -54,7 +70,9 @@ echo "installed $dest"
 
 # The browser runner (halti's sandboxed browsing), with its pinned playwright-core, root-owned too.
 (cd runner && npm ci --ignore-scripts --no-audit --no-fund --silent)
-node runner/node_modules/playwright-core/cli.js install chromium-headless-shell >/dev/null
+# Playwright would also clear the browsers of installs it no longer finds out of its cache: not
+# ours to remove.
+PLAYWRIGHT_SKIP_BROWSER_GC=1 node runner/node_modules/playwright-core/cli.js install chromium-headless-shell >/dev/null
 sudo rm -rf "$runner"
 sudo install -d -o root -g wheel -m 755 "$runner"
 sudo cp -R runner/runner.mjs runner/package.json runner/package-lock.json runner/node_modules "$runner/"
