@@ -199,16 +199,30 @@ mod tests {
         found
     }
 
-    /// Sign in to `sites` with a stand-in window; `stops` says what the person does at each poll
-    /// (nothing, once the list is used up).
+    /// Sign in to `sites` with a stand-in window; `stops` says what the person does, once, at
+    /// each site's window in turn (nothing, once the list is used up). By site and not by poll:
+    /// how many polls a window takes to open depends on how busy the machine is.
     fn go(dir: &TempDir, sites: &[(&str, &str)], mut stops: Vec<Option<Stop>>) -> (Result<Vec<String>>, Vec<String>, Sessions) {
         fs::create_dir_all(dir.0.join("browser")).unwrap();
         let sessions = Sessions::new(&dir.0, "box key", true);
         let sites: Vec<(String, Policy)> = sites.iter().map(|(name, page)| (name.to_string(), site(page))).collect();
         let mut said = Vec::new();
-        stops.reverse();
-        let result =
-            sign_in_sites(&sessions, &sites, &mut Window { spawn: &fake, headed: false, stop: &mut || stops.pop().flatten(), say: &mut |line| said.push(line.to_string()) });
+        let announced = std::cell::Cell::new(0usize);
+        let result = sign_in_sites(
+            &sessions,
+            &sites,
+            &mut Window {
+                spawn: &fake,
+                headed: false,
+                stop: &mut || announced.get().checked_sub(1).and_then(|site| stops.get_mut(site)).and_then(Option::take),
+                say: &mut |line| {
+                    if line.starts_with("signing in to ") {
+                        announced.set(announced.get() + 1);
+                    }
+                    said.push(line.to_string());
+                },
+            },
+        );
         (result, said, sessions)
     }
 
