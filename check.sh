@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Everything a change must pass that needs no human: formatting, lints, the tests, a release build
-# and what its build-info says, the shim, the runner's syntax and install.sh's. Run before
-# pushing (`mise run check` runs this).
+# and what its build-info says, the shim, and the syntax of the runner, install.sh and
+# macos-check.sh. Run before pushing (`mise run check` runs this).
 #
 # CARGO_BUILD_JOBS defaults to 3. A set CARGO_TARGET_DIR is used for halti; the shim builds in
 # SHIM_TARGET_DIR if that is set, else in its own target/.
@@ -126,8 +126,9 @@ step shim
   cargo test
 )
 
-step "runner and install.sh"
+step "runner, install.sh and macos-check.sh"
 node --check runner/runner.mjs
 bash -n install.sh
+bash -n macos-check.sh
 
 step "all checks passed"

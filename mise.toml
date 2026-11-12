@@ -17,3 +17,7 @@ run = "cd runner && npm ci --ignore-scripts --no-audit --no-fund --silent && cd 
 description = "Engine and door end to end: builds the agent and browser images and runs VMs, with Chromium through the door (needs Apple container and the internet)"
 env = { HALTI_E2E_BOX = "1" }
 run = "cargo test --test box_engine -- --ignored --nocapture && cargo test --bin halti real_vm -- --ignored --nocapture"
+
+[tasks.macos-check]
+description = "The check only a Mac can run, with one report, printed and saved: check.sh, the hdiutil and VM tests, the finger steps (see macos-check.sh; takes [--no-vm] [BRANCH])"
+run = "./macos-check.sh"
