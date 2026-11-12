@@ -10,11 +10,14 @@
 #[path = "../src/engine.rs"]
 mod engine;
 #[path = "../src/legacy.rs"]
-#[allow(dead_code)] // the engine uses a few
-mod legacy;
-#[path = "../box/shim/src/legacy.rs"]
 #[allow(dead_code)]
-mod shim_legacy;
+mod legacy;
+#[path = "../src/names.rs"]
+#[allow(dead_code)] // the engine uses a few
+mod names;
+#[path = "../box/shim/src/names.rs"]
+#[allow(dead_code)]
+mod shim_names;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -97,7 +100,7 @@ fn dial(socket: PathBuf, seen: Seen, stop: Arc<AtomicBool>) {
 fn answer(kind: &str, conn: &mut BufReader<UnixStream>, seen: &Seen) {
     let record = |line: String| seen.lock().unwrap().push((kind.to_string(), line));
     match kind {
-        "proxy" | legacy::DOOR_KIND => {
+        "proxy" | names::DOOR_KIND => {
             // the request head, up to the empty line
             let mut head = String::new();
             loop {
@@ -108,7 +111,7 @@ fn answer(kind: &str, conn: &mut BufReader<UnixStream>, seen: &Seen) {
                 head.push_str(&line);
             }
             record(head);
-            let reply = if kind == legacy::DOOR_KIND {
+            let reply = if kind == names::DOOR_KIND {
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
             } else {
                 "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -157,8 +160,8 @@ fn sh(vm: &str, env: &[(String, String)], script: &str) -> (bool, String) {
 #[test]
 fn host_and_shim_agree_on_the_guest_names() {
     assert_eq!(
-        (legacy::SHIM, legacy::DOOR_SOCKET, legacy::LOCAL_SOCKET, legacy::DOOR_KIND),
-        (shim_legacy::SHIM, shim_legacy::DOOR_SOCKET, shim_legacy::LOCAL_SOCKET, shim_legacy::DOOR_KIND)
+        (names::SHIM, names::DOOR_SOCKET, names::LOCAL_SOCKET, names::DOOR_KIND),
+        (shim_names::SHIM, shim_names::DOOR_SOCKET, shim_names::LOCAL_SOCKET, shim_names::DOOR_KIND)
     );
 }
 
@@ -176,7 +179,7 @@ fn vm_has_only_the_door() {
         Ok(name) => engine::image_digest(&name).unwrap(),
         Err(_) => {
             let image = engine::build_agent_image(&Path::new(env!("CARGO_MANIFEST_DIR")).join("box")).unwrap();
-            assert!(image.starts_with(&format!("{}@sha256:", legacy::AGENT_IMAGE)), "{image}");
+            assert!(image.starts_with(&format!("{}@sha256:", names::AGENT_IMAGE)), "{image}");
             assert_eq!(engine::image_digest(engine::AGENT_IMAGE).unwrap(), image);
             image
         }
@@ -224,10 +227,10 @@ fn vm_has_only_the_door() {
     // halti itself, at 127.0.0.2, is not sent to the proxy even with the agent's environment
     let (ok, out) = sh(&name, &env, "curl -sS -m 10 http://127.0.0.2/model/x");
     assert!(ok && out == "ok", "{out}");
-    assert!(door.saw(legacy::DOOR_KIND, "GET /model/x"), "{:?}", door.seen.lock().unwrap());
+    assert!(door.saw(names::DOOR_KIND, "GET /model/x"), "{:?}", door.seen.lock().unwrap());
 
     // the shim's `mcp`: stdio in and out, paired with a connection of kind `mcp`
-    let mcp = [legacy::SHIM.to_string(), "mcp".to_string()];
+    let mcp = [names::SHIM.to_string(), "mcp".to_string()];
     let mut child = engine::exec_command(&name, &[], &mcp, false).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -260,13 +263,13 @@ fn vm_has_only_the_door() {
         &[],
         &format!(
             "find / -xdev \\( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path /home/agent \\) -prune -o -writable ! -type l ! -path {} -print 2>/dev/null",
-            legacy::LOCAL_SOCKET
+            names::LOCAL_SOCKET
         ),
     );
     assert_eq!(writable, "", "the agent can write on the root filesystem");
     assert_eq!(sh(&name, &[], "find / -xdev -perm /6000 -type f 2>/dev/null").1, "", "setuid files");
     assert!(sh(&name, &[], "echo ok > /tmp/x && cat /tmp/x").0);
-    let (ok, out) = sh(&name, &[], &format!("python3 -c \"import socket; s = socket.socket(socket.AF_UNIX); s.connect('{}')\"", legacy::DOOR_SOCKET));
+    let (ok, out) = sh(&name, &[], &format!("python3 -c \"import socket; s = socket.socket(socket.AF_UNIX); s.connect('{}')\"", names::DOOR_SOCKET));
     assert!(!ok && out.contains("Permission denied"), "{out}");
 
     // the mounted folder is writable as the agent, and the Mac sees it; a read-only mount isn't
@@ -306,7 +309,7 @@ fn browser_vm_has_only_the_door_and_runs_the_runner() {
     let built = Instant::now();
     let image = engine::build_browser_image(&Path::new(env!("CARGO_MANIFEST_DIR")).join("box")).unwrap();
     println!("browser image built in {:?}: {image}", built.elapsed());
-    assert!(image.starts_with(&format!("{}@sha256:", legacy::BROWSER_IMAGE)), "{image}");
+    assert!(image.starts_with(&format!("{}@sha256:", names::BROWSER_IMAGE)), "{image}");
     assert_eq!(engine::image_digest(engine::BROWSER_IMAGE).unwrap(), image);
 
     let dir = PathBuf::from(format!("/tmp/halti-e2e-browser-{}", process::id()));
@@ -339,13 +342,13 @@ fn browser_vm_has_only_the_door_and_runs_the_runner() {
         &[],
         &format!(
             "find / -xdev \\( -path /proc -o -path /sys -o -path /dev -o -path /tmp -o -path /var/tmp -o -path /home/browser -o -path /downloads \\) -prune -o -writable ! -type l ! -path {} -print 2>/dev/null",
-            legacy::LOCAL_SOCKET
+            names::LOCAL_SOCKET
         ),
     );
     assert_eq!(writable, "", "the browser's user can write on the root filesystem");
     let (ok, out) = sh(&name, &[], "node --version");
     assert!(ok && out.starts_with("v22."), "{out}");
-    let connect = format!(r#"node -e "require('net').connect('{}').on('error', (e) => {{ console.log(e.code); process.exit(1) }})""#, legacy::DOOR_SOCKET);
+    let connect = format!(r#"node -e "require('net').connect('{}').on('error', (e) => {{ console.log(e.code); process.exit(1) }})""#, names::DOOR_SOCKET);
     let (ok, out) = sh(&name, &[], &connect);
     assert!(!ok && out.contains("EACCES"), "only root may dial the door socket: {out}");
 

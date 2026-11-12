@@ -44,7 +44,7 @@ impl Dirs {
         static COUNT: AtomicUsize = AtomicUsize::new(0);
         let dir = env::temp_dir().join(format!("halti-release-{}-{}", std::process::id(), COUNT.fetch_add(1, Ordering::Relaxed)));
         let _ = fs::remove_dir_all(&dir);
-        for sub in ["home/.config/cred/policy", "hooks/keychain", "hooks/policy", "hooks/box", "env_home", "xdg"] {
+        for sub in ["home/.config/halti/policy", "hooks/keychain", "hooks/policy", "hooks/box", "env_home", "xdg"] {
             fs::create_dir_all(dir.join(sub)).unwrap();
         }
         Self { dir }
@@ -126,7 +126,7 @@ fn the_home_folder_is_the_passwd_one() {
     let out = dirs.run(&release(), &["build-info"]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert_eq!(info(&out, "home"), "/root", "HOME, XDG_DATA_HOME and XDG_CONFIG_HOME are ignored");
-    assert_eq!(info(&out, "config"), "/root/.config/cred");
+    assert_eq!(info(&out, "config"), "/root/.config/halti");
     assert!(!text(&out.stderr).contains("DEV"), "{}", text(&out.stderr));
 
     let out = dirs.run(Path::new(DEBUG), &["build-info"]);
@@ -140,7 +140,7 @@ fn the_home_folder_is_the_passwd_one() {
 fn no_variable_answers_an_approval() {
     let dirs = Dirs::new();
     let policy = "[run]\nmode = \"allow\"\n";
-    fs::write(dirs.path("home/.config/cred/policy/app.toml"), policy).unwrap();
+    fs::write(dirs.path("home/.config/halti/policy/app.toml"), policy).unwrap();
     fs::write(dirs.path("hooks/policy/app.toml"), policy).unwrap();
 
     let out = dirs.run(&release(), &["policy", "approve", "app"]);
@@ -163,9 +163,9 @@ fn no_variable_moves_the_index_the_policies_the_boxes_or_the_keychain() {
     fs::write(dirs.path("hooks/box/hookedbox.toml"), "about = \"a box\"\n").unwrap();
 
     // What the passwd home has, so the release binary is seen reading somewhere.
-    fs::write(dirs.path("home/.config/cred/index.json"), r#"{"passwdres":{"fields":{"token":{}}}}"#).unwrap();
-    fs::create_dir_all(dirs.path("home/.config/cred/box")).unwrap();
-    fs::write(dirs.path("home/.config/cred/box/passwdbox.toml"), "about = \"a box\"\n").unwrap();
+    fs::write(dirs.path("home/.config/halti/index.json"), r#"{"passwdres":{"fields":{"token":{}}}}"#).unwrap();
+    fs::create_dir_all(dirs.path("home/.config/halti/box")).unwrap();
+    fs::write(dirs.path("home/.config/halti/box/passwdbox.toml"), "about = \"a box\"\n").unwrap();
 
     let release = release();
     let debug = Path::new(DEBUG);
@@ -203,9 +203,9 @@ fn without_a_passwd_home_nothing_runs() {
     // and every path relative to the current folder, where these planted files are.
     let dirs = Dirs::new();
     let cwd = dirs.path("cwd");
-    fs::create_dir_all(cwd.join(".config/cred/policy")).unwrap();
-    fs::write(cwd.join(".config/cred/index.json"), r#"{"planted":{"fields":{"token":{}}}}"#).unwrap();
-    fs::write(cwd.join(".config/cred/policy/planted.toml"), "[run]\nmode = \"allow\"\n").unwrap();
+    fs::create_dir_all(cwd.join(".config/halti/policy")).unwrap();
+    fs::write(cwd.join(".config/halti/index.json"), r#"{"planted":{"fields":{"token":{}}}}"#).unwrap();
+    fs::write(cwd.join(".config/halti/policy/planted.toml"), "[run]\nmode = \"allow\"\n").unwrap();
     for args in [&["ls"][..], &["policy", "show", "planted"], &["build-info"]] {
         let out = Command::new("unshare")
             .args(["-U", "--map-user=4242", "--map-group=4242", "--"])

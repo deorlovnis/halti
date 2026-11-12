@@ -1,10 +1,8 @@
 # The browser VM's image for halti boxes: halti's runner and Chromium, and the shim to reach the
 # door. Build with the repo root as the context (.dockerignore keeps the rest out):
-#   container build -f box/browser.Containerfile -t cred-browser .
-# halti pins the result by digest (name@sha256:...), like the agent image.
-# The image's name and the shim's (cred-shim, /usr/local/bin/cred-shim) are from before halti was
-# renamed from cred: the shim is the one the agent images carry, which box policies pin by
-# digest, so they stay until the workspace migration. src/legacy.rs lists them.
+#   container build -f box/browser.Containerfile -t halti-browser .
+# halti pins the result by digest (name@sha256:...), like the agent image. The image's name and
+# the shim's (halti-shim, /usr/local/bin/halti-shim) are in src/names.rs.
 
 # The shim, the guest side of the door, built here: the Mac has no Linux target.
 FROM rust:1.92-slim-bookworm AS shim
@@ -27,7 +25,7 @@ COPY runner/runner.mjs ./
 # The image's user 1000 ("node") becomes the browser's. Chromium keeps its profile in memory
 # and /tmp (both gone at stop); only its home holds the CA (~/.pki/nssdb), made at each start.
 RUN usermod -l browser -d /home/browser -m node && groupmod -n browser node
-COPY --from=shim /src/target/release/cred-shim /usr/local/bin/cred-shim
+COPY --from=shim /src/target/release/halti-shim /usr/local/bin/halti-shim
 # As in the agent image: the VM can't run with a read-only root, so nothing in it may be setuid
 # and nothing outside /tmp, /var/tmp and the browser's home may be writable by it.
 RUN chmod 755 /run/lock && find / -xdev -perm /6000 -type f -exec chmod a-s {} +

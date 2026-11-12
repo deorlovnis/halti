@@ -35,7 +35,7 @@ use crate::chain::{self, Chain};
 use crate::door::inspect::parse_prefix;
 use crate::policy::{self, Approval, Mode, Site, Status};
 use crate::util::{config_dir, expand_home, home, store_root};
-use crate::{approve, engine, keychain, legacy, parse_env, parse_resource};
+use crate::{approve, engine, keychain, legacy, names, parse_env, parse_resource};
 pub use login::login;
 use store::Layout;
 
@@ -105,7 +105,7 @@ pub struct BoxPolicy {
     /// Resources the agent may use through halti; their own policies apply.
     #[serde(default)]
     pub sites: Vec<String>,
-    /// Environment variables set to the stand-in (`legacy::STANDIN`) for tools that refuse to start
+    /// Environment variables set to the stand-in (`names::STANDIN`) for tools that refuse to start
     /// without a token (`GH_TOKEN`). The door adds the real credential on the hosts of `sites`.
     #[serde(default)]
     pub standins: Vec<String>,
@@ -243,7 +243,7 @@ impl BoxPolicy {
                     && digest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
             });
             if !pinned {
-                bail!("image must be pinned by digest, like {}@sha256:<64 hex digits>", legacy::AGENT_IMAGE);
+                bail!("image must be pinned by digest, like {}@sha256:<64 hex digits>", names::AGENT_IMAGE);
             }
         }
         if let Some(model) = &self.model {
@@ -313,7 +313,7 @@ impl BoxPolicy {
 
 fn template(name: &str, image: Option<&str>) -> String {
     let image = image.map_or_else(
-        || format!("# image = \"{}@sha256:...\"       # the system inside, pinned: build it with install.sh, then paste its digest", legacy::AGENT_IMAGE),
+        || format!("# image = \"{}@sha256:...\"       # the system inside, pinned: build it with install.sh, then paste its digest", names::AGENT_IMAGE),
         |digest| format!("image = \"{digest}\"                  # the system inside, pinned: a new image is a policy change"),
     );
     format!(
@@ -343,7 +343,7 @@ writes = "deny"                         # anything but a read (GET, HEAD, OPTION
 # path = "~/Git/project"
 # mode = "clone"                        # clone: the agent works on its own copy in work/ | ro: read-only
 "#,
-        standin = legacy::STANDIN
+        standin = names::STANDIN
     )
 }
 
@@ -504,8 +504,7 @@ pub fn run(name: &str, temp: bool, command: Vec<String>) -> Result<u8> {
 
 pub fn stop(name: &str) -> Result<()> {
     let layout = Layout::real()?;
-    // Under its name from before the rename too, if the old binary started it.
-    let running: Vec<String> = run::vm_names(name).into_iter().filter(|vm| engine::running(vm)).collect();
+    let running: Vec<String> = [run::vm_name(name)].into_iter().filter(|vm| engine::running(vm)).collect();
     for vm in &running {
         engine::stop(vm)?;
     }

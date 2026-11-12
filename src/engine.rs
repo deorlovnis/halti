@@ -7,8 +7,8 @@
 //! secret goes through it: the environment given to `exec` holds stand-ins only, because
 //! command-line arguments are visible to every process on the Mac.
 //!
-//! This module uses only external crates and `legacy`, so tests/box_engine.rs can include both as
-//! they are.
+//! This module uses only external crates, `names` and `legacy`, so tests/box_engine.rs can include
+//! them as they are.
 #![allow(dead_code)] // used by the box commands
 
 use std::fs::DirBuilder;
@@ -22,26 +22,26 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
-use crate::legacy;
+use crate::names;
 
 /// The local image name; a box's policy pins it as `name@sha256:...`.
-pub const AGENT_IMAGE: &str = legacy::AGENT_IMAGE;
+pub const AGENT_IMAGE: &str = names::AGENT_IMAGE;
 /// The user the agent runs as (uid and gid 1000, home /home/agent).
 pub const AGENT_USER: &str = "agent";
 const AGENT_ID: &str = "1000";
 const AGENT_HOME: &str = "/home/agent";
 /// Where the shim in the VM listens for the door's connections.
-const DOOR_SOCKET: &str = legacy::DOOR_SOCKET;
+const DOOR_SOCKET: &str = names::DOOR_SOCKET;
 /// What the box holds in place of the model key; the door's gateway swaps in the real one.
 /// Same value as the door's `STANDIN`.
-const STANDIN: &str = legacy::STANDIN;
-/// Where the box CA is installed in the VM (under its name from before the rename, see `legacy`),
-/// and the bundle `update-ca-certificates` builds from it and the system's roots.
-pub const CA_CERT: &str = legacy::CA_CERT;
+const STANDIN: &str = names::STANDIN;
+/// Where the box CA is installed in the VM, and the bundle `update-ca-certificates` builds from
+/// it and the system's roots.
+pub const CA_CERT: &str = names::CA_CERT;
 const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 /// The browser VM's image, and what it holds: where the runner is, the user's home (Chromium runs
 /// as the image's user 1000), and where the Mac's downloads folder appears.
-pub const BROWSER_IMAGE: &str = legacy::BROWSER_IMAGE;
+pub const BROWSER_IMAGE: &str = names::BROWSER_IMAGE;
 const BROWSER_HOME: &str = "/home/browser";
 const RUNNER: &str = "/opt/runner/runner.mjs";
 pub const BROWSER_DOWNLOADS: &str = "/downloads";
@@ -185,7 +185,7 @@ fn run_args(spec: &VmSpec, image: &str) -> Result<Vec<String>> {
     for m in &spec.mounts {
         args.extend(["--mount".into(), mount_arg(m)?]);
     }
-    args.extend(["--entrypoint".into(), legacy::SHIM.into(), image.into(), "serve".into()]);
+    args.extend(["--entrypoint".into(), names::SHIM.into(), image.into(), "serve".into()]);
     if spec.docker {
         args.push("--bridges".into());
     }
@@ -307,13 +307,7 @@ pub fn docker_proxies() -> Value {
 }
 
 pub fn browser_vm_name(box_id: &str) -> String {
-    format!("halti-browser-{box_id}")
-}
-
-/// The browser VM's name from before halti was renamed, which a run that didn't clean up may
-/// have left.
-pub fn legacy_browser_vm_name(box_id: &str) -> String {
-    format!("{}{box_id}", legacy::BROWSER_VM_PREFIX)
+    format!("{}{box_id}", names::BROWSER_VM_PREFIX)
 }
 
 /// The box's browser VM: one for all of the box's sites, with the same kind of door as the
@@ -353,7 +347,7 @@ pub fn exec_runner(vm: &str, env: &[(String, String)]) -> Result<Child> {
 
 fn runner_command(vm: &str, env: &[(String, String)]) -> Result<Command> {
     #[cfg(not(halti_dev))]
-    if let Some((key, _)) = env.iter().find(|(key, _)| key.starts_with("HALTI_RUNNER_DEBUG") || key.starts_with(&format!("{}RUNNER_DEBUG", legacy::ENV_PREFIX))) {
+    if let Some((key, _)) = env.iter().find(|(key, _)| key.starts_with("HALTI_RUNNER_DEBUG") || key.starts_with(&format!("{}RUNNER_DEBUG", crate::legacy::ENV_PREFIX))) {
         bail!("{key} is only for tests");
     }
     let mut c = container();
@@ -513,10 +507,10 @@ mod tests {
     fn env_uses_stand_ins_and_the_right_key() {
         let get = |env: &[(String, String)], k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
         let oauth = agent_env(true);
-        assert_eq!(get(&oauth, "CLAUDE_CODE_OAUTH_TOKEN").as_deref(), Some(legacy::STANDIN));
+        assert_eq!(get(&oauth, "CLAUDE_CODE_OAUTH_TOKEN").as_deref(), Some(names::STANDIN));
         assert_eq!(get(&oauth, "ANTHROPIC_API_KEY"), None);
         let key = agent_env(false);
-        assert_eq!(get(&key, "ANTHROPIC_API_KEY").as_deref(), Some(legacy::STANDIN));
+        assert_eq!(get(&key, "ANTHROPIC_API_KEY").as_deref(), Some(names::STANDIN));
         assert_eq!(get(&key, "CLAUDE_CODE_OAUTH_TOKEN"), None);
         assert_eq!(get(&key, "HTTPS_PROXY").as_deref(), Some("http://127.0.0.1:3128"));
         assert_eq!(get(&key, "HOME").as_deref(), Some("/home/agent"));
@@ -538,7 +532,7 @@ mod tests {
     #[test]
     fn run_args_isolate_the_vm() {
         let args = run_args(&spec(), "agent:abc").unwrap().join(" ");
-        // The guest's names are the old images' (see `legacy`).
+        // The guest's names are the images' (see `names`).
         assert_eq!(
             args,
             format!(
@@ -548,8 +542,8 @@ mod tests {
                  --mount type=bind,source=/Volumes/box/home,target=/home/agent \
                  --mount type=bind,source=/Users/me/src,target=/work/src,readonly \
                  --entrypoint {} agent:abc serve",
-                legacy::DOOR_SOCKET,
-                legacy::SHIM
+                names::DOOR_SOCKET,
+                names::SHIM
             )
         );
     }
@@ -557,7 +551,6 @@ mod tests {
     #[test]
     fn the_runner_starts_in_the_browser_vm_as_its_user() {
         assert_eq!(browser_vm_name("research"), "halti-browser-research");
-        assert_eq!(legacy_browser_vm_name("research"), format!("{}research", legacy::BROWSER_VM_PREFIX));
         let env = vec![("HALTI_RUNNER_DEBUG_NO_ROUTING".to_string(), "1".to_string())];
         let cmd = runner_command("halti-browser-research", &env).unwrap();
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
@@ -627,8 +620,8 @@ mod tests {
                  --mount type=bind,source=/Volumes/box/home,target=/home/agent \
                  --mount type=bind,source=/Users/me/src,target=/work/src,readonly \
                  --entrypoint {} agent:abc serve --bridges",
-                legacy::DOOR_SOCKET,
-                legacy::SHIM
+                names::DOOR_SOCKET,
+                names::SHIM
             )
         );
         assert!(!docker.contains("--rosetta"));

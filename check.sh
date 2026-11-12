@@ -74,6 +74,8 @@ HOOK
 esac
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-3}"
 target="${CARGO_TARGET_DIR:-target}"
+# Absolute, since the release tests run the binary from other folders.
+case "$target" in /*) ;; *) target="$PWD/$target" ;; esac
 
 step() { printf '\n== %s\n' "$*"; }
 

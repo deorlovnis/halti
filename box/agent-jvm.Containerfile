@@ -1,11 +1,9 @@
 # The agent's VM image for JVM work (Kotlin, Gradle): the agent image plus a JDK and the Kotlin
 # language server, which Claude Code's kotlin-lsp plugin runs. Build it from the digest of the
 # agent image's build, so it can't start from another image of that name (install.sh does this):
-#   container build -f box/agent-jvm.Containerfile -t cred-agent-jvm \
-#     --build-arg AGENT=cred-agent@sha256:<digest> box
-# A box uses it by pinning cred-agent-jvm@sha256:... as its `image`.
-# The image names are from before halti was renamed from cred: box policies pin them by digest,
-# so they stay until the workspace migration. src/legacy.rs lists them.
+#   container build -f box/agent-jvm.Containerfile -t halti-agent-jvm \
+#     --build-arg AGENT=halti-agent@sha256:<digest> box
+# A box uses it by pinning halti-agent-jvm@sha256:... as its `image`. The names are in src/names.rs.
 
 ARG AGENT
 FROM ${AGENT}

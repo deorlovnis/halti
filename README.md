@@ -20,9 +20,9 @@ Boxes (in progress) run agents in VMs made by Apple's [`container`](https://gith
 
 ### Renamed from cred
 
-halti was called cred. The binary is now `/usr/local/bin/halti`, with its runner in `/usr/local/lib/halti`; `install.sh` removes the old `/usr/local/bin/cred` and `/usr/local/lib/cred`. Register the MCP server again under the new name (see Agents), and change a `Bash(cred copy:*)` deny rule to `Bash(halti copy:*)` (see With Claude Code). Its tools on the Mac are now `mcp__halti__*`, so update permission rules that name `mcp__cred__*` (inside a box they stay `mcp__cred__*`, see below). `halti run` no longer reads a `.cred` file: name each resource with `-s`. Environment variables are `HALTI_*` now; the old `CRED_*` names are still read when the new one isn't set, and refresh scripts get both.
+halti was called cred. Its names are now halti's throughout: the binary `/usr/local/bin/halti` with its runner in `/usr/local/lib/halti`, Keychain items `halti:…`, `~/.config/halti`, `~/Library/Application Support/halti`, the images `halti-agent`, `halti-agent-jvm`, `halti-agent-rust` and `halti-browser`, and inside a box `halti-shim`, `/run/halti`, the stand-in `halti-managed` and the `halti` MCP server, so an agent's tools are `mcp__halti__*` on the Mac and in a box alike. `src/names.rs` lists them. Environment variables are `HALTI_*`; the old `CRED_*` names are still read when the new one isn't set, and refresh scripts get both. `halti run` no longer reads a `.cred` file: name each resource with `-s`.
 
-Some names still say cred, because an existing install depends on them; `src/legacy.rs` lists each one and what depends on it. The Keychain items (`cred:…`), `~/.config/cred` and `~/Library/Application Support/cred` hold your secrets, approvals, policies and boxes, and the agent and browser images (`cred-agent`, `cred-agent-jvm`, `cred-agent-rust`, `cred-browser`) are pinned in approved box policies, along with what is inside them (`cred-shim`, `/run/cred`, the stand-in `cred-managed`, and the `cred` MCP server in a box, so the agent's tools there stay `mcp__cred__*`). These move to halti's names with a later migration. The codesign identifier `com.deorlovnis.cred` stays for good: Keychain items you allowed trust it, and changing it asks again for each. `install.sh` still signs with a "cred code signing" identity when there is no "halti code signing" one.
+An install made by cred is left alone: `install.sh` doesn't read or change its items, files, images or running boxes, so both can be on one Mac. Moving a cred install's secrets, approvals and boxes over to halti is a migration that comes later; `src/legacy.rs` keeps the names it will read.
 
 ### Signing
 
@@ -49,7 +49,7 @@ security import halti.p12 -k ~/Library/Keychains/login.keychain-db -P tmp   # no
 rm -f key.pem cert.pem halti.p12 /tmp/halti-cert.cnf
 ```
 
-When `codesign` asks to use the key, choose **Allow**, never **Always Allow**: a key anything can use silently lets any program running as you sign a lookalike halti that the Keychain trusts. `install.sh` signs with `HALTI_SIGN_IDENTITY` (or `CRED_SIGN_IDENTITY`) if set, else "halti code signing", else an identity made before the rename, "cred code signing". After switching identities, run `halti reseal` so each item trusts only the new halti, then approve your policies again.
+When `codesign` asks to use the key, choose **Allow**, never **Always Allow**: a key anything can use silently lets any program running as you sign a lookalike halti that the Keychain trusts. `install.sh` signs with `HALTI_SIGN_IDENTITY` if set, else "halti code signing". After switching identities, run `halti reseal` so each item trusts only the new halti, then approve your policies again.
 
 Items halti writes itself, policy approvals included, stay tied to the exact build that wrote them: without an Apple Developer Team ID, macOS can't tie them to the signing identity. Approvals are read without allowing a prompt, so after an update they read as missing and every resource is blocked until you approve again. `install.sh` does that at the end. Keychain prompts take your login password; Touch ID only appears in halti's own approval prompts.
 
@@ -72,7 +72,7 @@ halti audit                                  # what agents did through halti mcp
 
 ## Policies
 
-`~/.config/cred/policy/<resource>.toml`:
+`~/.config/halti/policy/<resource>.toml`:
 
 ```toml
 [run]
@@ -84,7 +84,7 @@ from = "firefox:https://app.example.com#session_token"   # read from Firefox Loc
                                                # (or firefox-cookie:… / chrome-cookie:… for a cookie)
 
 [refresh.token]
-run = "~/.config/cred/refresh/app.sh"          # prints a fresh value
+run = "~/.config/halti/refresh/app.sh"          # prints a fresh value
 
 [agent]
 consent = "session"                            # Touch ID before an agent session first uses it
@@ -128,9 +128,9 @@ Results are masked: the resource's values, and anything shaped like a JWT. Write
 
 ### Audit log
 
-Every call an agent makes through `halti mcp` is appended to `~/.config/cred/audit.log` once it has run, before the agent gets the result. If the log can't be opened or written (say, its Keychain key is unreadable), the agent gets an error instead. One JSON line per call: time, site, tool, method, URL and decision: `allowed`, `asked:yes` or `asked:no` (you were asked, and answered), or `blocked` (refused by the policy, or failed before an answer). Never values, headers, bodies or typed text. URLs are masked like everything else the agent sees, and lose any user, password and `#fragment`; query values that look like secrets (keys like `token`, `key`, `code`, or long opaque strings) and opaque path segments become `********`.
+Every call an agent makes through `halti mcp` is appended to `~/.config/halti/audit.log` once it has run, before the agent gets the result. If the log can't be opened or written (say, its Keychain key is unreadable), the agent gets an error instead. One JSON line per call: time, site, tool, method, URL and decision: `allowed`, `asked:yes` or `asked:no` (you were asked, and answered), or `blocked` (refused by the policy, or failed before an answer). Never values, headers, bodies or typed text. URLs are masked like everything else the agent sees, and lose any user, password and `#fragment`; query values that look like secrets (keys like `token`, `key`, `code`, or long opaque strings) and opaque path segments become `********`.
 
-Each line carries an HMAC over its content and the previous line's, keyed by an item in the Keychain (`cred:_audit/hmac`, created on first use). `halti audit` shows the latest entries (`-n 50` for more); `halti audit --verify` reads the whole log and reports the first line where the chain breaks, so an edited, swapped or removed line shows. Cutting lines off the end can't be seen. Same-user limit: whoever can read the key from the Keychain (a program running as you, with your approval of a prompt) could forge a chain.
+Each line carries an HMAC over its content and the previous line's, keyed by an item in the Keychain (`halti:_audit/hmac`, created on first use). `halti audit` shows the latest entries (`-n 50` for more); `halti audit --verify` reads the whole log and reports the first line where the chain breaks, so an edited, swapped or removed line shows. Cutting lines off the end can't be seen. Same-user limit: whoever can read the key from the Keychain (a program running as you, with your approval of a prompt) could forge a chain.
 
 ## Browsing
 
@@ -185,15 +185,15 @@ halti box rm research              # Touch ID; deletes the key, then the store
 
 `halti policy approve` with no names approves your boxes too, so `install.sh` still needs one Touch ID.
 
-`~/.config/cred/box/<name>.toml`:
+`~/.config/halti/box/<name>.toml`:
 
 ```toml
 about = "Market research"
 run = ["claude"]                        # what `halti box run` starts; `-- CMD` replaces it
-image = "cred-agent@sha256:..."         # the system inside, pinned by digest: a new image is a policy change
+image = "halti-agent@sha256:..."        # the system inside, pinned by digest: a new image is a policy change
 model = "anthropic"                     # resource whose key halti adds to the agent's model calls
 sites = ["github", "app"]               # resources the agent may use through halti; their policies apply
-standins = ["GH_TOKEN"]                 # variables set to "cred-managed", for tools that won't start without a token
+standins = ["GH_TOKEN"]                 # variables set to "halti-managed", for tools that won't start without a token
 keep = true                             # false: a new store every run, shredded when it stops, key never kept
 cpus = 4
 memory = "8G"
@@ -223,9 +223,9 @@ mode = "clone"                          # clone: the agent works on its own copy
 - **Sessions.** When a browser closes (`browse_close`, the idle or `max_minutes` limit, or the box stopping), halti takes the session it ends with (cookies and Local Storage, including the new values a site rotated) and seals it in the store's `browser/` folder, one file per site, encrypted with a key derived from the box key for that site alone: a file doesn't open as another site's, and no VM mounts the folder. The next `browse_open` starts from it instead of the Keychain fields, so a site that rotates its session cookie stays signed in across closes and box restarts. The session goes into the browser over a pipe and is masked in everything the agent reads, like the stored values. A file that doesn't open (changed or damaged) isn't used: the site's usual sources are, the audit log gets a `browse_session_unreadable` line, and `browse_open` tells the agent. `keep_sessions = false` writes and reads none. A session nobody signed in to (no cookies, no Local Storage) isn't sealed.
 - **`halti box login BOX [SITE]`.** For sites that need you: a visible Chromium on the Mac with an empty profile opens on the site's `start` page (or its one exact origin), you sign in by hand (SSO, two-factor), and closing the window, or Enter in the terminal, seals the session into the box. Touch ID first; the box must be stopped; the session is never printed. Without `SITE` it goes through the box's sites that have `[browse]` and no sealed session yet, one window after another (`signing in to docs (2 of 3)`), sealing each as it closes; Ctrl-C skips just that site, and so does closing a window before signing in. `--all` includes sites that already have a session. `halti box ls` shows which sites have one, by name only.
 - Mounts: `clone` copies the folder (with its `.git`) into the box's `work/` on the first run, and the agent keeps its own copy after. `ro` mounts the folder itself read-only. Folders that hold halti's own files, your home folder and `/` are refused.
-- **Images.** `cred-agent` has Claude Code, Node, Python, git, `gh` and `uv`, and sends `git@github.com:` remotes over HTTPS, the only way out of a box. `cred-agent-jvm` adds Temurin 25 and JetBrains' Kotlin language server: pin it as a box's `image` (`container image inspect cred-agent-jvm` gives the digest) for Kotlin and Gradle work, and run `claude plugin marketplace add anthropics/claude-plugins-official`, then `claude plugin install kotlin-lsp@claude-plugins-official`, once in the box for code intelligence (the first import of a large Gradle project takes minutes; until it ends the server only knows the file it has open). The JVM ignores the proxy variables, so halti also sets `JAVA_TOOL_OPTIONS` to the door's proxy; the image keeps Java's truststore in step with the box CA. `cred-agent-rust` adds a C toolchain and Rust 1.92 with clippy, rustfmt and rust-analyzer, pinned the same way. All three have Docker Engine, which runs only in a box whose policy says `docker = true`; Testcontainers then works as it does on a laptop. `rosetta = true` adds Rosetta to the VM, for x86-64 images with no arm64 build. Pulls go through the door, so allow the registry (`registry-1.docker.io`, `auth.docker.io`, `production.cloudfront.docker.com`).
-- Inside, `/home/agent`, `/work` and `/downloads` are folders of the store; `/tmp` is memory. The agent starts in `/work`. On each run halti makes sure Claude Code's settings skip the web-fetch check and know halti's tools (`cred-shim mcp`), keeping anything else the agent put in those files.
-- The store is an APFS sparse bundle in `~/Library/Application Support/cred/box/`, opened with the key on `hdiutil`'s stdin into a private folder, hidden from Finder and Spotlight, and only while the box runs. A store never shrinks when files are deleted (`hdiutil compact` doesn't work on APFS images).
+- **Images.** `halti-agent` has Claude Code, Node, Python, git, `gh` and `uv`, and sends `git@github.com:` remotes over HTTPS, the only way out of a box. `halti-agent-jvm` adds Temurin 25 and JetBrains' Kotlin language server: pin it as a box's `image` (`container image inspect halti-agent-jvm` gives the digest) for Kotlin and Gradle work, and run `claude plugin marketplace add anthropics/claude-plugins-official`, then `claude plugin install kotlin-lsp@claude-plugins-official`, once in the box for code intelligence (the first import of a large Gradle project takes minutes; until it ends the server only knows the file it has open). The JVM ignores the proxy variables, so halti also sets `JAVA_TOOL_OPTIONS` to the door's proxy; the image keeps Java's truststore in step with the box CA. `halti-agent-rust` adds a C toolchain and Rust 1.92 with clippy, rustfmt and rust-analyzer, pinned the same way. All three have Docker Engine, which runs only in a box whose policy says `docker = true`; Testcontainers then works as it does on a laptop. `rosetta = true` adds Rosetta to the VM, for x86-64 images with no arm64 build. Pulls go through the door, so allow the registry (`registry-1.docker.io`, `auth.docker.io`, `production.cloudfront.docker.com`).
+- Inside, `/home/agent`, `/work` and `/downloads` are folders of the store; `/tmp` is memory. The agent starts in `/work`. On each run halti makes sure Claude Code's settings skip the web-fetch check and know halti's tools (`halti-shim mcp`), keeping anything else the agent put in those files.
+- The store is an APFS sparse bundle in `~/Library/Application Support/halti/box/`, opened with the key on `hdiutil`'s stdin into a private folder, hidden from Finder and Spotlight, and only while the box runs. A store never shrinks when files are deleted (`hdiutil compact` doesn't work on APFS images).
 - `export`, `import` and `rm` need the box stopped, because halti doesn't touch a folder a VM has mounted (and a running agent could swap a link in the folder while it is read). `export` copies regular files only, never follows links, and logs each file in the box's log. `log` reads an open box without asking.
 - `halti box rm` warns that Time Machine may still hold encrypted copies of the store; restored together with a Keychain from before the removal, which has the old key, they would open.
 - A crash leaves an attached store or a throwaway store behind; the next `run` or `stop` detaches and deletes them.
@@ -251,7 +251,7 @@ Deny direct Keychain and clipboard reads in `~/.claude/settings.json` too:
 ] } }
 ```
 
-Metadata (never values) is kept in `~/.config/cred/index.json`. `HALTI_WARN_DAYS` sets the warning window (the old `CRED_WARN_DAYS` still works). The home folder is the one your user account names (the passwd entry), not `$HOME`, and no variable moves halti's files. A user without one (a container run with `--user N`, say) can't run halti.
+Metadata (never values) is kept in `~/.config/halti/index.json`. `HALTI_WARN_DAYS` sets the warning window (the old `CRED_WARN_DAYS` still works). The home folder is the one your user account names (the passwd entry), not `$HOME`, and no variable moves halti's files. A user without one (a container run with `--user N`, say) can't run halti.
 
 ## Development
 

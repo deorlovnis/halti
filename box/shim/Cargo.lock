@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "cred-shim"
+name = "halti-shim"
 version = "0.1.0"

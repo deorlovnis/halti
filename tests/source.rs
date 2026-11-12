@@ -95,6 +95,59 @@ const DEV_ONLY_READS: &[(&str, &str, &str)] = &[
     ("src/util.rs", "env::var_os(name)", "#[cfg(halti_dev)]\npub fn dev_var(name: &str) -> Option<OsString> {\n    "),
 ];
 
+/// Names an install made by cred (halti's old name) holds: halti writes none of them, so they
+/// appear only in `legacy`, which the migration of such an install reads.
+const OLD_NAMES: &[&str] = &[
+    "cred-agent",
+    "cred-browser",
+    "cred-shim",
+    "cred-box",
+    "cred-managed",
+    "\"cred:",
+    "/run/cred",
+    ".config/cred",
+    "Application Support/cred",
+    "com.deorlovnis.cred",
+    "cred code signing",
+];
+
+#[test]
+fn the_old_names_stay_in_legacy() {
+    let mut files = Vec::new();
+    for dir in ["src", "tests", "box"] {
+        all_files(&root().join(dir), &mut files);
+    }
+    files.extend(["install.sh", "mise.toml", "check.sh"].map(|f| root().join(f)));
+    let mut found = Vec::new();
+    for path in files {
+        let rel = path.strip_prefix(root()).unwrap().display().to_string();
+        if rel == "src/legacy.rs" || rel == "tests/source.rs" || rel.contains("/target/") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        for (n, line) in text.lines().enumerate() {
+            if let Some(name) = OLD_NAMES.iter().find(|n| line.contains(*n)) {
+                found.push(format!("{rel}:{}: {name}", n + 1));
+            }
+        }
+    }
+    assert!(found.is_empty(), "halti's own names are in src/names.rs; the old ones belong in src/legacy.rs only:\n{}", found.join("\n"));
+}
+
+fn all_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|n| n == "target" || n == "node_modules") {
+                continue;
+            }
+            all_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
