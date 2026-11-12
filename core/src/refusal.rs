@@ -19,6 +19,9 @@ pub enum Refusal {
     NameOne,
     /// The typed name is well formed and no workspace has it. It holds only what was typed.
     Unknown(WsName),
+    /// It could not be opened or checked: wrong key, or it was changed. It carries nothing, so
+    /// every such failure looks the same.
+    Unreadable,
 }
 
 impl fmt::Display for Refusal {
@@ -29,6 +32,7 @@ impl fmt::Display for Refusal {
             Refusal::NoWorkspace => write!(f, "there is no workspace yet (make one first)"),
             Refusal::NameOne => write!(f, "there is more than one workspace (name one)"),
             Refusal::Unknown(name) => write!(f, "there is no workspace named {name}"),
+            Refusal::Unreadable => write!(f, "that can't be opened (wrong key, or it was changed)"),
         }
     }
 }
