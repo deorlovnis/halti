@@ -1,7 +1,8 @@
 //! Checks on the source itself, for what the compiler can't see: that test hooks are keyed to
 //! `halti_dev` (debug-profile builds, see build.rs) and never to debug assertions, that every
-//! `HALTI_*` variable is on a reviewed list saying who reads it, and that the macOS-only code
-//! stays as it was while the Linux host is built (it can't be compiled or run here).
+//! `HALTI_*` variable is on a reviewed list saying who reads it, that the macOS-only code
+//! stays as it was while the Linux host is built (it can't be compiled or run here), and that the
+//! core crate stays plain Rust: no I/O, no code for one OS, nothing kept between calls.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -114,7 +115,7 @@ const OLD_NAMES: &[&str] = &[
 #[test]
 fn the_old_names_stay_in_legacy() {
     let mut files = Vec::new();
-    for dir in ["src", "tests", "box"] {
+    for dir in ["src", "tests", "box", "core"] {
         all_files(&root().join(dir), &mut files);
     }
     files.extend(["install.sh", "mise.toml", "check.sh"].map(|f| root().join(f)));
@@ -358,4 +359,108 @@ fn the_name_scan_finds_families_and_skips_the_bare_prefix() {
     assert_eq!(code, "a\nc");
     let code = "const NAME: &str = \"WARN_DAYS\";\npub fn env_var(s: &str) {}\nenv_var(NAME); util::env_var(\"X\"); env_var(name); my_env_var(\"Y\")";
     assert_eq!(names_read(code, "env_var"), ["WARN_DAYS", "X", "?"]);
+}
+
+/// What core's source may name from `std`: nothing that reaches outside the process. Of
+/// `collections` only the ordered ones: the hashed ones seed from the OS and list in another order
+/// each run.
+const CORE_STD: &[&str] = &["fmt", "error", "collections", "cell", "rc"];
+
+/// What core may be built from. A crate that does I/O for core would pass every other check here,
+/// so a new one is added to this list by hand.
+const CORE_DEPENDENCIES: &[(&str, &[&str])] = &[("[dependencies]", &["anyhow", "serde"]), ("[dev-dependencies]", &["serde_json"])];
+
+/// Core is plain Rust with no I/O, no code for one OS and nothing kept between calls (see
+/// core/src/lib.rs). Clippy's list in core/clippy.toml refuses the calls by name; this refuses the
+/// ways around that list, tests included.
+#[test]
+fn the_core_crate_stays_pure() {
+    const BANNED: &[&str] = &[
+        "std::{",
+        "use std;",
+        "std as",
+        "sync::",
+        "extern ",
+        "#[path",
+        "include!",
+        "include_str!",
+        "include_bytes!",
+        "env!(",
+        "thread_local!",
+        "print!(",
+        "println!(",
+        "eprint!(",
+        "eprintln!(",
+        "dbg!(",
+        "HashMap",
+        "HashSet",
+        "hash_map",
+        "hash_set",
+        "RandomState",
+        "HALTI_",
+        "halti_dev",
+        "debug_assertions",
+        "target_",
+        "rustfmt",
+    ];
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let files = sources(&["core"]);
+    let forbids = files.iter().any(|(path, text)| path == "core/src/lib.rs" && text.lines().any(|l| l == "#![forbid(unsafe_code)]"));
+    assert!(forbids, "core/src/lib.rs forbids unsafe code");
+    let mut found = Vec::new();
+    for (path, text) in &files {
+        if !path.starts_with("core/src/") {
+            found.push(format!("{path}: core's code is all under core/src"));
+        }
+        for (n, line) in text.lines().enumerate() {
+            let mut why: Vec<&str> = BANNED.iter().copied().filter(|t| line.contains(t)).collect();
+            // Only tests are conditional, and of `std` only what stays in the process is named.
+            why.extend(line.match_indices("cfg").filter(|(i, _)| !line[*i..].starts_with("cfg(test)") && !line[*i..].starts_with("cfg_attr(not(test),")).map(|_| "cfg"));
+            why.extend(line.match_indices("std::").filter(|(i, _)| !CORE_STD.iter().any(|m| line[i + 5..].starts_with(m))).map(|_| "std::"));
+            // The keyword, wherever it stands; `&'static str` is a lifetime.
+            if line.match_indices("static").any(|(i, _)| !line[..i].ends_with('\'') && !line[..i].ends_with(word) && !line[i + 6..].starts_with(word)) {
+                why.push("static");
+            }
+            if line.contains("unsafe") && line != "#![forbid(unsafe_code)]" {
+                why.push("unsafe");
+            }
+            found.extend(why.iter().map(|w| format!("{path}:{}: {w}", n + 1)));
+        }
+    }
+
+    // The manifest: the listed crates and no others, nothing per OS, no build script.
+    let manifest = fs::read_to_string(root().join("core/Cargo.toml")).unwrap();
+    let mut section = "";
+    for line in manifest.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        if line.starts_with('[') {
+            section = line;
+            if !["[package]", "[dependencies]", "[dev-dependencies]"].contains(&line) {
+                found.push(format!("core/Cargo.toml: {line}"));
+            }
+            continue;
+        }
+        let key = line.split('=').next().unwrap().trim();
+        let allowed = CORE_DEPENDENCIES.iter().find(|(s, _)| *s == section).map(|(_, names)| *names);
+        if allowed.is_some_and(|names| !names.contains(&key)) || (section == "[package]" && key == "build") {
+            found.push(format!("core/Cargo.toml: {section} {key}"));
+        }
+    }
+    if root().join("core/build.rs").exists() {
+        found.push("core/build.rs: core has no build script".into());
+    }
+    assert!(found.is_empty(), "core does no I/O, has no code for one OS and keeps no state:\n{}", found.join("\n"));
+}
+
+/// A `Keystore` is bound to its workspace in one place, which only core can call: a second way to
+/// make one, or a public `bind`, would let any caller pick the workspace a handle reads. (The doc
+/// test on `Keystore` shows `bind` can't be named from outside; it would pass as well if `bind`
+/// were renamed and another constructor made public.)
+#[test]
+fn only_core_binds_a_keystore() {
+    let files = sources(&["core/src"]);
+    let lines = || files.iter().flat_map(|(path, text)| text.lines().map(move |l| (path.as_str(), l)));
+    let binds: Vec<_> = lines().filter(|(_, l)| l.contains("-> Keystore<")).collect();
+    assert_eq!(binds, [("core/src/store.rs", "    pub(crate) fn bind(ws: WsId, backend: &'p dyn KeystoreBackend) -> Keystore<'p> {")]);
+    let made: Vec<_> = lines().filter(|(_, l)| l.trim_start().starts_with("Keystore {")).map(|(path, _)| path).collect();
+    assert_eq!(made, ["core/src/store.rs"]);
 }

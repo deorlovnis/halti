@@ -83,14 +83,14 @@ step "no private references"
 refs
 
 step format
-cargo fmt --check
+cargo fmt --all --check
 (cd box/shim && cargo fmt --check)
 
 step clippy
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 
 step tests
-cargo test
+cargo test --workspace
 
 # Again with their output, to show which escape tests ran here and which were skipped.
 step "escape tests"
