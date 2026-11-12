@@ -7,9 +7,12 @@ use std::rc::Rc;
 use anyhow::{Result, bail};
 use zeroize::Zeroizing;
 
+use crate::anchor::{Anchor, Pin};
 use crate::crypto::kem::DecapKey;
+use crate::holder::{Change, Commitment, KeyHolder, KeyKind, KeyRef, Prompt, Released};
 use crate::ids::{WsId, WsName};
 use crate::key::{KemCiphertext, KemShares, PublicKey};
+use crate::passphrase::{KdfParams, Passphrase, PassphraseRecord};
 use crate::platform::{Adapter, Grade, Label, Lacks, Property};
 use crate::refusal::Refusal;
 use crate::store::{FileKey, Files, Held, ItemName, KeystoreBackend};
@@ -163,16 +166,29 @@ impl Files for MemFiles {
     }
 }
 
-/// A software key in memory that counts how often it is asked for shares.
+/// A software key in memory that counts how often it is asked for shares. As a key holder it keeps
+/// the commitment it is given, counts the keys it makes, and remembers every prompt it is shown
+/// (the prompt itself can't be kept: it can't be cloned). Its key ref is the one byte of its kind.
 pub struct SoftKey {
     key: DecapKey,
     decapsulations: Cell<u32>,
+    creates: Cell<u32>,
+    commitment: Cell<Option<Commitment>>,
+    asked: RefCell<Vec<(WsId, WsName, Change, String)>>,
+    decline: Cell<bool>,
 }
 
 impl SoftKey {
     /// From a 96-byte seed, as `DecapKey` takes it.
     pub fn from_seed(seed: [u8; 96]) -> SoftKey {
-        SoftKey { key: DecapKey::from_seed(Zeroizing::new(seed)), decapsulations: Cell::new(0) }
+        SoftKey {
+            key: DecapKey::from_seed(Zeroizing::new(seed)),
+            decapsulations: Cell::new(0),
+            creates: Cell::new(0),
+            commitment: Cell::new(None),
+            asked: RefCell::new(Vec::new()),
+            decline: Cell::new(false),
+        }
     }
 
     /// Its public half.
@@ -189,6 +205,194 @@ impl SoftKey {
     /// How many times it has been asked for shares.
     pub fn decapsulations(&self) -> u32 {
         self.decapsulations.get()
+    }
+
+    /// How many keys it has been asked to make.
+    pub fn creates(&self) -> u32 {
+        self.creates.get()
+    }
+
+    /// The workspace, name, change and text of every prompt it was shown, in order.
+    pub fn asked(&self) -> Vec<(WsId, WsName, Change, String)> {
+        self.asked.borrow().clone()
+    }
+
+    /// From now on, says no to every prompt (or, given false, stops saying no).
+    pub fn decline(&self, no: bool) {
+        self.decline.set(no);
+    }
+
+    /// Remembers the prompt, then answers it.
+    fn ask(&self, prompt: &Prompt) -> Result<(), Refusal> {
+        self.asked.borrow_mut().push((prompt.ws(), prompt.name().clone(), prompt.change(), prompt.text()));
+        if self.decline.get() {
+            return Err(Refusal::Declined);
+        }
+        Ok(())
+    }
+}
+
+impl Adapter for SoftKey {
+    fn label(&self) -> Label {
+        label("soft-key")
+    }
+}
+
+impl KeyHolder for SoftKey {
+    fn kind(&self) -> KeyKind {
+        KeyKind::Soft
+    }
+
+    fn create(&self, prompt: &Prompt, commitment: &Commitment) -> Result<(KeyRef, PublicKey)> {
+        self.creates.set(self.creates.get() + 1);
+        self.ask(prompt)?;
+        self.commitment.set(Some(*commitment));
+        Ok((KeyRef(vec![KeyKind::Soft.tag()]), self.key.public()))
+    }
+
+    fn public(&self, key: &KeyRef) -> Result<PublicKey> {
+        if key.0 != [KeyKind::Soft.tag()] {
+            return Err(Refusal::Unreadable.into());
+        }
+        Ok(self.key.public())
+    }
+
+    /// Goes through `shares_for`, so it counts. With no commitment kept (it never made a key), it
+    /// refuses after decapsulating.
+    fn decapsulate(&self, key: &KeyRef, prompt: &Prompt, ct: &KemCiphertext) -> Result<Released> {
+        KeyHolder::public(self, key)?;
+        self.ask(prompt)?;
+        let shares = self.shares_for(ct)?;
+        let commitment = self.commitment.get().ok_or(Refusal::Unreadable)?;
+        Ok(Released { shares, commitment })
+    }
+
+    fn destroy(&self, _key: &KeyRef) -> Result<()> {
+        self.commitment.set(None);
+        Ok(())
+    }
+}
+
+/// An anchor in memory that counts its reads, and can be told to fail its next write.
+#[derive(Default)]
+pub struct MemAnchor {
+    pins: RefCell<BTreeMap<WsId, Pin>>,
+    reads: Cell<u32>,
+    fail_next_advance: Cell<bool>,
+}
+
+impl MemAnchor {
+    pub fn new() -> MemAnchor {
+        MemAnchor::default()
+    }
+
+    /// How many times a pin was read.
+    pub fn reads(&self) -> u32 {
+        self.reads.get()
+    }
+
+    /// The next `advance` fails, as a disk would, and keeps nothing.
+    pub fn fail_next_advance(&self) {
+        self.fail_next_advance.set(true);
+    }
+}
+
+impl Adapter for MemAnchor {
+    fn label(&self) -> Label {
+        label("mem-anchor")
+    }
+}
+
+impl Anchor for MemAnchor {
+    fn read(&self, ws: WsId) -> Result<Option<Pin>> {
+        self.reads.set(self.reads.get() + 1);
+        Ok(self.pins.borrow().get(&ws).copied())
+    }
+
+    fn advance(&self, ws: WsId, pin: &Pin) -> Result<()> {
+        if self.fail_next_advance.replace(false) {
+            bail!("the anchor could not be written");
+        }
+        let mut pins = self.pins.borrow_mut();
+        let kept = pins.get(&ws).map_or(0, |old| old.version);
+        if pin.version <= kept {
+            bail!("pin version {} is not above {kept}", pin.version);
+        }
+        pins.insert(ws, *pin);
+        Ok(())
+    }
+
+    fn forget(&self, ws: WsId) -> Result<()> {
+        self.pins.borrow_mut().remove(&ws);
+        Ok(())
+    }
+}
+
+/// A passphrase key holder whose passphrase is already typed: the terminal's adapter without the
+/// terminal or the randomness. Its seed, salt and nonce are given, and it counts every time it
+/// asks for the passphrase.
+pub struct FixedPassphrase {
+    answer: RefCell<String>,
+    seed: [u8; 96],
+    salt: [u8; 16],
+    nonce: [u8; 12],
+    asks: Cell<u32>,
+}
+
+impl FixedPassphrase {
+    /// Answers `text` when asked, and makes the key of `seed`, sealed under `salt` and `nonce`.
+    pub fn new(text: &str, seed: [u8; 96], salt: [u8; 16], nonce: [u8; 12]) -> FixedPassphrase {
+        FixedPassphrase { answer: RefCell::new(text.to_string()), seed, salt, nonce, asks: Cell::new(0) }
+    }
+
+    /// Answers `text` from now on.
+    pub fn answer(&self, text: &str) {
+        *self.answer.borrow_mut() = text.to_string();
+    }
+
+    /// How many times it asked for the passphrase.
+    pub fn asks(&self) -> u32 {
+        self.asks.get()
+    }
+
+    /// Asks for the passphrase: counts, then checks what was typed.
+    fn typed(&self) -> Result<Passphrase, Refusal> {
+        self.asks.set(self.asks.get() + 1);
+        Passphrase::new(Zeroizing::new(self.answer.borrow().clone()))
+    }
+}
+
+impl Adapter for FixedPassphrase {
+    fn label(&self) -> Label {
+        label("fixed-passphrase")
+    }
+}
+
+impl KeyHolder for FixedPassphrase {
+    fn kind(&self) -> KeyKind {
+        KeyKind::Passphrase
+    }
+
+    fn create(&self, prompt: &Prompt, commitment: &Commitment) -> Result<(KeyRef, PublicKey)> {
+        let passphrase = self.typed()?;
+        let key = DecapKey::from_seed(Zeroizing::new(self.seed));
+        let record = PassphraseRecord::seal(prompt, &passphrase, &key, commitment, KdfParams::DEFAULT, &self.salt, &self.nonce)?;
+        Ok((record.to_key_ref(), record.public().clone()))
+    }
+
+    fn public(&self, key: &KeyRef) -> Result<PublicKey> {
+        Ok(PassphraseRecord::from_key_ref(key)?.public().clone())
+    }
+
+    fn decapsulate(&self, key: &KeyRef, prompt: &Prompt, ct: &KemCiphertext) -> Result<Released> {
+        let record = PassphraseRecord::from_key_ref(key)?;
+        let passphrase = self.typed()?;
+        Ok(record.decapsulate(prompt, &passphrase, ct)?)
+    }
+
+    /// The record is the key ref itself, so there is nothing else to forget.
+    fn destroy(&self, _key: &KeyRef) -> Result<()> {
+        Ok(())
     }
 }
 

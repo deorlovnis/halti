@@ -1,6 +1,7 @@
 //! What every adapter must do, whatever it is made of. Run here against the adapters in memory;
 //! an adapter over real files or a real keystore is held to the same.
 
+use crate::anchor::{Anchor, Pin};
 use crate::fakes::{MemFiles, MemKeystore};
 use crate::ids::{WsId, WsName};
 use crate::platform::Grade;
@@ -76,9 +77,44 @@ pub fn files_contract(files: &dyn Files) {
     drop((other, again));
 }
 
+/// An anchor keeps one pin per workspace, only lets its version rise, and forgets. Give it an
+/// empty one.
+///
+/// It refuses only a version that does not rise: that core advances by exactly one is core's rule,
+/// not the anchor's.
+pub fn anchor_contract(anchor: &dyn Anchor) {
+    let pin = |version: u64| Pin { version, key_ref: [1; 48], public_key: [2; 48], state: [3; 48] };
+    assert_eq!(anchor.read(A).unwrap(), None);
+    assert!(anchor.advance(A, &pin(0)).is_err(), "a first pin is version 1 or more");
+    assert_eq!(anchor.read(A).unwrap(), None);
+
+    anchor.advance(A, &pin(1)).unwrap();
+    assert_eq!(anchor.read(A).unwrap(), Some(pin(1)));
+    assert!(anchor.advance(A, &pin(1)).is_err(), "the same version again");
+    assert!(anchor.advance(A, &pin(0)).is_err(), "a lower one");
+    assert_eq!(anchor.read(A).unwrap(), Some(pin(1)), "a refused pin changes nothing");
+
+    let second = Pin { state: [4; 48], ..pin(2) };
+    anchor.advance(A, &second).unwrap();
+    assert_eq!(anchor.read(A).unwrap(), Some(second), "the whole pin is replaced");
+    anchor.advance(A, &pin(7)).unwrap();
+    assert_eq!(anchor.read(A).unwrap(), Some(pin(7)), "any rise is kept");
+
+    assert_eq!(anchor.read(B).unwrap(), None, "another workspace's");
+    anchor.advance(B, &pin(1)).unwrap();
+    assert_eq!(anchor.read(A).unwrap(), Some(pin(7)));
+    assert_eq!(anchor.read(B).unwrap(), Some(pin(1)));
+
+    anchor.forget(A).unwrap();
+    assert_eq!(anchor.read(A).unwrap(), None);
+    anchor.forget(A).unwrap();
+    assert_eq!(anchor.read(B).unwrap(), Some(pin(1)), "forgetting one workspace's pin leaves another's");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fakes::{FixedPassphrase, MemAnchor, SoftKey};
     use crate::platform::{Adapter, Property};
 
     #[test]
@@ -91,10 +127,17 @@ mod tests {
         files_contract(&MemFiles::new());
     }
 
+    #[test]
+    fn the_memory_anchor_keeps_the_anchor_contract() {
+        anchor_contract(&MemAnchor::new());
+    }
+
     /// An adapter for tests says so: nothing may mistake it for one that protects anything.
     #[test]
     fn the_adapters_in_memory_are_labelled_dev_and_lack_everything() {
-        for label in [MemKeystore::new().label(), MemFiles::new().label()] {
+        let soft = SoftKey::from_seed([0; 96]);
+        let passphrase = FixedPassphrase::new("acme passphrase one", [0; 96], [0; 16], [0; 12]);
+        for label in [MemKeystore::new().label(), MemFiles::new().label(), MemAnchor::new().label(), soft.label(), passphrase.label()] {
             assert_eq!(label.grade, Grade::Dev, "{}", label.adapter);
             assert!(Property::ALL.iter().all(|p| label.lacks.contains(*p)), "{}", label.adapter);
             assert!(!label.why.is_empty());

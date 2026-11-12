@@ -8,6 +8,7 @@ description = "Halti's workspace rules: plain Rust, no code for one OS, no I/O"
 [dependencies]
 aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
 anyhow = "1.0"
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 hkdf = "0.13"
 ml-kem = { version = "0.3.4", features = ["hazmat", "zeroize"] }
 p256 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa"] }

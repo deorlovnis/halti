@@ -115,6 +115,10 @@ pub enum FileKey {
     Manifest(WsId),
     Policy(WsId),
     Log(WsId),
+    /// What the key holder needs to find the workspace's key again (`holder::KeyRef`).
+    KeyRef(WsId),
+    /// The inner key, wrapped to the workspace's key.
+    Wrap(WsId),
 }
 
 /// Holds a workspace's lock until it is dropped.

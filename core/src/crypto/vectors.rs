@@ -1,5 +1,6 @@
-//! Fixed inputs and expected bytes for the tests under `crypto` and `key`: published vectors, each
-//! with where it comes from, and this crate's own known answers.
+//! Fixed inputs and expected bytes for the tests under `crypto`, `key`, `passphrase`, `anchor` and
+//! the sequences: published vectors, each with where it comes from, and this crate's own known
+//! answers.
 
 /// Bytes from hex, skipping whitespace so a long value can be broken over lines. Panics on
 /// anything that is not a hex digit, and on an odd number of digits.
@@ -28,6 +29,7 @@ pub(crate) fn arr<const N: usize>(bytes: &[u8]) -> [u8; N] {
 // Wycheproof: github.com/C2SP/wycheproof, directory testvectors_v1, commit 65ca494727a52944c204441c860b039e6786b99b.
 // ACVP: github.com/usnistgov/ACVP-Server, directory gen-val/json-files, commit 975de31eb83d87039ec88934fdc47d8c312b892d.
 // RFC 6979: rfc-editor.org/rfc/rfc6979.txt, appendix A.2.5.
+// RFC 9106: rfc-editor.org/rfc/rfc9106.txt, section 5.3.
 
 /// One HKDF-SHA-384 case (RFC 5869). All three are valid: `okm` is the whole expected output.
 pub(crate) struct Hkdf {
@@ -521,6 +523,41 @@ pub(crate) const ML_KEM_1024_BAD_KEY: &[MlKemBadKey] = &[
     },
 ];
 
+/// One Argon2id case (RFC 9106) with a secret and associated data. `tag` is the whole output; its length is the length asked for.
+pub(crate) struct Argon2Id {
+    /// The password, P.
+    pub(crate) password: &'static str,
+    /// The salt, S.
+    pub(crate) salt: &'static str,
+    /// The secret, K.
+    pub(crate) secret: &'static str,
+    /// The associated data, X.
+    pub(crate) data: &'static str,
+    /// Memory in KiB, m.
+    pub(crate) m_kib: u32,
+    /// Passes, t.
+    pub(crate) t: u32,
+    /// Lanes, p.
+    pub(crate) p: u32,
+    /// The tag, T.
+    pub(crate) tag: &'static str,
+}
+
+// RFC 9106 section 5.3, the one Argon2id case it gives (version 0x13). Its pre-hashing digest and the blocks after each pass are left out.
+pub(crate) const ARGON2ID_RFC9106: &[Argon2Id] = &[
+    // 32 KiB, 3 passes, 4 lanes, a 32-byte tag: four lanes and a secret, which the passphrase key never uses, so both are checked here.
+    Argon2Id {
+        password: "0101010101010101010101010101010101010101010101010101010101010101",
+        salt: "02020202020202020202020202020202",
+        secret: "0303030303030303",
+        data: "040404040404040404040404",
+        m_kib: 32,
+        t: 3,
+        p: 4,
+        tag: "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659",
+    },
+];
+
 // ---- known answers ----
 //
 // This crate's own formats have no published vectors. These values were computed by an independent
@@ -555,6 +592,19 @@ pub(crate) fn inner_bytes() -> [u8; 32] {
 /// The workspace id: acme's, in the tests.
 pub(crate) fn ws_bytes() -> [u8; 16] {
     arr(&seq(0x10, 16))
+}
+
+/// The passphrase of the known answers' passphrase record, sealed for acme under that name: 19 ASCII characters.
+pub(crate) const PASSPHRASE: &str = "acme passphrase one";
+
+/// The salt of its key: Argon2id with 65536 KiB, 3 passes and 1 lane.
+pub(crate) fn passphrase_salt() -> [u8; 16] {
+    arr(&seq(0x90, 16))
+}
+
+/// The nonce its seed and commitment are sealed under.
+pub(crate) fn passphrase_nonce() -> [u8; 12] {
+    arr(&seq(0xa0, 12))
 }
 
 /// `derive_scalar(KEM_ID, seq(0x00, 32))`.
@@ -689,3 +739,63 @@ pub(crate) const KAT_POLICY_8_RAW: &str = "ab8aaea15417129caea327a786072f8964549
 
 /// And as `sign_policy` must return it: the same r, and the order less that s.
 pub(crate) const KAT_POLICY_8_SIGNATURE: &str = "ab8aaea15417129caea327a786072f89645496c9165268dce26a083f0df8c1d070a401e6d7d38f0a50c246de5985e26a5c66dbf5e809c1f287903eab935396a6";
+
+// The passphrase key and the pin of a new workspace: computed by the same independent implementation, written from the
+// specification and not from this code, once it had reproduced RFC 9106's Argon2id case above and the published vectors of
+// Argon2id with 64 MiB of memory in one lane.
+
+/// The key Argon2id derives from `PASSPHRASE` under `passphrase_salt()`, with 65536 KiB, 3 passes, 1 lane, no secret and no
+/// associated data: 32 bytes.
+pub(crate) const KAT_PASSPHRASE_KEK: &str = "991f4d84fb7a64ff43754dbaf699e851d914c2ce93a96c0d82e4cede2d167e05";
+
+/// The record's sealed part: `aead::seal` under that key, with `passphrase_nonce()`, of the hardware seed and the inner key's
+/// commitment (`KAT_POLICY_VERIFY`), for acme under its name. 190 bytes.
+pub(crate) const KAT_PASSPHRASE_SEALED: &str = "01a0a1a2a3a4a5a6a7a8a9aaabe6c2a58e61ec74b1777677701448836bb5b331dd8bed5570bd987ca23d47044e3c2d107888b896ed21affff253383f93b5910c\
+    424035814120b9ced618c572162f33821be795154999dfaf1ee48a7af39a84f825e3e31e05e0ffec47043555e9ef803d41e7f6b161851ca8c0d8ffdd852ee06b\
+    c53b2248900c0f3cbca5264e032aefcb6a9ee4935140bc3ae5e61edef9f24700dffa5395b412d7e6fbc39bb9d4059c987ff0bcc72eb3be86a3c936c64a9d";
+
+/// The whole passphrase record, all 1855 bytes: its public key is the hardware seed's, its parameters are the default, and it
+/// ends in `KAT_PASSPHRASE_SEALED`.
+pub(crate) const KAT_PASSPHRASE_RECORD: &str = "0105014b94c29450111191823b3514c9ac1ea3d9825ccb86393a2dfb04654fa2192d37bfad1c497c6502eee5ca80a73bfce0baf5a54a88585a401397a3d232f4\
+    26a7afb082bc21a44317090eaac7592c2ea88a653c4491ea193931335f52e989a3c4cc56d9c553732d57c470fb41ab759b65d2d04445382fcd9c4e344a1128fa\
+    9e11e04358e192ed014b23232a7ee2b22e23717f44111ee33575399c37646da9813ec9b212afe94e5dc5c2330a7294cc1f4234a6d3fbb4f1685ab8892c04acb1\
+    7cd1c170d7b0611b6a7176c794cc8c67f55fc923c2ad203100f365991882c30243d77813843b5ec7c964032263706092ecf00c7516be64e4598ca4226c069bb5\
+    e67e4175cf2286c8dd5c488a6c5861f31baa0bd0269470e8b551dd3bcd38c86c12f9cdb176c77dc8b6c02a701f478902c8553f694c0d82727b4c4a5c2c104121\
+    2aa1274808b82111b377ec75214e9b1978f76004d4139d98613f4b8e98d20af7b534073a509a959b7a7564f9b40ca218bf61829320a8502017954d328d7ac6c7\
+    69ec29700756e7b0685b340d5e118059504a49a9a50a10198eb10a5784678eb427d7b4babb9552933b062897973e1318eaf0a0eac37584a65401b1703e042acc\
+    d837531483f241cadcd1c1d378119e694429db199ac891e4c5343757085bb3ae783667350c4458d97672e861e80b1d2679510ea3a6f2360c77a46942c7a06a55\
+    4d228080c84b47aef14db17620cb16c06ab30a1be4cda7082be9f87e9c211c46916349a5ba8eaa5201c7294a3c0885b53b657452108825ec646c90a04612324e\
+    e7d031afe5343132cbef67b6efb1a5ec2809b773538ce77b3d8b04eb0b3c2256011e4c716c19a8ba0752bf71492117649f0615c3290fc29a46fde4bd52db9286\
+    d603388244259c15a7ac2b640a60cc03376a5841a3fb8a473568fa9b1a267215f34c01697b0f0e627175d72105b7707c29b9e614bdc33a6f6c818a95370b4278\
+    82d7b476796a9ec6eb993274cd9b2391a82ba45e3393d2e9ae9721ca9d6c1b988b5827713f90a6585de9433528c02b03ce10bb5f720138d0fbb4c30c1266b918\
+    e52925dfe17b37f95d22bca54f475919ac859098c0f0d08ac5875ef29b56fd141e6ef15f700a0b66f39595c588177373c4669b21bc071e4c3aa5f0b4a31b6258\
+    f35da24ac3cd29c7f2092410c5078355b138fb53a6b9ae6e0b9c08243e7baa45c47376eb8c7f13d4cf51aa736fa31540c9241f370da544bf9f9c28d9a57e2f2a\
+    7ca95a4e4b466e641ab3bcc76adf1139d567a6f12b52f3a65e7ec0aae26bcaa8c55833b04e59998ebc9a1930fbb6d2233c53d2c1f8b9518e3c2de73a19dee6b3\
+    80a5b32971cf64e129fd6c1fa6e75d4a234501e966dd3a540af5c8f4f34a6b4a253ee28492566d5e67c6f55855fcb0506fb06c156744d9a03a31a26fa94cad14\
+    f157b7f303d07a69c773768fcb4d079c09059703a0c3a94de4b99ea3a2f16583d0f9170a3950db07b4f0bc30802927f9f7961b6259892636a9502a2705303637\
+    799dd344da451c1cf7bf67840ceb3079ab8c6b8c1927f64053c612450c45c9e603bc16666e596b3471e103b6f15447424d17022048111ffbd37e1c670f64f14b\
+    8a7b32b94c1a49b45dd2fc38cd5289d910ad63602cf5e13042c64ac6797b89fb551ad08e05a92d200cccb7e712ef23c9312cb350f029ab537e287347fd3075ac\
+    10906a783f1c6c07ccb88f41228c4be1c640f790b5c3a5d5d3ca792495d74bc461562658c07ac600276b924ab5bc9be1f0494cb76f82f460a7480972663381e1\
+    69996061d799859ec54d4f5ca5c411c01db1597b165977669de13a928a34afbac258fea8c4764239c9421dc3119bf5b47699206978327b1c5345ef746a798384\
+    1f056e2534100ab24d4e9abbd0b17c6a95bd4c3c0e40f69e1612aceeb28b99086c95116e7204273893390bf46b899b36286b0ebf1947bb9884f732ca27da82b1\
+    9b5dc0cc7f8885714910888b2310c4f9319d410b34e6433b9003e2176bb995257456106e8952163b8ba592530cc5aa0aeb43ad398fe9e97baa523d7a4431677c\
+    3d3af0719e475db85ca95af5089beabeb05b2faab4896ba60f81c88472a57b46a828826a0cdfb446f8189182d2bf5eac4ec1cc5deaf599c8a13e48235406d17f\
+    fddc8344b6c66984a868aa92fa02227a086950eb0c8701ed58dc628776b983882e117504333061ba04606df6bb849ac4b223f14bed83ddd8808d88c9a96af50a\
+    ce61f85900e1888a8a90f593aec029df25892da20a7ac2e3eb6835f5f24c65b230a85f6e01000100000000000300000001909192939495969798999a9b9c9d9e\
+    9f01a0a1a2a3a4a5a6a7a8a9aaabe6c2a58e61ec74b1777677701448836bb5b331dd8bed5570bd987ca23d47044e3c2d107888b896ed21affff253383f93b591\
+    0c424035814120b9ced618c572162f33821be795154999dfaf1ee48a7af39a84f825e3e31e05e0ffec47043555e9ef803d41e7f6b161851ca8c0d8ffdd852ee0\
+    6bc53b2248900c0f3cbca5264e032aefcb6a9ee4935140bc3ae5e61edef9f24700dffa5395b412d7e6fbc39bb9d4059c987ff0bcc72eb3be86a3c936c64a9d";
+
+/// The pin's hash of a passphrase key holder's kind and its key ref, `KAT_PASSPHRASE_RECORD`, for acme.
+pub(crate) const KAT_PIN_KEY_REF: &str = "2a820add3dcb9200f6ea573a92c30fd048ead4cd81eaa0c9ecb666eea9c93829c63abfe3cf0c5cf8b718b0e1eff3ee3f";
+
+/// Its hash of the hardware seed's public key.
+pub(crate) const KAT_PIN_PUBLIC_KEY: &str = "393a49ee8923b29d89c94e8ccf677a4af4a6fe14e1fbfeb0b21ad08767acb494cac8179a651174942b330b85fd393069";
+
+/// Its hash of the name acme, the wrap `KAT_HARDWARE_WRAP`, and no manifest and no policy.
+pub(crate) const KAT_PIN_STATE: &str = "ee641624346cbb163d1ffb52045fdbbeffd8071de4603e31b362858fff787da3668321f2354b2876dc51fe885a459f0b";
+
+/// The pin at version 1 over those three hashes, all 153 bytes.
+pub(crate) const KAT_PIN: &str = "0100000000000000012a820add3dcb9200f6ea573a92c30fd048ead4cd81eaa0c9ecb666eea9c93829c63abfe3cf0c5cf8b718b0e1eff3ee3f393a49ee8923b2\
+    9d89c94e8ccf677a4af4a6fe14e1fbfeb0b21ad08767acb494cac8179a651174942b330b85fd393069ee641624346cbb163d1ffb52045fdbbeffd8071de4603e\
+    31b362858fff787da3668321f2354b2876dc51fe885a459f0b";

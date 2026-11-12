@@ -5,6 +5,7 @@
 use std::fmt;
 
 use crate::ids::WsName;
+use crate::passphrase::Passphrase;
 
 /// Why core said no.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -22,6 +23,12 @@ pub enum Refusal {
     /// It could not be opened or checked: wrong key, or it was changed. It carries nothing, so
     /// every such failure looks the same.
     Unreadable,
+    /// The key holder was asked and said no, or the person stopped it.
+    Declined,
+    /// A check failed after the key holder proved its answer: the workspace's files were changed.
+    Tampered,
+    /// A new passphrase is too short. It is never echoed.
+    ShortPassphrase,
 }
 
 impl fmt::Display for Refusal {
@@ -33,6 +40,9 @@ impl fmt::Display for Refusal {
             Refusal::NameOne => write!(f, "there is more than one workspace (name one)"),
             Refusal::Unknown(name) => write!(f, "there is no workspace named {name}"),
             Refusal::Unreadable => write!(f, "that can't be opened (wrong key, or it was changed)"),
+            Refusal::Declined => write!(f, "that was not approved"),
+            Refusal::Tampered => write!(f, "this workspace's files were changed by something other than halti"),
+            Refusal::ShortPassphrase => write!(f, "a passphrase has at least {} characters", Passphrase::MIN_CHARS),
         }
     }
 }
