@@ -30,7 +30,7 @@ use super::store::{self, Layout};
 use super::{BoxPolicy, MountPolicy, mount_problem};
 use crate::chain::{self, Chain};
 use crate::index::Index;
-use crate::{approve, door, engine, keychain, legacy, policy, seal};
+use crate::{approve, door, engine, keychain, names, policy, seal};
 
 /// Where the store's folders appear in the VM, and where `ro` folders go.
 const GUEST_HOME: &str = "/home/agent";
@@ -173,14 +173,7 @@ pub struct Request<'a> {
 }
 
 pub fn vm_name(id: &str) -> String {
-    format!("halti-box-{id}")
-}
-
-/// The names the agent's VM may run under: halti's, then its name from before the rename
-/// (`legacy::BOX_VM_PREFIX`), so a box the old binary started is joined or stopped, never started
-/// twice.
-pub fn vm_names(id: &str) -> [String; 2] {
-    [vm_name(id), format!("{}{id}", legacy::BOX_VM_PREFIX)]
+    format!("{}{id}", names::BOX_VM_PREFIX)
 }
 
 /// Run the box. Returns the exit code of the command inside.
@@ -199,9 +192,9 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
 
     // Another halti has the box open: work in the same VM, through the same door.
     let Some(lock) = store::lock(&layout.lock(&req.id))? else {
-        let Some(vm) = vm_names(&req.id).into_iter().find(|vm| world.running(vm)) else {
+        if !world.running(&vm) {
             bail!("box {} is being opened or closed by another halti: try again in a moment", req.name);
-        };
+        }
         // The door of the open box keeps the rules it started with, so joining under a policy
         // approved since would promise rules nothing enforces.
         if fs::read_to_string(layout.opened_with(&req.id)).ok().as_deref() != Some(req.policy_sha.as_str()) {
@@ -211,10 +204,10 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     };
     fs::write(layout.opened_with(&req.id), &req.policy_sha).with_context(|| format!("noting the policy box {} opens with", req.name))?;
 
-    // Holding the lock, whatever a crashed run left is ours to clear: its VMs too, under either name.
+    // Holding the lock, whatever a crashed run left is ours to clear: its VMs too.
     sweep_temp(layout)?;
     sweep(layout, &req.id)?;
-    for leftover in vm_names(&req.id).into_iter().chain([engine::browser_vm_name(&req.id), engine::legacy_browser_vm_name(&req.id)]) {
+    for leftover in [vm.clone(), engine::browser_vm_name(&req.id)] {
         if world.running(&leftover) {
             world.stop_vm(&leftover);
         }
@@ -222,7 +215,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
 
     world.available()?;
     let image =
-        policy.image.as_deref().ok_or_else(|| anyhow!("the policy of box {} names no image (set image = \"{}@sha256:...\" and approve it)", req.name, legacy::AGENT_IMAGE))?;
+        policy.image.as_deref().ok_or_else(|| anyhow!("the policy of box {} names no image (set image = \"{}@sha256:...\" and approve it)", req.name, names::AGENT_IMAGE))?;
     let env = agent_env()?;
     for site in policy.model.iter().chain(&policy.sites) {
         world.site_ready(site).with_context(|| format!("box {} uses {site}", req.name))?;
@@ -492,7 +485,7 @@ fn prepare_home(home: &Path, docker: bool) -> Result<()> {
         o.insert("hasCompletedOnboarding".into(), json!(true));
         let servers = o.entry("mcpServers").or_insert_with(|| json!({}));
         if let Some(servers) = servers.as_object_mut() {
-            servers.insert(legacy::MCP_SERVER_KEY.into(), json!({ "type": "stdio", "command": legacy::SHIM, "args": ["mcp"], "env": {} }));
+            servers.insert(names::MCP_SERVER_KEY.into(), json!({ "type": "stdio", "command": names::SHIM, "args": ["mcp"], "env": {} }));
         }
     })
 }
@@ -566,6 +559,7 @@ mod tests {
 
     use super::*;
     use crate::browse::BoxBrowser;
+    use crate::legacy;
     use crate::util::TempDir;
 
     const DIGEST: &str = "agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -844,14 +838,14 @@ mod tests {
         assert!(log.ends_with("log/door.log"), "{}", log.display());
 
         let (env, cmd, tty) = seen.exec.clone().unwrap();
-        assert!(env.contains(&("CLAUDE_CODE_OAUTH_TOKEN".into(), legacy::STANDIN.into())), "the bearer stand-in: {env:?}");
+        assert!(env.contains(&("CLAUDE_CODE_OAUTH_TOKEN".into(), names::STANDIN.into())), "the bearer stand-in: {env:?}");
         let pem = seen.ca.clone().expect("the CA is installed in the VM");
         assert!(pem.starts_with("-----BEGIN CERTIFICATE-----") && !pem.contains("PRIVATE"), "{pem}");
         assert_eq!(seen.door_ca.as_deref(), Some(pem.as_str()), "the door ends TLS with the CA the VM trusts");
         for var in ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "PIP_CERT", "GIT_SSL_CAINFO"] {
             assert!(env.iter().any(|(k, v)| k == var && v.starts_with("/")), "{var} in {env:?}");
         }
-        assert!(env.contains(&("GH_TOKEN".into(), legacy::STANDIN.into())), "the policy's stand-ins: {env:?}");
+        assert!(env.contains(&("GH_TOKEN".into(), names::STANDIN.into())), "the policy's stand-ins: {env:?}");
         let (writes, allow_writes, _) = seen.net.clone().unwrap();
         assert_eq!((writes, allow_writes), (policy::Mode::Ask, vec!["https://api.example.com/search".to_string()]));
         assert_eq!(&cmd[..2], ["sh", "-c"]);
@@ -862,8 +856,8 @@ mod tests {
         let settings: Value = serde_json::from_str(&seen.files[".claude/settings.json"]).unwrap();
         assert_eq!(settings["skipWebFetchPreflight"], json!(true));
         let claude: Value = serde_json::from_str(&seen.files[".claude.json"]).unwrap();
-        let server = &claude["mcpServers"][legacy::MCP_SERVER_KEY];
-        assert_eq!((server["command"].clone(), server["args"].clone()), (json!(legacy::SHIM), json!(["mcp"])));
+        let server = &claude["mcpServers"][names::MCP_SERVER_KEY];
+        assert_eq!((server["command"].clone(), server["args"].clone()), (json!(names::SHIM), json!(["mcp"])));
         assert!(seen.files.contains_key("work/proj"), "the clone: {:?}", seen.files.keys());
         assert_eq!(seen.files["work/proj/README"], "original");
         assert!(!seen.files.contains_key("work/data"), "ro folders are not copied");
@@ -945,32 +939,35 @@ mod tests {
     }
 
     #[test]
-    fn joins_a_box_under_its_name_from_before_the_rename() {
+    fn joins_only_a_box_under_its_own_name() {
         let s = setup();
         let p = policy(&s, "");
         s.layout.prepare().unwrap();
         let held = store::lock(&s.layout.lock("r")).unwrap().unwrap();
         fs::write(s.layout.opened_with("r"), "sha-1").unwrap();
 
-        let old = format!("{}r", legacy::BOX_VM_PREFIX);
-        let fake = Fake { running: Mutex::new(true), only: Some(old.clone()), ..Fake::default() };
+        // A VM of the same box started by another install is not this box: nothing is joined.
+        let other = format!("{}r", legacy::BOX_VM_PREFIX);
+        let fake = Fake { running: Mutex::new(true), only: Some(other), ..Fake::default() };
+        let err = run(&s.layout, &fake, &request(&s, &p, false)).unwrap_err().to_string();
+        assert!(err.contains("being opened or closed by another halti"), "{err}");
+        assert_eq!(fake.calls(), Vec::<String>::new(), "nothing started, nothing joined");
+
+        let fake = Fake { running: Mutex::new(true), only: Some(vm_name("r")), ..Fake::default() };
         assert_eq!(run(&s.layout, &fake, &request(&s, &p, false)).unwrap(), 0);
         assert_eq!(fake.calls(), ["bearer: anthropic", "exec"], "no second VM");
-        assert_eq!(fake.seen.lock().unwrap().exec_vm.as_deref(), Some(old.as_str()));
-        assert_eq!(vm_names("r"), ["halti-box-r".to_string(), old]);
-        // Joining doesn't install the CA again, so it's named where the old binary put it.
-        let (env, _, _) = fake.seen.lock().unwrap().exec.clone().unwrap();
-        assert!(env.contains(&("NODE_EXTRA_CA_CERTS".into(), legacy::CA_CERT.into())), "{env:?}");
+        assert_eq!(fake.seen.lock().unwrap().exec_vm.as_deref(), Some("halti-box-r"));
         drop(held);
     }
 
     #[test]
-    fn stops_a_browser_vm_left_under_its_name_from_before_the_rename() {
+    fn leaves_a_browser_vm_of_another_install_alone() {
         let s = setup();
         let p = policy(&s, "");
-        let fake = Fake { running: Mutex::new(true), only: Some(engine::legacy_browser_vm_name("r")), unavailable: true, ..Fake::default() };
+        let other = format!("{}r", legacy::BROWSER_VM_PREFIX);
+        let fake = Fake { running: Mutex::new(true), only: Some(other), unavailable: true, ..Fake::default() };
         assert!(run(&s.layout, &fake, &request(&s, &p, false)).is_err());
-        assert_eq!(fake.calls(), ["stop_vm", "available"]);
+        assert_eq!(fake.calls(), ["available"], "not ours to stop");
         assert_put_away(&s);
     }
 
@@ -1189,11 +1186,11 @@ mod tests {
         assert_eq!((settings["theme"].clone(), settings["skipWebFetchPreflight"].clone()), (json!("dark"), json!(true)));
         let claude: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
         assert_eq!((claude["mcpServers"]["mine"]["command"].clone(), claude["halti"].clone()), (json!("x"), json!(1)));
-        assert_eq!(claude["mcpServers"][legacy::MCP_SERVER_KEY]["command"], json!(legacy::SHIM));
+        assert_eq!(claude["mcpServers"][names::MCP_SERVER_KEY]["command"], json!(names::SHIM));
 
         fs::write(home.join(".claude.json"), "not json").unwrap();
         prepare_home(&home, false).unwrap();
-        assert!(fs::read_to_string(home.join(".claude.json")).unwrap().contains(legacy::SHIM), "a broken file is replaced");
+        assert!(fs::read_to_string(home.join(".claude.json")).unwrap().contains(names::SHIM), "a broken file is replaced");
 
         assert!(!home.join(".docker").exists());
         fs::create_dir_all(home.join(".docker")).unwrap();

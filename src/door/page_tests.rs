@@ -27,9 +27,8 @@ use super::http;
 use super::intercept_tests::{Guest, Shim, client, log_lines, wait_for};
 use super::tls::{BoxCa, trust_only};
 use super::{Config, Door, Tokens};
-use crate::legacy;
 use crate::util::TempDir;
-use crate::{approve, keychain, policy};
+use crate::{approve, keychain, names, policy};
 
 const SECRET: &str = "tok-SECRET-0123456789-abcdef";
 const LOG_KEY: [u8; 32] = [5; 32];
@@ -296,7 +295,7 @@ fn scenario(dir: &Path, yes: bool) {
     drop(as_agent);
 
     // The browser's VM has no business with halti itself or MCP.
-    for kind in [legacy::DOOR_KIND, "mcp"] {
+    for kind in [names::DOOR_KIND, "mcp"] {
         let mut io = browser.take();
         write!(io.writer, "{kind}\nGET /model/v1/messages HTTP/1.1\r\nHost: halti.internal\r\n\r\n").unwrap();
         let mut rest = Vec::new();

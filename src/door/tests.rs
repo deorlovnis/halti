@@ -24,7 +24,7 @@ use super::addr::Net;
 use super::http::{self, Head};
 use super::{Config, Door, STANDIN};
 use crate::util::TempDir;
-use crate::{approve, keychain, legacy, policy};
+use crate::{approve, keychain, names, policy};
 
 const REAL_KEY: &str = "sk-ant-REAL-0123456789abcdef";
 const PUBLIC_IP: &str = "93.184.216.34";
@@ -420,7 +420,7 @@ fn proxy(conn: &mut Conn, guest: &Guest, dialed: &Arc<Mutex<Vec<SocketAddr>>>) {
 }
 
 fn gateway(guest: &Guest, upstream: &Upstream) {
-    let mut conn = guest.connection(legacy::DOOR_KIND);
+    let mut conn = guest.connection(names::DOOR_KIND);
     let calls = upstream.seen.lock().unwrap().len();
 
     // A streamed answer arrives event by event, before the upstream has finished it.
@@ -522,7 +522,7 @@ fn model_refusals(dir: &Path) {
             browser: None,
         };
         let door = Door::start_with(config, Net::system()).unwrap();
-        let mut conn = guest.connection(legacy::DOOR_KIND);
+        let mut conn = guest.connection(names::DOOR_KIND);
         conn.send(&post("/model/v1/messages", &[("x-api-key", STANDIN)], "{}"));
         let reply = conn.head();
         assert_eq!(reply.status, status);

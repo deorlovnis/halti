@@ -20,7 +20,7 @@ use similar::TextDiff;
 use url::{Host, Url};
 
 use crate::util::{config_dir, expand_home, sha256_hex};
-use crate::{approve, ask, boxes, browser, interactive, keychain, legacy, parse_env, parse_field, parse_resource};
+use crate::{approve, ask, boxes, browser, interactive, keychain, names, parse_env, parse_field, parse_resource};
 
 /// Keychain field of a resource's approval record. Field names can't start with "_".
 const APPROVAL: &str = "_policy";
@@ -785,7 +785,7 @@ pub fn edit(res: &str) -> Result<()> {
     let p = path(res);
     if !p.exists() {
         fs::create_dir_all(dir())?;
-        fs::write(&p, TEMPLATE.replace("CONFIG", legacy::CONFIG_DIR).replace("RES", res))?;
+        fs::write(&p, TEMPLATE.replace("CONFIG", names::CONFIG_DIR).replace("RES", res))?;
     }
     if edit_file(res, &p, |text| Policy::parse(text).map(drop))? {
         offer_approval(&p, &format!("halti policy approve {res}"), || approve(&[res.to_string()]))?;

@@ -22,10 +22,13 @@ mod engine;
 mod fetch;
 mod index;
 mod keychain;
+// Mostly read by nothing until the migration of an install made under the old name exists.
+#[allow(dead_code)]
 mod legacy;
 mod limits;
 mod mask;
 mod mcp;
+mod names;
 mod policy;
 mod refresh;
 #[cfg(all(halti_dev, target_os = "linux"))]

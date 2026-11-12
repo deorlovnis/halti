@@ -1,11 +1,9 @@
 # The agent's VM image for Rust work: the agent image plus a C toolchain and Rust, with
 # rust-analyzer for Claude Code's rust-analyzer-lsp plugin. Build it from the agent image's build,
 # so it can't start from another image of that name (install.sh does this):
-#   container build -f box/agent-rust.Containerfile -t cred-agent-rust \
-#     --build-arg AGENT=cred-agent:<hex> box
-# A box uses it by pinning cred-agent-rust@sha256:... as its `image`.
-# The image names are from before halti was renamed from cred: box policies pin them by digest,
-# so they stay until the workspace migration. src/legacy.rs lists them.
+#   container build -f box/agent-rust.Containerfile -t halti-agent-rust \
+#     --build-arg AGENT=halti-agent:<hex> box
+# A box uses it by pinning halti-agent-rust@sha256:... as its `image`. The names are in src/names.rs.
 
 ARG AGENT
 FROM ${AGENT}

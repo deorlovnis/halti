@@ -1,5 +1,5 @@
 //! The shim: the guest side of a halti box's door. Its names, in the VM and on the Mac's command
-//! line, are the old images' (see `legacy`).
+//! line, are in `names`.
 //!
 //! A box has no network. halti, on the Mac, dials connections into the Unix socket this daemon
 //! listens on (`serve`, the VM's init process); programs in the box talk to local listeners
@@ -8,7 +8,7 @@
 //!
 //! - `proxy`: TCP 127.0.0.1:3128, the HTTP proxy (`serve --bridges`: port 3128 on every address,
 //!   so Docker's containers reach it at their bridge's gateway)
-//! - `legacy::DOOR_KIND`: TCP 127.0.0.2:80, `halti.internal` (halti itself)
+//! - `names::DOOR_KIND`: TCP 127.0.0.2:80, `halti.internal` (halti itself)
 //! - `mcp`:   `LOCAL_SOCK`, which the shim's `mcp` command (halti's MCP server over stdio) dials
 //!
 //! After that line the bytes go both ways until both sides are done (half-close aware).
@@ -22,11 +22,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use std::{env, fs, process, thread};
 
-mod legacy;
+mod names;
 
-const RUN_DIR: &str = legacy::RUN_DIR;
-const DOOR_SOCK: &str = legacy::DOOR_SOCKET;
-const LOCAL_SOCK: &str = legacy::LOCAL_SOCKET;
+const RUN_DIR: &str = names::RUN_DIR;
+const DOOR_SOCK: &str = names::DOOR_SOCKET;
+const LOCAL_SOCK: &str = names::LOCAL_SOCKET;
 const PROXY_ADDR: (&str, u16) = ("127.0.0.1", 3128);
 /// The proxy for a box with Docker: a container has a network namespace of its own, where
 /// 127.0.0.1 is the container itself, so it can only reach the proxy at an address of the VM on
@@ -44,12 +44,12 @@ fn main() {
             .map_err(|e| io::Error::new(e.kind(), format!("connecting to {LOCAL_SOCK}: {e}")))
             .and_then(|sock| relay(sock, io::stdin(), io::stdout())),
         _ => {
-            eprintln!("usage: {} serve [--bridges] | mcp", legacy::SHIM);
+            eprintln!("usage: {} serve [--bridges] | mcp", names::SHIM);
             process::exit(2);
         }
     };
     if let Err(e) = result {
-        eprintln!("{}: {e}", legacy::SHIM);
+        eprintln!("{}: {e}", names::SHIM);
         process::exit(1);
     }
 }
@@ -201,7 +201,7 @@ fn serve(proxy: (&str, u16)) -> io::Result<()> {
     thread::spawn(move || accept_loop(local.incoming(), "mcp", p));
     let p = pool.clone();
     thread::spawn(move || accept_loop(proxy.incoming(), "proxy", p));
-    accept_loop(halti.incoming(), legacy::DOOR_KIND, pool);
+    accept_loop(halti.incoming(), names::DOOR_KIND, pool);
     Ok(())
 }
 
@@ -279,7 +279,7 @@ mod tests {
         let (mac, shim_end) = dialed();
         pool.put(shim_end);
         let (mut program, client) = tcp_pair();
-        thread::spawn(move || serve_client(client, legacy::DOOR_KIND, &pool));
+        thread::spawn(move || serve_client(client, names::DOOR_KIND, &pool));
 
         program.write_all(b"request").unwrap();
         program.shutdown(Shutdown::Write).unwrap();
@@ -288,7 +288,7 @@ mod tests {
         let mut mac = mac;
         let mut got = String::new();
         mac.read_to_string(&mut got).unwrap();
-        assert_eq!(got, format!("{}\nrequest", legacy::DOOR_KIND));
+        assert_eq!(got, format!("{}\nrequest", names::DOOR_KIND));
         mac.write_all(b"response").unwrap();
         mac.shutdown(Shutdown::Write).unwrap();
 

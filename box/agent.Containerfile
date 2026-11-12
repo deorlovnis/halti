@@ -1,9 +1,7 @@
 # The agent's VM image for halti boxes. Build with the box/ folder as the context:
-#   container build -f box/agent.Containerfile -t cred-agent box
-# halti pins the result by digest (name@sha256:...); a box's policy keeps that pin.
-# The image's name and the shim's (cred-shim, /usr/local/bin/cred-shim) are from before halti was
-# renamed from cred: box policies pin this image by digest, so they stay until the workspace
-# migration. src/legacy.rs lists them.
+#   container build -f box/agent.Containerfile -t halti-agent box
+# halti pins the result by digest (name@sha256:...); a box's policy keeps that pin. The image's
+# name and the shim's (halti-shim, /usr/local/bin/halti-shim) are in src/names.rs.
 
 # The shim, the guest side of the door, built here: the Mac has no Linux target.
 FROM rust:1.92-slim-bookworm AS shim
@@ -70,7 +68,7 @@ RUN git config --system url."https://github.com/".insteadOf "git@github.com:" \
 # The image's user 1000 ("node") becomes the agent. Its home is a folder of the box's store at
 # run time, so everything the agent keeps (pip, npm and uv installs, ~/.claude) lands there.
 RUN usermod -l agent -d /home/agent -m node && groupmod -n agent node
-COPY --from=shim /src/target/release/cred-shim /usr/local/bin/cred-shim
+COPY --from=shim /src/target/release/halti-shim /usr/local/bin/halti-shim
 # The VM can't run with a read-only root: `container` reaches the door socket only on the root
 # filesystem. So the system is made unwritable for the agent instead: no setuid programs (no
 # su, no mount) and no world-writable directory but the memory-backed ones (/tmp, /var/tmp).

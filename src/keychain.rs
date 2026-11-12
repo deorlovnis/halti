@@ -1,5 +1,5 @@
 //! Keychain items: every value is its own generic password, service "<prefix><resource>/<field>"
-//! (the prefix is `legacy::KEYCHAIN_PREFIX`), account = the macOS user.
+//! (the prefix is `names::KEYCHAIN_PREFIX`), account = the macOS user.
 
 use std::env;
 #[cfg(halti_dev)]
@@ -7,14 +7,14 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::legacy;
+use crate::names;
 
 fn account() -> String {
     env::var("USER").unwrap_or_default()
 }
 
 fn service(res: &str, field: &str) -> String {
-    format!("{}{res}/{field}", legacy::KEYCHAIN_PREFIX)
+    format!("{}{res}/{field}", names::KEYCHAIN_PREFIX)
 }
 
 /// Debug builds keep items in files under $HALTI_TEST_KEYCHAIN when it is set, so end-to-end

@@ -1,4 +1,4 @@
-//! The gateway kind (`legacy::DOOR_KIND`): plain HTTP/1.1 to halti itself, with keep-alive because Claude Code reuses
+//! The gateway kind (`names::DOOR_KIND`): plain HTTP/1.1 to halti itself, with keep-alive because Claude Code reuses
 //! its connections. Its one route is `/model/...`, the model gateway. The box holds a stand-in
 //! key; the gateway checks for it, drops the box's own auth headers, adds the real one from the
 //! model resource's approved policy and fields, sends the call over TLS to the policy's first

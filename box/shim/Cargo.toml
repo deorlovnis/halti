@@ -1,7 +1,6 @@
 [package]
-# Keeps its name from before halti was renamed from cred: the binary is the entrypoint and MCP
-# command of every pinned agent image, until the workspace migration (see src/legacy.rs).
-name = "cred-shim"
+# The binary is the entrypoint and MCP command of every pinned agent image (see src/names.rs).
+name = "halti-shim"
 version = "0.1.0"
 edition = "2024"
 description = "Guest side of a halti box's door: pairs the box's connections with ones halti dials in"

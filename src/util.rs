@@ -10,6 +10,7 @@ use anyhow::Result;
 use sha2::{Digest, Sha256};
 
 use crate::legacy;
+use crate::names;
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
@@ -56,12 +57,12 @@ fn passwd_home() -> Option<PathBuf> {
 }
 
 pub fn config_dir() -> PathBuf {
-    home().join(if cfg!(halti_dev) { DEV_CONFIG_DIR } else { legacy::CONFIG_DIR })
+    home().join(if cfg!(halti_dev) { DEV_CONFIG_DIR } else { names::CONFIG_DIR })
 }
 
 /// Box stores, mount points and locks (`box/`) and downloads.
 pub fn store_root() -> PathBuf {
-    home().join(if cfg!(halti_dev) { DEV_STORE_ROOT } else { legacy::STORE_ROOT })
+    home().join(if cfg!(halti_dev) { DEV_STORE_ROOT } else { names::STORE_ROOT })
 }
 
 /// The two names of a user-facing environment variable: `HALTI_<suffix>`, then the old
