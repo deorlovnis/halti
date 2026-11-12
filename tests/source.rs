@@ -368,7 +368,8 @@ const CORE_STD: &[&str] = &["fmt", "error", "collections", "cell", "rc"];
 
 /// What core may be built from. A crate that does I/O for core would pass every other check here,
 /// so a new one is added to this list by hand.
-const CORE_DEPENDENCIES: &[(&str, &[&str])] = &[("[dependencies]", &["anyhow", "serde"]), ("[dev-dependencies]", &["serde_json"])];
+const CORE_DEPENDENCIES: &[(&str, &[&str])] =
+    &[("[dependencies]", &["aes-gcm", "anyhow", "hkdf", "ml-kem", "p256", "serde", "sha2", "zeroize"]), ("[dev-dependencies]", &["serde_json"])];
 
 /// Core is plain Rust with no I/O, no code for one OS and nothing kept between calls (see
 /// core/src/lib.rs). Clippy's list in core/clippy.toml refuses the calls by name; this refuses the
@@ -402,6 +403,12 @@ fn the_core_crate_stays_pure() {
         "debug_assertions",
         "target_",
         "rustfmt",
+        // Randomness is an argument: core never draws its own, and the crates it is built on can.
+        "getrandom",
+        "OsRng",
+        "SysRng",
+        "_from_rng(",
+        "generate(",
     ];
     let word = |c: char| c.is_alphanumeric() || c == '_';
     let files = sources(&["core"]);
@@ -443,6 +450,14 @@ fn the_core_crate_stays_pure() {
         let allowed = CORE_DEPENDENCIES.iter().find(|(s, _)| *s == section).map(|(_, names)| *names);
         if allowed.is_some_and(|names| !names.contains(&key)) || (section == "[package]" && key == "build") {
             found.push(format!("core/Cargo.toml: {section} {key}"));
+        }
+        // The list above reads only a crate's name. Its features matter as much: none may bring the
+        // OS's randomness in, and these two do by default.
+        if allowed.is_some() && line.contains("getrandom") {
+            found.push(format!("core/Cargo.toml: {section} {key} names getrandom"));
+        }
+        if section == "[dependencies]" && ["aes-gcm", "p256"].contains(&key) && !line.contains("default-features = false") {
+            found.push(format!("core/Cargo.toml: {section} {key} keeps its default features"));
         }
     }
     if root().join("core/build.rs").exists() {

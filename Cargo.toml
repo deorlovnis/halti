@@ -51,6 +51,59 @@ strip = true
 inherits = "release"
 lto = false
 
+# Core's cryptography is far too slow unoptimised for its tests (thousands of key generations
+# and decapsulations), so these crates are optimised in debug builds too.
+[profile.dev.package.ml-kem]
+opt-level = 3
+
+[profile.dev.package.module-lattice]
+opt-level = 3
+
+[profile.dev.package.sha3]
+opt-level = 3
+
+[profile.dev.package.shake]
+opt-level = 3
+
+[profile.dev.package.keccak]
+opt-level = 3
+
+[profile.dev.package.p256]
+opt-level = 3
+
+[profile.dev.package.primeorder]
+opt-level = 3
+
+[profile.dev.package.primefield]
+opt-level = 3
+
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+
+[profile.dev.package.aes-gcm]
+opt-level = 3
+
+[profile.dev.package.aes]
+opt-level = 3
+
+[profile.dev.package.ghash]
+opt-level = 3
+
+[profile.dev.package.polyval]
+opt-level = 3
+
+[profile.dev.package.hkdf]
+opt-level = 3
+
+[profile.dev.package.hmac]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
 # The binary (this package) and core are one workspace; the binary doesn't use core yet. Naming
 # "." as a member would undo the exclude. The shim keeps its own lock, since the agent images
 # build it on its own.

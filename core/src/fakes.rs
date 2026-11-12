@@ -5,9 +5,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use anyhow::{Result, bail};
+use zeroize::Zeroizing;
 
+use crate::crypto::kem::DecapKey;
 use crate::ids::{WsId, WsName};
+use crate::key::{KemCiphertext, KemShares, PublicKey};
 use crate::platform::{Adapter, Grade, Label, Lacks, Property};
+use crate::refusal::Refusal;
 use crate::store::{FileKey, Files, Held, ItemName, KeystoreBackend};
 
 fn label(adapter: &'static str) -> Label {
@@ -156,5 +160,59 @@ impl Files for MemFiles {
             bail!("workspace {ws} is locked");
         }
         Ok(Box::new(MemHeld { locks: self.locks.clone(), ws }))
+    }
+}
+
+/// A software key in memory that counts how often it is asked for shares.
+pub struct SoftKey {
+    key: DecapKey,
+    decapsulations: Cell<u32>,
+}
+
+impl SoftKey {
+    /// From a 96-byte seed, as `DecapKey` takes it.
+    pub fn from_seed(seed: [u8; 96]) -> SoftKey {
+        SoftKey { key: DecapKey::from_seed(Zeroizing::new(seed)), decapsulations: Cell::new(0) }
+    }
+
+    /// Its public half.
+    pub fn public(&self) -> PublicKey {
+        self.key.public()
+    }
+
+    /// Counts the call, then decapsulates.
+    pub fn shares_for(&self, ct: &KemCiphertext) -> Result<KemShares, Refusal> {
+        self.decapsulations.set(self.decapsulations.get() + 1);
+        self.key.decapsulate(ct)
+    }
+
+    /// How many times it has been asked for shares.
+    pub fn decapsulations(&self) -> u32 {
+        self.decapsulations.get()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::kem::encapsulate;
+    use crate::crypto::vectors::{KAT_HARDWARE_P256, hardware_rand, hardware_seed, hex};
+
+    #[test]
+    fn the_soft_key_counts_each_decapsulation() {
+        let key = SoftKey::from_seed(hardware_seed());
+        assert_eq!(key.public().p256.as_slice(), hex(KAT_HARDWARE_P256), "the key of its seed");
+        let (ct, shares) = encapsulate(&key.public(), &hardware_rand()).unwrap();
+        assert_eq!(key.decapsulations(), 0, "giving its public half is no decapsulation");
+        for asked in 1..=3 {
+            let back = key.shares_for(&ct).unwrap();
+            assert_eq!((&back.mlkem, &back.p256), (&shares.mlkem, &shares.p256));
+            assert_eq!(key.decapsulations(), asked);
+        }
+        // A ciphertext it refuses was still asked about.
+        let mut compressed = ct.clone();
+        compressed.p256_eph[0] = 0x02;
+        assert_eq!(key.shares_for(&compressed).unwrap_err(), Refusal::Unreadable);
+        assert_eq!(key.decapsulations(), 4);
     }
 }

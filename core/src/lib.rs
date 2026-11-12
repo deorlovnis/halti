@@ -7,7 +7,8 @@
 //! - It has no code for one OS, and its own code never reads the environment, the clock or the
 //!   current folder: what it needs is an argument. (Its errors are carried by anyhow, which asks
 //!   the standard library whether to keep a stack trace. That changes an error's debug text only,
-//!   never a decision.)
+//!   never a decision. The cipher and hash crates under `crypto` may each ask the CPU once per
+//!   process which instructions it has. That changes their speed only, never a result.)
 //! - It keeps no state between calls. Nothing here is "the current workspace": a handle is bound
 //!   to one workspace when it is made and stays there.
 //!
@@ -15,7 +16,9 @@
 //! third that nothing here outlives a call: no item that is one for the whole process.
 #![forbid(unsafe_code)]
 
+pub mod crypto;
 pub mod ids;
+pub mod key;
 pub mod platform;
 pub mod refusal;
 pub mod store;
