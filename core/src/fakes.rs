@@ -1,6 +1,7 @@
 //! Adapters in memory, for tests: they keep what they are given and remember what they were asked.
 
 use std::cell::{Cell, RefCell};
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
@@ -15,7 +16,7 @@ use crate::key::{KemCiphertext, KemShares, PublicKey};
 use crate::passphrase::{KdfParams, Passphrase, PassphraseRecord};
 use crate::platform::{Adapter, Grade, Label, Lacks, Property};
 use crate::refusal::Refusal;
-use crate::store::{FileKey, Files, Held, ItemName, KeystoreBackend};
+use crate::store::{FileKey, Files, Held, ItemName, KeystoreBackend, KeystoreKind};
 
 fn label(adapter: &'static str) -> Label {
     Label { adapter, grade: Grade::Dev, lacks: Lacks::of(&Property::ALL), why: "kept in memory, for tests" }
@@ -46,6 +47,10 @@ impl Adapter for MemKeystore {
 }
 
 impl KeystoreBackend for MemKeystore {
+    fn kind(&self) -> KeystoreKind {
+        KeystoreKind::Memory
+    }
+
     fn put(&self, ws: WsId, name: &ItemName, blob: &[u8]) -> Result<()> {
         self.calls.borrow_mut().push(ws);
         self.items.borrow_mut().insert((ws, *name), blob.to_vec());
@@ -68,13 +73,15 @@ impl KeystoreBackend for MemKeystore {
     }
 }
 
-/// Halti's files in memory, with a lock that excludes.
+/// Halti's files in memory, with a lock that excludes. Its label can be changed, to stand for
+/// files on another machine.
 #[derive(Default)]
 pub struct MemFiles {
     files: RefCell<BTreeMap<FileKey, Vec<u8>>>,
     locks: Rc<RefCell<BTreeSet<WsId>>>,
     calls: Cell<usize>,
     reads: RefCell<Vec<FileKey>>,
+    relabel: Cell<Option<(&'static str, Lacks)>>,
 }
 
 impl MemFiles {
@@ -92,6 +99,12 @@ impl MemFiles {
         self.reads.borrow().clone()
     }
 
+    /// From now on its label has this name and lacks only these: a machine weaker or stronger than
+    /// the one a workspace was made on, or an adapter whose name a manifest can't record.
+    pub fn label_as(&self, adapter: &'static str, lacks: Lacks) {
+        self.relabel.set(Some((adapter, lacks)));
+    }
+
     fn called(&self) {
         self.calls.set(self.calls.get() + 1);
     }
@@ -99,7 +112,10 @@ impl MemFiles {
 
 impl Adapter for MemFiles {
     fn label(&self) -> Label {
-        label("mem-files")
+        match self.relabel.get() {
+            Some((adapter, lacks)) => Label { adapter, lacks, ..label("mem-files") },
+            None => label("mem-files"),
+        }
     }
 }
 
@@ -127,6 +143,14 @@ impl Files for MemFiles {
         self.called();
         self.files.borrow_mut().insert(k.clone(), bytes.to_vec());
         Ok(())
+    }
+
+    fn create_new(&self, k: &FileKey, bytes: &[u8]) -> Result<bool> {
+        self.called();
+        let mut files = self.files.borrow_mut();
+        let Entry::Vacant(free) = files.entry(k.clone()) else { return Ok(false) };
+        free.insert(bytes.to_vec());
+        Ok(true)
     }
 
     fn append(&self, k: &FileKey, line: &[u8]) -> Result<()> {
@@ -168,14 +192,17 @@ impl Files for MemFiles {
 
 /// A software key in memory that counts how often it is asked for shares. As a key holder it keeps
 /// the commitment it is given, counts the keys it makes, and remembers every prompt it is shown
-/// (the prompt itself can't be kept: it can't be cloned). Its key ref is the one byte of its kind.
+/// (the prompt itself can't be kept: it can't be cloned) and every key ref it is told to destroy.
+/// Its key ref is the one byte of its kind.
 pub struct SoftKey {
     key: DecapKey,
     decapsulations: Cell<u32>,
     creates: Cell<u32>,
     commitment: Cell<Option<Commitment>>,
     asked: RefCell<Vec<(WsId, WsName, Change, String)>>,
+    destroyed: RefCell<Vec<KeyRef>>,
     decline: Cell<bool>,
+    grade: Cell<Grade>,
 }
 
 impl SoftKey {
@@ -187,7 +214,9 @@ impl SoftKey {
             creates: Cell::new(0),
             commitment: Cell::new(None),
             asked: RefCell::new(Vec::new()),
+            destroyed: RefCell::new(Vec::new()),
             decline: Cell::new(false),
+            grade: Cell::new(Grade::Dev),
         }
     }
 
@@ -217,9 +246,19 @@ impl SoftKey {
         self.asked.borrow().clone()
     }
 
+    /// The key ref of every `destroy` so far, in order.
+    pub fn destroyed(&self) -> Vec<KeyRef> {
+        self.destroyed.borrow().clone()
+    }
+
     /// From now on, says no to every prompt (or, given false, stops saying no).
     pub fn decline(&self, no: bool) {
         self.decline.set(no);
+    }
+
+    /// From now on its label claims this grade: a key held in software that says it is more.
+    pub fn label_grade(&self, grade: Grade) {
+        self.grade.set(grade);
     }
 
     /// Remembers the prompt, then answers it.
@@ -234,7 +273,7 @@ impl SoftKey {
 
 impl Adapter for SoftKey {
     fn label(&self) -> Label {
-        label("soft-key")
+        Label { grade: self.grade.get(), ..label("soft-key") }
     }
 }
 
@@ -267,7 +306,9 @@ impl KeyHolder for SoftKey {
         Ok(Released { shares, commitment })
     }
 
-    fn destroy(&self, _key: &KeyRef) -> Result<()> {
+    /// Remembers the key ref, and forgets the commitment.
+    fn destroy(&self, key: &KeyRef) -> Result<()> {
+        self.destroyed.borrow_mut().push(key.clone());
         self.commitment.set(None);
         Ok(())
     }
@@ -330,19 +371,26 @@ impl Anchor for MemAnchor {
 
 /// A passphrase key holder whose passphrase is already typed: the terminal's adapter without the
 /// terminal or the randomness. Its seed, salt and nonce are given, and it counts every time it
-/// asks for the passphrase.
+/// asks for the passphrase. Its label can be changed, to stand for the terminal's adapter.
 pub struct FixedPassphrase {
     answer: RefCell<String>,
     seed: [u8; 96],
     salt: [u8; 16],
     nonce: [u8; 12],
     asks: Cell<u32>,
+    relabel: Cell<Option<(&'static str, Grade)>>,
 }
 
 impl FixedPassphrase {
     /// Answers `text` when asked, and makes the key of `seed`, sealed under `salt` and `nonce`.
     pub fn new(text: &str, seed: [u8; 96], salt: [u8; 16], nonce: [u8; 12]) -> FixedPassphrase {
-        FixedPassphrase { answer: RefCell::new(text.to_string()), seed, salt, nonce, asks: Cell::new(0) }
+        FixedPassphrase { answer: RefCell::new(text.to_string()), seed, salt, nonce, asks: Cell::new(0), relabel: Cell::new(None) }
+    }
+
+    /// From now on its label has this name and claims this grade: one a release build admits, so
+    /// the adapters after it are the ones judged.
+    pub fn label_as(&self, adapter: &'static str, grade: Grade) {
+        self.relabel.set(Some((adapter, grade)));
     }
 
     /// Answers `text` from now on.
@@ -364,7 +412,10 @@ impl FixedPassphrase {
 
 impl Adapter for FixedPassphrase {
     fn label(&self) -> Label {
-        label("fixed-passphrase")
+        match self.relabel.get() {
+            Some((adapter, grade)) => Label { adapter, grade, ..label("fixed-passphrase") },
+            None => label("fixed-passphrase"),
+        }
     }
 }
 

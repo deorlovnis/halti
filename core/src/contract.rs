@@ -1,10 +1,13 @@
 //! What every adapter must do, whatever it is made of. Run here against the adapters in memory;
-//! an adapter over real files or a real keystore is held to the same.
+//! an adapter over real files or a real keystore is held to the same. Public so that an adapter's
+//! own tests, in the binary, can run them:
+//!
+//! ```
+//! let _ = halti_core::contract::files_contract;
+//! ```
 
 use crate::anchor::{Anchor, Pin};
-use crate::fakes::{MemFiles, MemKeystore};
 use crate::ids::{WsId, WsName};
-use crate::platform::Grade;
 use crate::store::{FileKey, Files, ItemName, KeystoreBackend};
 
 const A: WsId = WsId::from_bytes([0xa; 16]);
@@ -68,6 +71,12 @@ pub fn files_contract(files: &dyn Files) {
     assert_eq!(files.read(&FileKey::Policy(A)).unwrap().unwrap(), b"new", "removing one file removes that file");
     files.remove(&FileKey::Manifest(B)).unwrap();
 
+    let initech = FileKey::DirRecord(name("initech"));
+    assert!(files.create_new(&initech, b"first").unwrap(), "there was none");
+    assert!(!files.create_new(&initech, b"second").unwrap(), "there is one now");
+    assert_eq!(files.read(&initech).unwrap().unwrap(), b"first", "and it is left as it was");
+    files.remove(&initech).unwrap();
+
     let held = files.lock(A).unwrap();
     assert!(files.lock(A).is_err(), "a held lock can't be had again");
     let other = files.lock(B).unwrap();
@@ -114,8 +123,8 @@ pub fn anchor_contract(anchor: &dyn Anchor) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fakes::{FixedPassphrase, MemAnchor, SoftKey};
-    use crate::platform::{Adapter, Property};
+    use crate::fakes::{FixedPassphrase, MemAnchor, MemFiles, MemKeystore, SoftKey};
+    use crate::platform::{Adapter, Grade, Property};
 
     #[test]
     fn the_keystore_in_memory_keeps_the_contract() {

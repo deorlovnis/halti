@@ -1,6 +1,6 @@
-//! Fixed inputs and expected bytes for the tests under `crypto`, `key`, `passphrase`, `anchor` and
-//! the sequences: published vectors, each with where it comes from, and this crate's own known
-//! answers.
+//! Fixed inputs and expected bytes for the tests under `crypto`, `key`, `passphrase`, `anchor`,
+//! `directory`, `manifest` and the verbs: published vectors, each with where it comes from, and
+//! this crate's own known answers.
 
 /// Bytes from hex, skipping whitespace so a long value can be broken over lines. Panics on
 /// anything that is not a hex digit, and on an odd number of digits.
@@ -607,6 +607,11 @@ pub(crate) fn passphrase_nonce() -> [u8; 12] {
     arr(&seq(0xa0, 12))
 }
 
+/// The nonce acme's first manifest is sealed under.
+pub(crate) fn manifest_nonce() -> [u8; 12] {
+    arr(&seq(0xb0, 12))
+}
+
 /// `derive_scalar(KEM_ID, seq(0x00, 32))`.
 pub(crate) const KAT_SCALAR: &str = "c88dfa16bd1d181676c6b316dca1ec7092bb41fab16ba8e270cbcd76f3d5f5fa";
 
@@ -799,3 +804,39 @@ pub(crate) const KAT_PIN_STATE: &str = "ee641624346cbb163d1ffb52045fdbbeffd8071d
 pub(crate) const KAT_PIN: &str = "0100000000000000012a820add3dcb9200f6ea573a92c30fd048ead4cd81eaa0c9ecb666eea9c93829c63abfe3cf0c5cf8b718b0e1eff3ee3f393a49ee8923b2\
     9d89c94e8ccf677a4af4a6fe14e1fbfeb0b21ad08767acb494cac8179a651174942b330b85fd393069ee641624346cbb163d1ffb52045fdbbeffd8071de4603e\
     31b362858fff787da3668321f2354b2876dc51fe885a459f0b";
+
+// A workspace's directory record and sealed manifest: computed by an independent implementation written from the
+// specification and not from this code, once it had reproduced `KAT_KEY_STORE`, `KAT_KEY_ITEM_NAMES`, `KAT_AEAD_BLOB` and
+// `KAT_PIN_STATE` above. It takes `KAT_HARDWARE_WRAP` as a fixed input.
+
+/// acme's directory record: its id, a passphrase key and a keystore of files. 19 bytes.
+pub(crate) const KAT_DIR_RECORD: &str = "01101112131415161718191a1b1c1d1e1f0502";
+
+/// The plaintext of a manifest as a release build on macOS might write it for acme: a passphrase key and a keystore of files,
+/// trial, the adapters `passphrase-key` (weaker, lacking bits 0x00000007), `file-anchor` and `dir-files` (weaker, 0x00000060)
+/// and `file-keystore` (weaker, 0x00000020), and every place kept for later empty. 154 bytes.
+pub(crate) const KAT_MANIFEST_PLAIN: &str = "01020105020104010e706173737068726173652d6b65790200000007020b66696c652d616e63686f72020000006003096469722d66696c65730200000060040d\
+    66696c652d6b657973746f7265020000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\
+    0000000000000000000000000000000000000000000000000000";
+
+/// The key manifests are sealed under, from the inner key: `manifest` under `KEYS_ID`, as the working keys are derived.
+pub(crate) const KAT_KEY_MANIFEST: &str = "17239b76b94d6c4490f9a6a9bcf7fc05fcb1e29aca3a000a3c9650077a7c8b20";
+
+/// That plaintext sealed under that key with `manifest_nonce()`, for acme under its name. 183 bytes.
+pub(crate) const KAT_MANIFEST: &str = "01b0b1b2b3b4b5b6b7b8b9babb0795e447db8ac0695b9bfbc82af853f46de9f07595a74847a01e21497e6a625cca47d4b6fd6796728699eccef255ea66bc1d99\
+    05b5e79713a3d53fb98539621b25fa7389a82d3ad5dc23723c2c4a1987bc60ebed5059b6ca935cb129b4d53bc90708a13d8a52bbca375f97e78e4b003418989b\
+    d689dcd14e59142955a93718a1227bd5b6a754330bb5f7481532f29a84ba43e667ebfe0e86d25fcf071420b48c2e8e1a24bf4cdb860526";
+
+/// The pin's hash of the name acme, the wrap `KAT_HARDWARE_WRAP`, the manifest `KAT_MANIFEST` and no policy.
+pub(crate) const KAT_WS_PIN_STATE: &str = "3ca3a22478f04fc629222efeaa6db7cd19761d2aed451f019ad8ba938df78751d66063ae03e8cb55b38f4315e73e18d8";
+
+/// The manifest a debug build on macOS writes for acme with the adapters in memory: a key held in software (`soft-key`) and a
+/// keystore in memory, trial, `soft-key`, `mem-anchor`, `mem-files` and `mem-keystore` each dev and lacking all thirteen
+/// properties (0x00001fff), every place kept for later empty; sealed under the inner key with `manifest_nonce()`. 175 bytes.
+pub(crate) const KAT_DEV_MANIFEST: &str = "01b0b1b2b3b4b5b6b7b8b9babb0796e446d88ac0695d98f5dd2da550e3759b9558e13d334fcd7b4c631d0f675dc950f8d7931b011efdf689a3df538003bd07ea\
+    28d3910472dcba5ad4a832036f30e7709ee0475facb0a81d4e49481987bc40ebed5059b6ca935cb129b4d53bc90708a13d8a52bbca375f97e78e4b003418989b\
+    d689dcd14e59142955a93718a1227bd5b6a754330bb5f7481532f29a84ba43e1e0a5cf0d0d4bc49bb6b5b247d0a447";
+
+/// The pin's hash of the name acme, the wrap `KAT_HARDWARE_WRAP`, the manifest `KAT_DEV_MANIFEST` and no policy: the state of
+/// acme's first pin when a debug build makes it with a key held in software.
+pub(crate) const KAT_DEV_PIN_STATE: &str = "623c145f562b8922a6892b431050eda1a041e0f191e4536cb94a32e37199d422d48fb2e991eacd4e0911f14e42791d4c";

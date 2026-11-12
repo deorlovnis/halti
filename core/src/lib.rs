@@ -19,17 +19,18 @@
 #![forbid(unsafe_code)]
 
 pub mod anchor;
+pub mod contract;
 pub mod crypto;
+pub mod directory;
 pub mod holder;
 pub mod ids;
 pub mod key;
+pub mod manifest;
 pub mod passphrase;
 pub mod platform;
 pub mod refusal;
 pub mod store;
 pub mod verbs;
 
-#[cfg(test)]
-mod contract;
 #[cfg(test)]
 mod fakes;
