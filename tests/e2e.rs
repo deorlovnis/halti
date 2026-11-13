@@ -10,6 +10,7 @@
 //!
 //! Run those with `mise run e2e-opt-in`; they are #[ignore]d otherwise.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -412,6 +413,220 @@ fn policy_edit_shows_a_diff_against_the_approved_version() {
 
     env.halti(&["policy", "approve", "app"]);
     assert!(stdout(&edit(&env)).contains("no change from the approved policy"));
+}
+
+// --- rm, reseal, check and describe ---
+
+/// Every item in the fake Keychain, by its file name, with its bytes.
+fn keychain_items(env: &Env) -> BTreeMap<String, Vec<u8>> {
+    fs::read_dir(env.dir.join("keychain")).unwrap().map(|e| e.unwrap()).map(|e| (e.file_name().into_string().unwrap(), fs::read(e.path()).unwrap())).collect()
+}
+
+fn index_text(env: &Env) -> String {
+    fs::read_to_string(env.dir.join("index.json")).unwrap()
+}
+
+/// The index entry `Env::store` makes, as `halti` writes it back: fields with no dates.
+fn stored_entry(res: &str, fields: &[&str]) -> String {
+    let fields: Vec<String> = fields.iter().map(|f| format!("      \"{f}\": {{}}")).collect();
+    format!("  \"{res}\": {{\n    \"url\": \"\",\n    \"description\": \"the {res} test site\",\n    \"fields\": {{\n{}\n    }}\n  }}", fields.join(",\n"))
+}
+
+/// Exit code 1, and on stderr only what the error says.
+fn failed_with(out: &Output, error: &str) {
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(out));
+    assert_eq!(stderr(out), format!("halti: {error}\n"));
+    assert_eq!(stdout(out), "");
+}
+
+#[test]
+fn rm_removes_the_values_and_the_approval() {
+    let env = Env::new();
+    env.store("app", "login", "someone");
+    env.store("app", "token", TOKEN);
+    env.store("other", "token", "other-token");
+    env.policy("app", "[run]\nmode = \"allow\"\nexport = { token = \"APP_TOKEN\" }\n");
+    let keychain = env.dir.join("keychain");
+    let item = |name: &str| keychain.join(name).exists();
+    assert!(item("app._policy"));
+
+    // One field: its value and its line go, and the policy stays approved.
+    let out = env.halti(&["rm", "app", "login"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "removed app/login\n");
+    assert_eq!(stderr(&out), "");
+    assert!(!item("app.login") && item("app.token") && item("app._policy"));
+    assert_eq!(index_text(&env), format!("{{\n{},\n{}\n}}\n", stored_entry("app", &["token"]), stored_entry("other", &["token"])));
+
+    // A field with no value is said on stderr, and the command still succeeds.
+    let out = env.halti(&["rm", "app", "nothing"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "removed app/nothing\n");
+    assert_eq!(stderr(&out), "halti: app/nothing not in Keychain\n");
+
+    // The whole resource: every value it lists, its approval and its line; its policy file stays.
+    env.store("app", "session", "gone already");
+    fs::remove_file(keychain.join("app.session")).unwrap();
+    let out = env.halti(&["rm", "app"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "removed app\n");
+    assert_eq!(stderr(&out), "halti: app/session not in Keychain\n");
+    assert!(!item("app.token") && !item("app._policy"));
+    assert!(env.dir.join("policy/app.toml").exists());
+    assert_eq!(keychain_items(&env), BTreeMap::from([("other.token".to_string(), b"other-token".to_vec())]));
+    assert_eq!(index_text(&env), format!("{{\n{}\n}}\n", stored_entry("other", &["token"])));
+    assert!(stdout(&env.halti(&["policy", "show", "app"])).contains("(not approved)\n"));
+
+    // A resource the index doesn't list can't be removed whole; a field of it is tried anyway.
+    failed_with(&env.halti(&["rm", "app"]), "app doesn't exist (create it with: halti set app FIELD)");
+    let out = env.halti(&["rm", "app", "token"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "removed app/token\n");
+    assert_eq!(stderr(&out), "halti: app/token not in Keychain\n");
+    assert_eq!(index_text(&env), format!("{{\n{}\n}}\n", stored_entry("other", &["token"])));
+}
+
+#[test]
+fn reseal_keeps_every_value() {
+    let env = Env::new();
+    env.store("app", "login", "someone\non two lines\n");
+    env.store("app", "token", TOKEN);
+    env.store("draft", "token", "draft-token");
+    env.store("gone", "token", "removed by hand");
+    fs::remove_file(env.dir.join("keychain/gone.token")).unwrap();
+    env.policy("app", "[run]\nmode = \"allow\"\nexport = { token = \"APP_TOKEN\" }\n");
+    env.write_policy("draft", "[run]\nmode = \"allow\"\nexport = { token = \"DRAFT_TOKEN\" }\n");
+    let (items, index) = (keychain_items(&env), index_text(&env));
+
+    // Every resource the index lists, field by field; a policy that isn't approved is named.
+    let out = env.halti(&["reseal"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "resealed app/login\nresealed app/token\nresealed draft/token\napprove draft's policy again: halti policy approve draft\n");
+    assert_eq!(stderr(&out), "halti: gone/token not in Keychain, skipped\n");
+    assert_eq!(keychain_items(&env), items, "every value and approval keeps its bytes");
+    assert_eq!(index_text(&env), index);
+
+    // Only the ones named.
+    let out = env.halti(&["reseal", "app"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "resealed app/login\nresealed app/token\n");
+    assert_eq!(stderr(&out), "");
+    assert_eq!(keychain_items(&env), items);
+    assert!(stdout(&env.halti(&["policy", "show", "app"])).contains("(approved)\n"));
+
+    failed_with(&env.halti(&["reseal", "nope"]), "nope doesn't exist (create it with: halti set nope FIELD)");
+    assert_eq!(keychain_items(&env), items);
+}
+
+#[test]
+fn check_reports_expiry_and_refreshes_what_is_due() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use jiff::ToSpan;
+
+    let env = Env::new();
+    let today = jiff::Zoned::now().date();
+    let day = |n: i64| today.checked_add(n.days()).unwrap().to_string();
+
+    // A refreshed token that says when it expires, an hour from now.
+    let exp = jiff::Timestamp::now().as_second() + 3600;
+    let jwt = format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(format!("{{\"exp\":{exp}}}")));
+    let until = jiff::Timestamp::from_second(exp).unwrap().to_zoned(jiff::tz::TimeZone::system()).strftime("%Y-%m-%d %H:%M").to_string();
+    let script = |name: &str, body: &str| {
+        let path = env.dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        path.display().to_string()
+    };
+    let (fresh, fails, unused) = (script("fresh.sh", &format!("printf '%s' '{jwt}'")), script("fails.sh", "exit 1"), script("unused.sh", "printf 'not-due'"));
+
+    for (res, field, value) in [("app", "later", "a1"), ("app", "old", "a2"), ("app", "token", "a3"), ("auto", "key", "k0"), ("auto", "token", "t0"), ("broken", "token", "b0")] {
+        env.store(res, field, value);
+    }
+    let index = json!({
+        "app": { "url": "https://app.example.com/tokens", "description": "", "fields": {
+            "later": { "expires": day(30) }, "old": { "expires": day(-10) }, "token": { "expires": day(3) } } },
+        "auto": { "url": "", "description": "", "fields": { "key": { "expires": day(5) }, "token": { "expires": day(-1) } } },
+        "broken": { "url": "https://broken.example.com", "description": "", "fields": { "token": { "expires": day(-1) } } },
+    });
+    fs::write(env.dir.join("index.json"), index.to_string()).unwrap();
+    env.policy("auto", &format!("[refresh.token]\nrun = \"{fresh}\"\n[refresh.key]\nrun = \"{unused}\"\n"));
+    env.policy("broken", &format!("[refresh.token]\nrun = \"{fails}\"\n"));
+    let value = |name: &str| fs::read_to_string(env.dir.join("keychain").join(name)).unwrap();
+
+    // What refreshes and is due goes first, then whatever is still expired or due in 7 days is listed.
+    let out = env.halti(&["check", "7"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        format!(
+            "app/old expired 10d ago ({}) — rotate at https://app.example.com/tokens\n\
+             app/token expires in 3d ({}) — rotate at https://app.example.com/tokens\n\
+             broken/token expired and auto-refresh failed (halti refresh broken) — rotate at https://broken.example.com\n",
+            day(-10),
+            day(3)
+        )
+    );
+    assert_eq!(stderr(&out), format!("halti: refreshed auto/token (expires {until})\nhalti: refresh script for broken/token failed (exit status: 1)\n"));
+    assert_eq!((value("auto.token"), value("auto.key"), value("broken.token")), (jwt.clone(), "k0".to_string(), "b0".to_string()));
+    let saved: Value = serde_json::from_str(&index_text(&env)).unwrap();
+    assert_eq!(saved["auto"]["fields"]["token"]["expires_at"], json!(jiff::Timestamp::from_second(exp).unwrap()));
+    assert_eq!(saved["auto"]["fields"]["token"]["updated"], json!(day(0)));
+
+    // A token refreshed a moment ago isn't due again; a narrower window lists less.
+    let out = env.halti(&["check", "2"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        format!(
+            "app/old expired 10d ago ({}) — rotate at https://app.example.com/tokens\n\
+             broken/token expired and auto-refresh failed (halti refresh broken) — rotate at https://broken.example.com\n",
+            day(-10)
+        )
+    );
+    assert_eq!(stderr(&out), "halti: refresh script for broken/token failed (exit status: 1)\n");
+    assert_eq!(value("auto.token"), jwt);
+
+    // Nothing due, nothing said.
+    let env = Env::new();
+    env.store("app", "token", TOKEN);
+    let out = env.halti(&["check", "7"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!((stdout(&out), stderr(&out)), (String::new(), String::new()));
+}
+
+#[test]
+fn describe_keeps_the_values() {
+    let env = Env::new();
+    env.store("app", "login", "someone");
+    env.store("app", "token", TOKEN);
+    env.policy("app", "[run]\nmode = \"allow\"\nexport = { token = \"APP_TOKEN\" }\n");
+    let mut index: Value = serde_json::from_str(&index_text(&env)).unwrap();
+    index["app"]["fields"]["token"] = json!({ "updated": "2026-01-02", "expires": "2027-01-02" });
+    fs::write(env.dir.join("index.json"), index.to_string()).unwrap();
+    let items = keychain_items(&env);
+    let described = |url: &str, desc: &str| {
+        format!(
+            "{{\n  \"app\": {{\n    \"url\": \"{url}\",\n    \"description\": \"{desc}\",\n    \"fields\": {{\n      \"login\": {{}},\n      \"token\": {{\n        \
+             \"updated\": \"2026-01-02\",\n        \"expires\": \"2027-01-02\"\n      }}\n    }}\n  }}\n}}\n"
+        )
+    };
+
+    let out = env.halti(&["describe", "app", "--url", "https://app.example.com/tokens", "--desc", "The app"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!((stdout(&out), stderr(&out)), ("updated app\n".to_string(), String::new()));
+    assert_eq!(index_text(&env), described("https://app.example.com/tokens", "The app"));
+
+    // "" clears one, and the other stays.
+    let out = env.halti(&["describe", "app", "--desc", ""]);
+    assert_eq!((stdout(&out), stderr(&out)), ("updated app\n".to_string(), String::new()));
+    assert_eq!(index_text(&env), described("https://app.example.com/tokens", ""));
+
+    // With no flags and no terminal there is nothing to ask, and nothing changes.
+    failed_with(&env.halti(&["describe", "app"]), "give --url and/or --desc, or run in a terminal to be prompted");
+    failed_with(&env.halti(&["describe", "nope", "--desc", "x"]), "nope doesn't exist (create it with: halti set nope FIELD)");
+    assert_eq!(index_text(&env), described("https://app.example.com/tokens", ""));
+    assert_eq!(keychain_items(&env), items, "values and the approval keep their bytes");
+    assert!(stdout(&env.halti(&["policy", "show", "app"])).contains("(approved)\n"));
 }
 
 // --- halti mcp ---
