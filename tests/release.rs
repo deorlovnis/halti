@@ -263,6 +263,9 @@ const TEMPLATE: &str = "# halti config. edit with: halti config\n\n[approval]\nd
                         config  = \"sudo\"              # a change to this file: sudo\n\n[paths]\nworkspaces = \"~/Library/Application Support/halti/ws\"\n\n\
                         [passwords]\nmanager = \"none\"              # none\n\n[secrets]\nstore = \"files\"               # files\n\n[workspace]\n\
                         passphrase = \"own\"            # own | generate\n\n[workspace.approval]\nopen   = \"passphrase\"         # opening a workspace: passphrase\n\
+                        set    = \"passphrase\"         # storing a secret in a workspace: passphrase\n\
+                        rm     = \"passphrase\"         # removing secrets from a workspace: passphrase\n\
+                        policy = \"passphrase\"         # approving a policy in a workspace: passphrase\n\
                         delete = \"passphrase\"         # deleting a workspace: passphrase\n";
 
 #[test]

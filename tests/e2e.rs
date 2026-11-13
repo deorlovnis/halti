@@ -1657,6 +1657,455 @@ fn storing_a_secret_is_never_approved_by_nothing() {
     assert!(out.status.success() && asked(&out) == 1, "{}", stderr(&out));
 }
 
+// --- a workspace's policies ---
+
+/// The policy the tests approve in acme, and the first 12 hex characters of its sha256.
+const POLICY_TEXT: &str = "[fetch]\nhosts = [\"https://api.github.com\"]\n";
+const POLICY_SHA: &str = "80982e4c451a";
+
+/// A workspace's policies folder.
+fn policies_dir(env: &Env, name: &str) -> PathBuf {
+    ws_dir(env).join(ws_id(env, name)).join("policies")
+}
+
+/// The first 12 hex characters of the sha256 of `text`, as halti shows a policy's.
+fn sha12(text: &str) -> String {
+    sha256(text.as_bytes())[..12].to_string()
+}
+
+/// `halti ws policy edit TARGET` with an "editor" that writes `text` over the file. Standard input
+/// isn't a terminal, so nothing is offered or asked.
+fn ws_policy_edit(env: &Env, target: &str, text: &str) -> Output {
+    let file = env.dir.join("edited-policy.toml");
+    fs::write(&file, text).unwrap();
+    let mut command = env.command();
+    command.args(["ws", "policy", "edit", target]).env("EDITOR", format!("cp {}", file.display())).env_remove("VISUAL").env("HALTI_TEST_PASSPHRASE", PASSPHRASE);
+    command.output().unwrap()
+}
+
+/// As `ws_policy_edit`, with standard input a terminal, as a person runs it: once halti asks
+/// whether to approve, `meanwhile` runs, then "y" is typed.
+fn ws_policy_edit_then_y(env: &Env, target: &str, text: &str, meanwhile: impl FnOnce()) -> Output {
+    let file = env.dir.join("edited-policy.toml");
+    fs::write(&file, text).unwrap();
+    let (person, terminal) = pty();
+    let mut command = env.command();
+    command.args(["ws", "policy", "edit", target]).env("EDITOR", format!("cp {}", file.display())).env_remove("VISUAL").env("HALTI_TEST_PASSPHRASE", PASSPHRASE);
+    let mut child = command.stdin(terminal).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut said = child.stderr.take().unwrap();
+    let mut err = Vec::new();
+    let mut byte = [0];
+    while !err.ends_with(b"Approve it now? [y/N] ") && said.read(&mut byte).unwrap() == 1 {
+        err.push(byte[0]);
+    }
+    meanwhile();
+    (&person).write_all(b"y\n").unwrap();
+    said.read_to_end(&mut err).unwrap();
+    let out = child.wait_with_output().unwrap();
+    Output { stderr: err, ..out }
+}
+
+/// Exit code 1, on stderr only `error` after what the passphrase questions say, and on stdout at
+/// most what was shown to approve: never a line that says something was approved.
+fn refused_with(out: &Output, error: &str) {
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(out));
+    assert!(stderr(out).ends_with(&format!("halti: {error}\n")), "{}", stderr(out));
+    let said = stdout(out);
+    assert!(said.lines().all(|line| !line.starts_with("approved the policy") && !line.ends_with("was approved already")), "{said}");
+}
+
+#[test]
+fn a_workspace_policy_is_edited_approved_and_shown() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let version = pin_version(&env, "acme");
+    let dir = policies_dir(&env, "acme");
+    let file = dir.join("github.toml");
+    let path = file.display();
+
+    // Left as the template: saved, nothing asked, and the template is the workspace's own.
+    let out = env.command().args(["ws", "policy", "edit", "acme/github"]).env("EDITOR", "true").env_remove("VISUAL").env("HALTI_TEST_PASSPHRASE", PASSPHRASE).output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), format!("saved {path} — it takes effect once approved: halti ws policy approve acme/github\n"));
+    assert_eq!((prompted(&out), asked(&out)), (0, 0));
+    let template = fs::read_to_string(&file).unwrap();
+    assert!(template.starts_with("# halti policy for github in acme. It takes effect only once approved: halti ws policy approve acme/github\n\n# [fetch]\n"), "{template}");
+    assert!(!template.contains("[run]") && !template.contains("[agent]") && !template.contains("refresh"), "{template}");
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!((mode(&dir), mode(&file)), (0o700, 0o600));
+    assert_eq!(pin_version(&env, "acme"), version, "editing writes nothing sealed");
+
+    // Edited, and approved with "y": what was read is shown whole, then the passphrase, once.
+    let out = ws_policy_edit_then_y(&env, "acme/github", POLICY_TEXT, || {});
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = format!(
+        "saved {path} — it takes effect once approved: halti ws policy approve acme/github\n\
+         Policy for github in acme ({path}), new:\n\n[fetch]\nhosts = [\"https://api.github.com\"]\n\nsha256 {POLICY_SHA}\n\n\
+         approved the policy for github in acme\n"
+    );
+    assert_eq!(stdout(&out), said);
+    // On the terminal the question's answer ends its line; here the prompt follows it on the same line.
+    assert_eq!((stderr(&out).matches("halti: [test] [DEV, not protected] approve policies in workspace acme\n").count(), asked(&out)), (1, 1), "{}", stderr(&out));
+    assert_eq!(pin_version(&env, "acme"), version + 1);
+    assert_eq!(fs::read_to_string(dir.join("approved/github.toml")).unwrap(), POLICY_TEXT);
+    assert_eq!((mode(&dir.join("approved")), mode(&dir.join("approved/github.toml"))), (0o700, 0o600));
+
+    // Shown: one passphrase, the status, and the bytes that were hashed. Nothing written.
+    let before = ws_files(&env);
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme/github"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), format!("{path} (approved)\n\n[fetch]\nhosts = [\"https://api.github.com\"]\n"));
+    assert_eq!((prompted(&out), asked(&out)), (1, 1));
+    assert!(stderr(&out).contains("halti: [test] [DEV, not protected] open workspace acme\n"), "{}", stderr(&out));
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme"]);
+    assert_eq!(stdout(&out), "RESOURCE         POLICY\ngithub           approved\n", "{}", stderr(&out));
+    assert_eq!((prompted(&out), asked(&out)), (1, 1));
+    assert!(ws_files(&env) == before && pin_version(&env, "acme") == version + 1, "showing writes nothing");
+
+    // Edited to the same text: nothing to approve, and nothing more is said.
+    let out = ws_policy_edit(&env, "acme/github", POLICY_TEXT);
+    assert!(out.status.success() && stdout(&out) == "no change from the approved policy for github in acme\n" && prompted(&out) == 0, "{}{}", stdout(&out), stderr(&out));
+    // Approving one shows its whole text, whatever its copy says.
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme/github"]);
+    let said =
+        format!("Policy for github in acme ({path}), unchanged:\n\n{}\n\nsha256 {POLICY_SHA}\n\nthe policy for github in acme was approved already\n", POLICY_TEXT.trim_end());
+    assert!(out.status.success() && stdout(&out) == said && asked(&out) == 1, "{}{}", stdout(&out), stderr(&out));
+    assert!(ws_files(&env) == before, "approved already: nothing written");
+
+    // No file: said, and nothing asked. A file asked for and missing is refused before anything is asked.
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme/slack"]);
+    assert!(out.status.success() && stdout(&out) == "no policy file for slack in acme. write one with: halti ws policy edit acme/slack\n" && prompted(&out) == 0);
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme/slack"]);
+    refused_with(&out, "acme has no policy file for slack. write one with: halti ws policy edit acme/slack");
+    assert_eq!(prompted(&out), 0);
+    for args in [&["ws", "policy", "approve", "initech"][..], &["ws", "policy", "show", "initech/github"], &["ws", "policy", "edit", "initech/github"]] {
+        let out = ws(&env, PASSPHRASE, args);
+        refused_with(&out, "there is no workspace named initech");
+        assert_eq!(prompted(&out), 0, "{args:?}");
+    }
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "edit", "acme"]);
+    assert!(stderr(&out).contains("error: invalid value 'acme' for '<WS/RESOURCE>': use a workspace and a resource, e.g. acme/github"), "{}", stderr(&out));
+    for target in ["acme/GitHub", "Acme", "acme/github/x"] {
+        let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", target]);
+        assert!(stderr(&out).contains("use a workspace, or a workspace and a resource, e.g. acme/github") && prompted(&out) == 0, "{target}: {}", stderr(&out));
+    }
+    // A file name a policy can't have is refused, not skipped.
+    fs::write(dir.join("Linear.toml"), POLICY_TEXT).unwrap();
+    for args in [&["ws", "policy", "approve", "acme"][..], &["ws", "policy", "show", "acme"]] {
+        let out = ws(&env, PASSPHRASE, args);
+        refused_with(&out, &format!("{} isn't a policy file name: use a-z, 0-9 and -", dir.join("Linear.toml").display()));
+        assert_eq!(prompted(&out), 0, "{args:?}");
+    }
+}
+
+#[test]
+fn approve_all_shows_new_changed_and_unchanged() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let dir = policies_dir(&env, "acme");
+    let (linear, slack) = ("[fetch]\nhosts = [\"https://api.linear.example\"]\n", "[fetch]\nhosts = [\"https://slack.example\"]\n");
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme"]);
+    refused_with(&out, "acme has no policy files. write one with: halti ws policy edit acme/RESOURCE");
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme"]);
+    assert_eq!(stdout(&out), "acme has no policy files. write one with: halti ws policy edit acme/RESOURCE\n");
+    for (target, text) in [("acme/linear", linear), ("acme/slack", slack)] {
+        assert!(ws_policy_edit(&env, target, text).status.success());
+    }
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme"]);
+    assert!(out.status.success() && stdout(&out).ends_with("approved the policy for linear in acme\napproved the policy for slack in acme\n"), "{}", stderr(&out));
+
+    // github new, linear changed, slack as approved.
+    let wider = format!("{linear}writes = \"ask\"\n");
+    assert!(ws_policy_edit(&env, "acme/github", POLICY_TEXT).status.success());
+    assert!(ws_policy_edit(&env, "acme/linear", &wider).status.success());
+    let version = pin_version(&env, "acme");
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let path = |resource: &str| dir.join(format!("{resource}.toml")).display().to_string();
+    let said = format!(
+        "Policy for github in acme ({}), new:\n\n[fetch]\nhosts = [\"https://api.github.com\"]\n\nsha256 {POLICY_SHA}\n\n\
+         Policy for linear in acme ({}), changed:\n--- approved\n+++ now\n@@ -1,2 +1,3 @@\n [fetch]\n hosts = [\"https://api.linear.example\"]\n+writes = \"ask\"\nsha256 {}\n\n\
+         Policy for slack in acme ({}), unchanged, sha256 {}\n\n\
+         approved the policy for github in acme\napproved the policy for linear in acme\nthe policy for slack in acme was approved already\n",
+        path("github"),
+        path("linear"),
+        sha12(&wider),
+        path("slack"),
+        sha12(slack)
+    );
+    assert_eq!(stdout(&out), said);
+    assert_eq!((prompted(&out), asked(&out), pin_version(&env, "acme")), (1, 1, version + 1), "one passphrase, one change");
+
+    // The approved copy of linear changed: shown against it, then refused after the passphrase, and nothing is written.
+    let narrower = format!("{linear}writes = \"deny\"\n");
+    assert!(ws_policy_edit(&env, "acme/linear", &narrower).status.success());
+    fs::write(dir.join("approved/linear.toml"), linear).unwrap();
+    let before = ws_files(&env);
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme"]);
+    refused_with(&out, "the approved copy of linear in acme isn't what was approved, so nothing was approved. approve it alone: halti ws policy approve acme/linear");
+    assert_eq!(asked(&out), 1);
+    assert!(ws_files(&env) == before, "nothing was written");
+    // Approved alone, its whole text is shown, and the copy is written again.
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme/linear"]);
+    let said =
+        format!("Policy for linear in acme ({}), changed:\n\n{}\n\nsha256 {}\n\napproved the policy for linear in acme\n", path("linear"), narrower.trim_end(), sha12(&narrower));
+    assert!(out.status.success() && stdout(&out) == said, "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(fs::read_to_string(dir.join("approved/linear.toml")).unwrap(), narrower);
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme"]);
+    assert_eq!(stdout(&out), "RESOURCE         POLICY\ngithub           approved\nlinear           approved\nslack            approved\n");
+}
+
+#[test]
+fn edit_then_y_approves_the_bytes_it_diffed() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert!(ws_policy_edit_then_y(&env, "acme/github", POLICY_TEXT, || {}).status.success());
+    let file = policies_dir(&env, "acme").join("github.toml");
+    let path = file.display().to_string();
+    let wider = format!("{POLICY_TEXT}writes = \"ask\"\n");
+    // While halti asks, the file is changed again: what was diffed is what is approved.
+    let planted = format!("{POLICY_TEXT}writes = \"allow\"\n");
+    let out = ws_policy_edit_then_y(&env, "acme/github", &wider, || fs::write(&file, &planted).unwrap());
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = format!(
+        "--- approved\n+++ now\n@@ -1,2 +1,3 @@\n [fetch]\n hosts = [\"https://api.github.com\"]\n+writes = \"ask\"\n\n\
+         saved {path} — it takes effect once approved: halti ws policy approve acme/github\nsha256 {}\n\napproved the policy for github in acme\n",
+        sha12(&wider)
+    );
+    assert_eq!(stdout(&out), said);
+    assert_eq!(asked(&out), 1);
+    let approved = policies_dir(&env, "acme").join("approved/github.toml");
+    assert_eq!(fs::read_to_string(&approved).unwrap(), wider);
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme/github"]);
+    assert!(stdout(&out).starts_with(&format!("{path} (changed since approval)\n\n")) && stdout(&out).contains("\"allow\""), "{}", stdout(&out));
+    fs::write(&file, &wider).unwrap();
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme/github"]);
+    assert!(stdout(&out).starts_with(&format!("{path} (approved)\n\n")), "{}", stdout(&out));
+}
+
+#[test]
+fn an_edited_workspace_policy_reads_as_changed_until_approved_again() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert!(ws_policy_edit(&env, "acme/github", POLICY_TEXT).status.success());
+    assert!(ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme/github"]).status.success());
+    let path = policies_dir(&env, "acme").join("github.toml").display().to_string();
+    let wider = format!("{POLICY_TEXT}writes = \"ask\"\n");
+    let out = ws_policy_edit(&env, "acme/github", &wider);
+    let said = format!(
+        "--- approved\n+++ now\n@@ -1,2 +1,3 @@\n [fetch]\n hosts = [\"https://api.github.com\"]\n+writes = \"ask\"\n\n\
+         saved {path} — it takes effect once approved: halti ws policy approve acme/github\n"
+    );
+    assert!(out.status.success() && stdout(&out) == said && prompted(&out) == 0, "{}{}", stdout(&out), stderr(&out));
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme/github"]);
+    assert_eq!(stdout(&out), format!("{path} (changed since approval)\n\n{}\n", wider.trim_end()));
+    assert_eq!(stdout(&ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme"])), "RESOURCE         POLICY\ngithub           changed since approval\n");
+    assert!(ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme"]).status.success());
+    assert_eq!(stdout(&ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme"])), "RESOURCE         POLICY\ngithub           approved\n");
+}
+
+#[test]
+fn approving_twice_writes_nothing_the_second_time() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert!(ws_policy_edit(&env, "acme/github", POLICY_TEXT).status.success());
+    assert!(ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme"]).status.success());
+    let path = policies_dir(&env, "acme").join("github.toml").display().to_string();
+    let before = ws_files(&env);
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme"]);
+    let said = format!("Policy for github in acme ({path}), unchanged, sha256 {POLICY_SHA}\n\nthe policy for github in acme was approved already\n");
+    assert!(out.status.success() && stdout(&out) == said, "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(asked(&out), 1, "the passphrase is still asked");
+    assert!(ws_files(&env) == before, "every file as it was, the pin too");
+    // A removed copy: approving all of them can't show this one against it, so it is refused; approved alone, the copy is written again.
+    let copy = policies_dir(&env, "acme").join("approved/github.toml");
+    fs::remove_file(&copy).unwrap();
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme"]);
+    refused_with(&out, "the approved copy of github in acme isn't what was approved, so nothing was approved. approve it alone: halti ws policy approve acme/github");
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme/github"]);
+    assert!(out.status.success() && stdout(&out).ends_with("the policy for github in acme was approved already\n"), "{}", stderr(&out));
+    assert!(ws_files(&env) == before, "the copy is back, and nothing else changed");
+}
+
+#[test]
+fn a_workspace_policy_can_t_refresh() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let file = policies_dir(&env, "acme").join("github.toml");
+    let why = format!("{}: in a workspace, [refresh] can't be used yet, and [run] and [agent] must keep their defaults", file.display());
+    let refreshing = format!("{POLICY_TEXT}\n[refresh.token]\nrun = \"~/refresh/github.sh\"\n");
+    let out = ws_policy_edit(&env, "acme/github", &refreshing);
+    refused_with(&out, &why);
+    assert_eq!(fs::read_to_string(&file).unwrap(), refreshing, "the file stays as the editor left it");
+    let before = ws_files(&env);
+    for args in [&["ws", "policy", "approve", "acme/github"][..], &["ws", "policy", "approve", "acme"], &["ws", "policy", "show", "acme/github"]] {
+        let out = ws(&env, PASSPHRASE, args);
+        refused_with(&out, &why);
+        assert_eq!(prompted(&out), 0, "{args:?}: nothing asked");
+    }
+    // Nor [run] or [agent] other than their defaults, nor a host in other letters.
+    for (text, why) in [
+        ("[run]\nmode = \"allow\"\n".to_string(), why.clone()),
+        ("[agent]\nconsent = \"none\"\n".to_string(), why.clone()),
+        (
+            "[fetch]\nhosts = [\"https://\u{430}pi.github.com\"]\n".to_string(),
+            format!("{}: line 2 has a character that isn't plain ASCII. write a host with other letters in its xn-- form", file.display()),
+        ),
+    ] {
+        refused_with(&ws_policy_edit(&env, "acme/github", &text), &why);
+        refused_with(&ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme/github"]), &why);
+    }
+    // One that doesn't parse gets today's error, with its path.
+    let out = ws_policy_edit(&env, "acme/github", "[fetch]\nhosts = \"one\"\n");
+    assert!(!out.status.success() && stderr(&out).starts_with(&format!("halti: {}: ", file.display())), "{}", stderr(&out));
+    assert!(ws_files(&env).iter().filter(|(path, _)| !path.ends_with("github.toml")).eq(before.iter().filter(|(path, _)| !path.ends_with("github.toml"))));
+}
+
+#[test]
+fn a_planted_or_copied_approval_approves_nothing() {
+    let env = Env::new();
+    // github approved in the Keychain, and its file copied into acme.
+    env.policy("github", POLICY_TEXT);
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert!(ws_policy_edit(&env, "acme/github", POLICY_TEXT).status.success());
+    let dir = policies_dir(&env, "acme");
+    let show = || stdout(&ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme/github"]));
+    assert!(show().contains("(not approved)"), "{}", show());
+    // A copy planted as the approved one: still not approved, and approving all is refused.
+    fs::create_dir_all(dir.join("approved")).unwrap();
+    fs::write(dir.join("approved/github.toml"), POLICY_TEXT).unwrap();
+    assert!(show().contains("(not approved)"), "{}", show());
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme"]);
+    refused_with(&out, "the approved copy of github in acme isn't what was approved, so nothing was approved. approve it alone: halti ws policy approve acme/github");
+    assert!(stdout(&out).contains(", unchanged, sha256 "), "shown against the planted copy: {}", stdout(&out));
+    assert!(show().contains("(not approved)"));
+
+    // globex's sealed manifest, with its approval, put over acme's: refused before anything is asked.
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "globex"]).status.success());
+    assert!(ws_policy_edit(&env, "globex/github", POLICY_TEXT).status.success());
+    assert!(ws(&env, PASSPHRASE, &["ws", "policy", "approve", "globex"]).status.success());
+    let manifest = |name: &str| ws_dir(&env).join(ws_id(&env, name)).join("manifest");
+    let acme_s = fs::read(manifest("acme")).unwrap();
+    fs::copy(manifest("globex"), manifest("acme")).unwrap();
+    for args in [&["ws", "policy", "show", "acme/github"][..], &["ws", "policy", "show", "acme"], &["ws", "policy", "approve", "acme/github"]] {
+        let out = ws(&env, PASSPHRASE, args);
+        assert!(!out.status.success() && stderr(&out).contains("can't be opened") && prompted(&out) == 0 && asked(&out) == 0, "{args:?}: {}", stderr(&out));
+    }
+    fs::write(manifest("acme"), acme_s).unwrap();
+    // A policy file planted where the workspace's own would be: refused before anything is asked.
+    let planted = ws_dir(&env).join(ws_id(&env, "acme")).join("policy");
+    fs::write(&planted, POLICY_TEXT).unwrap();
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme/github"]);
+    assert!(!out.status.success() && prompted(&out) == 0 && asked(&out) == 0, "{}", stderr(&out));
+    fs::remove_file(&planted).unwrap();
+    assert!(show().contains("(not approved)"), "{}", show());
+}
+
+#[test]
+fn rm_of_a_resource_drops_its_policy_approval() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert!(ws_with(&env, PASSPHRASE, &["ws", "set", "acme/github", "token"], VALUE.as_bytes()).status.success());
+    assert!(ws_policy_edit(&env, "acme/github", POLICY_TEXT).status.success());
+    assert!(ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme/github"]).status.success());
+    let dir = policies_dir(&env, "acme");
+    let show = || stdout(&ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme/github"]));
+    // One field: the approval stays.
+    assert!(ws(&env, PASSPHRASE, &["ws", "rm", "acme/github", "token"]).status.success());
+    assert!(show().contains("(approved)"), "{}", show());
+    // The whole resource, with no secret left: the approval goes, and its copy; the file stays.
+    let version = pin_version(&env, "acme");
+    let out = ws(&env, PASSPHRASE, &["ws", "rm", "acme/github"]);
+    assert!(out.status.success() && stdout(&out) == "removed github from acme\n" && asked(&out) == 1, "{}", stderr(&out));
+    assert_eq!(pin_version(&env, "acme"), version + 1);
+    assert!(show().contains("(not approved)"), "{}", show());
+    assert!(dir.join("github.toml").exists() && !dir.join("approved/github.toml").exists());
+    // With neither a secret nor an approval, there is nothing to remove.
+    refused_with(&ws(&env, PASSPHRASE, &["ws", "rm", "acme/github"]), "there is no github in acme");
+}
+
+#[test]
+fn removing_the_file_revokes_nothing() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert!(ws_policy_edit(&env, "acme/github", POLICY_TEXT).status.success());
+    assert!(ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme"]).status.success());
+    let file = policies_dir(&env, "acme").join("github.toml");
+    fs::remove_file(&file).unwrap();
+    assert_eq!(stdout(&ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme"])), "RESOURCE         POLICY\ngithub           approved, no file\n");
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme/github"]);
+    assert!(stdout(&out) == "no policy file for github in acme. write one with: halti ws policy edit acme/github\n" && prompted(&out) == 0);
+    // The same text written back is approved again.
+    fs::write(&file, POLICY_TEXT).unwrap();
+    assert!(stdout(&ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme/github"])).contains("(approved)"));
+}
+
+#[test]
+fn deleting_a_workspace_removes_its_policies() {
+    let env = Env::new();
+    for name in ["acme", "globex"] {
+        assert!(ws(&env, PASSPHRASE, &["ws", "new", name]).status.success());
+        assert!(ws_policy_edit(&env, &format!("{name}/github"), POLICY_TEXT).status.success());
+    }
+    assert!(ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme"]).status.success());
+    let dir = policies_dir(&env, "acme");
+    for left in [".github.toml.swp", "github.toml~", "4913"] {
+        fs::write(dir.join(left), "left").unwrap();
+    }
+    let acme = ws_dir(&env).join(ws_id(&env, "acme"));
+    // What an earlier delete cut short left: an id no record names, with only policies in it.
+    let orphan = ws_dir(&env).join("0123456789abcdef0123456789abcdef");
+    fs::create_dir_all(orphan.join("policies/approved")).unwrap();
+    fs::write(orphan.join("policies/github.toml"), POLICY_TEXT).unwrap();
+    let out = ws(&env, PASSPHRASE, &["ws", "delete", "acme"]);
+    assert!(out.status.success() && stdout(&out) == "deleted workspace acme\n" && stderr(&out).lines().all(|l| !l.starts_with("halti: the policies")), "{}", stderr(&out));
+    assert!(!acme.exists() && !orphan.exists(), "acme's folder and the orphan are gone");
+    assert!(policies_dir(&env, "globex").join("github.toml").exists(), "globex's are its own");
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "the keychain is only on a mac")]
+fn a_saved_passphrase_approves_a_policy_after_touch_id_and_never_after_nothing() {
+    let env = Env::new();
+    let text = with_keychain("passphrase", "passphrase").replace("policy = \"passphrase\"", "policy = \"touchid\"");
+    assert!(config(&env, &text, "yes").status.success());
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert!(ws_policy_edit(&env, "acme/github", POLICY_TEXT).status.success());
+    let approve = |answer: &str| env.command().args(["ws", "policy", "approve", "acme"]).env("HALTI_TEST_APPROVE", answer).output().unwrap();
+    // Touch ID, whose window names the policy and its hash; then the saved copy. Nothing typed.
+    let out = approve("yes");
+    assert!(out.status.success() && stdout(&out).ends_with("approved the policy for github in acme\n") && asked(&out) == 0, "{}", stderr(&out));
+    assert_eq!(stderr(&out), format!("halti: [test] [DEV, not protected] approve policies github {POLICY_SHA} in workspace acme: yes\n"));
+    assert!(keeps_quiet(&out, PASSPHRASE));
+    // A no: nothing is written, and halti says how to type the passphrase instead.
+    assert!(ws_policy_edit(&env, "acme/github", &format!("{POLICY_TEXT}writes = \"ask\"\n")).status.success());
+    let before = ws_files(&env);
+    let out = approve("no");
+    let declined = "halti: the policies in acme were not approved. to type the passphrase instead: halti ws policy approve acme --type\n";
+    assert!(!out.status.success() && stderr(&out).ends_with(declined) && stdout(&out).contains("changed:\n--- approved\n"), "{}", stderr(&out));
+    assert!(ws_files(&env) == before);
+    // Approving a policy is never approved by nothing.
+    let out = config(&env, &text.replace("policy = \"touchid\"         # approving a policy", "policy = \"none\"         # approving a policy"), "yes");
+    let refused =
+        format!("halti: {}, line 23: policy can't be none. it can be passphrase, sudo or touchid\nnothing was approved. fix it with: halti config\n", config_file(&env).display());
+    assert!(!out.status.success() && stderr(&out) == refused, "{}", stderr(&out));
+}
+
+#[test]
+fn a_wrong_passphrase_approves_nothing() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert!(ws_policy_edit(&env, "acme/github", POLICY_TEXT).status.success());
+    let before = ws_files(&env);
+    for args in [&["ws", "policy", "approve", "acme"][..], &["ws", "policy", "approve", "acme/github"], &["ws", "policy", "show", "acme/github"], &["ws", "policy", "show", "acme"]]
+    {
+        let out = ws(&env, "acme passphrase two", args);
+        refused_with(&out, "that can't be opened (wrong key, or it was changed)");
+        assert_eq!((prompted(&out), asked(&out)), (1, 1), "{args:?}: asked once, and not again");
+        assert!(ws_files(&env) == before, "{args:?}: every file as it was");
+    }
+}
+
 // --- halti config ---
 
 /// The person's settings file in a test's debug-build home.
@@ -1689,7 +2138,8 @@ fn template() -> String {
          [paths]\nworkspaces = \"~/{DEV_STORE_ROOT}/ws\"\n\n[passwords]\nmanager = \"none\"              # {managers}\n\n[secrets]\nstore = \"files\"               # files\n\n\
          [workspace]\npassphrase = \"own\"            # own | generate\n\n[workspace.approval]\n\
          open   = \"passphrase\"         # opening a workspace: {ws}\nset    = \"passphrase\"         # storing a secret in a workspace: {set}\n\
-         rm     = \"passphrase\"         # removing secrets from a workspace: {ws}\ndelete = \"passphrase\"         # deleting a workspace: {ws}\n{boxes}"
+         rm     = \"passphrase\"         # removing secrets from a workspace: {ws}\npolicy = \"passphrase\"         # approving a policy in a workspace: {set}\n\
+         delete = \"passphrase\"         # deleting a workspace: {ws}\n{boxes}"
     )
 }
 
@@ -1722,7 +2172,7 @@ fn config_shows_the_template_and_what_is_in_effect() {
     let last = if cfg!(target_os = "macos") {
         "\n[box.approval]\nrun    = \"touchid\"\npolicy = \"touchid\"\nwrite  = \"touchid\"\nexport = \"touchid\"\ndelete = \"touchid\"\n"
     } else {
-        "\n[workspace.approval]\nopen   = \"passphrase\"\nset    = \"passphrase\"\nrm     = \"passphrase\"\ndelete = \"passphrase\"\n"
+        "\n[workspace.approval]\nopen   = \"passphrase\"\nset    = \"passphrase\"\nrm     = \"passphrase\"\npolicy = \"passphrase\"\ndelete = \"passphrase\"\n"
     };
     assert!(stdout(&shown).ends_with(last), "{}", stdout(&shown));
     assert!(!config_file(&env).exists() && !approved_copy(&env).exists(), "showing writes nothing");

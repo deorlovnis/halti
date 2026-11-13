@@ -179,7 +179,7 @@ enum Cmd {
         #[arg(long)]
         default: bool,
     },
-    /// Workspaces, each opened with its own passphrase: create, list and delete them, and store secrets in them
+    /// Workspaces, each opened with its own passphrase: create, list and delete them, store secrets in them, and approve their policies
     Ws {
         #[command(subcommand)]
         action: WsCmd,
@@ -372,6 +372,36 @@ enum WsCmd {
         #[arg(long = "type")]
         type_it: bool,
     },
+    /// Edit, approve or show a workspace's policies
+    Policy {
+        #[command(subcommand)]
+        action: WsPolicyCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum WsPolicyCmd {
+    /// Open a resource's policy in $EDITOR (a template if new); approve it afterwards
+    Edit {
+        #[arg(value_name = "WS/RESOURCE", value_parser = parse_ws_resource)]
+        target: String,
+    },
+    /// Approve one policy, or every policy in the workspace (asks as halti config says for policy)
+    Approve {
+        #[arg(value_name = "WS[/RESOURCE]", value_parser = parse_ws_maybe_resource)]
+        target: String,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
+    },
+    /// Print a policy and whether it is approved, or list them all (asks as halti config says for open)
+    Show {
+        #[arg(value_name = "WS[/RESOURCE]", value_parser = parse_ws_maybe_resource)]
+        target: String,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
+    },
 }
 
 /// Whose passphrase `ws new` gives the workspace, if its flags say.
@@ -401,6 +431,12 @@ fn parse_ws_resource(s: &str) -> Result<String, String> {
         Ok(_) => Ok(s.to_string()),
         Err(_) => Err("use a workspace and a resource, e.g. acme/github".into()),
     }
+}
+
+/// `acme`, or `acme/github`: a workspace, and maybe one of its resources.
+fn parse_ws_maybe_resource(s: &str) -> Result<String, String> {
+    let ok = if s.contains('/') { ws::target(s).is_ok() } else { halti_core::ids::WsName::parse(s).is_ok() };
+    if ok { Ok(s.to_string()) } else { Err("use a workspace, or a workspace and a resource, e.g. acme/github".into()) }
 }
 
 fn parse_env(s: &str) -> Result<String, String> {
@@ -878,6 +914,11 @@ fn main() -> ExitCode {
             WsCmd::Ls { name, type_it } => ws::ls(name.as_deref(), type_it),
             WsCmd::Rm { target, field, type_it } => ws::rm(&target, field.as_deref(), type_it),
             WsCmd::Delete { name, type_it } => ws::delete(&name, type_it),
+            WsCmd::Policy { action } => match action {
+                WsPolicyCmd::Edit { target } => ws::policies::edit(&target),
+                WsPolicyCmd::Approve { target, type_it } => ws::policies::approve(&target, type_it),
+                WsPolicyCmd::Show { target, type_it } => ws::policies::show(&target, type_it),
+            },
         }),
         Cmd::Open { name, type_it } => ok(ws::open(name.as_deref(), type_it)),
         Cmd::Close { name } => ok(ws::close(name.as_deref())),

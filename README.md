@@ -80,6 +80,9 @@ halti ws set acme/github token             # asks as [workspace.approval] says, 
 pbpaste | halti ws set acme/github token   # or the value piped in; the approval is still asked
 halti ws ls acme                           # the resources and fields stored in acme (asks as for open)
 halti ws rm acme/github token              # one field; `halti ws rm acme/github` removes every field of github
+halti ws policy edit acme/github           # github's policy in acme, in $EDITOR; asks nothing
+halti ws policy approve acme               # every policy in acme, shown against what was approved (or acme/github)
+halti ws policy show acme                  # which are approved (asks as for open); acme/github prints one
 halti ws ls                                # the workspaces (asks nothing)
 halti open acme                            # checks the passphrase and the files
 halti ws delete acme                       # the workspace and everything in it
@@ -89,6 +92,16 @@ halti ws delete acme                       # the workspace and everything in it
 - A value is text of 1 to 65536 bytes with no control characters but tab and line feed; binary goes in as base64. From a pipe, one trailing line break is dropped and nothing else. Typed, a value is one line, and the tab and escape keys type nothing; pipe in a value that has a line break or a tab.
 - Values are kept as `[secrets] store` says: files, one per secret, sealed and named by 64 hex characters, beside a sealed list of what is stored. `halti ws ls acme` says if a secret's file is missing or isn't the one the list names, and how to set it again.
 - **Limit:** older copies of a workspace's files, put back together with its pin file, read as they were, older secrets included.
+
+### Policies in a workspace
+
+A workspace's policies are its own: `halti ws policy edit acme/github` writes github's in acme's folder, apart from the Keychain's `~/.config/halti/policy/github.toml`, and an approval in one never counts in the other. A policy in a workspace takes effect for boxes once boxes run in workspaces; until then nothing reads it.
+
+- Approving asks as `[workspace.approval] policy` says, never `none`, and seals the sha256 of each policy's text in the workspace, with its secrets' list. What is shown before you approve is what is sealed. `halti ws policy approve acme` shows each policy against the copy kept when it was last approved: `new` with its whole text, `changed` with a diff, or `unchanged`. If a copy isn't what was approved, nothing is approved, and `halti ws policy approve acme/github` shows that one whole. With a password manager, the Touch ID window or sudo names each policy and the start of its sha256.
+- `halti ws policy show` says `approved`, `not approved`, `changed since approval`, or `approved, no file`: the file's bytes now, against the sealed sha256.
+- A policy in a workspace is at most 64 KiB of plain ASCII (a host with other letters is written in its `xn--` form), can't use `[refresh]` yet, and keeps `[run]` and `[agent]` as they are when left out. A policy copied from the Keychain's folder passes as it is once any line that isn't plain ASCII is rewritten.
+- Deleting or narrowing a policy's file revokes nothing: the text approved, written back, is approved again. `halti ws rm acme/github` removes github's secrets and its approval, and keeps the file; approving another text replaces it. `halti ws delete acme` removes the policies with the workspace.
+- **Limit:** any earlier state of a workspace's files can be put back, with approvals and revocations as they were then.
 
 ## Settings
 
@@ -117,6 +130,7 @@ passphrase = "own"            # own | generate
 open   = "passphrase"         # opening a workspace: passphrase | sudo | touchid | none
 set    = "passphrase"         # storing a secret in a workspace: passphrase | sudo | touchid
 rm     = "passphrase"         # removing secrets from a workspace: passphrase | sudo | touchid | none
+policy = "passphrase"         # approving a policy in a workspace: passphrase | sudo | touchid
 delete = "passphrase"         # deleting a workspace: passphrase | sudo | touchid | none
 
 [box]
@@ -136,7 +150,7 @@ delete = "touchid"            # deleting a box: touchid | sudo | none
 - `halti config` shows what your edit changed, on the terminal where sudo asks, then approves it. `halti config --show` prints the settings in effect, `halti config --default` the template. Until a change is approved, every workspace command says so.
 - With no approved copy, or one someone other than root could change, the template is in effect.
 - `[approval] default` is for any action without its own line, except a box's and a workspace's. `[paths] workspaces` is where new workspaces go: a folder that isn't there yet, an empty one only you can open, or one halti made. Ones already made stay where they are, and aren't listed until you move them there. `[workspace] passphrase` says whether `halti ws new` asks for a passphrase of your own or makes one (`--own` and `--generate` say otherwise).
-- `[passwords] manager = "keychain"` (on a Mac) saves each new workspace's passphrase in your login Keychain once `halti ws new` has made it. `[workspace.approval]` says how you approve opening a workspace (and listing its secrets, `halti ws ls NAME`), storing a secret in it, removing secrets from it, and deleting it: `passphrase`, the default, has you type it, and the saved copy isn't used; `sudo`, `touchid` or `none` has you approve that way, or not at all, and halti takes the passphrase from the Keychain. Those three need a manager, and `set` can't be `none`. `--type` on `halti open`, `halti ws ls NAME`, `halti ws set`, `halti ws rm` and `halti ws delete` always has you type it. The copy is kept in your login Keychain only, whatever your default keychain is. If the saved copy can't be read (after a halti update, say, or while your login Keychain is locked), halti asks you to type it once, and `halti open` saves it again. A workspace made before its passphrase could be saved stays typed each time; to have one saved, make the workspace again. halti never shows a Keychain window for a saved passphrase: if one asks to use an item named `halti-ws:...`, choose Deny.
+- `[passwords] manager = "keychain"` (on a Mac) saves each new workspace's passphrase in your login Keychain once `halti ws new` has made it. `[workspace.approval]` says how you approve opening a workspace (and listing its secrets, `halti ws ls NAME`, and its policies, `halti ws policy show`), storing a secret in it, removing secrets from it, approving its policies, and deleting it: `passphrase`, the default, has you type it, and the saved copy isn't used; `sudo`, `touchid` or `none` has you approve that way, or not at all, and halti takes the passphrase from the Keychain. Those three need a manager, and `set` and `policy` can't be `none`. `--type` on `halti open`, `halti ws ls NAME`, `halti ws set`, `halti ws rm`, `halti ws policy approve`, `halti ws policy show` and `halti ws delete` always has you type it. The copy is kept in your login Keychain only, whatever your default keychain is. If the saved copy can't be read (after a halti update, say, or while your login Keychain is locked), halti asks you to type it once, and `halti open` saves it again. A workspace made before its passphrase could be saved stays typed each time; to have one saved, make the workspace again. halti never shows a Keychain window for a saved passphrase: if one asks to use an item named `halti-ws:...`, choose Deny.
 - `[box]` names what runs a box (Apple's `container`) and where its key is kept (the Keychain). `[box.approval]` says what you answer before a box opens, before its changed policy counts, before a write its policy says to ask about, before files are copied out of it, and before it is deleted: Touch ID, your password through sudo, or nothing (`none`). A write is asked while the agent has the terminal, so only Touch ID or `none` can approve it. A box line you leave out is Touch ID, whatever `default` says. A running box keeps the write approval it opened with. On Linux no box runs, so the template has no `[box]` section.
 
 ## Policies

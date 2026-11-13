@@ -10,7 +10,7 @@ use std::fs;
 
 use super::*;
 use crate::approval::fake_tests::Fake;
-use crate::util::TempDir;
+use crate::util::{TempDir, sha256_hex};
 
 const ACME: &str = "acme passphrase one";
 const GLOBEX: &str = "globex passphrase one";
@@ -90,7 +90,7 @@ fn typing(passphrase: &str) -> impl Fn() -> TtyPassphrase {
 }
 
 fn way<'a>(world: &'a Fake, copies: &'a Memory, means: Option<Means>) -> Way<'a> {
-    Way { world, copies, means }
+    Way { world, copies, means, detail: None }
 }
 
 fn out(said: &Said) -> Vec<&str> {
@@ -358,4 +358,39 @@ fn a_store_in_a_workspace_made_to_be_typed_reads_the_value_once_after_typing() {
     assert_eq!(error.to_string(), "no value was given, so nothing was stored");
     let said = items_with(&f.here, &name("globex"), &way(&world, &copies, None), &typing(GLOBEX)).unwrap();
     assert_eq!(out(&said), ["RESOURCE         FIELDS", "linear           token"]);
+}
+
+#[test]
+fn the_approve_window_names_the_policies() {
+    let f = folder("halti-saved-policies");
+    let copies = Memory::default();
+    let (acme, _) = make(&f.here, "acme", ACME, true, &copies);
+    let files = f.here.policies(acme);
+    let text = |resource: &str| format!("# {resource}\n[fetch]\nhosts = [\"https://{resource}.example\"]\n");
+    let hash = |resource: &str| sha256_hex(text(resource).as_bytes())[..12].to_string();
+    for resource in ["github", "linear", "slack", "zoom", "zulip"] {
+        assert!(files.create(resource, &text(resource)).unwrap());
+    }
+    // Every policy, through the copy after Touch ID: the window names three, then how many more.
+    let world = Fake::answering(true, true);
+    let said = policies::approve_with(&f.here, &name("acme"), None, &way(&world, &copies, Some(Means::TouchId)), &typing("not the passphrase")).unwrap();
+    let approved: Vec<String> = ["github", "linear", "slack", "zoom", "zulip"].iter().map(|resource| format!("approved the policy for {resource} in acme")).collect();
+    assert_eq!(said.out, approved);
+    let (github, linear, slack) = (hash("github"), hash("linear"), hash("slack"));
+    let named = format!("touch id: [DEV, not protected] approve policies github {github}, linear {linear}, slack {slack} and 2 more in workspace acme");
+    assert_eq!(world.calls(), [named]);
+    // One, after sudo: named alone.
+    fs::write(files.path("zoom"), format!("{}# wider\n", text("zoom"))).unwrap();
+    let said = policies::approve_with(&f.here, &name("acme"), Some("zoom"), &way(&world, &copies, Some(Means::Sudo)), &typing("not the passphrase")).unwrap();
+    assert_eq!(out(&said), ["approved the policy for zoom in acme"]);
+    let zoom = sha256_hex(fs::read(files.path("zoom")).unwrap().as_slice())[..12].to_string();
+    assert_eq!(world.calls(), [format!("sudo: [DEV, not protected] approve policies zoom {zoom} in workspace acme")]);
+    // Any other change says only core's words, whatever detail the way was given.
+    let named = Way { world: &world, copies: &copies, means: Some(Means::TouchId), detail: Some(format!("github {github}")) };
+    assert_eq!(out(&open_with(&f.here, &name("acme"), &named, &typing("not the passphrase")).unwrap()), OPENED);
+    assert_eq!(world.calls(), ["touch id: [DEV, not protected] open workspace acme"]);
+    // Typed, nothing but the passphrase is asked.
+    let said = policies::approve_with(&f.here, &name("acme"), None, &way(&world, &copies, None), &typing(ACME)).unwrap();
+    assert_eq!(said.out.iter().filter(|line| line.ends_with("was approved already")).count(), 5);
+    assert!(world.calls().is_empty());
 }

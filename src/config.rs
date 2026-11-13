@@ -860,7 +860,8 @@ mod tests {
              [passwords]\nmanager = \"none\"              # {managers}\n\n[secrets]\nstore = \"files\"               # files\n\n\
              [workspace]\npassphrase = \"own\"            # own | generate\n\n[workspace.approval]\n\
              open   = \"passphrase\"         # opening a workspace: {ws}\nset    = \"passphrase\"         # storing a secret in a workspace: {set}\n\
-             rm     = \"passphrase\"         # removing secrets from a workspace: {ws}\ndelete = \"passphrase\"         # deleting a workspace: {ws}\n{boxes}",
+             rm     = \"passphrase\"         # removing secrets from a workspace: {ws}\npolicy = \"passphrase\"         # approving a policy in a workspace: {set}\n\
+             delete = \"passphrase\"         # deleting a workspace: {ws}\n{boxes}",
             util::DEV_STORE_ROOT
         )
     }
@@ -873,10 +874,26 @@ mod tests {
         text.replace(&format!("opening a workspace: {ws}"), "opening a workspace: passphrase").replace(&format!("deleting a workspace: {ws}"), "deleting a workspace: passphrase")
     }
 
-    /// `text` without the lines of storing and removing a workspace's secrets, as a copy approved
-    /// before they could be stored has it.
+    /// `text` without the lines of storing and removing a workspace's secrets and approving its
+    /// policies, as a copy approved before they could be stored has it.
     fn without_secret_lines(text: &str) -> String {
-        text.lines().filter(|line| !line.starts_with("set ") && !line.starts_with("rm ")).map(|line| format!("{line}\n")).collect()
+        without_policy_line(text).lines().filter(|line| !line.starts_with("set ") && !line.starts_with("rm ")).map(|line| format!("{line}\n")).collect()
+    }
+
+    /// `text` without `[workspace.approval] policy`, as a copy approved before a workspace had
+    /// policies has it. A box's `policy` line stays.
+    fn without_policy_line(text: &str) -> String {
+        let mut section = "";
+        let mut kept = String::new();
+        for line in text.lines() {
+            if line.starts_with('[') {
+                section = line;
+            }
+            if section != "[workspace.approval]" || !line.starts_with("policy ") {
+                kept += &format!("{line}\n");
+            }
+        }
+        kept
     }
 
     /// The template with `config` and `workspaces` changed.
@@ -902,15 +919,15 @@ mod tests {
             assert_eq!(parse(&template(os), os), Ok(Settings::builtin(os)), "{os:?}");
         }
         let builtin = Settings::builtin(Os::Macos);
-        let means = [Action::Config, Action::WsOpen, Action::WsSet, Action::WsRm, Action::WsDelete].map(|action| builtin.means(action));
-        assert_eq!(means, [Some(Means::Sudo), Some(Means::Passphrase), Some(Means::Passphrase), Some(Means::Passphrase), Some(Means::Passphrase)]);
+        let means = [Action::Config, Action::WsOpen, Action::WsSet, Action::WsRm, Action::WsPolicy, Action::WsDelete].map(|action| builtin.means(action));
+        assert_eq!(means, [Some(Means::Sudo), Some(Means::Passphrase), Some(Means::Passphrase), Some(Means::Passphrase), Some(Means::Passphrase), Some(Means::Passphrase)]);
         assert_eq!(BOX_ACTIONS.map(|action| builtin.means(action)), [Some(Means::TouchId); 5], "a box asks for Touch ID, as it always did");
         assert_eq!((builtin.engine, builtin.keys), (Some(Engine::Container), Some(Keys::Keychain)));
         assert_eq!(builtin.workspaces.path, util::store_root().join(names::WS_DIR), "where workspaces always were");
         let shown = format!(
             "\n[approval]\ndefault = \"sudo\"\nconfig  = \"sudo\"\n\n[paths]\nworkspaces = \"~/{}/ws\"\n\n[passwords]\nmanager = \"none\"\n\n[secrets]\nstore = \"files\"\n\n\
-             [workspace]\npassphrase = \"own\"\n\n[workspace.approval]\nopen   = \"passphrase\"\nset    = \"passphrase\"\nrm     = \"passphrase\"\ndelete = \"passphrase\"\n\n\
-             [box]\nengine = \"container\"\nkeys   = \"keychain\"\n\n[box.approval]\nrun    = \"touchid\"\npolicy = \"touchid\"\nwrite  = \"touchid\"\n\
+             [workspace]\npassphrase = \"own\"\n\n[workspace.approval]\nopen   = \"passphrase\"\nset    = \"passphrase\"\nrm     = \"passphrase\"\n\
+             policy = \"passphrase\"\ndelete = \"passphrase\"\n\n[box]\nengine = \"container\"\nkeys   = \"keychain\"\n\n[box.approval]\nrun    = \"touchid\"\npolicy = \"touchid\"\nwrite  = \"touchid\"\n\
              export = \"touchid\"\ndelete = \"touchid\"\n",
             util::DEV_STORE_ROOT
         );
@@ -941,6 +958,10 @@ mod tests {
             // Storing a secret is never approved by nothing, whatever keeps the passphrase.
             ("[passwords]\nmanager = \"keychain\"\n[workspace.approval]\nset = \"none\"\n", Os::Macos, 4, "set can't be none. it can be passphrase, sudo or touchid"),
             ("[workspace.approval]\nset = \"none\"\n", Os::Linux, 2, "set can't be none. it can only be passphrase"),
+            // Nor is approving a policy.
+            ("[passwords]\nmanager = \"keychain\"\n[workspace.approval]\npolicy = \"none\"\n", Os::Macos, 4, "policy can't be none. it can be passphrase, sudo or touchid"),
+            ("[workspace.approval]\npolicy = \"none\"\n", Os::Linux, 2, "policy can't be none. it can only be passphrase"),
+            ("[workspace.approval]\npolicy = \"touchid\"\n", Os::Macos, 2, "policy can't be touchid while [passwords] manager is none"),
             ("[workspace.approval]\nrm = \"sudo\"\n", Os::Macos, 2, "rm can't be sudo while [passwords] manager is none"),
             // A workspace's line that takes the passphrase from a password manager, where the file names none.
             ("[workspace.approval]\nopen = \"sudo\"\n", Os::Macos, 2, "open can't be sudo while [passwords] manager is none"),
@@ -1108,14 +1129,37 @@ mod tests {
             // With any `default` it took, a workspace still opens and is deleted with its passphrase typed.
             for default in default_choices(os) {
                 let settings = parse(&before.replace("default = \"sudo\"", &format!("default = \"{}\"", default.name())), os).unwrap();
-                let ws = [Action::WsOpen, Action::WsSet, Action::WsRm, Action::WsDelete].map(|action| settings.means(action));
-                assert_eq!(ws, [Some(Means::Passphrase); 4], "{os:?} {default:?}");
+                let ws = [Action::WsOpen, Action::WsSet, Action::WsRm, Action::WsPolicy, Action::WsDelete].map(|action| settings.means(action));
+                assert_eq!(ws, [Some(Means::Passphrase); 5], "{os:?} {default:?}");
                 assert_eq!(settings.manager, Manager::None);
             }
         }
         // As the approved copy: in effect, with nothing said about it.
         let fake = Fake::answering(true, true);
         *fake.anchor.borrow_mut() = Some(before_managers(Os::Macos));
+        let now = in_effect(&fake, &place(), Os::Macos);
+        assert_eq!((now.source, now.notes.len(), now.settings), (Source::Sudo, 0, Settings::builtin(Os::Macos)));
+    }
+
+    #[test]
+    fn a_copy_approved_before_the_policy_line_still_reads() {
+        for os in BOTH {
+            let before = without_policy_line(&template(os));
+            assert!(!before.contains("approving a policy in a workspace") && before.contains("deleting a workspace: "), "{before}");
+            assert_eq!(parse(&before, os), Ok(Settings::builtin(os)), "{os:?}");
+            assert_eq!(parse(&before, os).unwrap().means(Action::WsPolicy), Some(Means::Passphrase), "{os:?}");
+        }
+        // With the keychain as manager and other lines saying otherwise, a missing line is still the passphrase.
+        let managed = "[passwords]\nmanager = \"keychain\"\n\n[workspace.approval]\nopen = \"touchid\"\nset = \"sudo\"\ndelete = \"none\"\n";
+        assert_eq!(parse(managed, Os::Macos).unwrap().means(Action::WsPolicy), Some(Means::Passphrase));
+        let policy = parse(&format!("{managed}policy = \"touchid\"\n"), Os::Macos).unwrap();
+        assert_eq!(policy.means(Action::WsPolicy), Some(Means::TouchId));
+        assert_eq!(parse(&policy.render(Os::Macos), Os::Macos), Ok(policy));
+        // A box's policy line is its own.
+        assert!(without_policy_line(&template(Os::Macos)).contains("policy = \"touchid\"            # approving a changed box policy"));
+        // As the approved copy: in effect, with nothing said about it.
+        let fake = Fake::answering(true, true);
+        *fake.anchor.borrow_mut() = Some(without_policy_line(&template(Os::Macos)));
         let now = in_effect(&fake, &place(), Os::Macos);
         assert_eq!((now.source, now.notes.len(), now.settings), (Source::Sudo, 0, Settings::builtin(Os::Macos)));
     }

@@ -1,7 +1,8 @@
 //! A workspace's passphrase saved by a password manager (`[passwords] manager`): the Keychain, on a
-//! Mac. `ws new` saves it once the workspace is made, and `open`, `ws ls WS`, `ws set`, `ws rm`
-//! and `ws delete` take it from there after the approval the settings name for them
-//! (`[workspace.approval]`; listing follows `open`), instead of having it typed.
+//! Mac. `ws new` saves it once the workspace is made, and `open`, `ws ls WS`, `ws set`, `ws rm`,
+//! `ws policy approve` and `ws delete` take it from there after the approval the settings name for
+//! them (`[workspace.approval]`; listing and `ws policy show` follow `open`), instead of having it
+//! typed. Approving policies names them and their hashes in what the approval says.
 //!
 //! A workspace records which way it was made. One made with the saved copy records this module's
 //! label, which lacks more than a typed one's: a program running as you has more ways to get a
@@ -102,13 +103,32 @@ pub struct KeychainPassphrase<'a> {
     /// Any but the passphrase, which is typed instead of taken from here.
     means: Means,
     action: Action,
+    /// What an approval of policies approves, named in what the approval says.
+    detail: Option<String>,
     /// The workspace whose copy it read, so `destroy` removes that copy.
     read: Cell<Option<WsId>>,
 }
 
 impl<'a> KeychainPassphrase<'a> {
     pub fn new(copies: &'a dyn Copies, world: &'a dyn World, means: Means, action: Action) -> KeychainPassphrase<'a> {
-        KeychainPassphrase { copies, world, means, action, read: Cell::new(None) }
+        KeychainPassphrase { copies, world, means, action, detail: None, read: Cell::new(None) }
+    }
+
+    /// Names `detail` (the policies and their hashes) in what the Touch ID window or sudo says
+    /// before policies are approved: core's words say only which workspace.
+    pub fn naming(self, detail: Option<String>) -> KeychainPassphrase<'a> {
+        KeychainPassphrase { detail, ..self }
+    }
+
+    /// What the approval says for `prompt`: core's words, with the detail after "approve policies"
+    /// when that is the change.
+    fn reason(&self, prompt: &Prompt) -> String {
+        let text = prompt.text();
+        let in_workspace = format!(" in workspace {}", prompt.name());
+        match (&self.detail, text.strip_suffix(&in_workspace)) {
+            (Some(detail), Some(verb)) if prompt.change() == Change::Approve => format!("{verb} {detail}{in_workspace}"),
+            _ => text,
+        }
     }
 }
 
@@ -142,7 +162,7 @@ impl KeyHolder for KeychainPassphrase<'_> {
         if prompt.change() == Change::Delete {
             tty::tell(&tty::deleting(prompt.name()));
         }
-        approval::ask_by(self.world, Some(self.means), self.action, &prompt.text()).map_err(|_| Declined)?;
+        approval::ask_by(self.world, Some(self.means), self.action, &self.reason(prompt)).map_err(|_| Declined)?;
         self.read.set(Some(prompt.ws()));
         let text = self.copies.get(prompt.ws()).ok_or(Unusable)?;
         let passphrase = Passphrase::new(text).map_err(|_| Unusable)?;
