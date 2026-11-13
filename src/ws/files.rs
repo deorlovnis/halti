@@ -10,6 +10,7 @@
 //!   locks/ID             0600   the workspace's lock, held with flock; left in place but
 //!                               for the id of a create that failed
 //!   ID/                  0700   key, wrap, manifest, policy, log
+//!   ID/manifest.next     0600   a manifest replacing the one there, until it takes its place
 //!   ID/items/ITEM        0600   one stored item, named by 64 hex characters
 //! ```
 //!
@@ -310,6 +311,7 @@ impl DirFiles {
             FileKey::KeyRef(ws) => (ws, "key"),
             FileKey::Wrap(ws) => (ws, "wrap"),
             FileKey::Manifest(ws) => (ws, "manifest"),
+            FileKey::NextManifest(ws) => (ws, "manifest.next"),
             FileKey::Policy(ws) => (ws, "policy"),
             FileKey::Log(ws) => (ws, "log"),
         };
@@ -706,7 +708,7 @@ mod tests {
         let root = dir.0.join("ws");
         let (files, keystore) = (DirFiles::at(&root), FileKeystore::at(&root));
         let acme = WsId::from_bytes([0x10; 16]);
-        let all = [FileKey::Wrap(acme), FileKey::KeyRef(acme), FileKey::Manifest(acme), FileKey::Policy(acme), FileKey::Log(acme)];
+        let all = [FileKey::Wrap(acme), FileKey::KeyRef(acme), FileKey::Manifest(acme), FileKey::NextManifest(acme), FileKey::Policy(acme), FileKey::Log(acme)];
         for file in &all {
             files.write_atomic(file, b"written").unwrap();
         }

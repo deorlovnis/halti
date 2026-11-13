@@ -140,10 +140,10 @@ pub fn ws_open(machine: &Machine<'_>, name: &WsName) -> Result<Workspace> {
     machine.admit()?;
     let record = read_record(machine.host.files, name)?;
     kinds_match(machine, &record)?;
-    unlock(&machine.host, record.id, name, machine.build, Change::Open, |inner, _, sealed| {
-        let manifest = checked(Manifest::open(inner, record.id, name, sealed)?, &record, machine.build)?;
+    unlock(&machine.host, record.id, name, machine.build, Change::Open, |unlocked| {
+        let manifest = checked(Manifest::open(unlocked.inner, record.id, name, unlocked.manifest)?, &record, machine.build)?;
         not_weaker(&manifest, &machine.adapters())?;
-        Ok(Workspace { id: record.id, keys: opened(inner), manifest })
+        Ok(Workspace { id: record.id, keys: opened(unlocked.inner), manifest })
     })
 }
 
@@ -167,8 +167,8 @@ pub fn ws_delete(machine: &Machine<'_>, name: &WsName) -> Result<Deleted> {
         remove_files(files, ws, name)?;
         return Ok(Deleted::FilesOnly);
     }
-    unlock(&machine.host, ws, name, machine.build, Change::Delete, |inner, key_ref, sealed| {
-        checked(Manifest::open(inner, ws, name, sealed)?, &record, machine.build)?;
+    unlock(&machine.host, ws, name, machine.build, Change::Delete, |unlocked| {
+        checked(Manifest::open(unlocked.inner, ws, name, unlocked.manifest)?, &record, machine.build)?;
         // The items first: a crash here leaves a pinned workspace, whose items need the approval again.
         let items = Keystore::bind(ws, machine.keystore);
         for item in items.list()? {
@@ -176,7 +176,7 @@ pub fn ws_delete(machine: &Machine<'_>, name: &WsName) -> Result<Deleted> {
         }
         // From here nothing opens, and a delete cut short is finished by the path with no pin.
         machine.host.anchor.forget(ws)?;
-        machine.host.holder.destroy(key_ref)?;
+        machine.host.holder.destroy(unlocked.key_ref)?;
         remove_files(files, ws, name)?;
         Ok(Deleted::Whole)
     })
@@ -242,7 +242,7 @@ fn not_weaker(manifest: &Manifest, now: &[(Role, Label)]) -> Result<(), Refusal>
 
 /// Removes the workspace's files, then its record last, so a run cut short is found by name again.
 fn remove_files(files: &dyn Files, ws: WsId, name: &WsName) -> Result<()> {
-    for file in [FileKey::Wrap(ws), FileKey::KeyRef(ws), FileKey::Manifest(ws), FileKey::Policy(ws), FileKey::Log(ws)] {
+    for file in [FileKey::Wrap(ws), FileKey::KeyRef(ws), FileKey::Manifest(ws), FileKey::NextManifest(ws), FileKey::Policy(ws), FileKey::Log(ws)] {
         files.remove(&file)?;
     }
     files.remove(&FileKey::DirRecord(name.clone()))
@@ -695,6 +695,23 @@ mod tests {
         assert_eq!(world.everything(GLOBEX, "globex"), globex);
         world.open(&world.globex, "globex").unwrap();
         assert_eq!(ws_list(&world.files, &world.anchor).unwrap().iter().map(|listed| listed.name.as_str()).collect::<Vec<_>>(), ["globex"]);
+    }
+
+    #[test]
+    fn deleting_a_workspace_removes_any_next_manifest() {
+        // Left beside the manifest by a replacement cut short.
+        let world = World::new().made();
+        world.files.write_atomic(&FileKey::NextManifest(acme()), b"left").unwrap();
+        assert_eq!(world.delete(&world.acme, "acme").unwrap(), Deleted::Whole);
+        assert_eq!(world.file(&FileKey::NextManifest(acme())), None);
+        assert_eq!(world.everything(acme(), "acme"), (vec![None; 6], None, None));
+        // With no pin, so nothing is unlocked: the files go, that one with them.
+        let world = World::new().made();
+        world.files.write_atomic(&FileKey::NextManifest(acme()), b"left").unwrap();
+        world.anchor.forget(acme()).unwrap();
+        assert_eq!(world.delete(&world.acme, "acme").unwrap(), Deleted::FilesOnly);
+        assert_eq!(world.file(&FileKey::NextManifest(acme())), None);
+        assert_eq!(world.everything(acme(), "acme"), (vec![None; 6], None, None));
     }
 
     #[test]
