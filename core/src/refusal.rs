@@ -8,6 +8,7 @@ use crate::ids::WsName;
 use crate::item::Secret;
 use crate::passphrase::Passphrase;
 use crate::platform::{Build, Grade, Lacks, Property};
+use crate::policy::Approval;
 
 /// Why core said no.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -47,6 +48,12 @@ pub enum Refusal {
     /// The workspace holds no secret of that name, or none of that resource. `what` is an
     /// `item::ItemKey`'s text or a checked resource, so it holds only what was typed and checked.
     NoSecret { ws: WsName, what: String },
+    /// A policy can't be approved as given: its name isn't a resource's, its text is empty or too
+    /// long, it is given twice, or none is given. Neither is echoed.
+    BadPolicy,
+    /// A policy was shown against a copy of what was approved, or as new, and the workspace says
+    /// otherwise, so nothing was approved. `name` is a checked resource.
+    NotTheBase { name: String },
 }
 
 impl fmt::Display for Refusal {
@@ -71,6 +78,8 @@ impl fmt::Display for Refusal {
             Refusal::BadSecretName => write!(f, "that isn't a secret's name (a resource of a-z, 0-9 and -, then a field of a-z, 0-9 and _)"),
             Refusal::BadSecret => write!(f, "that value can't be stored: a secret is text of up to {} bytes", Secret::MAX),
             Refusal::NoSecret { ws, what } => write!(f, "there is no {what} in {ws}"),
+            Refusal::BadPolicy => write!(f, "that policy can't be approved: a policy is 1 to {} bytes, for a resource of a-z, 0-9 and -", Approval::MAX_TEXT),
+            Refusal::NotTheBase { name } => write!(f, "the approved copy of {name} isn't what was approved, so nothing was approved"),
         }
     }
 }
