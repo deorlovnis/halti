@@ -112,7 +112,7 @@ fn ws_new_saves_the_passphrase_only_where_a_manager_keeps_it() {
     // Each records which way it was made.
     let made_with_a_copy = |text: &str, passphrase: &str| {
         let holder = TtyPassphrase::new(false).answering(passphrase);
-        made_saved(&ws_open(&f.here.machine(&holder), &name(text)).unwrap().manifest)
+        made_saved(ws_open(&f.here.machine(&holder), &name(text)).unwrap().manifest())
     };
     assert!(made_with_a_copy("acme", ACME) && !made_with_a_copy("globex", GLOBEX));
     // A copy that can't be saved leaves the workspace as made, and says it is typed next time.

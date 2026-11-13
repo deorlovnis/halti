@@ -8,22 +8,30 @@
 //!           ‖ pin version (8) ‖ log count (8) ‖ log MAC (48)
 //!           ‖ store length (2) ‖ store (at most 1024) ‖ keystore ref length (2) ‖ keystore ref (at most 1024)
 //!           ‖ m (4) ‖ m × (item name (32) ‖ version (8) ‖ length (1) ‖ resource ‖ length (1) ‖ field)
-//!           [ ‖ p (2) ‖ p × (kind (1) ‖ length (1) ‖ name ‖ sha256 (32)) ]     only when p ≥ 1
+//!           [ ‖ p (2) ‖ p × (kind (1) ‖ length (1) ‖ name ‖ sha256 (32))
+//!             [ ‖ b (2) ‖ b × (length (1) ‖ box ‖ item name (32) ‖ version (8)) ] ]
 //! sealed  = aead::seal(manifest key, nonce, aad, plain)
 //! aad     = ws (16) ‖ length of the name (1) ‖ name
 //! ```
 //!
-//! Every number is big-endian. Roles, item names and approvals are strictly increasing, the
-//! approvals are written only when there is at least one, and nothing follows the approvals, so
+//! Every number is big-endian. Roles, item names, approvals and boxes are strictly increasing.
+//! What follows the items is written only when there is an approval or a box: then the count of
+//! approvals always, and the boxes only when there is at least one, so a count of no approvals is
+//! written only with boxes after it, and a count of no boxes never. Nothing follows the boxes, so
 //! each manifest has one encoding and every encoding read back is written the same. The places
 //! between the adapters and the items are kept for later steps, empty or zero until then. Each
 //! item's resource and field are what a person calls it (`item::ItemKey`), each 1 to 32 bytes, so
 //! an item takes at least 44 bytes. A manifest with no items is written as it was before items had
-//! a resource and field, and one with no approvals as it was before there were approvals.
+//! a resource and field, one with no approvals and no boxes as it was before there were
+//! approvals, and one with no boxes as it was before there were boxes.
 //!
 //! An approval is a policy's kind (`policy::Kind`), its name, 1 to 32 bytes as a resource is, and
 //! the SHA-256 of the text approved, so it takes at least 35 bytes. Approvals are ordered by kind,
 //! then name, so there is at most one for each policy.
+//!
+//! A box is its name, 1 to 32 bytes as a resource's, the name its key is kept under in the keystore
+//! (`boxkey`) and the pin version that key was sealed for, so it takes at least 42 bytes. A box
+//! made with no key to keep (a box that keeps nothing between runs) is approved and not listed.
 //!
 //! The workspace's id and name are not fields: the seal binds them, so a manifest copied from
 //! another workspace, or read under another name, does not open. Whoever holds the inner key can
@@ -33,6 +41,7 @@ use std::fmt;
 
 use zeroize::Zeroizing;
 
+use crate::boxkey::check_box;
 use crate::crypto::aead;
 use crate::holder::KeyKind;
 use crate::ids::{WsId, WsName};
@@ -56,10 +65,13 @@ const MIN_ITEM: usize = 32 + 8 + 1 + 1 + 1 + 1;
 /// The fewest bytes an approval takes: its kind, a name of one byte with its length, and its hash.
 const MIN_APPROVAL: usize = 1 + 1 + 1 + 32;
 
+/// The fewest bytes a box takes: a name of one byte with its length, its key's name and its version.
+const MIN_BOX: usize = 1 + 1 + 32 + 8;
+
 /// What a workspace was made with, sealed so that only its inner key reads or writes it. The
 /// directory keeps the name, id and two kinds in clear; this is what they are checked against.
-/// Printing it shows the lengths of its references, item map and approvals, not their contents:
-/// those can identify a client.
+/// Printing it shows the lengths of its references, item map, approvals and boxes, not their
+/// contents: those can identify a client.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub built_by: Build,
@@ -82,6 +94,8 @@ pub struct Manifest {
     pub items: Vec<Entry>,
     /// Each approved policy, in order of kind and name; empty until one is approved.
     pub approvals: Vec<Approval>,
+    /// Each box whose key the keystore keeps, in order of name; empty until one is made.
+    pub boxes: Vec<BoxEntry>,
 }
 
 impl fmt::Debug for Manifest {
@@ -99,6 +113,7 @@ impl fmt::Debug for Manifest {
             .field("keystore_ref", &format_args!("{} bytes", self.keystore_ref.len()))
             .field("items", &format_args!("{} items", self.items.len()))
             .field("approvals", &format_args!("{} approvals", self.approvals.len()))
+            .field("boxes", &format_args!("{} boxes", self.boxes.len()))
             .finish()
     }
 }
@@ -111,6 +126,16 @@ pub struct Entry {
     pub name: ItemName,
     pub version: u64,
     pub key: ItemKey,
+}
+
+/// One box as a manifest lists it: its name, the name its key is kept under, and the pin version
+/// that key was sealed for. The key's name is derived from the box's under the workspace's names
+/// key (`boxkey`); nothing here checks that, since only the verbs hold that key.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BoxEntry {
+    pub name: String,
+    pub item: ItemName,
+    pub version: u64,
 }
 
 /// One adapter as a manifest records it.
@@ -147,8 +172,9 @@ impl Manifest {
     pub const MAX_REF: usize = 1024;
 
     /// Refuses, with `Refusal::Unreadable`, one whose bytes would not read back as it is: an
-    /// adapter name that is not 1 to 32 of a-z, 0-9 and -, roles, items or approvals out of order
-    /// or repeated, more approvals than two bytes count, a reference over `MAX_REF` bytes. An
+    /// adapter name that is not 1 to 32 of a-z, 0-9 and -, roles, items, approvals or boxes out of
+    /// order or repeated, a box name that isn't one, more approvals or boxes than two bytes count,
+    /// a reference over `MAX_REF` bytes. An
     /// item's resource and field, and an approval's name, are well formed already: an `ItemKey`
     /// or an `Approval` can't be made otherwise.
     pub fn check(&self) -> Result<(), Refusal> {
@@ -156,8 +182,11 @@ impl Manifest {
         let roles = self.adapters.windows(2).all(|pair| pair[0].role < pair[1].role);
         let items = self.items.windows(2).all(|pair| pair[0].name < pair[1].name) && u32::try_from(self.items.len()).is_ok();
         let approvals = self.approvals.windows(2).all(|pair| (pair[0].kind(), pair[0].name()) < (pair[1].kind(), pair[1].name())) && u16::try_from(self.approvals.len()).is_ok();
+        let boxes = self.boxes.iter().all(|entry| check_box(&entry.name).is_ok())
+            && self.boxes.windows(2).all(|pair| pair[0].name < pair[1].name)
+            && u16::try_from(self.boxes.len()).is_ok();
         let refs = self.store.len() <= Manifest::MAX_REF && self.keystore_ref.len() <= Manifest::MAX_REF;
-        if names && roles && items && approvals && refs { Ok(()) } else { Err(Refusal::Unreadable) }
+        if names && roles && items && approvals && boxes && refs { Ok(()) } else { Err(Refusal::Unreadable) }
     }
 
     /// Seals it for `ws` and `name` under the key `inner` gives manifests. Checks it first
@@ -176,7 +205,13 @@ impl Manifest {
     /// Opens what `seal` made for `ws` and `name`. Called only once the key holder has proved its
     /// answer, so every failure is `Refusal::Tampered`.
     pub(crate) fn open(inner: &InnerKey, ws: WsId, name: &WsName, sealed: &[u8]) -> Result<Manifest, Refusal> {
-        let plain = aead::open(&inner.manifest_key(), &aad(ws, name), sealed).map_err(|_| Refusal::Tampered)?;
+        Manifest::open_under(&inner.manifest_key(), ws, name, sealed)
+    }
+
+    /// Opens it under the manifest key itself, as an open workspace reads it again. Every failure is
+    /// `Refusal::Tampered`.
+    pub(crate) fn open_under(key: &[u8; 32], ws: WsId, name: &WsName, sealed: &[u8]) -> Result<Manifest, Refusal> {
+        let plain = aead::open(key, &aad(ws, name), sealed).map_err(|_| Refusal::Tampered)?;
         decode(&plain).ok_or(Refusal::Tampered)
     }
 }
@@ -215,13 +250,22 @@ fn encode(m: &Manifest) -> Vec<u8> {
             out.extend_from_slice(part.as_bytes());
         }
     }
-    if !m.approvals.is_empty() {
+    if !m.approvals.is_empty() || !m.boxes.is_empty() {
         out.extend_from_slice(&u16::try_from(m.approvals.len()).expect("a checked manifest has fewer than 2^16 approvals").to_be_bytes());
         for approval in &m.approvals {
             out.push(approval.kind().tag());
             out.push(u8::try_from(approval.name().len()).expect("a name is at most 32 bytes"));
             out.extend_from_slice(approval.name().as_bytes());
             out.extend_from_slice(approval.sha256());
+        }
+    }
+    if !m.boxes.is_empty() {
+        out.extend_from_slice(&u16::try_from(m.boxes.len()).expect("a checked manifest has fewer than 2^16 boxes").to_be_bytes());
+        for entry in &m.boxes {
+            out.push(u8::try_from(entry.name.len()).expect("a checked box name is at most 32 bytes"));
+            out.extend_from_slice(entry.name.as_bytes());
+            out.extend_from_slice(entry.item.as_bytes());
+            out.extend_from_slice(&entry.version.to_be_bytes());
         }
     }
     out
@@ -276,26 +320,45 @@ fn decode(bytes: &[u8]) -> Option<Manifest> {
         items.push(Entry { name, version, key: ItemKey::parse(resource, field).ok()? });
     }
     let mut approvals: Vec<Approval> = Vec::new();
+    let mut boxes: Vec<BoxEntry> = Vec::new();
+    if r.0.is_empty() {
+        return Some(Manifest { built_by, origin, key, keystore, trial, adapters, pin_version, log_head, store, keystore_ref, items, approvals, boxes });
+    }
+    // Written only when an approval or a box follows: a count of none, only when boxes come after it.
+    let count = r.u16()?;
+    if usize::from(count).checked_mul(MIN_APPROVAL)? > r.0.len() {
+        return None;
+    }
+    for _ in 0..count {
+        let kind = Kind::from_tag(r.byte()?).ok()?;
+        let name = r.text()?;
+        let approval = Approval::sealed(kind, name, r.array::<32>()?).ok()?;
+        if approvals.last().is_some_and(|last| (last.kind(), last.name()) >= (kind, name)) {
+            return None;
+        }
+        approvals.push(approval);
+    }
     if !r.0.is_empty() {
         // Written only when there is one: a count of none is never written.
         let count = r.u16()?;
-        if count == 0 || usize::from(count).checked_mul(MIN_APPROVAL)? > r.0.len() {
+        if count == 0 || usize::from(count).checked_mul(MIN_BOX)? > r.0.len() {
             return None;
         }
         for _ in 0..count {
-            let kind = Kind::from_tag(r.byte()?).ok()?;
             let name = r.text()?;
-            let approval = Approval::sealed(kind, name, r.array::<32>()?).ok()?;
-            if approvals.last().is_some_and(|last| (last.kind(), last.name()) >= (kind, name)) {
+            check_box(name).ok()?;
+            if boxes.last().is_some_and(|last| last.name.as_str() >= name) {
                 return None;
             }
-            approvals.push(approval);
+            boxes.push(BoxEntry { name: name.to_string(), item: ItemName::from_bytes(r.array::<32>()?), version: r.u64()? });
         }
+    } else if count == 0 {
+        return None;
     }
     if !r.0.is_empty() {
         return None;
     }
-    Some(Manifest { built_by, origin, key, keystore, trial, adapters, pin_version, log_head, store, keystore_ref, items, approvals })
+    Some(Manifest { built_by, origin, key, keystore, trial, adapters, pin_version, log_head, store, keystore_ref, items, approvals, boxes })
 }
 
 /// The associated data of the seal: the workspace and its name.
@@ -337,8 +400,8 @@ impl<'b> Reader<'b> {
         self.array::<8>().map(u64::from_be_bytes)
     }
 
-    /// Text of one byte's length: what an item's resource or field, or an approval's name, is
-    /// checked from.
+    /// Text of one byte's length: what an item's resource or field, an approval's name or a box's
+    /// name is checked from.
     fn text(&mut self) -> Option<&'b str> {
         let len = usize::from(self.byte()?);
         str::from_utf8(self.take(len)?).ok()
@@ -359,9 +422,10 @@ mod tests {
     use super::*;
     use crate::anchor::state_hash;
     use crate::crypto::vectors::{
-        KAT_APPROVAL_PIN_STATE, KAT_HARDWARE_WRAP, KAT_ITEM_NAME, KAT_ITEM_PIN_STATE, KAT_KEY_MANIFEST, KAT_MANIFEST, KAT_MANIFEST_APPROVAL, KAT_MANIFEST_APPROVAL_PLAIN,
-        KAT_MANIFEST_ITEM, KAT_MANIFEST_ITEM_APPROVAL_PLAIN, KAT_MANIFEST_ITEM_PLAIN, KAT_MANIFEST_PLAIN, KAT_POLICY_SHA256, KAT_TWO_APPROVALS, KAT_WS_PIN_STATE, POLICY_TEXT,
-        approval_manifest_nonce, arr, hex, inner_bytes, item_manifest_nonce, manifest_nonce, seq, ws_bytes,
+        KAT_APPROVAL_PIN_STATE, KAT_BOX_NAME, KAT_BOX_PIN_STATE, KAT_HARDWARE_WRAP, KAT_ITEM_NAME, KAT_ITEM_PIN_STATE, KAT_KEY_MANIFEST, KAT_MANIFEST, KAT_MANIFEST_APPROVAL,
+        KAT_MANIFEST_APPROVAL_PLAIN, KAT_MANIFEST_BOX, KAT_MANIFEST_BOX_ONLY_PLAIN, KAT_MANIFEST_BOX_PLAIN, KAT_MANIFEST_ITEM, KAT_MANIFEST_ITEM_APPROVAL_PLAIN,
+        KAT_MANIFEST_ITEM_PLAIN, KAT_MANIFEST_PLAIN, KAT_POLICY_SHA256, KAT_TWO_APPROVALS, KAT_WS_PIN_STATE, POLICY_TEXT, approval_manifest_nonce, arr, box_manifest_nonce, hex,
+        inner_bytes, item_manifest_nonce, manifest_nonce, seq, ws_bytes,
     };
     use crate::passphrase::LABEL;
     use crate::platform::Property;
@@ -402,6 +466,7 @@ mod tests {
             keystore_ref: Vec::new(),
             items: Vec::new(),
             approvals: Vec::new(),
+            boxes: Vec::new(),
         }
     }
 
@@ -429,6 +494,21 @@ mod tests {
     /// The known answers' manifest with that approval.
     fn with_an_approval() -> Manifest {
         Manifest { approvals: vec![github()], ..release() }
+    }
+
+    /// A box as a manifest lists it: its key's name all `byte`, at `version`.
+    fn listed(name: &str, byte: u8, version: u64) -> BoxEntry {
+        BoxEntry { name: name.to_string(), item: ItemName::from_bytes([byte; 32]), version }
+    }
+
+    /// The known answers' box dev: its key's known name, at version 2.
+    fn dev() -> BoxEntry {
+        BoxEntry { name: "dev".to_string(), item: ItemName::from_bytes(arr(&hex(KAT_BOX_NAME))), version: 2 }
+    }
+
+    /// The known answers' manifest with that approval and box dev.
+    fn with_a_box() -> Manifest {
+        Manifest { boxes: vec![dev()], ..with_an_approval() }
     }
 
     #[test]
@@ -469,9 +549,11 @@ mod tests {
         let known = hex(KAT_MANIFEST_PLAIN);
         let with_item = hex(KAT_MANIFEST_ITEM_PLAIN);
         let approved = hex(KAT_MANIFEST_APPROVAL_PLAIN);
+        let boxed = hex(KAT_MANIFEST_BOX_PLAIN);
+        let box_only = hex(KAT_MANIFEST_BOX_ONLY_PLAIN);
         // Every other value of every byte is refused, or read as a manifest that is written back as exactly those bytes.
-        let mut one_bit = [0, 0, 0];
-        for (n, plain) in [&known, &with_item, &approved].into_iter().enumerate() {
+        let mut one_bit = [0, 0, 0, 0, 0];
+        for (n, plain) in [&known, &with_item, &approved, &boxed, &box_only].into_iter().enumerate() {
             for (i, &byte) in plain.iter().enumerate() {
                 for value in (0..=255).filter(|&value| value != byte) {
                     let mut changed = plain.clone();
@@ -483,13 +565,19 @@ mod tests {
                 }
             }
             for len in 0..plain.len() {
-                // Cut where its approvals start, the one with an approval is the manifest with none.
-                let whole = (plain == &approved && len == known.len()).then(release);
+                // Cut where what follows the items starts, each is the manifest with nothing there; cut where the boxes start,
+                // the one with an approval and a box is the one with the approval.
+                let whole = match len {
+                    154 if n >= 2 => Some(release()),
+                    196 if n == 3 => Some(with_an_approval()),
+                    _ => None,
+                };
                 assert_eq!(decode(&plain[..len]), whole, "manifest {n}, cut to {len} bytes");
             }
         }
-        // Of the changes to bit 0 of the manifest with no items, the independent implementation reads the same 118 as manifests.
-        assert_eq!(one_bit[0], 118);
+        // Of the changes to bit 0 of each, the independent implementation reads the same as manifests: 118 of the one with no
+        // items, as before there were boxes.
+        assert_eq!(one_bit, [118, 169, 156, 199, 161]);
 
         // Each of these breaks a rule: `check` refuses it, and so does `decode` as it is written.
         let adapters = release().adapters;
@@ -511,6 +599,12 @@ mod tests {
             Manifest { approvals: vec![approval("linear", [0; 32]), github()], ..release() },
             Manifest { approvals: vec![github(), approval("github", [0; 32])], ..release() },
             Manifest { approvals: vec![github(), github()], ..release() },
+            Manifest { boxes: vec![listed("test", 0x07, 2), dev()], ..release() },
+            Manifest { boxes: vec![dev(), listed("dev", 0x08, 3)], ..release() },
+            Manifest { boxes: vec![listed("Dev", 0x07, 2)], ..release() },
+            Manifest { boxes: vec![listed("", 0x07, 2)], ..release() },
+            Manifest { boxes: vec![listed("-dev", 0x07, 2)], ..release() },
+            Manifest { boxes: vec![listed(&"a".repeat(33), 0x07, 2)], ..with_an_approval() },
         ];
         for manifest in &broken {
             assert_eq!(manifest.check(), Err(Refusal::Unreadable), "{manifest:?}");
@@ -523,6 +617,10 @@ mod tests {
         let many = Manifest { approvals: names.iter().map(|name| approval(name, [0; 32])).collect(), ..release() };
         assert_eq!(many.check(), Err(Refusal::Unreadable));
         assert_eq!(Manifest { approvals: many.approvals[1..].to_vec(), ..release() }.check(), Ok(()), "as many as two bytes count");
+        // And so with boxes.
+        let many = Manifest { boxes: names.iter().map(|name| listed(name, 0, 1)).collect(), ..release() };
+        assert_eq!(many.check(), Err(Refusal::Unreadable));
+        assert_eq!(Manifest { boxes: many.boxes[1..].to_vec(), ..release() }.check(), Ok(()), "as many boxes as two bytes count");
         // And bytes no manifest is written as.
         let with = |at: usize, bytes: &[u8]| [&known[..at], bytes, &known[at + bytes.len()..]].concat();
         let unwritten = [
@@ -548,7 +646,7 @@ mod tests {
             ([&approved[..154], &[0x00, 0x02], &approved[156..]].concat(), "two approvals, and one behind"),
             ([&known[..], &[0xff, 0xff]].concat(), "0xffff approvals, and none behind"),
             ([&known[..], &[0x00, 0x01], &[0; MIN_APPROVAL - 1]].concat(), "one approval, and a byte too few behind"),
-            (with_at(&approved, 156, &[0x02]), "kind 0x02, kept for later"),
+            (with_at(&approved, 156, &[0x03]), "kind 0x03, kept for later"),
             (with_at(&approved, 156, &[0x00]), "kind 0x00"),
             ([&approved[..157], &[0x03], b"Git", &approved[164..]].concat(), "the name Git"),
             ([&approved[..157], &[0x06], b"-ithub", &approved[164..]].concat(), "a name starting with -"),
@@ -558,6 +656,22 @@ mod tests {
             ([&known[..], &hex(KAT_TWO_APPROVALS)[..2], &hex(KAT_TWO_APPROVALS)[42..], &hex(KAT_TWO_APPROVALS)[2..42]].concat(), "two approvals out of order"),
             ([&known[..], &[0x00, 0x02], &approved[156..], &approved[156..]].concat(), "the same approval twice"),
             ([&known[..], &[0x00, 0x02], &approved[156..164], &[0; 32], &approved[156..]].concat(), "two approvals of one name"),
+            ([approved.as_slice(), &[0x00, 0x00]].concat(), "no boxes, written out after an approval"),
+            ([known.as_slice(), &[0x00, 0x00, 0x00, 0x00]].concat(), "no approvals and no boxes, written out"),
+            ([boxed.as_slice(), [0x00].as_slice()].concat(), "one byte more after the boxes"),
+            ([&boxed[..196], &[0x00, 0x02], &boxed[198..]].concat(), "two boxes, and one behind"),
+            ([&known[..], &[0x00, 0x00, 0xff, 0xff]].concat(), "0xffff boxes, and none behind"),
+            ([&known[..], &[0x00, 0x00, 0x00, 0x01], &[0; MIN_BOX - 1]].concat(), "one box, and a byte too few behind"),
+            ([&known[..], &[0x00, 0x00], &[0; MIN_BOX]].concat(), "a box count of none, with a box's bytes behind"),
+            ([&boxed[..198], &[0x03], b"Dev", &boxed[202..]].concat(), "the box Dev"),
+            ([&boxed[..198], &[0x03], b"d.v", &boxed[202..]].concat(), "a box with a dot"),
+            ([&boxed[..198], &[0x03], b"-ev", &boxed[202..]].concat(), "a box starting with -"),
+            ([&boxed[..198], &[0x03], b"d\xffv", &boxed[202..]].concat(), "a box that is not UTF-8"),
+            ([&boxed[..198], &[0x00], &boxed[202..]].concat(), "an empty box name"),
+            ([&boxed[..198], &[0x21], &[b'a'; 33], &boxed[202..]].concat(), "a box name of 33 bytes"),
+            ([&boxed[..196], &[0x00, 0x02], &boxed[198..], &boxed[198..]].concat(), "the same box twice"),
+            ([&boxed[..196], &[0x00, 0x02], &boxed[198..202], &[0; 40], &boxed[198..]].concat(), "two boxes of one name"),
+            ([&boxed[..196], &[0x00, 0x02], &[0x04], b"test", &[0; 40], &boxed[198..]].concat(), "two boxes out of order"),
         ];
         for (bytes, what) in unwritten {
             assert_eq!(decode(&bytes), None, "{what}");
@@ -594,6 +708,18 @@ mod tests {
         let plain = encode(&both);
         assert_eq!(plain.len(), 154 + 2 + MIN_APPROVAL + (MIN_APPROVAL + 31));
         assert_eq!(decode(&plain), Some(both));
+        // And so with a box, after an empty count of approvals: the shortest, then the longest name and version after it.
+        let boxes = vec![listed("a", 0x5a, 1), listed(&longest, 0xa5, u64::MAX)];
+        let shortest = Manifest { boxes: boxes[..1].to_vec(), ..release() };
+        let plain = encode(&shortest);
+        assert_eq!(plain.len(), 154 + 2 + 2 + MIN_BOX);
+        assert_eq!(decode(&plain), Some(shortest));
+        let both = Manifest { boxes, items: vec![entry(0x07, 1, "a", "b")], approvals: vec![github()], ..release() };
+        assert_eq!(both.check(), Ok(()));
+        let plain = encode(&both);
+        assert_eq!(decode(&plain), Some(both.clone()));
+        let sealed = both.seal(&inner(), acme(), &ws_name("acme"), &manifest_nonce()).unwrap();
+        assert_eq!(Manifest::open(&inner(), acme(), &ws_name("acme"), &sealed), Ok(both));
     }
 
     /// `bytes` with `at` onwards overwritten by `with`.
@@ -622,6 +748,58 @@ mod tests {
         assert_eq!(Manifest::open(&inner(), acme(), &ws_name("acme"), &sealed), Ok(with_an_approval()), "it opens back to the manifest");
         let state = state_hash(acme(), &ws_name("acme"), &hex(KAT_HARDWARE_WRAP), &sealed, b"");
         assert_eq!(state.as_slice(), hex(KAT_APPROVAL_PIN_STATE));
+    }
+
+    #[test]
+    fn a_manifest_with_a_box_is_unchanged() {
+        let plain = encode(&with_a_box());
+        assert_eq!(plain.len(), 242);
+        // Piece by piece first, so that a difference says where it is.
+        assert_eq!(plain[..196], hex(KAT_MANIFEST_APPROVAL_PLAIN), "all before the boxes, as with none");
+        assert_eq!(plain[196..202], hex("0001 03 646576"), "one box, its name 3 bytes, dev");
+        assert_eq!(plain[202..234], hex(KAT_BOX_NAME), "its key's name");
+        assert_eq!(plain[234..], 2u64.to_be_bytes(), "its key's version");
+        assert_eq!(plain, hex(KAT_MANIFEST_BOX_PLAIN));
+        assert_eq!(decode(&plain), Some(with_a_box()), "and it reads back");
+
+        let sealed = with_a_box().seal(&inner(), acme(), &ws_name("acme"), &box_manifest_nonce()).unwrap();
+        assert_eq!(sealed.len(), 271);
+        assert_eq!(sealed, hex(KAT_MANIFEST_BOX));
+        let key: [u8; 32] = arr(&hex(KAT_KEY_MANIFEST));
+        assert_eq!(*aead::open(&key, &aad(acme(), &ws_name("acme")), &sealed).unwrap(), hex(KAT_MANIFEST_BOX_PLAIN));
+        assert_eq!(Manifest::open(&inner(), acme(), &ws_name("acme"), &sealed), Ok(with_a_box()), "it opens back to the manifest");
+        let state = state_hash(acme(), &ws_name("acme"), &hex(KAT_HARDWARE_WRAP), &sealed, b"");
+        assert_eq!(state.as_slice(), hex(KAT_BOX_PIN_STATE));
+    }
+
+    #[test]
+    fn boxes_come_after_approvals_or_after_an_empty_count() {
+        // With no approval, the count of none is written, then the box.
+        let only = Manifest { boxes: vec![dev()], ..release() };
+        let plain = encode(&only);
+        assert_eq!(plain.len(), 202);
+        assert_eq!(plain[..154], hex(KAT_MANIFEST_PLAIN), "all before, as with nothing after the items");
+        assert_eq!(plain[154..156], [0, 0], "no approvals");
+        assert_eq!(plain[156..], hex(KAT_MANIFEST_BOX_PLAIN)[196..], "then the box, as after an approval");
+        assert_eq!(plain, hex(KAT_MANIFEST_BOX_ONLY_PLAIN));
+        assert_eq!(decode(&plain), Some(only));
+
+        // After an item, an approval of a resource and one of a box of the same name: the box's approval second, then the box.
+        let box_approval = Approval::of(Kind::Box, "dev", b"run = [\"claude\"]\n").unwrap();
+        let resource = Approval::of(Kind::Resource, "dev", POLICY_TEXT.as_bytes()).unwrap();
+        let all = Manifest { approvals: vec![resource, github(), box_approval.clone()], boxes: vec![dev()], ..with_a_secret() };
+        let plain = encode(&all);
+        assert_eq!(plain[..207], hex(KAT_MANIFEST_ITEM_PLAIN), "the item first");
+        assert_eq!(plain[207..209], [0, 3], "three approvals");
+        // The box section is its count and dev's 44 bytes; the box's approval, 37 bytes, comes right before it.
+        let boxes_at = plain.len() - 46;
+        assert_eq!(plain[boxes_at - 37..boxes_at - 32], hex("02 03 646576"), "the box's approval last of them");
+        assert_eq!(plain[boxes_at..], hex(KAT_MANIFEST_BOX_PLAIN)[196..], "then the box");
+        assert_eq!(decode(&plain), Some(all));
+        // Kinds in order: a box's approval before a resource's is refused, read or written.
+        let wrong = Manifest { approvals: vec![box_approval, github()], ..release() };
+        assert_eq!(wrong.check(), Err(Refusal::Unreadable));
+        assert_eq!(decode(&encode(&wrong)), None);
     }
 
     #[test]
@@ -689,11 +867,12 @@ mod tests {
 
     #[test]
     fn a_manifest_prints_no_reference_or_item_name() {
-        let manifest = Manifest { store: b"acme-store".to_vec(), keystore_ref: b"acme-vault".to_vec(), approvals: vec![github()], ..with_a_secret() };
+        let manifest = Manifest { store: b"acme-store".to_vec(), keystore_ref: b"acme-vault".to_vec(), approvals: vec![github()], boxes: vec![dev()], ..with_a_secret() };
         for shown in [format!("{manifest:?}"), format!("{manifest:#?}")] {
             assert!(!shown.contains("acme") && !shown.contains("github") && !shown.contains("token") && !shown.contains(&KAT_ITEM_NAME[..8]), "{shown}");
             assert!(!shown.contains(&KAT_POLICY_SHA256[..8]), "{shown}");
-            assert!(shown.contains("10 bytes") && shown.contains("1 items") && shown.contains("1 approvals"), "{shown}");
+            assert!(!shown.contains("dev") && !shown.contains(&KAT_BOX_NAME[..8]), "{shown}");
+            assert!(shown.contains("10 bytes") && shown.contains("1 items") && shown.contains("1 approvals") && shown.contains("1 boxes"), "{shown}");
         }
     }
 

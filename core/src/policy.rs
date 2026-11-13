@@ -15,6 +15,8 @@ use crate::refusal::Refusal;
 pub enum Kind {
     /// A resource's policy: which hosts and tools its secrets may be used with.
     Resource,
+    /// A box's policy: what it runs, what it mounts and which sites it reaches.
+    Box,
 }
 
 impl Kind {
@@ -22,6 +24,7 @@ impl Kind {
     pub(crate) const fn tag(self) -> u8 {
         match self {
             Kind::Resource => 0x01,
+            Kind::Box => 0x02,
         }
     }
 
@@ -29,6 +32,7 @@ impl Kind {
     pub(crate) fn from_tag(tag: u8) -> Result<Kind, Refusal> {
         match tag {
             0x01 => Ok(Kind::Resource),
+            0x02 => Ok(Kind::Box),
             _ => Err(Refusal::Unreadable),
         }
     }
@@ -47,9 +51,9 @@ impl Approval {
     /// The longest policy text: 64 KiB.
     pub const MAX_TEXT: usize = 65536;
 
-    /// The approval of `text` as `name`'s policy. The name is a resource's (`ItemKey::check_resource`:
-    /// 1 to 32 of a-z, 0-9 and `-`, starting with a letter or digit), and the text 1 to `MAX_TEXT`
-    /// bytes. Anything else is `Refusal::BadPolicy`.
+    /// The approval of `text` as `name`'s policy. The name is a resource's, and a box's is the same
+    /// (`ItemKey::check_resource`: 1 to 32 of a-z, 0-9 and `-`, starting with a letter or digit);
+    /// the text is 1 to `MAX_TEXT` bytes. Anything else is `Refusal::BadPolicy`.
     pub fn of(kind: Kind, name: &str, text: &[u8]) -> Result<Approval, Refusal> {
         if text.is_empty() || text.len() > Approval::MAX_TEXT {
             return Err(Refusal::BadPolicy);
@@ -203,11 +207,17 @@ mod tests {
 
     #[test]
     fn a_kind_is_written_as_its_fixed_tag() {
-        assert_eq!(Kind::Resource.tag(), 0x01);
+        assert_eq!((Kind::Resource.tag(), Kind::Box.tag()), (0x01, 0x02));
         for tag in 0..=255 {
-            let known = if tag == 0x01 { Ok(Kind::Resource) } else { Err(Refusal::Unreadable) };
+            let known = match tag {
+                0x01 => Ok(Kind::Resource),
+                0x02 => Ok(Kind::Box),
+                _ => Err(Refusal::Unreadable),
+            };
             assert_eq!(Kind::from_tag(tag), known, "tag {tag}");
         }
+        // Resources come before boxes, so a manifest lists every resource's approval first.
+        assert!(Kind::Resource < Kind::Box);
     }
 
     #[test]

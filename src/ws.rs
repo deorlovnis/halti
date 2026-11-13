@@ -41,9 +41,7 @@ use halti_core::manifest::Manifest;
 use halti_core::platform::{Build, Os, Role};
 use halti_core::refusal::Refusal;
 use halti_core::store::{FileKey, Files};
-use halti_core::verbs::{
-    Deleted, Draws, Fresh, Host, Machine, Nonces, Put, State, Stored, Which, Workspace, resolve_name, ws_delete, ws_items, ws_list, ws_new, ws_open, ws_remove, ws_set,
-};
+use halti_core::verbs::{Deleted, Draws, Fresh, Host, Machine, Nonces, Put, State, Stored, Which, resolve_name, ws_delete, ws_items, ws_list, ws_new, ws_open, ws_remove, ws_set};
 use zeroize::Zeroizing;
 
 use crate::approval::{Action, Declined, Means, Real, World};
@@ -289,14 +287,15 @@ fn open_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> Tty
     let typing: &dyn Fn() -> TtyPassphrase = if way.means.is_some() { &keeping } else { typing };
     let declined = declined(&format!("{name} was not opened"), &format!("open {name}"));
     let open = |machine: &Machine<'_>| ws_open(machine, name);
-    let (Workspace { id, keys, manifest }, typed) = approved(here, name, way, Action::WsOpen, &declined, typing, &open)?;
-    drop(keys);
+    let (reader, typed) = approved(here, name, way, Action::WsOpen, &declined, typing, &open)?;
+    let (id, made_with_a_copy) = (reader.id(), made_saved(reader.manifest()));
+    drop(reader);
     let mut said = Said { out: vec!["passphrase correct".to_string()], notes: Vec::new() };
     let Some(holder) = typed else {
         said.out.push(closed);
         return Ok(said);
     };
-    if made_saved(&manifest) {
+    if made_with_a_copy {
         if let Some(passphrase) = holder.take() {
             match way.copies.add(id, &passphrase) {
                 Ok(()) => said.out.push(format!("saved the passphrase of {name} in the keychain again")),

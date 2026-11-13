@@ -935,3 +935,65 @@ pub(crate) const KAT_MANIFEST_ITEM_APPROVAL_PLAIN: &str = "01020105020104010e706
 /// of no bytes. 82 bytes.
 pub(crate) const KAT_TWO_APPROVALS: &str = "0002010667697468756280982e4c451a63e91bbf2d72f3e957e6d5db212eed864fdeb5140c4b5b32e63c01066c696e656172e3b0c44298fc1c149afbf4c8996f\
     b92427ae41e4649b934ca495991b7852b855";
+
+// A box in a workspace: its key's name and seal, the manifest that lists it, and the audit log's key. Computed by an
+// independent implementation written from the format as described and not from this code, once it had reproduced
+// `KAT_KEY_STORE`, `KAT_KEY_LOGS`, `KAT_MANIFEST_APPROVAL`, `KAT_APPROVAL_PIN_STATE` and `KAT_ITEM_VALUE` above. It takes
+// `KAT_HARDWARE_WRAP` as a fixed input.
+
+/// The name of box dev's key in acme: under `KAT_KEY_ITEM_NAMES`, `name` under `BOX_ID` over `dev`, its first 32 bytes.
+pub(crate) const KAT_BOX_NAME: &str = "655b9141280360a3d0c49c84fb249948f73d92de62e41b7a69e630d13519225e";
+
+/// The name of box dev's key in globex: under the names key of the inner key `[0x22; 32]`.
+pub(crate) const KAT_BOX_NAME_GLOBEX: &str = "390d4c756c77b52b88fd719887ac3bc9f0d9e703d62f232ccdac393dc9185822";
+
+/// The key of the known answers' box: 32 bytes, as the binary draws them.
+pub(crate) fn box_key_bytes() -> [u8; 32] {
+    arr(&seq(0x30, 32))
+}
+
+/// The nonce that key is sealed under.
+pub(crate) fn box_key_nonce() -> [u8; 12] {
+    arr(&seq(0xd8, 12))
+}
+
+/// What the seal of box dev's key in acme at version 2 binds: the version string, `BOX_ID`, the workspace id, the name
+/// `KAT_BOX_NAME` and the version. 72 bytes.
+pub(crate) const KAT_BOX_AAD: &str = "776f726b73706163652d7631424f5801101112131415161718191a1b1c1d1e1f655b9141280360a3d0c49c84fb249948f73d92de62e41b7a69e630d13519225e\
+    0000000000000002";
+
+/// That key sealed under `KAT_KEY_STORE` with `box_key_nonce()`, bound by `KAT_BOX_AAD`. 61 bytes.
+pub(crate) const KAT_BOX_KEY: &str = "01d8d9dadbdcdddedfe0e1e2e3264da700ca6f8e3745703356ebc6984d375c90758b3d8fe979427394b84a90be475576484242083bb099c66439df3ece";
+
+/// The nonce acme's manifest holding the approval and the box is sealed under.
+pub(crate) fn box_manifest_nonce() -> [u8; 12] {
+    arr(&seq(0xf8, 12))
+}
+
+/// The plaintext of `KAT_MANIFEST_APPROVAL_PLAIN`'s manifest with box dev after the approvals: one box (`0001`), its name
+/// of 3 bytes, `KAT_BOX_NAME` and version 2. 242 bytes.
+pub(crate) const KAT_MANIFEST_BOX_PLAIN: &str = "01020105020104010e706173737068726173652d6b65790200000007020b66696c652d616e63686f72020000006003096469722d66696c65730200000060040d\
+    66696c652d6b657973746f7265020000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\
+    00000000000000000000000000000000000000000000000000000001010667697468756280982e4c451a63e91bbf2d72f3e957e6d5db212eed864fdeb5140c4b\
+    5b32e63c000103646576655b9141280360a3d0c49c84fb249948f73d92de62e41b7a69e630d13519225e0000000000000002";
+
+/// That plaintext sealed under `KAT_KEY_MANIFEST` with `box_manifest_nonce()`, for acme under its name. 271 bytes.
+pub(crate) const KAT_MANIFEST_BOX: &str = "01f8f9fafbfcfdfeff00010203f84a4c9cf9927046ca7788e3820972cb22a6ccf33a42d14101f6bdc5d0ec394bdc92b958c6e81fa567855ffd7d9ac2351b0803\
+    60aa30d1931f90419ce2c4cf8502d8b6ae11942f1d85694a2ab0cceae2fb122d6389a3c3e6a40533686a8809c9f75abaf77c67939cf37d713ef473ea3d49ca4e\
+    797836267da419df9bbc5372bb66b8405764514903cd9eb68a0c996f4fea376b10daf1089c3d4d3a41657df088cd95370e8833548d74b1f06473d928338268b8\
+    1fedccbf3b753b3e7bb843f9b2d47618879eed0672c71243c8c0d4d7f11419eff478c35496ce29b96e0c0fa7fa1159998a9427bfa4cd327b1defc12fe964a4b8\
+    06f6071fc7cd60856984e3c0d68917";
+
+/// The pin's hash of the name acme, the wrap `KAT_HARDWARE_WRAP`, the manifest `KAT_MANIFEST_BOX` and no policy.
+pub(crate) const KAT_BOX_PIN_STATE: &str = "19296143ec7546342a3738655de9030b7a9696f6eb7313a843a9eb7e8991465ba7821739305f84915161c58ebec94654";
+
+/// The plaintext of `KAT_MANIFEST_PLAIN`'s manifest with box dev and no approval: after the items, no approvals (`0000`),
+/// then the box as above. 202 bytes.
+pub(crate) const KAT_MANIFEST_BOX_ONLY_PLAIN: &str = "01020105020104010e706173737068726173652d6b65790200000007020b66696c652d616e63686f72020000006003096469722d66696c65730200000060040d\
+    66696c652d6b657973746f7265020000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\
+    00000000000000000000000000000000000000000000000000000000000103646576655b9141280360a3d0c49c84fb249948f73d92de62e41b7a69e630d13519\
+    225e0000000000000002";
+
+/// The key acme's boxes chain their audit log with: under `KAT_KEY_LOGS`, `mcp` under `AUDIT_ID` over acme's id, its first
+/// 32 bytes.
+pub(crate) const KAT_AUDIT_KEY: &str = "65aed4565e83e8e4fc596f3da8acef3d66da633cd4dea701cca9aa82b39021c6";

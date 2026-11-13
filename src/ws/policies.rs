@@ -309,9 +309,11 @@ fn show_with(here: &Here, name: &WsName, which: Option<&str>, way: &Way<'_>, typ
         for approval in &approvals {
             match approval.kind() {
                 Kind::Resource => rows.push((approval.name(), status(Some(approval), files.read(approval.name())?.as_deref()))),
+                // A box's policy is no resource's: it is never listed as one.
+                Kind::Box => {}
             }
         }
-        let approved_names: Vec<&str> = approvals.iter().map(Approval::name).collect();
+        let approved_names: Vec<&str> = approvals.iter().filter(|approval| approval.kind() == Kind::Resource).map(Approval::name).collect();
         rows.extend(names.iter().filter(|resource| !approved_names.contains(&resource.as_str())).map(|resource| (resource.as_str(), status(None, None))));
         if rows.is_empty() {
             return Ok(Said { out: vec![format!("{name} has no policy files. write one with: halti ws policy edit {name}/RESOURCE")], notes: Vec::new() });
@@ -330,4 +332,66 @@ fn show_with(here: &Here, name: &WsName, which: Option<&str>, way: &Way<'_>, typ
     let path = files.path(resource);
     let out = vec![format!("{} ({})", path.display(), status(approval, Some(&text))), String::new(), String::from_utf8_lossy(&text).trim_end().to_string()];
     Ok(Said { out, notes: Vec::new() })
+}
+
+#[cfg(all(test, halti_dev))]
+mod tests {
+    use halti_core::ids::WsId;
+    use halti_core::verbs::{BoxNonces, ws_box_new};
+    use zeroize::Zeroizing;
+
+    use super::super::saved::Copies;
+    use super::super::{Said, new_with};
+    use super::*;
+    use crate::approval::fake_tests::Fake;
+    use crate::util::TempDir;
+
+    const ACME: &str = "acme passphrase one";
+
+    /// No saved passphrase, ever.
+    struct NoCopies;
+
+    impl Copies for NoCopies {
+        fn exists(&self, _ws: WsId) -> bool {
+            false
+        }
+
+        fn add(&self, _ws: WsId, _passphrase: &str) -> Result<()> {
+            bail!("nothing is saved here")
+        }
+
+        fn get(&self, _ws: WsId) -> Option<Zeroizing<String>> {
+            None
+        }
+
+        fn remove(&self, _ws: WsId) -> bool {
+            false
+        }
+    }
+
+    fn out(said: &Said) -> Vec<&str> {
+        said.out.iter().map(String::as_str).collect()
+    }
+
+    // Each make and open here derives a key at 64 MiB once: four in all.
+    #[test]
+    fn an_approved_box_never_hides_a_resource_file() {
+        let dir = TempDir::new("halti-policies-box").unwrap();
+        let here = Here::at(&dir.0.join("ws"));
+        let acme = WsName::parse("acme").unwrap();
+        new_with(&here, &acme, &TtyPassphrase::new(false).answering(ACME), &NoCopies).unwrap();
+        // A box dev approved in acme, with no key: an approval of its kind only.
+        let holder = TtyPassphrase::new(false).answering(ACME);
+        let proposal = Proposal { kind: Kind::Box, name: "dev", text: b"run = [\"claude\"]\n", base: Base::New };
+        ws_box_new(&here.machine(&holder), &acme, None, &proposal, || Ok(()), BoxNonces { key: [1; 12], manifest: [2; 12] }).unwrap();
+        // And a resource of the same name, with a policy file and no approval.
+        let text = "[fetch]\nhosts = [\"https://dev.example\"]\n";
+        assert!(policies_of(&here, &acme).unwrap().create("dev", text).unwrap());
+        let way = Way { world: &Fake::answering(true, true), copies: &NoCopies, means: None, detail: None };
+        let typing = || TtyPassphrase::new(false).answering(ACME);
+        let said = show_with(&here, &acme, None, &way, &typing).unwrap();
+        assert_eq!(out(&said), ["RESOURCE         POLICY", "dev              not approved"]);
+        let said = show_with(&here, &acme, Some("dev"), &way, &typing).unwrap();
+        assert_eq!(said.out[0], format!("{} (not approved)", policies_of(&here, &acme).unwrap().path("dev").display()));
+    }
 }
