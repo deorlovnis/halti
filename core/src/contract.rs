@@ -58,6 +58,9 @@ pub fn files_contract(files: &dyn Files) {
     assert_eq!(files.read(&FileKey::Log(B)).unwrap(), None, "one workspace's log isn't another's");
     assert_eq!(files.read(&FileKey::Policy(B)).unwrap(), None);
     assert_eq!(files.read(&FileKey::Manifest(A)).unwrap(), None, "nor is its policy its manifest");
+    files.write_atomic(&FileKey::NextManifest(A), b"next").unwrap();
+    assert_eq!(files.read(&FileKey::Manifest(A)).unwrap(), None, "a manifest's replacement is a file of its own");
+    files.remove(&FileKey::NextManifest(A)).unwrap();
 
     assert!(files.names().unwrap().is_empty(), "only a directory record gives a name");
     files.write_atomic(&FileKey::DirRecord(name("acme")), b"record").unwrap();
