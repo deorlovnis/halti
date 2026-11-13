@@ -19,9 +19,9 @@
 
 pub mod browser_vm;
 mod login;
-mod run;
+pub(crate) mod run;
 pub(crate) mod sessions;
-mod store;
+pub(crate) mod store;
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -234,7 +234,6 @@ pub enum MountRule {
     /// of running boxes and the Keychains, and outside the home folder are other users' sockets and
     /// mounted disks: a rule that allows names them all, where a list that refuses would miss the
     /// next one.
-    #[allow(dead_code)] // for a workspace's boxes
     Workspace(Vec<PathBuf>),
 }
 
@@ -246,7 +245,6 @@ impl MountRule {
     }
 
     /// A workspace's rule, with the same folders of halti's kept out.
-    #[allow(dead_code)] // for a workspace's boxes
     pub fn workspace(settings: &Settings) -> MountRule {
         MountRule::Workspace(own_folders(settings))
     }
@@ -302,7 +300,12 @@ impl BoxPolicy {
         Self::parse_with(text, Mounts::Under(rule))
     }
 
+    /// Under a workspace's rule the text must also be plain, as any policy approved in a workspace
+    /// is (`policy::plain_text`).
     fn parse_with(text: &str, mounts: Mounts<'_>) -> Result<Self> {
+        if matches!(mounts, Mounts::Under(rule) if rule.in_workspace()) {
+            policy::plain_text(text.as_bytes())?;
+        }
         let policy: BoxPolicy = toml::from_str(text)?;
         policy.validate(mounts)?;
         Ok(policy)
@@ -448,7 +451,6 @@ writes = "deny"                         # anything but a read (GET, HEAD, OPTION
 
 /// The box template for a workspace: today's fields, with hints naming `halti ws …`, and no lines
 /// for signing in, importing or exporting, which a workspace's boxes don't have yet.
-#[allow(dead_code)] // for a workspace's boxes
 pub fn workspace_template(ws: &WsName, name: &str, image: Option<&str>) -> String {
     let image = image.map_or_else(
         || format!("# image = \"{}@sha256:...\"       # the system inside, pinned: build it with install.sh, then paste its digest", names::AGENT_IMAGE),
@@ -538,7 +540,7 @@ fn ask_for(world: &dyn approval::World, settings: &Settings, action: Action, rea
 
 /// The engine `[box] engine` names: the one place a box's engine is picked. Another engine is one
 /// more variant of `config::Engine` and one more arm here.
-fn vms(settings: &Settings) -> Result<&'static dyn Vms> {
+pub(crate) fn vms(settings: &Settings) -> Result<&'static dyn Vms> {
     match settings.engine {
         Some(Engine::Container) => Ok(&engine::Container),
         None => bail!("boxes can't run on this system: halti has no box engine for it"),
@@ -725,7 +727,82 @@ pub fn run(name: &str, temp: bool, command: Vec<String>) -> Result<u8> {
         mounts: MountRule::guarded(&settings),
         confirm: true,
     };
-    run::run(&layout, &run::Real { vms, keys: KeyStore::of(&settings), settings: &settings }, &request)
+    run_request(&layout, vms, &settings, &request)
+}
+
+/// Today's run of a box, and a workspace's: the engine, the key where `KeyStore::of` finds it, and
+/// the settings read for this run.
+fn run_request(layout: &Layout, vms: &'static dyn Vms, settings: &Settings, request: &run::Request<'_>) -> Result<u8> {
+    run::run(layout, &run::Real { vms, keys: KeyStore::of(settings), settings }, request)
+}
+
+/// A workspace's box to start, as `ws run` found it before the workspace was opened: what `run_in`
+/// needs once `main` has chosen the workspace as the place.
+pub struct Start {
+    /// The settings read once, before the choice.
+    pub settings: Settings,
+    pub vms: &'static dyn Vms,
+    pub layout: Layout,
+    /// The box's name, and as messages name it: `acme/dev`.
+    pub name: String,
+    pub shown: String,
+    /// The policy file's bytes, read once, and what they parse to under `mounts`.
+    pub text: Vec<u8>,
+    pub policy: BoxPolicy,
+    pub mounts: MountRule,
+    pub command: Option<Vec<String>>,
+}
+
+/// A second terminal's way into a workspace's box that runs: the engine and the files its opener
+/// noted, nothing else (`run::join`).
+pub struct Join {
+    pub vms: &'static dyn Vms,
+    pub layout: Layout,
+    pub name: String,
+    pub shown: String,
+    /// The policy file's bytes, read once.
+    pub text: Vec<u8>,
+    pub mounts: MountRule,
+    pub command: Option<Vec<String>>,
+}
+
+/// Runs a workspace's box once `main` has chosen its workspace. The box's approval must approve the
+/// text `ws run` read, and a box that keeps a store must have its key in the workspace: both read
+/// through the place. Then today's run, with no question: opening the workspace was the approval.
+pub fn run_in(start: Start) -> Result<u8> {
+    let Start { settings, vms, layout, name, shown, text, policy, mounts, command } = start;
+    let approve = format!("halti ws box approve {shown}");
+    match policy::status_of_text(&key(&name), &text) {
+        Status::Approved => {}
+        Status::Changed => bail!("the policy of box {shown} changed since it was approved. approve it with: {approve}"),
+        Status::Unapproved | Status::Missing => bail!("box {shown} isn't approved. approve it with: {approve}"),
+    }
+    if policy.keep && !KeyStore::of(&settings).exists(&name) {
+        bail!("box {shown} has a store but no key. remove it with: {}", source::current().hint(Hint::RemoveBox(&name)));
+    }
+    run::catch_signals();
+    let request = run::Request {
+        name: &name,
+        id: name.clone(),
+        policy: &policy,
+        policy_sha: crate::util::sha256_hex(&text),
+        persistent: policy.keep,
+        unique: false,
+        command,
+        tty: crate::interactive(),
+        stop: run::signalled(),
+        write: settings.means(Action::BoxWrite),
+        stop_with: format!("halti ws stop {shown}"),
+        shown,
+        mounts,
+        confirm: false,
+    };
+    run_request(&layout, vms, &settings, &request)
+}
+
+/// Joins a workspace's box that runs: no place, no question (`run::join`).
+pub fn join_in(join: Join) -> Result<u8> {
+    run::join(&join.layout, join.vms, &join.name, &join.shown, &join.mounts, &join.text, join.command.as_deref(), crate::interactive())
 }
 
 pub fn stop(name: &str) -> Result<()> {
@@ -934,7 +1011,7 @@ pub fn rm(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let (mut value, mut unit) = (bytes as f64, 0);
     while value >= 1000.0 && unit < UNITS.len() - 1 {

@@ -179,7 +179,7 @@ enum Cmd {
         #[arg(long)]
         default: bool,
     },
-    /// Workspaces, each opened with its own passphrase: create, list and delete them, store secrets in them, and approve their policies
+    /// Workspaces, each opened with its own passphrase: create, list and delete them, store secrets in them, approve their policies, and run their boxes
     Ws {
         #[command(subcommand)]
         action: WsCmd,
@@ -377,6 +377,75 @@ enum WsCmd {
         #[command(subcommand)]
         action: WsPolicyCmd,
     },
+    /// Make, change, approve, list or remove a workspace's boxes, or show a box's log
+    #[command(name = "box")]
+    Box {
+        #[command(subcommand)]
+        action: WsBoxCmd,
+    },
+    /// Start a box of a workspace (asks as halti config says for open), or join it if it runs (asks nothing)
+    #[command(after_help = "Without CMD, runs the box policy's `run` (claude). Ctrl-C or closing the terminal stops the box.")]
+    Run {
+        #[arg(value_name = "WS/BOX", value_parser = parse_ws_box)]
+        target: String,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
+        #[arg(last = true, value_name = "CMD")]
+        command: Vec<String>,
+    },
+    /// Stop a box of a workspace (asks nothing)
+    Stop {
+        #[arg(value_name = "WS/BOX", value_parser = parse_ws_box)]
+        target: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum WsBoxCmd {
+    /// Make a box: its policy in $EDITOR (a template if new), then its key, its approval and an empty encrypted store (asks as halti config says for policy)
+    New {
+        #[arg(value_name = "WS/BOX", value_parser = parse_ws_box)]
+        target: String,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
+    },
+    /// Open a box's policy in $EDITOR; shows what changed from the approved one, and approve it afterwards
+    Edit {
+        #[arg(value_name = "WS/BOX", value_parser = parse_ws_box)]
+        target: String,
+    },
+    /// Approve a box's policy (asks as halti config says for policy); until then the box can't start
+    Approve {
+        #[arg(value_name = "WS/BOX", value_parser = parse_ws_box)]
+        target: String,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
+    },
+    /// List a workspace's boxes: open or locked, size, last used, sites (asks nothing)
+    #[command(visible_alias = "list")]
+    Ls { name: String },
+    /// Delete a box for good: its key, then its store; its policy file stays (asks as halti config says for rm)
+    Rm {
+        #[arg(value_name = "WS/BOX", value_parser = parse_ws_box)]
+        target: String,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
+    },
+    /// Show what went through a box's door (asks as halti config says for open, unless the box runs)
+    Log {
+        #[arg(value_name = "WS/BOX", value_parser = parse_ws_box)]
+        target: String,
+        /// How many of the latest lines to show
+        #[arg(short = 'n', long, default_value_t = 50)]
+        last: usize,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -430,6 +499,14 @@ fn parse_ws_resource(s: &str) -> Result<String, String> {
     match ws::target(s) {
         Ok(_) => Ok(s.to_string()),
         Err(_) => Err("use a workspace and a resource, e.g. acme/github".into()),
+    }
+}
+
+/// `acme/dev`: a workspace, one `/`, then a box.
+fn parse_ws_box(s: &str) -> Result<String, String> {
+    match ws::boxes::target(s) {
+        Ok(_) => Ok(s.to_string()),
+        Err(_) => Err("use a workspace and a box, e.g. acme/dev".into()),
     }
 }
 
@@ -908,6 +985,14 @@ fn main() -> ExitCode {
             BoxCmd::Sh { engine: _, tools, command } => sandbox::sh(tools, command),
         },
         Cmd::Config { show, default } => ok(config::command(show, default)),
+        Cmd::Ws { action: WsCmd::Run { target, type_it, command } } => match ws::boxes::run(&target, command, type_it) {
+            Ok(ws::boxes::Run::Join(join)) => boxes::join_in(*join),
+            Ok(ws::boxes::Run::Start { source, start }) => {
+                source::choose(*source).expect("ws run chose where secrets are kept once");
+                boxes::run_in(*start)
+            }
+            Err(e) => Err(e),
+        },
         Cmd::Ws { action } => ok(match action {
             WsCmd::New { name, own, generate } => ws::new(&name, passphrase_choice(own, generate)),
             WsCmd::Set { target, field, type_it } => ws::set(&target, &field, type_it),
@@ -919,6 +1004,16 @@ fn main() -> ExitCode {
                 WsPolicyCmd::Approve { target, type_it } => ws::policies::approve(&target, type_it),
                 WsPolicyCmd::Show { target, type_it } => ws::policies::show(&target, type_it),
             },
+            WsCmd::Box { action } => match action {
+                WsBoxCmd::New { target, type_it } => ws::boxes::new(&target, type_it),
+                WsBoxCmd::Edit { target } => ws::boxes::edit(&target),
+                WsBoxCmd::Approve { target, type_it } => ws::boxes::approve(&target, type_it),
+                WsBoxCmd::Ls { name } => ws::boxes::ls(&name),
+                WsBoxCmd::Rm { target, type_it } => ws::boxes::rm(&target, type_it),
+                WsBoxCmd::Log { target, last, type_it } => ws::boxes::log(&target, last, type_it),
+            },
+            WsCmd::Stop { target } => ws::boxes::stop(&target),
+            WsCmd::Run { .. } => unreachable!("ws run returns its command's exit code, above"),
         }),
         Cmd::Open { name, type_it } => ok(ws::open(name.as_deref(), type_it)),
         Cmd::Close { name } => ok(ws::close(name.as_deref())),

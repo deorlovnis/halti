@@ -190,7 +190,6 @@ impl Source {
 
     /// The workspace `ws` as `reader` opened it, read again through `reading`, with the settings
     /// read before it is chosen. Its folders are found by the id the open read.
-    #[allow(dead_code)] // chosen by running a workspace's box
     pub fn workspace(ws: WsName, reader: Reader, reading: Reading, settings: Settings) -> Source {
         Source { place: Place::Workspace(Box::new(workspace::Opened::new(ws, reader, reading, settings))) }
     }

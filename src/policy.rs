@@ -650,9 +650,15 @@ pub fn status(res: &str) -> Status {
 /// kept under this Keychain name.
 pub fn status_of(key: &str, file: &Path) -> Status {
     let Ok(text) = fs::read(file) else { return Status::Missing };
+    status_of_text(key, &text)
+}
+
+/// The status of a text the caller read once, against the approval record under this name in the
+/// chosen place.
+pub fn status_of_text(key: &str, text: &[u8]) -> Status {
     match record(key) {
         None => Status::Unapproved,
-        Some(r) if r.policy == sha256_hex(&text) => Status::Approved,
+        Some(r) if r.policy == sha256_hex(text) => Status::Approved,
         Some(_) => Status::Changed,
     }
 }
@@ -896,15 +902,13 @@ pub fn offer_approval(p: &Path, approve_cmd: &str, approve_now: impl FnOnce() ->
     Ok(())
 }
 
-/// Whether a policy may be approved in a workspace, where it is kept apart from the Keychain's.
-/// It isn't empty. Its text is plain: printable ASCII, tab and line feed, so nothing in it reads as
-/// other than it is (a look-alike letter in a host, a control that reorders a line). A line that is
-/// only a comment may also have other letters and signs, as the Keychain's template does, but no
-/// control or invisible character; a text with a multi-line string has none of those lines, since
-/// a line in such a string may only look like a comment. And it uses only what the workspace's
-/// commands keep to: no `[refresh]` yet, and `[run]` and `[agent]` as an empty policy has them, so
-/// nothing approved now takes effect unseen once a later command honours it.
-pub fn in_workspace(text: &[u8], policy: &Policy) -> Result<()> {
+/// Whether the text of a policy, a resource's or a box's, may be approved in a workspace. It isn't
+/// empty. It is plain: printable ASCII, tab and line feed, so nothing in it reads as other than it
+/// is (a look-alike letter in a host, a control that reorders a line). A line that is only a
+/// comment may also have other letters and signs, as the Keychain's template does, but no control
+/// or invisible character; a text with a multi-line string has none of those lines, since a line in
+/// such a string may only look like a comment.
+pub fn plain_text(text: &[u8]) -> Result<()> {
     if text.is_empty() {
         bail!("an empty policy can't be approved");
     }
@@ -924,6 +928,15 @@ pub fn in_workspace(text: &[u8], policy: &Policy) -> Result<()> {
             _ => bail!("line {} has a character that isn't plain ASCII. write a host with other letters in its xn-- form", at + 1),
         }
     }
+    Ok(())
+}
+
+/// Whether a policy may be approved in a workspace, where it is kept apart from the Keychain's.
+/// Its text is plain (`plain_text`). And it uses only what the workspace's commands keep to: no
+/// `[refresh]` yet, and `[run]` and `[agent]` as an empty policy has them, so nothing approved now
+/// takes effect unseen once a later command honours it.
+pub fn in_workspace(text: &[u8], policy: &Policy) -> Result<()> {
+    plain_text(text)?;
     let empty = Policy::default();
     if !policy.refresh.is_empty() || policy.run != empty.run || policy.agent != empty.agent {
         bail!("in a workspace, [refresh] can't be used yet, and [run] and [agent] must keep their defaults");

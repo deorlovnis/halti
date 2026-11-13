@@ -2656,3 +2656,319 @@ fn touch_id_approval_pins_the_policy_in_the_real_keychain() {
     assert!(shown.contains("(approved)"), "{shown}");
     assert!(removed.status.success(), "{}", stderr(&removed));
 }
+
+// --- a workspace's boxes (the parts that need no VM) ---
+
+/// An image a box policy pins; no VM starts here, so it need not be there.
+const BOX_IMAGE: &str = "halti-agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// A box policy of acme's: its model, github, and a store if `keep`.
+fn box_text(keep: bool) -> String {
+    format!("about = \"acme's backend\"\nrun = [\"claude\"]\nimage = \"{BOX_IMAGE}\"\nmodel = \"anthropic\"\nsites = [\"github\"]\nkeep = {keep}\n")
+}
+
+/// PATH without a folder that holds an engine (`container`): what the workspace's box commands run
+/// with here, so none of them reaches a VM, or even asks about one.
+fn no_engine() -> String {
+    env::var("PATH").unwrap_or_default().split(':').filter(|dir| !Path::new(dir).join("container").exists()).collect::<Vec<_>>().join(":")
+}
+
+impl Env {
+    /// `halti ARGS` with no engine on PATH, `editor` as $EDITOR, and HALTI_TEST_PASSPHRASE
+    /// answering every passphrase question.
+    fn ws_box(&self, passphrase: &str, editor: &str, args: &[&str]) -> Output {
+        self.ws_box_command(passphrase, editor).args(args).output().unwrap()
+    }
+
+    fn ws_box_command(&self, passphrase: &str, editor: &str) -> Command {
+        let mut command = self.command();
+        command.env("PATH", no_engine()).env("EDITOR", editor).env_remove("VISUAL").env("HALTI_TEST_PASSPHRASE", passphrase);
+        command
+    }
+
+    /// A stand-in for the engine, first on PATH: it says it is ready, answers nothing else, and
+    /// notes each call it gets. Returns PATH with it, and where its calls are noted.
+    fn fake_engine(&self) -> (String, PathBuf) {
+        let (bin, calls) = (self.dir.join("fake-engine"), self.dir.join("engine-calls"));
+        fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("container");
+        fs::write(&script, format!("#!/bin/sh\necho \"$*\" >> '{}'\n[ \"$1 $2\" = \"system status\" ]\n", calls.display())).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        (format!("{}:{}", bin.display(), no_engine()), calls)
+    }
+}
+
+/// A workspace's folder, as halti prints it.
+fn wsdir(env: &Env, name: &str) -> PathBuf {
+    ws_dir(env).join(ws_id(env, name))
+}
+
+#[test]
+#[cfg_attr(target_os = "macos", ignore = "a Mac has a box engine")]
+fn ws_box_needs_a_box_engine() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let refused = "halti: boxes can't run on this system: halti has no box engine for it\n";
+    for args in [&["ws", "box", "new", "acme/dev"][..], &["ws", "run", "acme/dev"], &["ws", "stop", "acme/dev"]] {
+        let out = env.ws_box(PASSPHRASE, "true", args);
+        assert!(!out.status.success() && stderr(&out) == refused && asked(&out) == 0, "{args:?}: {}", stderr(&out));
+    }
+    assert!(!wsdir(&env, "acme").join("boxes").exists(), "nothing was made");
+    // Listing and removing need none: no store can be there.
+    assert_eq!(stdout(&env.ws_box(PASSPHRASE, "true", &["ws", "box", "ls", "acme"])), "acme has no boxes. make one with: halti ws box new acme/NAME\n");
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "rm", "acme/dev"]);
+    assert!(stderr(&out).ends_with("halti: there is no box acme/dev. make one with: halti ws box new acme/dev\n") && asked(&out) == 0, "{}", stderr(&out));
+}
+
+#[test]
+fn a_workspace_and_a_box_are_named_with_one_slash() {
+    let env = Env::new();
+    for args in
+        [&["ws", "run", "acme"][..], &["ws", "stop", "acme/Dev"], &["ws", "box", "new", "acme/dev/x"], &["ws", "box", "rm", "/dev"], &["ws", "box", "approve", "acme/dev.x"]]
+    {
+        let out = env.ws_box(PASSPHRASE, "true", args);
+        let target = args.last().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(stderr(&out).contains(&format!("error: invalid value '{target}' for '<WS/BOX>': use a workspace and a box, e.g. acme/dev")), "{}", stderr(&out));
+    }
+}
+
+#[test]
+fn deleting_a_workspace_with_a_store_is_refused_before_asking() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let boxes = wsdir(&env, "acme").join("boxes");
+    fs::create_dir_all(boxes.join("dev.sparsebundle")).unwrap();
+    fs::create_dir_all(boxes.join("temp/scratch.sparsebundle")).unwrap();
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "delete", "acme"]);
+    assert_eq!(stderr(&out), "halti: acme has boxes with stores: dev, scratch. remove them first: halti ws box rm acme/dev\n");
+    assert!(!out.status.success() && asked(&out) == 0 && ws_dir(&env).join("dir/acme").exists());
+    // A box whose lock is held runs: refused too, before anything is asked.
+    fs::remove_dir_all(boxes.join("dev.sparsebundle")).unwrap();
+    fs::remove_dir_all(boxes.join("temp")).unwrap();
+    fs::create_dir_all(boxes.join("open")).unwrap();
+    let lock = fs::File::create(boxes.join("open/dev.lock")).unwrap();
+    lock.lock().unwrap();
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "delete", "acme"]);
+    assert_eq!(stderr(&out), "halti: box acme/dev is running: stop it first (halti ws stop acme/dev)\n");
+    assert!(!out.status.success() && asked(&out) == 0 && ws_dir(&env).join("dir/acme").exists());
+    drop(lock);
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "delete", "acme"]);
+    assert!(out.status.success() && asked(&out) == 1, "{}", stderr(&out));
+}
+
+#[test]
+fn deleting_a_workspace_removes_its_boxes_folder() {
+    let env = Env::new();
+    for name in ["acme", "globex"] {
+        assert!(ws(&env, PASSPHRASE, &["ws", "new", name]).status.success());
+    }
+    let (acme, globex) = (wsdir(&env, "acme").join("boxes"), wsdir(&env, "globex").join("boxes"));
+    for boxes in [&acme, &globex] {
+        for folder in ["policies/approved", "open/dev", "downloads/dev/github", "blocked-writes"] {
+            fs::create_dir_all(boxes.join(folder)).unwrap();
+        }
+        for (file, bytes) in
+            [("policies/dev.toml", box_text(true)), ("audit.log", "{}\n".to_string()), ("dev.sessions", "github".to_string()), ("open/dev.policy", "x".to_string())]
+        {
+            fs::write(boxes.join(file), bytes).unwrap();
+        }
+    }
+    // What an earlier delete cut short left: an id no record names, with only a boxes folder.
+    let orphan = ws_dir(&env).join("0123456789abcdef0123456789abcdef");
+    fs::create_dir_all(orphan.join("boxes/policies")).unwrap();
+    fs::write(orphan.join("boxes/policies/dev.toml"), box_text(false)).unwrap();
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "delete", "acme"]);
+    assert!(out.status.success() && stdout(&out) == "deleted workspace acme\n" && asked(&out) == 1, "{}", stderr(&out));
+    assert!(stderr(&out).lines().all(|line| !line.contains("still in")), "{}", stderr(&out));
+    assert!(!acme.parent().unwrap().exists() && !orphan.exists(), "acme's folder and the orphan are gone");
+    assert!(globex.join("policies/dev.toml").exists() && globex.join("audit.log").exists(), "globex's are its own");
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "no box runs on Linux")]
+fn a_miss_never_reaches_the_keychain() {
+    let env = Env::new();
+    // The Keychain has an anthropic, approved and with its token; acme has none.
+    env.store("anthropic", "token", TOKEN);
+    env.policy("anthropic", "[fetch]\nhosts = [\"https://api.anthropic.com\"]\nauth = \"Bearer {token}\"\n");
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let out = env.ws_box(PASSPHRASE, &env.editor_writing(&box_text(false)), &["ws", "box", "new", "acme/dev"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (path, calls) = env.fake_engine();
+    let out = env.ws_box_command(PASSPHRASE, "true").env("PATH", path).args(["ws", "run", "acme/dev"]).output().unwrap();
+    let refused = "halti: box acme/dev uses anthropic: anthropic has no policy in acme. write one with: halti ws policy edit acme/anthropic\n";
+    assert!(!out.status.success() && stderr(&out).ends_with(refused) && asked(&out) == 1, "{}", stderr(&out));
+    assert!(quiet(&out, TOKEN));
+    // The engine was asked whether it is ready and whether the box's VMs run, by their workspace's
+    // names; nothing was started, and no other box's VM was named.
+    let tag = &ws_id(&env, "acme")[..12];
+    let asked_engine = fs::read_to_string(calls).unwrap();
+    assert_eq!(asked_engine, format!("inspect halti-wsbox-{tag}-dev\ninspect halti-wsbrowser-{tag}-dev\nsystem status\n"));
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+fn a_workspace_box_is_made_approved_listed_and_removed() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert_eq!(stdout(&env.ws_box(PASSPHRASE, "true", &["ws", "box", "ls", "acme"])), "acme has no boxes. make one with: halti ws box new acme/NAME\n");
+    let text = box_text(true);
+    let path = wsdir(&env, "acme").join("boxes/policies/dev.toml");
+    let pin = pin_version(&env, "acme");
+
+    // Made: shown whole, one passphrase, its key in acme, an encrypted store.
+    let out = env.ws_box(PASSPHRASE, &env.editor_writing(&text), &["ws", "box", "new", "acme/dev"]);
+    assert!(out.status.success() && asked(&out) == 1, "{}", stderr(&out));
+    let made = format!("Box dev in acme ({}), new:\n\n{}\n\nsha256 {}\n\nmade box acme/dev. run it with: halti ws run acme/dev\n", path.display(), text.trim_end(), sha12(&text));
+    assert_eq!(stdout(&out), made);
+    assert_eq!(pin_version(&env, "acme"), pin + 1);
+    assert_eq!(items(&env, "acme").len(), 1, "the box's key");
+    let store = wsdir(&env, "acme").join("boxes/dev.sparsebundle");
+    assert!(store.join("bands").is_dir() && fs::read(path.parent().unwrap().join("approved/dev.toml")).unwrap() == text.as_bytes());
+    assert!(!env.dir.join("keychain").read_dir().unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with("box.")), "nothing in the Keychain");
+    // Again: refused, before anything is asked.
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "new", "acme/dev"]);
+    assert!(stderr(&out).ends_with("halti: box acme/dev exists already. change it with: halti ws box edit acme/dev\n") && asked(&out) == 0, "{}", stderr(&out));
+
+    // Listed, asking nothing.
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "ls", "acme"]);
+    let listed = stdout(&out);
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines[0], "BOX                  STATE          SIZE  LAST USED         SITES                    SESSIONS         ABOUT");
+    assert!(
+        lines.len() == 2 && lines[1].starts_with("dev                  locked   ") && lines[1].ends_with("github                                    acme's backend"),
+        "{listed}"
+    );
+    assert_eq!(asked(&out), 0);
+    // Its log, read from the store: nothing yet.
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "log", "acme/dev"]);
+    assert!(out.status.success() && stdout(&out) == "nothing logged yet\n" && asked(&out) == 1, "{}", stderr(&out));
+
+    // Approved already; then edited, refused at run, and approved again.
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "approve", "acme/dev"]);
+    let shown = format!("Box dev in acme ({}):\n\n{}\n\nsha256 {}\n\n", path.display(), text.trim_end(), sha12(&text));
+    assert_eq!(stdout(&out), format!("{shown}box dev in acme was approved already\n"));
+    assert_eq!(pin_version(&env, "acme"), pin + 1);
+    let wider = format!("{text}cpus = 2\n");
+    let out = env.ws_box(PASSPHRASE, &env.editor_writing(&wider), &["ws", "box", "edit", "acme/dev"]);
+    assert!(out.status.success() && asked(&out) == 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("+cpus = 2\n"), "{}", stdout(&out));
+    assert!(stdout(&out).ends_with(&format!("saved {} — it takes effect once approved: halti ws box approve acme/dev\n", path.display())), "{}", stdout(&out));
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "run", "acme/dev"]);
+    let changed = "halti: the policy of box acme/dev changed since it was approved. approve it with: halti ws box approve acme/dev\n";
+    assert!(stderr(&out).ends_with(changed) && asked(&out) == 0, "{}", stderr(&out));
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "approve", "acme/dev"]);
+    assert!(stdout(&out).ends_with("\napproved box dev in acme\n") && asked(&out) == 1, "{}", stdout(&out));
+    assert_eq!(pin_version(&env, "acme"), pin + 2);
+
+    // Removed: its key and its store; its policy stays, and makes a fresh box.
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "rm", "acme/dev"]);
+    let removed = format!(
+        "deleted box acme/dev: its key and its store\nkept its policy {} (halti ws box new acme/dev makes a fresh box from it)\n\
+         Time Machine may still hold encrypted copies of the store. They stay closed unless restored together with acme's files from before this, and opened with its passphrase.\n",
+        path.display()
+    );
+    assert!(out.status.success() && stdout(&out) == removed && asked(&out) == 1, "{}", stderr(&out));
+    assert_eq!(pin_version(&env, "acme"), pin + 3);
+    assert!(items(&env, "acme").is_empty() && !store.exists() && path.exists() && !path.parent().unwrap().join("approved/dev.toml").exists());
+    let listed = stdout(&env.ws_box(PASSPHRASE, "true", &["ws", "box", "ls", "acme"]));
+    assert_eq!(listed.lines().nth(1), Some("dev                  no store          -  -                 github                                    acme's backend"), "{listed}");
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "rm", "acme/nothing"]);
+    assert!(stderr(&out).ends_with("halti: there is no box acme/nothing. make one with: halti ws box new acme/nothing\n") && asked(&out) == 0);
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "new", "acme/dev"]);
+    assert!(out.status.success() && stdout(&out).ends_with("made box acme/dev. run it with: halti ws run acme/dev\n") && store.exists(), "{}", stderr(&out));
+    assert!(env.ws_box(PASSPHRASE, "true", &["ws", "box", "rm", "acme/dev"]).status.success());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "no box runs on Linux")]
+fn ws_run_refuses_before_asking() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let run = || env.ws_box(PASSPHRASE, "true", &["ws", "run", "acme/dev"]);
+    let refused = |out: &Output, error: &str| {
+        assert!(!out.status.success() && stderr(out).ends_with(&format!("halti: {error}\n")) && asked(out) == 0, "{}", stderr(out));
+    };
+    refused(&run(), "there is no box acme/dev. make one with: halti ws box new acme/dev");
+    refused(&env.ws_box(PASSPHRASE, "true", &["ws", "box", "approve", "acme/dev"]), "there is no box acme/dev. make one with: halti ws box new acme/dev");
+    refused(&env.ws_box(PASSPHRASE, "true", &["ws", "box", "edit", "acme/dev"]), "there is no box acme/dev. make one with: halti ws box new acme/dev");
+    // A policy file no one approved.
+    let path = wsdir(&env, "acme").join("boxes/policies/dev.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, box_text(false)).unwrap();
+    refused(&run(), "box acme/dev isn't approved. approve it with: halti ws box approve acme/dev");
+    // Approved to keep a store it hasn't got.
+    fs::write(&path, box_text(true)).unwrap();
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "approve", "acme/dev"]);
+    assert!(out.status.success() && stdout(&out).ends_with("\napproved box dev in acme\n"), "{}", stderr(&out));
+    refused(&run(), "box acme/dev has no store. make one with: halti ws box new acme/dev");
+    refused(&env.ws_box(PASSPHRASE, "true", &["ws", "box", "log", "acme/dev"]), "box acme/dev has no store. make one with: halti ws box new acme/dev");
+    refused(&env.ws_box(PASSPHRASE, "true", &["ws", "stop", "acme/dev"]), "box acme/dev isn't running");
+    refused(&env.ws_box(PASSPHRASE, "true", &["ws", "run", "globex/dev"]), "there is no workspace named globex");
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "no box runs on Linux")]
+fn a_box_policy_with_a_hidden_mount_is_refused() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let path = wsdir(&env, "acme").join("boxes/policies/dev.toml");
+    let hidden = format!("{}\n[[mount]]\npath = \"~/.claude\"\n", box_text(false));
+    let why = format!("halti: {}: [[mount]] ~/.claude: a box in a workspace mounts only folders in your home that aren't hidden and aren't in ~/Library\n", path.display());
+    let out = env.ws_box(PASSPHRASE, &env.editor_writing(&hidden), &["ws", "box", "new", "acme/dev"]);
+    assert!(!out.status.success() && stderr(&out).ends_with(&why) && asked(&out) == 0, "{}", stderr(&out));
+    assert!(!path.parent().unwrap().join("approved").exists() && items(&env, "acme").is_empty());
+    for args in [&["ws", "box", "approve", "acme/dev"][..], &["ws", "run", "acme/dev"]] {
+        let out = env.ws_box(PASSPHRASE, "true", args);
+        assert!(!out.status.success() && stderr(&out).ends_with(&why) && asked(&out) == 0, "{args:?}: {}", stderr(&out));
+    }
+    // A text that isn't plain is refused as any policy in a workspace is.
+    let out = env.ws_box(PASSPHRASE, &env.editor_writing(&box_text(false).replace("acme's", "acme\u{2019}s")), &["ws", "box", "new", "acme/dev"]);
+    assert!(stderr(&out).contains("line 1 has a character that isn't plain ASCII") && asked(&out) == 0, "{}", stderr(&out));
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "the keychain is only on a mac")]
+fn a_saved_passphrase_starts_a_box_after_touch_id_naming_it() {
+    let env = Env::new();
+    let text = with_keychain("touchid", "passphrase").replace("policy = \"passphrase\"", "policy = \"touchid\"");
+    assert!(config(&env, &text, "yes").status.success());
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let policy = box_text(false);
+    let approve = |answer: &str| {
+        let mut command = env.ws_box_command("not the passphrase", &env.editor_writing(&policy));
+        command.env("HALTI_TEST_APPROVE", answer).args(["ws", "box", "new", "acme/dev"]).output().unwrap()
+    };
+    // A no makes nothing, and says how to type the passphrase instead.
+    let out = approve("no");
+    assert!(stderr(&out).ends_with("halti: box acme/dev was not made. to type the passphrase instead: halti ws box new acme/dev --type\n") && asked(&out) == 0);
+    assert!(!wsdir(&env, "acme").join("boxes/policies/approved").exists());
+    let out = approve("yes");
+    let named = format!("halti: [test] [DEV, not protected] make box dev {} in workspace acme: yes\n", sha12(&policy));
+    assert!(out.status.success() && stderr(&out) == named && asked(&out) == 0, "{}", stderr(&out));
+
+    // Starting it: Touch ID names the box, then the copy opens acme. Here the engine isn't there, so the run stops before any VM.
+    let run = |answer: &str| env.ws_box_command("not the passphrase", "true").env("HALTI_TEST_APPROVE", answer).args(["ws", "run", "acme/dev"]).output().unwrap();
+    let out = run("yes");
+    let started = "halti: [test] [DEV, not protected] open workspace acme to run box dev: yes\n";
+    assert!(!out.status.success() && stderr(&out).starts_with(started) && asked(&out) == 0 && keeps_quiet(&out, PASSPHRASE), "{}", stderr(&out));
+    assert!(stderr(&out).ends_with("halti: Apple's `container` isn't installed: get it from https://github.com/apple/container/releases\n"), "{}", stderr(&out));
+    let out = run("no");
+    assert!(stderr(&out).ends_with("halti: box acme/dev was not started. to type the passphrase instead: halti ws run acme/dev --type\n") && asked(&out) == 0, "{}", stderr(&out));
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+fn a_declined_make_leaves_no_store() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let before = ws_files(&env);
+    let out = env.ws_box("not the passphrase", &env.editor_writing(&box_text(true)), &["ws", "box", "new", "acme/dev"]);
+    assert!(!out.status.success() && asked(&out) == 1, "{}", stderr(&out));
+    let boxes = wsdir(&env, "acme").join("boxes");
+    assert!(!boxes.join("dev.sparsebundle").exists() && !boxes.join("policies/approved").exists() && items(&env, "acme").is_empty());
+    // Only the policy file was written, as the editor left it.
+    let after: Vec<PathBuf> = ws_files(&env).into_iter().map(|(path, _)| path).filter(|path| !before.iter().any(|(was, _)| was == path)).collect();
+    assert_eq!(after, [boxes.join("policies/dev.toml")]);
+}

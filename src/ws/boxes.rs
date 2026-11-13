@@ -1,0 +1,670 @@
+//! A workspace's boxes: `ws box new`, `edit`, `approve`, `ls`, `rm` and `log`, `ws run` and
+//! `ws stop`. A box of a workspace is its policy in the workspace's boxes folder, the approval of
+//! that policy sealed in the workspace, and for a box that keeps a store, the store's key sealed
+//! there too (`halti_core::verbs::ws_box_new`) and the store in the boxes folder.
+//!
+//! Making, approving and removing a box ask as `[workspace.approval] policy` and `rm` say; starting
+//! one opens the workspace, as `open` says, and that is the only question: the run itself is
+//! today's (`boxes::run_in`), with the workspace as the place everything is looked up in, which
+//! `main` chooses. A second terminal joins a box that runs and is asked nothing: it reads only what
+//! the opener noted beside the store (`boxes::join_in`). Listing and stopping ask nothing.
+//!
+//! What is shown before an approval is what is sealed: a policy's file is read once, checked
+//! against the workspace's mount rule and plain text, and those bytes are shown and sent to core.
+//! Nothing here looks anything up through a place: of `boxes` only what reaches none is used.
+
+use std::cell::Cell;
+use std::fs;
+use std::path::Path;
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use halti_core::boxkey::{BoxKey, check_box};
+use halti_core::ids::{WsId, WsName};
+use halti_core::policy::{Base, Kind, Proposal};
+use halti_core::refusal::Refusal;
+use halti_core::verbs::{BoxNonces, Machine, Was, ws_approve, ws_box_new, ws_box_rm, ws_open};
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
+
+use super::files::{PolicyFiles, Reading, boxes_dir, remove_boxes, stores_in};
+use super::tty::TtyPassphrase;
+use super::{Here, Said, Way, approved, declined, memory, random, saved, saved_means};
+use crate::approval::{Action, Real};
+use crate::boxes::store::Layout;
+use crate::boxes::{self, BoxPolicy, MountRule};
+use crate::config::{self, Settings};
+use crate::engine::{self, Vms};
+use crate::policy;
+use crate::source::Source;
+use crate::util::sha256_hex;
+
+/// `acme/dev`: a workspace's name, then after the first `/` a box, each as core checks it.
+pub fn target(text: &str) -> Result<(WsName, &str)> {
+    let Some((name, box_name)) = text.split_once('/') else { bail!("use a workspace and a box, e.g. acme/dev") };
+    let name = WsName::parse(name)?;
+    check_box(box_name)?;
+    Ok((name, box_name))
+}
+
+/// One box of a workspace, by the id the workspace's record names: its policy files and where its
+/// store, lock and VMs are.
+struct Found {
+    name: WsName,
+    id: WsId,
+    box_name: String,
+    /// `acme/dev`, as messages name it.
+    shown: String,
+    files: PolicyFiles,
+    layout: Layout,
+}
+
+/// Box `box_name` of `name`. There is no workspace without a record.
+fn find(here: &Here, name: &WsName, box_name: &str) -> Result<Found> {
+    let id = here.id_of(name).ok_or_else(|| Refusal::Unknown(name.clone()))?;
+    let layout = Layout::workspace(&boxes_dir(&here.root, id), id)?;
+    Ok(Found { name: name.clone(), id, box_name: box_name.to_string(), shown: format!("{name}/{box_name}"), files: PolicyFiles::boxes(&here.root, id), layout })
+}
+
+fn no_box(shown: &str) -> anyhow::Error {
+    anyhow!("there is no box {shown}. make one with: halti ws box new {shown}")
+}
+
+fn exists(shown: &str) -> anyhow::Error {
+    anyhow!("box {shown} exists already. change it with: halti ws box edit {shown}")
+}
+
+fn no_store(shown: &str) -> anyhow::Error {
+    anyhow!("box {shown} has no store. make one with: halti ws box new {shown}")
+}
+
+fn running(shown: &str) -> anyhow::Error {
+    anyhow!("box {shown} is running: stop it first (halti ws stop {shown})")
+}
+
+fn changed_while_opened(name: &WsName) -> anyhow::Error {
+    anyhow!("workspace {name} changed while it was opened: try again")
+}
+
+/// The box's policy, read once, as text, and what it parses to under `rule`: none if there is no
+/// file. A text that isn't plain or doesn't parse is refused with its path.
+fn read_checked(found: &Found, rule: &MountRule) -> Result<Option<(Vec<u8>, BoxPolicy)>> {
+    let Some(bytes) = found.files.read(&found.box_name)? else { return Ok(None) };
+    let path = found.files.path(&found.box_name);
+    let text = std::str::from_utf8(&bytes).with_context(|| format!("{} isn't UTF-8", path.display()))?;
+    let parsed = BoxPolicy::parse_in(text, rule).with_context(|| path.display().to_string())?;
+    Ok(Some((bytes, parsed)))
+}
+
+fn sha12(text: &[u8]) -> String {
+    sha256_hex(text)[..12].to_string()
+}
+
+/// A policy's whole text as it is shown before an approval: `Box dev in acme (PATH)HOW:`, the
+/// text, and the start of its sha256.
+fn shown_whole(found: &Found, how: &str, text: &[u8]) -> String {
+    let path = found.files.path(&found.box_name);
+    format!("Box {} in {} ({}){how}:\n\n{}\n\nsha256 {}\n\n", found.box_name, found.name, path.display(), String::from_utf8_lossy(text).trim_end(), sha12(text))
+}
+
+// --- making, changing and approving a box ---
+
+/// `halti ws box new WS/BOX [--type]`: the policy in the editor (the workspace's template if there
+/// is no file), then one approval as `[workspace.approval] policy` says, which stores the box's key,
+/// approves its policy and, for `keep = true`, makes its store.
+pub fn new(target_text: &str, type_it: bool) -> Result<()> {
+    let (name, box_name) = target(target_text)?;
+    let settings = config::settings();
+    let vms = boxes::vms(&settings)?;
+    let here = Here::at(&settings.workspaces.path);
+    let found = find(&here, &name, box_name)?;
+    let rule = MountRule::workspace(&settings);
+    found.layout.prepare()?;
+    if found.layout.bundle(box_name).exists() || found.files.approved_copy(box_name)?.is_some() {
+        return Err(exists(&found.shown));
+    }
+    if found.files.read(box_name)?.is_none() {
+        // The pinned image of the engine's agent system, if there is one yet.
+        let image = vms.image_digest(engine::AGENT_IMAGE).ok();
+        found.files.create(box_name, &boxes::workspace_template(&name, box_name, image.as_deref()))?;
+    }
+    policy::run_editor(&found.files.path(box_name))?;
+    let (text, parsed) = read_checked(&found, &rule)?.ok_or_else(|| no_box(&found.shown))?;
+    memory::harden();
+    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsPolicy, type_it), detail: None };
+    make_with(&here, &found, &text, parsed.keep, &way, &|| TtyPassphrase::new(false), &boxes::store::create)?.print();
+    Ok(())
+}
+
+/// Makes the box `found` with the policy `text`, shown whole as new, approved the way `way` says. For
+/// a box that `keep`s a store, a key is drawn and `create` makes the store with it once core has the
+/// approval and has checked the box isn't there; a failure after that shreds the store.
+fn make_with(
+    here: &Here,
+    found: &Found,
+    text: &[u8],
+    keep: bool,
+    way: &Way<'_>,
+    typing: &dyn Fn() -> TtyPassphrase,
+    create: &dyn Fn(&Layout, &Path, &str) -> Result<()>,
+) -> Result<Said> {
+    let (box_name, shown) = (found.box_name.as_str(), found.shown.as_str());
+    print!("{}", shown_whole(found, ", new", text));
+    let key = if keep { Some(BoxKey::from_bytes(random::<32>()?)) } else { None };
+    let bundle = found.layout.bundle(box_name);
+    let made = Cell::new(false);
+    let proposal = Proposal { kind: Kind::Box, name: box_name, text, base: Base::New };
+    let make = |machine: &Machine<'_>| {
+        let store = || {
+            if let Some(key) = &key {
+                create(&found.layout, &bundle, &key.hex())?;
+                made.set(true);
+            }
+            Ok(())
+        };
+        ws_box_new(machine, &found.name, key.as_ref(), &proposal, store, BoxNonces { key: *random::<12>()?, manifest: *random::<12>()? })
+    };
+    let way = Way { world: way.world, copies: way.copies, means: way.means, detail: Some(format!("{box_name} {}", sha12(text))) };
+    let declined = declined(&format!("box {shown} was not made"), &format!("ws box new {shown}"));
+    if let Err(error) = approved(here, &found.name, &way, Action::WsPolicy, &declined, typing, &make) {
+        if made.get() {
+            let _ = boxes::store::shred(&bundle);
+        }
+        return Err(match error.downcast_ref::<Refusal>() {
+            Some(Refusal::BoxExists { .. } | Refusal::NotTheBase { .. }) => exists(shown),
+            _ => error,
+        });
+    }
+    let mut said = Said::default();
+    said.out.push(match keep {
+        true => format!("made box {shown}. run it with: halti ws run {shown}"),
+        false => format!("made box {shown}. it keeps nothing between runs. run it with: halti ws run {shown}"),
+    });
+    if found.files.keep_approved(box_name, text).is_err() {
+        said.notes.push(format!("the approved copy of box {shown} couldn't be kept. approve it again: halti ws box approve {shown}"));
+    }
+    Ok(said)
+}
+
+/// `halti ws box edit WS/BOX`: the box's policy in the editor, read once when it ends, checked and
+/// shown against the approved copy. Asks nothing; on a terminal it offers to approve what was saved.
+pub fn edit(target_text: &str) -> Result<()> {
+    let (name, box_name) = target(target_text)?;
+    let settings = config::settings();
+    let here = Here::at(&settings.workspaces.path);
+    let found = find(&here, &name, box_name)?;
+    let rule = MountRule::workspace(&settings);
+    // A path there that isn't a plain file, or is too large, is refused before the editor opens it.
+    if found.files.read(box_name)?.is_none() {
+        return Err(no_box(&found.shown));
+    }
+    let path = found.files.path(box_name);
+    // A copy that can't be read, or isn't text, is taken as none: the edit is then approved as new,
+    // which core refuses if the box's policy has an approval.
+    let copy = found.files.approved_copy(box_name).ok().flatten().filter(|copy| std::str::from_utf8(copy).is_ok());
+    let read = |_: &Path| found.files.read(box_name)?.ok_or_else(|| no_box(&found.shown));
+    let check = |text: &str| BoxPolicy::parse_in(text, &rule).map(drop);
+    let shown_against = || copy.as_deref().map(|copy| String::from_utf8_lossy(copy).into_owned());
+    let Some(bytes) = policy::edit_against(&path, read, shown_against, &format!("box {box_name} in {name}"), check)? else { return Ok(()) };
+    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsPolicy, false), detail: None };
+    policy::offer_approval(&path, &format!("halti ws box approve {}", found.shown), || {
+        memory::harden();
+        let (base, shown) = match &copy {
+            Some(copy) => (Base::Copy(copy), format!("sha256 {}\n\n", sha12(&bytes))),
+            None => (Base::New, shown_whole(&found, ", new", &bytes)),
+        };
+        approve_shown(&here, &found, &bytes, base, &shown, &way, &|| TtyPassphrase::new(false))?.print();
+        Ok(())
+    })
+}
+
+/// `halti ws box approve WS/BOX [--type]`: the box's policy, read once, checked and shown whole,
+/// approved as `[workspace.approval] policy` says.
+pub fn approve(target_text: &str, type_it: bool) -> Result<()> {
+    let (name, box_name) = target(target_text)?;
+    let settings = config::settings();
+    memory::harden();
+    let here = Here::at(&settings.workspaces.path);
+    let found = find(&here, &name, box_name)?;
+    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsPolicy, type_it), detail: None };
+    approve_with(&here, &found, &MountRule::workspace(&settings), &way, &|| TtyPassphrase::new(false))?.print();
+    Ok(())
+}
+
+fn approve_with(here: &Here, found: &Found, rule: &MountRule, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
+    let (text, _) = read_checked(found, rule)?.ok_or_else(|| no_box(&found.shown))?;
+    approve_shown(here, found, &text, Base::Shown, &shown_whole(found, "", &text), way, typing)
+}
+
+/// Prints `shown`, then asks once (`approved`, as `[workspace.approval] policy` says) and has core
+/// seal the approval of `text` as the box's policy. Once it has, the approved copy is written with
+/// the bytes just approved, where it isn't those already.
+fn approve_shown(here: &Here, found: &Found, text: &[u8], base: Base<'_>, shown: &str, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
+    let (box_name, name) = (found.box_name.as_str(), &found.name);
+    print!("{shown}");
+    let proposal = Proposal { kind: Kind::Box, name: box_name, text, base };
+    let way = Way { world: way.world, copies: way.copies, means: way.means, detail: Some(format!("of box {box_name} {}", sha12(text))) };
+    let approve = |machine: &Machine<'_>| ws_approve(machine, name, std::slice::from_ref(&proposal), *random::<12>()?);
+    let declined = declined(&format!("the policy of box {} was not approved", found.shown), &format!("ws box approve {}", found.shown));
+    let (was, _) = approved(here, name, &way, Action::WsPolicy, &declined, typing, &approve).map_err(|error| match error.downcast_ref::<Refusal>() {
+        Some(Refusal::NotTheBase { .. }) => {
+            anyhow!("the approved copy of box {box_name} in {name} isn't what was approved, so nothing was approved. approve it alone: halti ws box approve {}", found.shown)
+        }
+        _ => error,
+    })?;
+    let mut said = Said::default();
+    match was.first() {
+        Some(Was::Already) => said.out.push(format!("box {box_name} in {name} was approved already")),
+        _ => {
+            said.out.push(format!("approved box {box_name} in {name}"));
+            if boxes::store::is_held(&found.layout.lock(box_name)) {
+                said.out.push(format!("a running box keeps the policy it started with. stop it (halti ws stop {}) and run it again", found.shown));
+            }
+        }
+    }
+    let kept = found.files.approved_copy(box_name).ok().flatten();
+    if kept.as_deref() != Some(text) && found.files.keep_approved(box_name, text).is_err() {
+        said.notes.push(format!("the approved copy of box {} couldn't be kept. approve it again: halti ws box approve {}", found.shown, found.shown));
+    }
+    Ok(said)
+}
+
+// --- listing, removing ---
+
+/// `halti ws box ls WS`: the workspace's boxes, from their files and folders; asks nothing. A box
+/// is listed if it has a policy file or a store.
+pub fn ls(name_text: &str) -> Result<()> {
+    let name = WsName::parse(name_text)?;
+    let settings = config::settings();
+    let here = Here::at(&settings.workspaces.path);
+    listing(&here, &name, &MountRule::workspace(&settings))?.print();
+    Ok(())
+}
+
+fn listing(here: &Here, name: &WsName, rule: &MountRule) -> Result<Said> {
+    let id = here.id_of(name).ok_or_else(|| Refusal::Unknown(name.clone()))?;
+    let folder = boxes_dir(&here.root, id);
+    let layout = Layout::workspace(&folder, id)?;
+    let files = PolicyFiles::boxes(&here.root, id);
+    let mut names = files.names()?;
+    names.extend(stores_in(&folder)?.into_iter().filter(|box_name| check_box(box_name).is_ok()));
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return Ok(Said { out: vec![format!("{name} has no boxes. make one with: halti ws box new {name}/NAME")], notes: Vec::new() });
+    }
+    let reading = Reading::at(&here.root);
+    let mut out = vec![format!("{:<20} {:<9} {:>9}  {:<17} {:<24} {:<16} ABOUT", "BOX", "STATE", "SIZE", "LAST USED", "SITES", "SESSIONS")];
+    for box_name in &names {
+        let text = files.read(box_name).ok().flatten();
+        let parsed = text.as_deref().and_then(|text| std::str::from_utf8(text).ok()).and_then(|text| BoxPolicy::parse_in(text, rule).ok());
+        let bundle = layout.bundle(box_name);
+        let state = match (boxes::store::is_held(&layout.lock(box_name)), bundle.exists(), parsed.as_ref().is_some_and(|parsed| !parsed.keep)) {
+            (true, _, _) => "open",
+            (false, true, _) => "locked",
+            (false, false, true) => "shredded",
+            (false, false, false) => "no store",
+        };
+        let (bytes, used) = if bundle.exists() { boxes::store::usage(&bundle) } else { (0, None) };
+        let size = if bundle.exists() { boxes::human(bytes) } else { "-".to_string() };
+        let used = used.and_then(|time| Timestamp::try_from(time).ok()).map_or("-".to_string(), |time| time.to_zoned(TimeZone::system()).strftime("%Y-%m-%d %H:%M").to_string());
+        let sites = parsed.as_ref().map_or(String::new(), |parsed| parsed.sites.join(", "));
+        let about = parsed.as_ref().map_or("", |parsed| parsed.about.as_str());
+        let sessions = reading.box_file(id, &format!("{box_name}.sessions")).ok().flatten().map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_default();
+        let sessions = sessions.split(',').filter(|site| !site.is_empty()).collect::<Vec<_>>().join(", ");
+        out.push(format!("{box_name:<20} {state:<9} {size:>9}  {used:<17} {sites:<24} {sessions:<16} {about}").trim_end().to_string());
+    }
+    Ok(Said { out, notes: Vec::new() })
+}
+
+/// `halti ws box rm WS/BOX [--type]`: with the box stopped, one approval as `[workspace.approval] rm`
+/// says, which drops its key and its approval from the workspace; then its leftover VMs are
+/// stopped, its store shredded, and what its runs left removed. Its policy file stays.
+pub fn rm(target_text: &str, type_it: bool) -> Result<()> {
+    let (name, box_name) = target(target_text)?;
+    let settings = config::settings();
+    memory::harden();
+    let here = Here::at(&settings.workspaces.path);
+    let found = find(&here, &name, box_name)?;
+    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsRm, type_it), detail: None };
+    rm_with(&here, &found, boxes::vms(&settings).ok(), &way, &|| TtyPassphrase::new(false))?.print();
+    Ok(())
+}
+
+fn rm_with(here: &Here, found: &Found, vms: Option<&dyn Vms>, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
+    let (box_name, shown) = (found.box_name.as_str(), found.shown.as_str());
+    let bundle = found.layout.bundle(box_name);
+    let has_file = found.files.read(box_name)?.is_some();
+    if !has_file && !bundle.exists() && found.files.approved_copy(box_name)?.is_none() {
+        return Err(no_box(shown));
+    }
+    found.layout.prepare()?;
+    let Some(_held) = boxes::store::lock(&found.layout.lock(box_name))? else { return Err(running(shown)) };
+    let way = Way { world: way.world, copies: way.copies, means: way.means, detail: Some(box_name.to_string()) };
+    let remove = |machine: &Machine<'_>| ws_box_rm(machine, &found.name, box_name, *random::<12>()?);
+    approved(here, &found.name, &way, Action::WsRm, &declined(&format!("box {shown} was not removed"), &format!("ws box rm {shown}")), typing, &remove)?;
+    let mut said = Said::default();
+    // Its key is gone: what is left is noise to anyone, and goes.
+    for vm in [found.layout.vm(box_name), found.layout.browser_vm(box_name)] {
+        if let Some(vms) = vms.filter(|vms| vms.running(&vm))
+            && let Err(error) = vms.stop(&vm)
+        {
+            said.notes.push(format!("stopping {vm}: {error:#}"));
+        }
+    }
+    boxes::store::shred(&bundle)?;
+    boxes::run::sweep(&found.layout, box_name)?;
+    if found.files.forget_approved(box_name).is_err() {
+        said.notes.push(format!("the approved copy of box {shown} couldn't be removed. remove {}", found.files.copy_path(box_name).display()));
+    }
+    let reading = Reading::at(&here.root);
+    for file in [format!("{box_name}.sessions"), format!("{box_name}.head")] {
+        let _ = reading.remove_box_file(found.id, &file);
+    }
+    said.out.push(format!("deleted box {shown}: its key and its store"));
+    if has_file {
+        said.out.push(format!("kept its policy {} (halti ws box new {shown} makes a fresh box from it)", found.files.path(box_name).display()));
+    }
+    said.out.push(format!(
+        "Time Machine may still hold encrypted copies of the store. They stay closed unless restored together with {}'s files from before this, and opened with its passphrase.",
+        found.name
+    ));
+    Ok(said)
+}
+
+// --- running, stopping, the log ---
+
+/// What `ws run` hands `main`: a box to join, or the workspace opened and the box to start in it.
+pub enum Run {
+    Join(Box<boxes::Join>),
+    Start { source: Box<Source>, start: Box<boxes::Start> },
+}
+
+/// `halti ws run WS/BOX [--type] [-- CMD]`: reads the settings once. A box that runs is joined, and
+/// nothing is asked. Otherwise its policy file is read once and checked, against the copy kept when
+/// it was approved too, and so are its store and its sockets; then the workspace is opened, as
+/// `[workspace.approval] open` says. `main` chooses it as the place and starts the box.
+pub fn run(target_text: &str, command: Vec<String>, type_it: bool) -> Result<Run> {
+    let (name, box_name) = target(target_text)?;
+    let settings = config::settings();
+    let vms = boxes::vms(&settings)?;
+    memory::harden();
+    let here = Here::at(&settings.workspaces.path);
+    let found = find(&here, &name, box_name)?;
+    let rule = MountRule::workspace(&settings);
+    let command = (!command.is_empty()).then_some(command);
+    if boxes::store::is_held(&found.layout.lock(box_name)) {
+        let text = found.files.read(box_name)?.ok_or_else(|| no_box(&found.shown))?;
+        let Found { box_name, shown, layout, .. } = found;
+        return Ok(Run::Join(Box::new(boxes::Join { vms, layout, name: box_name, shown, text, mounts: rule, command })));
+    }
+    let (text, parsed) = read_checked(&found, &rule)?.ok_or_else(|| no_box(&found.shown))?;
+    let shown = found.shown.clone();
+    match found.files.approved_copy(box_name).ok().flatten() {
+        None => bail!("box {shown} isn't approved. approve it with: halti ws box approve {shown}"),
+        Some(copy) if copy != text => bail!("the policy of box {shown} changed since it was approved. approve it with: halti ws box approve {shown}"),
+        Some(_) => {}
+    }
+    if parsed.keep && !found.layout.bundle(box_name).exists() {
+        return Err(no_store(&shown));
+    }
+    found.layout.sockets_fit(box_name)?;
+    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsOpen, type_it), detail: Some(format!("to run box {box_name}")) };
+    let reader = open_for(&here, &found, &way, &format!("box {shown} was not started"), &format!("ws run {shown}"), &|| TtyPassphrase::new(false))?;
+    // The keys are wiped once read; this process lives as long as the box.
+    memory::release();
+    let source = Source::workspace(name, reader, Reading::at(&here.root), settings.clone());
+    let Found { box_name, layout, .. } = found;
+    let start = boxes::Start { settings, vms, layout, name: box_name, shown, text, policy: parsed, mounts: rule, command };
+    Ok(Run::Start { source: Box::new(source), start: Box::new(start) })
+}
+
+/// Opens the workspace of `found` the way `way` says, and checks it is the one its record named
+/// before: the box's folders were found by that id.
+fn open_for(here: &Here, found: &Found, way: &Way<'_>, what: &str, command: &str, typing: &dyn Fn() -> TtyPassphrase) -> Result<halti_core::verbs::Reader> {
+    let open = |machine: &Machine<'_>| ws_open(machine, &found.name);
+    let (reader, _) = approved(here, &found.name, way, Action::WsOpen, &declined(what, command), typing, &open)?;
+    if reader.id() != found.id {
+        return Err(changed_while_opened(&found.name));
+    }
+    Ok(reader)
+}
+
+/// `halti ws stop WS/BOX`: stops the box's VM, asks nothing. The halti that runs it then puts it
+/// away; once it lets go of the box, what is left is cleared here, and the browser VM, which that
+/// halti stops last, is stopped if it still runs.
+pub fn stop(target_text: &str) -> Result<()> {
+    let (name, box_name) = target(target_text)?;
+    let settings = config::settings();
+    let vms = boxes::vms(&settings)?;
+    let here = Here::at(&settings.workspaces.path);
+    let found = find(&here, &name, box_name)?;
+    let vm = found.layout.vm(box_name);
+    let was_running = vms.running(&vm);
+    if was_running {
+        vms.stop(&vm)?;
+    }
+    let lock = found.layout.lock(box_name);
+    if lock.exists() {
+        for _ in 0..60 {
+            if let Some(_held) = boxes::store::lock(&lock)? {
+                boxes::run::sweep(&found.layout, box_name)?;
+                let browser = found.layout.browser_vm(box_name);
+                if vms.running(&browser) {
+                    vms.stop(&browser)?;
+                }
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+    if !was_running {
+        bail!("box {} isn't running", found.shown);
+    }
+    println!("stopped box {}", found.shown);
+    Ok(())
+}
+
+/// `halti ws box log WS/BOX [-n N] [--type]`: the last lines of what went through the box's door. A
+/// box that runs is read as it is, asking nothing; otherwise the workspace is opened, as `open`
+/// says, for the store's key, and the store is opened read-only while it is read.
+pub fn log(target_text: &str, last: usize, type_it: bool) -> Result<()> {
+    let (name, box_name) = target(target_text)?;
+    let settings = config::settings();
+    memory::harden();
+    let here = Here::at(&settings.workspaces.path);
+    let found = find(&here, &name, box_name)?;
+    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsOpen, type_it), detail: None };
+    let text = log_with(&here, &found, &way, &|| TtyPassphrase::new(false))?;
+    let lines: Vec<&str> = text.lines().collect();
+    for line in &lines[lines.len().saturating_sub(last)..] {
+        println!("{line}");
+    }
+    if lines.is_empty() {
+        println!("nothing logged yet");
+    }
+    Ok(())
+}
+
+fn log_with(here: &Here, found: &Found, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<String> {
+    let (box_name, shown) = (found.box_name.as_str(), found.shown.as_str());
+    let bundle = found.layout.bundle(box_name);
+    if !bundle.exists() {
+        return Err(no_store(shown));
+    }
+    found.layout.prepare()?;
+    let mnt = found.layout.mount_point(box_name);
+    let read = |mnt: &Path| fs::read_to_string(boxes::store::door_log(mnt)).unwrap_or_default();
+    let Some(_held) = boxes::store::lock(&found.layout.lock(box_name))? else {
+        if !boxes::store::is_mounted(&mnt) {
+            bail!("box {shown} is being opened or closed by another halti: try again in a moment");
+        }
+        return Ok(read(&mnt));
+    };
+    let way = Way { world: way.world, copies: way.copies, means: way.means, detail: Some(format!("to read the log of box {box_name}")) };
+    let reader = open_for(here, found, &way, &format!("the log of box {shown} was not read"), &format!("ws box log {shown}"), typing)?;
+    let key = reader.box_key(&here.keystore, box_name)?.ok_or_else(|| anyhow!("box {shown} has a store but no key. remove it with: halti ws box rm {shown}"))?;
+    drop(reader);
+    let open = boxes::store::open(&bundle, &mnt, &key.hex(), true)?;
+    Ok(read(open.path()))
+}
+
+// --- deleting a workspace ---
+
+/// Refuses to delete workspace `name` (id `id`) while one of its boxes runs or has a store: checked
+/// before anything is asked.
+pub(super) fn refuse_delete(here: &Here, name: &WsName, id: WsId) -> Result<()> {
+    let folder = boxes_dir(&here.root, id);
+    for entry in fs::read_dir(folder.join("open")).into_iter().flatten().flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if let Some(box_name) = file.strip_suffix(".lock")
+            && boxes::store::is_held(&entry.path())
+        {
+            return Err(running(&format!("{name}/{box_name}")));
+        }
+    }
+    let stores = stores_in(&folder)?;
+    if let Some(first) = stores.first() {
+        bail!("{name} has boxes with stores: {}. remove them first: halti ws box rm {name}/{first}", stores.join(", "));
+    }
+    Ok(())
+}
+
+/// Removes the boxes folder of a deleted workspace, after detaching whatever a run that ended
+/// without cleaning up left mounted in it. A store in it is never removed (`remove_boxes`).
+pub(super) fn clear(here: &Here, id: WsId) -> Result<()> {
+    let open = boxes_dir(&here.root, id).join("open");
+    for entry in fs::read_dir(&open).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            boxes::store::detach(&entry.path())?;
+        }
+    }
+    remove_boxes(&here.root, id)
+}
+
+/// The VMs a workspace's boxes could have left running, found before it is deleted and stopped once
+/// it is gone: both VMs of each box with a policy file, where there is an engine.
+pub(super) struct Leftovers {
+    vms: Option<&'static dyn Vms>,
+    layout: Option<Layout>,
+    names: Vec<String>,
+}
+
+impl Leftovers {
+    pub(super) fn of(here: &Here, name: &WsName, settings: &Settings) -> Leftovers {
+        let none = Leftovers { vms: None, layout: None, names: Vec::new() };
+        let (Ok(vms), Some(id)) = (boxes::vms(settings), here.id_of(name)) else { return none };
+        let names = PolicyFiles::boxes(&here.root, id).names().unwrap_or_default();
+        Leftovers { vms: Some(vms), layout: Layout::workspace(&boxes_dir(&here.root, id), id).ok(), names }
+    }
+
+    pub(super) fn stop(&self) {
+        let (Some(vms), Some(layout)) = (self.vms, &self.layout) else { return };
+        for box_name in &self.names {
+            for vm in [layout.vm(box_name), layout.browser_vm(box_name)] {
+                if vms.running(&vm)
+                    && let Err(error) = vms.stop(&vm)
+                {
+                    eprintln!("halti: stopping {vm}: {error:#}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, halti_dev))]
+mod tests {
+    use super::super::new_with;
+    use super::super::saved::Copies;
+    use super::*;
+    use crate::approval::Means;
+    use crate::approval::fake_tests::Fake;
+    use crate::util::TempDir;
+    use zeroize::Zeroizing;
+
+    const ACME: &str = "acme passphrase one";
+    /// A box that keeps nothing between runs: no store to make.
+    const SCRATCH: &str = "run = [\"claude\"]\nkeep = false\n";
+
+    /// One saved passphrase, read after the approval.
+    struct OneCopy(Cell<Option<WsId>>);
+
+    impl Copies for OneCopy {
+        fn exists(&self, ws: WsId) -> bool {
+            self.0.get() == Some(ws)
+        }
+
+        fn add(&self, ws: WsId, _passphrase: &str) -> Result<()> {
+            self.0.set(Some(ws));
+            Ok(())
+        }
+
+        fn get(&self, ws: WsId) -> Option<Zeroizing<String>> {
+            self.exists(ws).then(|| Zeroizing::new(ACME.to_string()))
+        }
+
+        fn remove(&self, _ws: WsId) -> bool {
+            false
+        }
+    }
+
+    fn not_typed() -> TtyPassphrase {
+        TtyPassphrase::new(false).answering("not the passphrase")
+    }
+
+    fn never_made(_layout: &Layout, _bundle: &Path, _key: &str) -> Result<()> {
+        panic!("a box that keeps nothing has no store")
+    }
+
+    // Each make and open here derives a key at 64 MiB once.
+    #[test]
+    fn the_window_names_the_box_for_making_running_and_removing_it() {
+        let dir = TempDir::new("halti-ws-box-window").unwrap();
+        let here = Here::at(&dir.0.join("ws"));
+        let acme = WsName::parse("acme").unwrap();
+        let copies = OneCopy(Cell::new(None));
+        new_with(&here, &acme, &TtyPassphrase::new(false).answering(ACME).saving(), &copies).unwrap();
+        let found = find(&here, &acme, "scratch").unwrap();
+        found.files.create("scratch", SCRATCH).unwrap();
+        let world = Fake::answering(true, true);
+        let way = |means| Way { world: &world, copies: &copies, means: Some(means), detail: None };
+        let sha = sha12(SCRATCH.as_bytes());
+
+        let said = make_with(&here, &found, SCRATCH.as_bytes(), false, &way(Means::TouchId), &not_typed, &never_made).unwrap();
+        assert_eq!(said.out, ["made box acme/scratch. it keeps nothing between runs. run it with: halti ws run acme/scratch"]);
+        assert_eq!(world.calls(), [format!("touch id: [DEV, not protected] make box scratch {sha} in workspace acme")]);
+        assert_eq!(found.files.approved_copy("scratch").unwrap().as_deref(), Some(SCRATCH.as_bytes()));
+
+        let said = approve_with(&here, &found, &MountRule::Workspace(Vec::new()), &way(Means::Sudo), &not_typed).unwrap();
+        assert_eq!(said.out, ["box scratch in acme was approved already"]);
+        assert_eq!(world.calls(), [format!("sudo: [DEV, not protected] approve policies of box scratch {sha} in workspace acme")]);
+
+        let way_to_run = Way { detail: Some("to run box scratch".to_string()), ..way(Means::TouchId) };
+        open_for(&here, &found, &way_to_run, "not started", "ws run acme/scratch", &not_typed).unwrap();
+        assert_eq!(world.calls(), ["touch id: [DEV, not protected] open workspace acme to run box scratch"]);
+
+        let said = rm_with(&here, &found, None, &way(Means::TouchId), &not_typed).unwrap();
+        assert_eq!(said.out[0], "deleted box acme/scratch: its key and its store");
+        assert_eq!(world.calls(), ["touch id: [DEV, not protected] remove box scratch from workspace acme"]);
+        assert_eq!(found.files.approved_copy("scratch").unwrap(), None, "its approved copy goes with it");
+        assert!(found.files.read("scratch").unwrap().is_some(), "its policy stays");
+
+        // A no makes nothing, and says how to type the passphrase instead.
+        let no = Fake::answering(false, false);
+        let declined = Way { world: &no, copies: &copies, means: Some(Means::TouchId), detail: None };
+        let error = make_with(&here, &found, SCRATCH.as_bytes(), false, &declined, &not_typed, &never_made).unwrap_err();
+        assert_eq!(error.to_string(), "box acme/scratch was not made. to type the passphrase instead: halti ws box new acme/scratch --type");
+        assert_eq!(found.files.approved_copy("scratch").unwrap(), None);
+    }
+
+    #[test]
+    fn a_target_is_a_workspace_then_a_box() {
+        let (name, box_name) = target("acme/dev").unwrap();
+        assert_eq!((name.as_str(), box_name), ("acme", "dev"));
+        for refused in ["acme", "acme/", "/dev", "Acme/dev", "acme/dev/x", "acme/Dev", "acme/-x", "acme/dev.x", "", &format!("acme/{}", "a".repeat(33))] {
+            assert!(target(refused).is_err(), "{refused:?}");
+        }
+        assert_eq!(target("acme").unwrap_err().to_string(), "use a workspace and a box, e.g. acme/dev");
+    }
+}

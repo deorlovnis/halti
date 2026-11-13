@@ -114,19 +114,24 @@ impl<'a> KeychainPassphrase<'a> {
         KeychainPassphrase { copies, world, means, action, detail: None, read: Cell::new(None) }
     }
 
-    /// Names `detail` (the policies and their hashes) in what the Touch ID window or sudo says
-    /// before policies are approved: core's words say only which workspace.
+    /// Names `detail` in what the Touch ID window or sudo says: the policies and their hashes
+    /// before policies are approved, the box before one is made, removed or run. Core's words say
+    /// only which workspace.
     pub fn naming(self, detail: Option<String>) -> KeychainPassphrase<'a> {
         KeychainPassphrase { detail, ..self }
     }
 
-    /// What the approval says for `prompt`: core's words, with the detail after "approve policies"
-    /// when that is the change.
+    /// What the approval says for `prompt`: core's words, with the detail where the change has
+    /// one: after "approve policies", in place of "a box", or after opening the workspace.
     fn reason(&self, prompt: &Prompt) -> String {
         let text = prompt.text();
+        let Some(detail) = &self.detail else { return text };
         let in_workspace = format!(" in workspace {}", prompt.name());
-        match (&self.detail, text.strip_suffix(&in_workspace)) {
-            (Some(detail), Some(verb)) if prompt.change() == Change::Approve => format!("{verb} {detail}{in_workspace}"),
+        match prompt.change() {
+            Change::Approve => text.strip_suffix(&in_workspace).map_or(text.clone(), |verb| format!("{verb} {detail}{in_workspace}")),
+            Change::MakeBox => text.replacen("make a box in", &format!("make box {detail} in"), 1),
+            Change::RemoveBox => text.replacen("remove a box from", &format!("remove box {detail} from"), 1),
+            Change::Open => format!("{text} {detail}"),
             _ => text,
         }
     }

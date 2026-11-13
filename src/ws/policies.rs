@@ -1,6 +1,6 @@
 //! A workspace's policies: what each of its resources' secrets may be used for. `ws policy edit`
 //! writes one in the workspace's folder (`files::PolicyFiles`), `ws policy approve` approves it, and
-//! `ws policy show` says whether it is approved. Nothing uses them yet.
+//! `ws policy show` says whether it is approved. The workspace's boxes use them (`boxes`).
 //!
 //! An approval is the SHA-256 of a policy's text, sealed in the workspace's manifest by core
 //! (`halti_core::verbs::ws_approve`): only the workspace's passphrase writes one, asked as
@@ -15,7 +15,7 @@
 //!
 //! A policy in a workspace isn't empty, is plain ASCII outside lines that are only a comment, can't
 //! refresh yet, and keeps `[run]` and `[agent]` as an empty policy has them (`policy::in_workspace`). Of the binary's policy module only what reaches
-//! no source is used here: the workspace's place comes later.
+//! no source is used here: a box's run reads them through the workspace's place.
 
 use std::io::{self, IsTerminal};
 
