@@ -68,6 +68,10 @@ pub enum Change {
     Open,
     /// Deleting the workspace: its items, pin, key and files.
     Delete,
+    /// Storing a secret in the workspace, or replacing one.
+    Store,
+    /// Removing secrets from the workspace.
+    Remove,
 }
 
 /// One request to a key holder: one workspace, one change. Only core makes one, from checked
@@ -112,8 +116,8 @@ impl Prompt {
         self.build
     }
 
-    /// The words to show: `open workspace acme`, after `[DEV, not protected] ` in a development
-    /// build. The name is the only part that varies, and a name holds only a-z, 0-9 and `-`, so
+    /// The words to show: `open workspace acme`, or `store a secret in workspace acme`, after
+    /// `[DEV, not protected] ` in a development build. The name is the only part that varies, and a name holds only a-z, 0-9 and `-`, so
     /// the text holds no control or direction character.
     pub fn text(&self) -> String {
         let dev = match self.build {
@@ -124,6 +128,8 @@ impl Prompt {
             Change::Create => "create",
             Change::Open => "open",
             Change::Delete => "delete",
+            Change::Store => "store a secret in",
+            Change::Remove => "remove secrets from",
         };
         format!("{dev}{verb} workspace {}", self.name)
     }
@@ -207,16 +213,22 @@ mod tests {
         assert_eq!(prompt.text(), "open workspace acme");
         assert_eq!(Prompt::new(acme(), &name("acme"), Change::Create, Build::Release).text(), "create workspace acme");
         assert_eq!(Prompt::new(acme(), &name("acme"), Change::Delete, Build::Release).text(), "delete workspace acme");
+        assert_eq!(Prompt::new(acme(), &name("acme"), Change::Store, Build::Release).text(), "store a secret in workspace acme");
+        assert_eq!(Prompt::new(acme(), &name("acme"), Change::Remove, Build::Release).text(), "remove secrets from workspace acme");
         // A development build says so first, whatever the change.
         assert_eq!(Prompt::new(acme(), &name("acme"), Change::Open, Build::Dev).text(), "[DEV, not protected] open workspace acme");
         assert_eq!(Prompt::new(acme(), &name("globex"), Change::Create, Build::Dev).text(), "[DEV, not protected] create workspace globex");
         assert_eq!(Prompt::new(acme(), &name("acme"), Change::Delete, Build::Dev).text(), "[DEV, not protected] delete workspace acme");
+        assert_eq!(Prompt::new(acme(), &name("acme"), Change::Store, Build::Dev).text(), "[DEV, not protected] store a secret in workspace acme");
+        assert_eq!(Prompt::new(acme(), &name("globex"), Change::Remove, Build::Dev).text(), "[DEV, not protected] remove secrets from workspace globex");
         // Each field tells one prompt from another.
         let globex = WsId::from_bytes([2; 16]);
         assert_ne!(prompt, Prompt::new(globex, &name("acme"), Change::Open, Build::Release));
         assert_ne!(prompt, Prompt::new(acme(), &name("globex"), Change::Open, Build::Release));
         assert_ne!(prompt, Prompt::new(acme(), &name("acme"), Change::Create, Build::Release));
         assert_ne!(prompt, Prompt::new(acme(), &name("acme"), Change::Delete, Build::Release));
+        assert_ne!(prompt, Prompt::new(acme(), &name("acme"), Change::Store, Build::Release));
+        assert_ne!(prompt, Prompt::new(acme(), &name("acme"), Change::Remove, Build::Release));
         assert_ne!(prompt, Prompt::new(acme(), &name("acme"), Change::Open, Build::Dev));
     }
 
@@ -226,7 +238,7 @@ mod tests {
         // Lowercase letters, digits, spaces and dashes, and the fixed words and brackets of the dev prefix: nothing a terminal draws as something else.
         let shown_as_typed = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || " -[],DEV".contains(c);
         for text in ["acme", "globex", "initech", "0-a", longest.as_str()] {
-            for change in [Change::Create, Change::Open, Change::Delete] {
+            for change in [Change::Create, Change::Open, Change::Delete, Change::Store, Change::Remove] {
                 for build in [Build::Dev, Build::Release] {
                     let shown = Prompt::new(acme(), &name(text), change, build).text();
                     assert!(shown.chars().all(shown_as_typed), "{shown:?}");

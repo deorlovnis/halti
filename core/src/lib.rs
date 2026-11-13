@@ -24,6 +24,7 @@ pub mod crypto;
 pub mod directory;
 pub mod holder;
 pub mod ids;
+pub mod item;
 pub mod key;
 pub mod manifest;
 pub mod passphrase;

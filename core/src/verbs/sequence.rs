@@ -114,7 +114,6 @@ impl Unlocked<'_> {
     ///
     /// A second call is refused even after a first that failed: an anchor that fails may still
     /// have moved the pin over the first one's manifest, which a second would overwrite.
-    #[cfg_attr(not(test), expect(dead_code, reason = "storing a secret is its first caller outside tests"))]
     pub(crate) fn replace_manifest(&self, sealed: &[u8]) -> Result<()> {
         if self.replaced.replace(true) {
             bail!("the manifest was already replaced in this change");

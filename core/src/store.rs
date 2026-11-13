@@ -6,10 +6,10 @@
 //! is handed a `Keystore`, which is bound to that workspace when it is made and has no way to name
 //! another: whatever such code is tricked into asking for, it asks its own workspace.
 //!
-//! What this does not yet do: values pass through as the bytes they are given (sealing them to
-//! the workspace's key comes with the keys), item names are whatever 32 bytes the caller has, and
-//! a holder of the raw backend or of `Files` can still name any workspace. Only adapters and the
-//! code that opens a workspace should hold those.
+//! Values that core's verbs put are sealed (`item`): a backend sees only sealed blobs and 32-byte
+//! names that spell nothing. What this does not yet do: a holder of the raw backend or of `Files`
+//! can still name any workspace. Only adapters and the code that opens a workspace should hold
+//! those.
 
 use std::fmt;
 
@@ -19,8 +19,8 @@ use crate::ids::{WsId, WsName, write_hex};
 use crate::platform::Adapter;
 use crate::refusal::Refusal;
 
-/// The name a stored value goes by: 32 opaque bytes. It should never spell a client's name, and
-/// nothing here checks that yet (see the top of this file).
+/// The name a stored value goes by: 32 opaque bytes. Core's verbs derive it from the secret's
+/// text under the workspace's names key (`item::item_name`), so it never spells a client's name.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ItemName([u8; 32]);
 

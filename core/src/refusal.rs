@@ -5,6 +5,7 @@
 use std::fmt;
 
 use crate::ids::WsName;
+use crate::item::Secret;
 use crate::passphrase::Passphrase;
 use crate::platform::{Build, Grade, Lacks, Property};
 
@@ -39,6 +40,13 @@ pub enum Refusal {
     Downgraded(Lacks),
     /// The workspace was made by a build of the other kind.
     OtherBuild(Build),
+    /// The text isn't a secret's resource and field. Neither is echoed.
+    BadSecretName,
+    /// The value isn't one a secret can hold (`item::Secret`). It is never echoed.
+    BadSecret,
+    /// The workspace holds no secret of that name, or none of that resource. `what` is an
+    /// `item::ItemKey`'s text or a checked resource, so it holds only what was typed and checked.
+    NoSecret { ws: WsName, what: String },
 }
 
 impl fmt::Display for Refusal {
@@ -60,6 +68,9 @@ impl fmt::Display for Refusal {
                 write!(f, "this machine lacks what this workspace was made with: {}", names.join(", "))
             }
             Refusal::OtherBuild(build) => write!(f, "this workspace was made by a {} build", build.name()),
+            Refusal::BadSecretName => write!(f, "that isn't a secret's name (a resource of a-z, 0-9 and -, then a field of a-z, 0-9 and _)"),
+            Refusal::BadSecret => write!(f, "that value can't be stored: a secret is text of up to {} bytes", Secret::MAX),
+            Refusal::NoSecret { ws, what } => write!(f, "there is no {what} in {ws}"),
         }
     }
 }

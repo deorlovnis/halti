@@ -4,7 +4,7 @@
 
 use anyhow::{Result, bail};
 
-use super::sequence::{Draws, Host, Opened, create_key, opened, unlock};
+use super::sequence::{Draws, Host, Opened, Unlocked, create_key, opened, unlock};
 use crate::anchor::Anchor;
 use crate::directory::DirRecord;
 use crate::holder::{Change, KeyKind};
@@ -35,7 +35,7 @@ impl Machine<'_> {
 
     /// Admission: a release build never runs a key held in software, whatever its label says,
     /// then `platform::admit`.
-    fn admit(&self) -> Result<(), Refusal> {
+    pub(super) fn admit(&self) -> Result<(), Refusal> {
         let holder = self.host.holder.label();
         if self.build == Build::Release && self.host.holder.kind() == KeyKind::Soft {
             return Err(Refusal::NotAdmitted { adapter: holder.adapter, grade: holder.grade });
@@ -141,8 +141,7 @@ pub fn ws_open(machine: &Machine<'_>, name: &WsName) -> Result<Workspace> {
     let record = read_record(machine.host.files, name)?;
     kinds_match(machine, &record)?;
     unlock(&machine.host, record.id, name, machine.build, Change::Open, |unlocked| {
-        let manifest = checked(Manifest::open(unlocked.inner, record.id, name, unlocked.manifest)?, &record, machine.build)?;
-        not_weaker(&manifest, &machine.adapters())?;
+        let manifest = opened_manifest(machine, &record, name, unlocked)?;
         Ok(Workspace { id: record.id, keys: opened(unlocked.inner), manifest })
     })
 }
@@ -202,16 +201,26 @@ pub fn ws_list(files: &dyn Files, anchor: &dyn Anchor) -> Result<Vec<Listed>> {
     Ok(listed)
 }
 
+/// The manifest an unlock was handed, opened and checked as opening a workspace checks it: that
+/// it agrees with the record and a build of this kind made it, then that this machine lacks
+/// nothing it did not lack then. In that order, so a downgrade is refused before anything else is
+/// asked.
+pub(super) fn opened_manifest(machine: &Machine<'_>, record: &DirRecord, name: &WsName, unlocked: &Unlocked<'_>) -> Result<Manifest> {
+    let manifest = checked(Manifest::open(unlocked.inner, record.id, name, unlocked.manifest)?, record, machine.build)?;
+    not_weaker(&manifest, &machine.adapters())?;
+    Ok(manifest)
+}
+
 /// The workspace's directory record: `Refusal::Unknown` if it has none, `Refusal::Unreadable` if
 /// it is not one.
-fn read_record(files: &dyn Files, name: &WsName) -> Result<DirRecord> {
+pub(super) fn read_record(files: &dyn Files, name: &WsName) -> Result<DirRecord> {
     let Some(bytes) = files.read(&FileKey::DirRecord(name.clone()))? else { return Err(Refusal::Unknown(name.clone()).into()) };
     Ok(DirRecord::from_bytes(&bytes)?)
 }
 
 /// Before anything is asked: the record names the kinds of key holder and keystore this machine
 /// has. Another would be found only after the holder had answered, or not at all.
-fn kinds_match(machine: &Machine<'_>, record: &DirRecord) -> Result<(), Refusal> {
+pub(super) fn kinds_match(machine: &Machine<'_>, record: &DirRecord) -> Result<(), Refusal> {
     if record.key == machine.host.holder.kind() && record.keystore == machine.keystore.kind() { Ok(()) } else { Err(Refusal::Unreadable) }
 }
 
