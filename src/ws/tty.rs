@@ -7,8 +7,9 @@
 //! terminal says what it removes. No secret mark is shown beside a question, since any program
 //! running as you could read one.
 //!
-//! `ws new` makes the passphrase unless asked not to: 20 random characters of base32, 100 bits,
-//! shown once and typed again to confirm. One of the person's own is typed twice.
+//! `ws new` asks for a passphrase of the person's own, typed twice, then reminds them to write it
+//! down. Asked to generate one, it makes 20 random characters of base32, 100 bits, shown once and
+//! typed again to confirm.
 //!
 //! A program running as you can type into a terminal it opened, or capture what you type.
 
@@ -33,15 +34,34 @@ const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 /// The passphrase key holder. It keeps nothing between calls: the record is the key ref, which the
 /// workspace's files hold.
 pub struct TtyPassphrase {
-    /// `ws new` asks for a passphrase of the person's own instead of making one.
-    own: bool,
+    /// `ws new` makes the passphrase and shows it once, instead of asking for one of the person's own.
+    generate: bool,
 }
 
 impl TtyPassphrase {
     /// Nothing is read until a passphrase is asked for.
-    pub fn new(own: bool) -> TtyPassphrase {
-        TtyPassphrase { own }
+    pub fn new(generate: bool) -> TtyPassphrase {
+        TtyPassphrase { generate }
     }
+}
+
+/// Whether a passphrase can be asked here: the terminal, or in a debug build the test variable.
+/// `ws new` checks this first, so with no terminal nothing is set up or made.
+pub fn ready() -> Result<()> {
+    #[cfg(halti_dev)]
+    if crate::util::dev_var("HALTI_TEST_PASSPHRASE").is_some() {
+        return Ok(());
+    }
+    open_tty().map(drop)
+}
+
+/// The terminal device, to ask on and show to.
+fn open_tty() -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|_| anyhow!("a passphrase is read only from a terminal, and halti has none here (run it in a terminal; a passphrase can't be piped in)"))
 }
 
 /// Where a passphrase is typed.
@@ -63,11 +83,7 @@ impl Terminal {
             eprintln!("halti: [test] {}", prompt.text());
             return Ok(Terminal::Test(Zeroizing::new(answer.to_string_lossy().into_owned())));
         }
-        let mut tty = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-            .map_err(|_| anyhow!("a passphrase is read only from a terminal, and halti has none here (run it in a terminal; a passphrase can't be piped in)"))?;
+        let mut tty = open_tty()?;
         if prompt.build() == Build::Dev {
             writeln!(tty, "{}", prompt.text())?;
         }
@@ -142,10 +158,10 @@ impl KeyHolder for TtyPassphrase {
         KeyKind::Passphrase
     }
 
-    /// Asks for a new passphrase (made here unless `own`), then seals a seed drawn here under it.
+    /// Asks for a new passphrase (the person's own unless `generate`), then seals a seed drawn here under it.
     fn create(&self, prompt: &Prompt, commitment: &Commitment) -> Result<(KeyRef, PublicKey)> {
         let mut terminal = Terminal::open(prompt)?;
-        let passphrase = if self.own { own(&mut terminal, prompt.name())? } else { made(&mut terminal, prompt.name())? };
+        let passphrase = if self.generate { made(&mut terminal, prompt.name())? } else { own(&mut terminal, prompt.name())? };
         let (seed, salt, nonce) = (random::<96>()?, random::<16>()?, random::<12>()?);
         let record = PassphraseRecord::seal_seed(prompt, &passphrase, seed, commitment, KdfParams::DEFAULT, &salt, &nonce)?;
         Ok((record.to_key_ref(), record.public().clone()))
@@ -201,8 +217,9 @@ fn made(terminal: &mut Terminal, name: &WsName) -> Result<Passphrase> {
     bail!("workspace {name} was not created: the passphrase didn't match")
 }
 
-/// Has a passphrase of the person's own typed twice. One too short or too long is asked for again.
-/// After three tries the error says what was wrong with the last.
+/// Has a passphrase of the person's own typed twice, then says to write it down: nothing else can
+/// open the workspace. One too short or too long is asked for again. After three tries the error
+/// says what was wrong with the last.
 fn own(terminal: &mut Terminal, name: &WsName) -> Result<Passphrase> {
     let question = format!("new passphrase for workspace {name} (at least {} characters): ", Passphrase::MIN_CHARS);
     let mut why = String::new();
@@ -211,6 +228,7 @@ fn own(terminal: &mut Terminal, name: &WsName) -> Result<Passphrase> {
         let retry = match Passphrase::new(first.clone()) {
             Ok(passphrase) => {
                 if *terminal.ask("type it again to confirm: ")? == *first {
+                    terminal.say(&format!("write this passphrase down and keep it safe. without it, {name} can't be opened."))?;
                     return Ok(passphrase);
                 }
                 why = "the two passphrases didn't match".to_string();

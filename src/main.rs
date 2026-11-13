@@ -34,6 +34,7 @@ mod refresh;
 #[cfg(all(halti_dev, target_os = "linux"))]
 mod sandbox;
 mod seal;
+mod setup;
 mod util;
 mod ws;
 
@@ -166,6 +167,15 @@ enum Cmd {
     Box {
         #[command(subcommand)]
         action: BoxCmd,
+    },
+    /// Choose where new workspaces keep their passphrase and their secrets, or show it
+    Setup {
+        /// mac or linux for a ready-made setup, custom to choose each setting
+        #[arg(value_parser = ["mac", "linux", "custom"])]
+        template: Option<String>,
+        /// Show the setup and change nothing
+        #[arg(long, conflicts_with = "template")]
+        show: bool,
     },
     /// Workspaces, each opened with its own passphrase: create, list and delete them
     Ws {
@@ -312,12 +322,12 @@ enum PolicyCmd {
 
 #[derive(Subcommand)]
 enum WsCmd {
-    /// Create a workspace, with a generated passphrase shown once (--own-passphrase to type your own)
+    /// Create a workspace with a passphrase of your own (--generate to have one made and shown once)
     New {
         name: String,
-        /// Type a passphrase of your own instead of a generated one
+        /// Have halti make the passphrase and show it once, instead of typing your own
         #[arg(long)]
-        own_passphrase: bool,
+        generate: bool,
     },
     /// List workspaces (asks for nothing)
     #[command(visible_alias = "list")]
@@ -776,8 +786,9 @@ fn main() -> ExitCode {
             #[cfg(all(halti_dev, target_os = "linux"))]
             BoxCmd::Sh { engine: _, tools, command } => sandbox::sh(tools, command),
         },
+        Cmd::Setup { template, show } => ok(setup::run(template.as_deref(), show)),
         Cmd::Ws { action } => ok(match action {
-            WsCmd::New { name, own_passphrase } => ws::new(&name, own_passphrase),
+            WsCmd::New { name, generate } => ws::new(&name, generate),
             WsCmd::Ls => ws::ls(),
             WsCmd::Delete { name } => ws::delete(&name),
         }),

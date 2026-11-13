@@ -29,6 +29,9 @@ const HALTI: &str = env!("CARGO_BIN_EXE_halti");
 const TOKEN: &str = "s3cret-token-value";
 /// Where a debug build keeps box stores under its home (`util::DEV_STORE_ROOT`).
 const DEV_STORE_ROOT: &str = "Library/Application Support/halti-dev";
+/// Where a debug build keeps its config under its home (`util::DEV_CONFIG_DIR`): never an
+/// installed halti's `.config/halti`, and in these tests always under the test's own home.
+const DEV_CONFIG_DIR: &str = ".config/halti-dev";
 
 /// A private home for one test: index, policies and fake Keychain, removed when dropped.
 struct Env {
@@ -927,8 +930,12 @@ fn a_workspace_is_made_listed_opened_closed_and_deleted_with_one_passphrase_each
     // Nothing on stdout until it is created; then that it was, how to open it, and that a debug build made it. Never the passphrase.
     let said = stdout(&made);
     assert_eq!(said, "created workspace acme\nopen it with: halti open acme\ndebug build: this workspace opens only with a debug build\n");
-    assert!(!said.contains(PASSPHRASE));
-    assert_eq!((prompted(&made), asked(&made)), (1, 0), "the test variable is the passphrase made, so nothing is typed back");
+    assert!(!said.contains(PASSPHRASE) && !stderr(&made).contains(PASSPHRASE));
+    // A passphrase of one's own is the default: asked for, then typed again.
+    assert_eq!((prompted(&made), asked(&made)), (1, 2));
+    for question in ["asked: new passphrase for workspace acme (at least 14 characters): \n", "asked: type it again to confirm: \n"] {
+        assert!(stderr(&made).contains(question), "{question}: {}", stderr(&made));
+    }
     assert!(stderr(&made).contains("halti: [test] [DEV, not protected] create workspace acme\n"), "{}", stderr(&made));
     // The record names no client; the key file is the passphrase record; only this user can read any of it.
     let (dir, id) = (ws_dir(&env), ws_id(&env, "acme"));
@@ -1011,17 +1018,18 @@ fn names_are_checked_never_swapped_and_an_unfinished_workspace_is_cleared() {
     // A passphrase of one's own that is too short makes nothing, frees the name, and leaves no lock file for the id it drew.
     let locks = || fs::read_dir(ws_dir(&env).join("locks")).unwrap().count();
     assert_eq!(locks(), 1, "acme's");
-    let short = ws(&env, "short", &["ws", "new", "globex", "--own-passphrase"]);
+    let short = ws(&env, "short", &["ws", "new", "globex"]);
     assert!(stderr(&short).contains("halti: workspace globex was not created: a passphrase has at least 14 characters"), "{}", stderr(&short));
     assert_eq!((prompted(&short), asked(&short), locks()), (1, 3, 1), "asked three times, and only acme's lock file is left");
-    assert!(ws(&env, PASSPHRASE, &["ws", "new", "globex"]).status.success());
-    // One of one's own, typed twice.
-    let own = ws(&env, PASSPHRASE, &["ws", "new", "initech", "--own-passphrase"]);
+    // One made by halti: the test variable is the passphrase made, so nothing is typed back.
+    let generated = ws(&env, PASSPHRASE, &["ws", "new", "globex", "--generate"]);
+    assert!(generated.status.success(), "{}", stderr(&generated));
+    assert_eq!((prompted(&generated), asked(&generated)), (1, 0));
+    assert_eq!(stdout(&generated), "created workspace globex\nopen it with: halti open globex\ndebug build: this workspace opens only with a debug build\n");
+    // One's own is the default: typed, then typed again.
+    let own = ws(&env, PASSPHRASE, &["ws", "new", "initech"]);
     assert!(own.status.success(), "{}", stderr(&own));
     assert_eq!((prompted(&own), asked(&own)), (1, 2));
-    for question in ["asked: new passphrase for workspace initech (at least 14 characters): \n", "asked: type it again to confirm: \n"] {
-        assert!(stderr(&own).contains(question), "{question}: {}", stderr(&own));
-    }
     assert!(stderr(&ws(&env, PASSPHRASE, &["open"])).contains("there is more than one workspace (name one)"));
     // globex's pin removed, as a program running as you could, or as a create cut short leaves it: listed as unfinished, its
     // name says how to remove it, and its files go without a passphrase.
@@ -1038,6 +1046,69 @@ fn names_are_checked_never_swapped_and_an_unfinished_workspace_is_cleared() {
     let said = stdout(&cleared);
     assert!(said == "removed workspace globex. it was never fully created, so no passphrase was asked\n" && prompted(&cleared) == 0, "{said}");
     assert!(!dir.join("dir/globex").exists() && !dir.join(&id).exists());
+}
+
+/// The setup file of a test's debug-build home.
+fn setup_file(env: &Env) -> PathBuf {
+    env.dir.join("home").join(DEV_CONFIG_DIR).join("setup.toml")
+}
+
+/// What `halti setup` writes today, on either system.
+const SETUP_WRITTEN: &str = "# halti setup: where new workspaces keep things. change it with: halti setup\nversion = 1\npassphrase = \"typed\"\nsecrets = \"files\"\n";
+
+#[test]
+fn the_first_ws_new_saves_the_setup_and_halti_setup_shows_it() {
+    let env = Env::new();
+    let place = if cfg!(target_os = "macos") { "mac" } else { "system" };
+    let lines = format!("halti setup for this {place}\n  passphrase  typed each time you open a workspace\n  secrets     kept in halti's files on this {place}\n");
+    let saved = format!("{lines}saved. change it with: halti setup\n");
+    let shown = env.halti(&["setup", "--show"]);
+    assert!(!shown.status.success() && stdout(&shown).is_empty(), "{}", stdout(&shown));
+    assert_eq!(stderr(&shown), "halti: nothing is set up yet. run: halti setup\n");
+    // A name that can't be one is refused before setup runs.
+    assert!(!ws(&env, PASSPHRASE, &["ws", "new", "Acme"]).status.success());
+    assert!(!setup_file(&env).exists());
+
+    // The first `ws new` saves the setup and says so on stderr, asking nothing; stdout is as ever.
+    let made = ws(&env, PASSPHRASE, &["ws", "new", "acme"]);
+    assert!(made.status.success() && stderr(&made).starts_with(&saved), "{}", stderr(&made));
+    assert_eq!(stdout(&made), "created workspace acme\nopen it with: halti open acme\ndebug build: this workspace opens only with a debug build\n");
+    assert_eq!(fs::read_to_string(setup_file(&env)).unwrap(), SETUP_WRITTEN);
+    assert_eq!(fs::metadata(setup_file(&env)).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!env.dir.join("home/.config/halti").exists(), "a debug build never writes an installed halti's config");
+    let again = ws(&env, PASSPHRASE, &["ws", "new", "globex"]);
+    assert!(again.status.success() && !stderr(&again).contains("halti setup for this"), "{}", stderr(&again));
+
+    // Shown, and run again: nothing else to choose yet.
+    let shown = env.halti(&["setup", "--show"]);
+    assert!(shown.status.success() && stdout(&shown) == lines, "{}{}", stdout(&shown), stderr(&shown));
+    let run = env.halti(&["setup"]);
+    assert!(run.status.success() && stdout(&run) == format!("{lines}there is nothing else to choose yet\n"), "{}{}", stdout(&run), stderr(&run));
+    for template in ["mac", "linux", "custom"] {
+        let out = env.halti(&["setup", template]);
+        assert!(out.status.success() && stdout(&out) == saved, "{template}: {}{}", stdout(&out), stderr(&out));
+        assert_eq!(fs::read_to_string(setup_file(&env)).unwrap(), SETUP_WRITTEN);
+    }
+    for wrong in [&["setup", "windows"][..], &["setup", "mac", "--show"]] {
+        let out = env.halti(wrong);
+        assert!(!out.status.success() && stdout(&out).is_empty(), "{wrong:?}");
+    }
+
+    // A file halti didn't write: `ws new` makes nothing, the workspaces there still open, and `halti setup` writes it again.
+    let broken = "version = 1\npassphrase = \"/bin/sh\"\nsecrets = \"files\"\n";
+    fs::write(setup_file(&env), broken).unwrap();
+    let refused = ws(&env, PASSPHRASE, &["ws", "new", "initech"]);
+    let why = format!("halti: workspace initech was not created: {} isn't a setup file halti wrote. write it again with: halti setup\n", setup_file(&env).display());
+    assert!(!refused.status.success() && stderr(&refused) == why && stdout(&refused).is_empty(), "{}", stderr(&refused));
+    assert!(!stdout(&ws(&env, PASSPHRASE, &["ws", "ls"])).contains("initech") && !ws_dir(&env).join("dir/initech").exists());
+    assert_eq!(fs::read_to_string(setup_file(&env)).unwrap(), broken);
+    assert!(ws(&env, PASSPHRASE, &["open", "acme"]).status.success());
+    assert!(!env.halti(&["setup", "--show"]).status.success());
+    let run = env.halti(&["setup"]);
+    let rewritten = format!("{} couldn't be read, so halti sets it up again\n{saved}", setup_file(&env).display());
+    assert!(run.status.success() && stdout(&run) == rewritten, "{}{}", stdout(&run), stderr(&run));
+    assert_eq!(fs::read_to_string(setup_file(&env)).unwrap(), SETUP_WRITTEN);
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "initech"]).status.success());
 }
 
 // --- opt-in: the browser and the real Touch ID ---

@@ -237,17 +237,28 @@ fn without_a_passwd_home_nothing_runs() {
 #[ignore = "needs a ci-release binary: HALTI_RELEASE_BIN=<path>, as check.sh sets"]
 fn no_variable_answers_a_passphrase() {
     let dirs = Dirs::new();
-    let out = dirs.run(&release(), &["ws", "new", "acme"]);
-    let said = text(&out.stderr);
-    assert!(!out.status.success() && said.contains("read only from a terminal") && !said.contains("[test]"), "{said}");
-    let listed = text(&dirs.run(&release(), &["ws", "ls"]).stdout);
-    assert!(listed.contains("no workspaces yet"), "the name is free again: {listed}");
-    // What it wrote before it failed is under the passwd home's store root, and nowhere else: the
-    // folders of the record and the lock file it made, both removed again.
     let store = "home/Library/Application Support/halti";
-    assert_eq!(dirs.names(store), ["ws"]);
-    assert_eq!(dirs.names(&format!("{store}/ws")), ["dir", "locks"]);
-    assert!(dirs.names(&format!("{store}/ws/dir")).is_empty() && dirs.names(&format!("{store}/ws/locks")).is_empty(), "no record, and no lock file for the id it drew");
+    let refused = |dirs: &Dirs| {
+        let out = dirs.run(&release(), &["ws", "new", "acme"]);
+        let said = text(&out.stderr);
+        assert!(!out.status.success() && said.contains("read only from a terminal") && !said.contains("[test]"), "{said}");
+        // With no terminal, nothing is set up or made: no setup, and nothing under the store root.
+        assert!(!said.contains("halti setup for") && !dirs.path(store).exists(), "{said}");
+    };
+    refused(&dirs);
+    assert_eq!(dirs.names("home/.config/halti"), ["policy"]);
+    // Setup asks nothing, as there is nothing to choose: it is saved in the passwd home's config folder.
+    let setup = "halti setup for this system\n  passphrase  typed each time you open a workspace\n  secrets     kept in halti's files on this system\n";
+    let out = dirs.run(&release(), &["setup"]);
+    assert!(out.status.success() && text(&out.stdout) == format!("{setup}saved. change it with: halti setup\n"), "{}", text(&out.stderr));
+    assert_eq!(dirs.names("home/.config/halti"), ["policy", "setup.toml"]);
+    let written = fs::read_to_string(dirs.path("home/.config/halti/setup.toml")).unwrap();
+    assert_eq!(written, "# halti setup: where new workspaces keep things. change it with: halti setup\nversion = 1\npassphrase = \"typed\"\nsecrets = \"files\"\n");
+    assert_eq!(text(&dirs.run(&release(), &["setup", "--show"]).stdout), setup);
+    // Set up, it still takes no answer from a variable, and makes nothing.
+    refused(&dirs);
+    let listed = text(&dirs.run(&release(), &["ws", "ls"]).stdout);
+    assert!(listed.contains("no workspaces yet"), "the name is free: {listed}");
     assert!(dirs.names("env_home").is_empty() && dirs.names("xdg").is_empty(), "HOME and XDG_* are not where it writes");
     assert_eq!(dirs.names("hooks"), ["box", "keychain", "policy"]);
     assert!(["box", "keychain", "policy"].iter().all(|hook| dirs.names(&format!("hooks/{hook}")).is_empty()), "nor are the hooks");
