@@ -281,3 +281,81 @@ fn deleting_removes_the_saved_copy_whichever_way_it_goes() {
     assert_eq!(said.notes, [format!("the saved passphrase of umbrella is still in the keychain. remove the item named halti-ws:{umbrella} in keychain access")]);
     assert!(world.calls().is_empty(), "none asks nothing");
 }
+
+#[test]
+fn secrets_are_stored_listed_and_removed_after_one_approval_each_with_the_value_read_once() {
+    let f = folder("halti-saved-secrets");
+    let copies = Memory::default();
+    let (acme, _) = make(&f.here, "acme", ACME, true, &copies);
+    let key = ItemKey::parse("github", "token").unwrap();
+    let reads = Cell::new(0);
+    let value = || {
+        reads.set(reads.get() + 1);
+        Ok(Secret::new(Zeroizing::new(b"acme github token".to_vec()))?)
+    };
+    // Through the copy, after Touch ID: nothing is typed, and any question would be answered wrong.
+    let world = Fake::answering(true, true);
+    let touch_id = way(&world, &copies, Some(Means::TouchId));
+    let said = set_with(&f.here, &name("acme"), &key, &touch_id, &typing("not the passphrase"), &value).unwrap();
+    assert_eq!((out(&said), reads.get()), (vec!["stored github/token in acme"], 1));
+    assert_eq!(world.calls(), ["touch id: [DEV, not protected] store a secret in workspace acme"]);
+    let said = items_with(&f.here, &name("acme"), &touch_id, &typing("not the passphrase")).unwrap();
+    assert_eq!(out(&said), ["RESOURCE         FIELDS", "github           token"]);
+    assert_eq!(world.calls(), ["touch id: [DEV, not protected] open workspace acme"]);
+
+    // Declined: nothing is read, typed or changed, and each says how to type the passphrase instead.
+    let no = Fake::answering(false, false);
+    let declined = way(&no, &copies, Some(Means::TouchId));
+    let error = set_with(&f.here, &name("acme"), &key, &declined, &typing(ACME), &value).unwrap_err();
+    assert_eq!(error.to_string(), "github/token was not stored. to type the passphrase instead: halti ws set acme/github token --type");
+    let error = items_with(&f.here, &name("acme"), &declined, &typing(ACME)).unwrap_err();
+    assert_eq!(error.to_string(), "the secrets of acme were not listed. to type the passphrase instead: halti ws ls acme --type");
+    let error = rm_with(&f.here, &name("acme"), &Which::Resource("github".to_string()), &declined, &typing(ACME)).unwrap_err();
+    assert_eq!(error.to_string(), "github was not removed. to type the passphrase instead: halti ws rm acme/github --type");
+    assert_eq!((no.calls().len(), reads.get()), (3, 1));
+
+    // A copy that can't be used is typed once, the value is still read once, and the copy is left for `open` to save again.
+    copies.put(acme, "acme passphrase two");
+    let world = Fake::answering(true, true);
+    let said = set_with(&f.here, &name("acme"), &key, &way(&world, &copies, Some(Means::TouchId)), &typing(ACME), &value).unwrap();
+    assert_eq!((out(&said), reads.get(), world.calls().len()), (vec!["replaced github/token in acme"], 2, 1));
+    assert_eq!(copies.copy(acme).as_deref(), Some("acme passphrase two"));
+
+    // Removing names what it removed, and naming nothing stored is refused after the approval.
+    let world = Fake::answering(true, true);
+    let typed = way(&world, &copies, None);
+    let said = rm_with(&f.here, &name("acme"), &Which::Resource("github".to_string()), &typed, &typing(ACME)).unwrap();
+    assert_eq!(out(&said), ["removed github from acme"]);
+    let error = rm_with(&f.here, &name("acme"), &Which::Field(key.clone()), &typed, &typing(ACME)).unwrap_err();
+    assert_eq!(error.downcast_ref::<Refusal>(), Some(&Refusal::NoSecret { ws: name("acme"), what: "github/token".to_string() }));
+    let said = items_with(&f.here, &name("acme"), &typed, &typing(ACME)).unwrap();
+    assert_eq!(out(&said), ["acme has no secrets yet. add one with: halti ws set acme/RESOURCE FIELD"]);
+    assert!(world.calls().is_empty(), "typed, nothing else is asked");
+}
+
+#[test]
+fn a_store_in_a_workspace_made_to_be_typed_reads_the_value_once_after_typing() {
+    let f = folder("halti-saved-secrets-typed");
+    let copies = Memory::default();
+    let (globex, _) = make(&f.here, "globex", GLOBEX, false, &copies);
+    // The right passphrase planted as its copy: core refuses the copy before the value is read, and it is typed.
+    copies.put(globex, GLOBEX);
+    let reads = Cell::new(0);
+    let value = || {
+        reads.set(reads.get() + 1);
+        Ok(Secret::new(Zeroizing::new(b"globex linear token".to_vec()))?)
+    };
+    let world = Fake::answering(true, true);
+    let key = ItemKey::parse("linear", "token").unwrap();
+    let said = set_with(&f.here, &name("globex"), &key, &way(&world, &copies, Some(Means::Sudo)), &typing(GLOBEX), &value).unwrap();
+    assert_eq!((out(&said), reads.get(), world.calls().len()), (vec!["stored linear/token in globex"], 1, 1));
+    // Typed wrong, nothing is read or stored.
+    let error = set_with(&f.here, &name("globex"), &key, &way(&world, &copies, None), &typing("globex passphrase two"), &value).unwrap_err();
+    assert_eq!((error.downcast_ref::<Refusal>(), reads.get()), (Some(&Refusal::Unreadable), 1));
+    // An empty value stores nothing, and says so.
+    let empty = || -> Result<Secret> { bail!("no value was given, so nothing was stored") };
+    let error = set_with(&f.here, &name("globex"), &ItemKey::parse("github", "token").unwrap(), &way(&world, &copies, None), &typing(GLOBEX), &empty).unwrap_err();
+    assert_eq!(error.to_string(), "no value was given, so nothing was stored");
+    let said = items_with(&f.here, &name("globex"), &way(&world, &copies, None), &typing(GLOBEX)).unwrap();
+    assert_eq!(out(&said), ["RESOURCE         FIELDS", "linear           token"]);
+}

@@ -1056,6 +1056,299 @@ fn names_are_checked_never_swapped_and_an_unfinished_workspace_is_cleared() {
     assert!(!dir.join("dir/globex").exists() && !dir.join(&id).exists());
 }
 
+// --- a workspace's secrets ---
+
+/// What the secret tests store.
+const VALUE: &str = "acme github token";
+
+/// `halti ARGS` as `ws` runs it, with `input` piped to its standard input and closed.
+fn ws_with(env: &Env, passphrase: &str, args: &[&str], input: &[u8]) -> Output {
+    let mut child = env.command().env("HALTI_TEST_PASSPHRASE", passphrase).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    // halti may end before it reads, when it refuses first.
+    let _ = child.stdin.take().unwrap().write_all(input);
+    child.wait_with_output().unwrap()
+}
+
+/// The version of a workspace's pin.
+fn pin_version(env: &Env, name: &str) -> u64 {
+    let pin = fs::read(ws_dir(env).join("pins").join(ws_id(env, name))).unwrap();
+    u64::from_be_bytes(pin[1..9].try_into().unwrap())
+}
+
+/// Every file of the workspaces folder, by path, with its bytes: lock files aside.
+fn ws_files(env: &Env) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = Vec::new();
+    let mut folders = vec![ws_dir(env)];
+    while let Some(folder) = folders.pop() {
+        for entry in fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if !path.ends_with("locks") {
+                    folders.push(path);
+                }
+            } else {
+                files.push((path.clone(), fs::read(&path).unwrap()));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// The files of a workspace's items folder.
+fn items(env: &Env, name: &str) -> Vec<PathBuf> {
+    let folder = ws_dir(env).join(ws_id(env, name)).join("items");
+    let mut found: Vec<PathBuf> = fs::read_dir(folder).map(|entries| entries.map(|entry| entry.unwrap().path()).collect()).unwrap_or_default();
+    found.sort();
+    found
+}
+
+/// Whether neither stdout nor stderr holds `value`.
+fn quiet(out: &Output, value: &str) -> bool {
+    !text(&out.stdout).contains(value) && !text(&out.stderr).contains(value)
+}
+
+#[test]
+fn a_secret_is_stored_listed_and_removed_with_one_passphrase_each() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let version = pin_version(&env, "acme");
+    let empty = ws(&env, PASSPHRASE, &["ws", "ls", "acme"]);
+    assert_eq!(stdout(&empty), "acme has no secrets yet. add one with: halti ws set acme/RESOURCE FIELD\n");
+
+    let stored = ws_with(&env, PASSPHRASE, &["ws", "set", "acme/github", "token"], format!("{VALUE}\n").as_bytes());
+    assert!(stored.status.success(), "{}", stderr(&stored));
+    assert_eq!(stdout(&stored), "stored github/token in acme\n");
+    assert_eq!((prompted(&stored), asked(&stored)), (1, 1));
+    assert!(stderr(&stored).contains("halti: [test] [DEV, not protected] store a secret in workspace acme\n"), "{}", stderr(&stored));
+    assert!(stderr(&stored).contains("halti: [test] asked: passphrase for workspace acme: \n") && !stderr(&stored).contains("value for"), "{}", stderr(&stored));
+    assert!(quiet(&stored, VALUE));
+    assert_eq!(pin_version(&env, "acme"), version + 1);
+    // One file, private, named by 64 hex characters, holding neither the name nor the value.
+    let files = items(&env, "acme");
+    assert_eq!(files.len(), 1);
+    let file = files[0].file_name().unwrap().to_str().unwrap().to_string();
+    assert!(file.len() == 64 && file.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{file}");
+    assert_eq!(fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777, 0o600);
+    let blob = fs::read(&files[0]).unwrap();
+    assert_eq!(blob.len(), VALUE.len() + 29);
+    for word in [&b"github"[..], b"token", VALUE.as_bytes()] {
+        assert!(!blob.windows(word.len()).any(|w| w == word) && !file.as_bytes().windows(word.len()).any(|w| w == word));
+    }
+    let manifest = fs::read(ws_dir(&env).join(ws_id(&env, "acme")).join("manifest")).unwrap();
+    assert!(!manifest.windows(6).any(|w| w == b"github"), "the list is sealed");
+
+    // Again: replaced, at the next version, still one file. Then two more.
+    let replaced = ws_with(&env, PASSPHRASE, &["ws", "set", "acme/github", "token"], b"acme github token two\r\n");
+    assert!(replaced.status.success() && stdout(&replaced) == "replaced github/token in acme\n", "{}", stderr(&replaced));
+    assert_eq!((pin_version(&env, "acme"), items(&env, "acme").len()), (version + 2, 1));
+    for (target, field) in [("acme/github", "user"), ("acme/linear", "token")] {
+        let out = ws_with(&env, PASSPHRASE, &["ws", "set", target, field], b"another value\n");
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+
+    // Listed with one passphrase, nothing written.
+    let before = ws_files(&env);
+    let listed = ws(&env, PASSPHRASE, &["ws", "ls", "acme"]);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    assert_eq!(stdout(&listed), "RESOURCE         FIELDS\ngithub           token, user\nlinear           token\n");
+    assert_eq!((prompted(&listed), asked(&listed)), (1, 1));
+    assert!(stderr(&listed).contains("halti: [test] [DEV, not protected] open workspace acme\n"), "{}", stderr(&listed));
+    assert!(ws_files(&env) == before, "listing writes nothing");
+    // Without a name, the workspaces, asking nothing, as before.
+    let all = ws(&env, PASSPHRASE, &["ws", "ls"]);
+    assert!(stdout(&all).starts_with("WORKSPACE ") && prompted(&all) == 0, "{}", stdout(&all));
+
+    // Removed: one field, then a resource.
+    let version = pin_version(&env, "acme");
+    let removed = ws(&env, PASSPHRASE, &["ws", "rm", "acme/github", "token"]);
+    assert!(removed.status.success() && stdout(&removed) == "removed github/token from acme\n", "{}", stderr(&removed));
+    assert_eq!((prompted(&removed), asked(&removed)), (1, 1));
+    assert!(stderr(&removed).contains("halti: [test] [DEV, not protected] remove secrets from workspace acme\n"), "{}", stderr(&removed));
+    assert_eq!((pin_version(&env, "acme"), items(&env, "acme").len()), (version + 1, 2));
+    let removed = ws(&env, PASSPHRASE, &["ws", "rm", "acme/linear"]);
+    assert!(removed.status.success() && stdout(&removed) == "removed linear from acme\n", "{}", stderr(&removed));
+    assert_eq!(stdout(&ws(&env, PASSPHRASE, &["ws", "ls", "acme"])), "RESOURCE         FIELDS\ngithub           user\n");
+    // Naming nothing stored: refused after the passphrase, nothing written.
+    let before = ws_files(&env);
+    let none = ws(&env, PASSPHRASE, &["ws", "rm", "acme/github", "token"]);
+    assert!(!none.status.success() && stderr(&none).ends_with("halti: there is no github/token in acme\n"), "{}", stderr(&none));
+    assert!(ws_files(&env) == before);
+    // Deleting the workspace takes its secrets with it.
+    assert!(ws(&env, PASSPHRASE, &["ws", "delete", "acme"]).status.success());
+    assert!(fs::read_dir(ws_dir(&env)).unwrap().all(|entry| entry.unwrap().file_name().len() != 32), "no workspace folder is left");
+}
+
+#[test]
+fn no_value_stores_nothing_and_a_value_is_never_an_argument() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let before = ws_files(&env);
+    // Nothing on stdin (null, as Env::command gives), or only a line break.
+    for out in [ws(&env, PASSPHRASE, &["ws", "set", "acme/github", "token"]), ws_with(&env, PASSPHRASE, &["ws", "set", "acme/github", "token"], b"\n")] {
+        assert!(!out.status.success() && stderr(&out).ends_with("halti: no value was given, so nothing was stored\n"), "{}", stderr(&out));
+        assert!(stdout(&out).is_empty() && asked(&out) == 1);
+        assert!(ws_files(&env) == before, "every file as it was");
+    }
+    // A value a secret can't hold: too long, or with a control character; never echoed.
+    for value in [vec![b'a'; 65537], b"acme\x1b[2Jtoken\n".to_vec(), b"acme\0token".to_vec(), b"acme\xfftoken".to_vec()] {
+        let out = ws_with(&env, PASSPHRASE, &["ws", "set", "acme/github", "token"], &value);
+        let said = stderr(&out);
+        assert!(!out.status.success() && said.ends_with("halti: that value can't be stored: a secret is text of up to 65536 bytes\n"), "{said}");
+        assert!(!said.contains("acme\x1b") && !said.contains("token\n") && stdout(&out).is_empty(), "{said}");
+        assert!(ws_files(&env) == before);
+    }
+    // The longest value is stored.
+    let out = ws_with(&env, PASSPHRASE, &["ws", "set", "acme/github", "token"], &[b'a'; 65536]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // A value in the arguments is a usage error, and nothing is asked.
+    let before = ws_files(&env);
+    let out = ws_with(&env, PASSPHRASE, &["ws", "set", "acme/github", "token", VALUE], b"");
+    assert!(!out.status.success() && stdout(&out).is_empty() && prompted(&out) == 0, "{}", stderr(&out));
+    assert!(ws_files(&env) == before);
+    // Names are checked before anything is asked, and none is said back.
+    let out = ws_with(&env, PASSPHRASE, &["ws", "set", "Acme/github", "token"], VALUE.as_bytes());
+    assert!(stderr(&out).contains("error: invalid value 'Acme/github' for '<WS/RESOURCE>': use a workspace and a resource, e.g. acme/github"), "{}", stderr(&out));
+    let out = ws_with(&env, PASSPHRASE, &["ws", "set", "acme/github", "Token"], VALUE.as_bytes());
+    assert!(stderr(&out).contains("use lowercase letters, digits and _, e.g. token") && prompted(&out) == 0, "{}", stderr(&out));
+    let out = ws_with(&env, PASSPHRASE, &["ws", "set", "initech/github", "token"], VALUE.as_bytes());
+    assert!(stderr(&out).ends_with("halti: there is no workspace named initech\n") && prompted(&out) == 0, "{}", stderr(&out));
+    let out = ws(&env, PASSPHRASE, &["ws", "ls", "--type"]);
+    assert!(!out.status.success() && prompted(&out) == 0, "--type needs a workspace");
+}
+
+#[test]
+fn a_put_back_secret_file_is_listed_as_unreadable() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    // Of other lengths, so each file is known by its size.
+    for (target, field, value) in [("acme/github", "token", VALUE), ("acme/linear", "token", "acme linear token one")] {
+        assert!(ws_with(&env, PASSPHRASE, &["ws", "set", target, field], value.as_bytes()).status.success());
+    }
+    let linear = items(&env, "acme").into_iter().find(|file| fs::read(file).unwrap().len() == "acme linear token one".len() + 29).unwrap();
+    let first = fs::read(&linear).unwrap();
+    assert!(ws_with(&env, PASSPHRASE, &["ws", "set", "acme/linear", "token"], b"acme linear token 2").status.success());
+    // Its file from before the last set put back: it can't be read, and the listing says how to set it again.
+    fs::write(&linear, &first).unwrap();
+    let hint = "linear/token can't be read. set it again with: halti ws set acme/linear token\n";
+    let listed = ws(&env, PASSPHRASE, &["ws", "ls", "acme"]);
+    assert_eq!(stdout(&listed), format!("RESOURCE         FIELDS\ngithub           token\nlinear           token\n{hint}"));
+    // Removed altogether: the same.
+    fs::remove_file(&linear).unwrap();
+    assert!(stdout(&ws(&env, PASSPHRASE, &["ws", "ls", "acme"])).ends_with(hint));
+    // Set again, it is read.
+    assert!(ws_with(&env, PASSPHRASE, &["ws", "set", "acme/linear", "token"], b"acme linear token 3").status.success());
+    assert!(!stdout(&ws(&env, PASSPHRASE, &["ws", "ls", "acme"])).contains("can't be read"));
+}
+
+#[test]
+fn a_wrong_passphrase_stores_lists_and_removes_nothing() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert!(ws_with(&env, PASSPHRASE, &["ws", "set", "acme/github", "token"], VALUE.as_bytes()).status.success());
+    let before = ws_files(&env);
+    let wrong = "acme passphrase two";
+    let tries: [(&[&str], &[u8]); 4] = [
+        (&["ws", "set", "acme/github", "token"], b"another value"),
+        (&["ws", "set", "acme/linear", "token"], b"another value"),
+        (&["ws", "ls", "acme"], b""),
+        (&["ws", "rm", "acme/github"], b""),
+    ];
+    for (args, input) in tries {
+        let out = ws_with(&env, wrong, args, input);
+        assert!(!out.status.success() && stderr(&out).ends_with("halti: that can't be opened (wrong key, or it was changed)\n"), "{args:?}: {}", stderr(&out));
+        assert!(stdout(&out).is_empty() && (prompted(&out), asked(&out)) == (1, 1), "{args:?}: asked once, and not again");
+        assert!(ws_files(&env) == before, "{args:?}: every file as it was");
+    }
+    // The manifest changed: refused before anything is asked.
+    let manifest = ws_dir(&env).join(ws_id(&env, "acme")).join("manifest");
+    let mut bytes = fs::read(&manifest).unwrap();
+    bytes[20] ^= 0x01;
+    fs::write(&manifest, &bytes).unwrap();
+    for args in [&["ws", "set", "acme/github", "token"][..], &["ws", "ls", "acme"], &["ws", "rm", "acme/github"]] {
+        let out = ws_with(&env, PASSPHRASE, args, VALUE.as_bytes());
+        assert!(!out.status.success() && stderr(&out).contains("can't be opened") && prompted(&out) == 0, "{args:?}: {}", stderr(&out));
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "the keychain is only on a mac")]
+fn a_saved_passphrase_stores_lists_and_removes_with_nothing_typed() {
+    let env = Env::new();
+    assert!(config(&env, &with_keychain_secrets("touchid", "touchid", "sudo", "passphrase"), "yes").status.success());
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    // No passphrase is given: Touch ID, or sudo, releases the saved copy.
+    let run = |args: &[&str], approve: &str, sudo: &str, input: &[u8]| {
+        let mut child = env
+            .command()
+            .args(args)
+            .env("HALTI_TEST_APPROVE", approve)
+            .env("HALTI_TEST_SUDO", sudo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(input);
+        child.wait_with_output().unwrap()
+    };
+    let out = run(&["ws", "set", "acme/github", "token"], "yes", "no", VALUE.as_bytes());
+    assert!(out.status.success() && stdout(&out) == "stored github/token in acme\n" && asked(&out) == 0, "{}", stderr(&out));
+    assert_eq!(stderr(&out), "halti: [test] [DEV, not protected] store a secret in workspace acme: yes\n");
+    assert!(quiet(&out, VALUE) && quiet(&out, PASSPHRASE));
+    let out = run(&["ws", "ls", "acme"], "yes", "no", b"");
+    assert!(out.status.success() && stdout(&out) == "RESOURCE         FIELDS\ngithub           token\n" && asked(&out) == 0, "{}", stderr(&out));
+    assert_eq!(stderr(&out), "halti: [test] [DEV, not protected] open workspace acme: yes\n");
+
+    // Declined: nothing is read or stored, and halti says how to type the passphrase instead.
+    let before = ws_files(&env);
+    let out = run(&["ws", "set", "acme/github", "token"], "no", "no", b"another value");
+    assert!(
+        !out.status.success() && stderr(&out).ends_with("halti: github/token was not stored. to type the passphrase instead: halti ws set acme/github token --type\n"),
+        "{}",
+        stderr(&out)
+    );
+    let out = run(&["ws", "rm", "acme/github"], "yes", "no", b"");
+    assert!(!out.status.success() && stderr(&out).ends_with("halti: github was not removed. to type the passphrase instead: halti ws rm acme/github --type\n"), "{}", stderr(&out));
+    assert!(ws_files(&env) == before);
+    // With --type it is typed, and nothing else is asked.
+    let out = env.command().args(["ws", "ls", "acme", "--type"]).env("HALTI_TEST_APPROVE", "no").env("HALTI_TEST_PASSPHRASE", PASSPHRASE).output().unwrap();
+    assert!(out.status.success() && asked(&out) == 1 && !stderr(&out).contains("open workspace acme: "), "{}", stderr(&out));
+
+    // A copy that can't be used: typed once, and left for `halti open` to save again.
+    let copy = saved_copy(&env, "acme");
+    fs::write(&copy, "acme passphrase two").unwrap();
+    let out = ws_with(&env, PASSPHRASE, &["ws", "set", "acme/linear", "token"], b"acme linear token");
+    assert!(out.status.success() && stdout(&out) == "stored linear/token in acme\n" && asked(&out) == 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("\nthe saved passphrase of acme can't be read. type it once.\n"), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(&copy).unwrap(), "acme passphrase two");
+    assert!(ws(&env, PASSPHRASE, &["open", "acme"]).status.success());
+    assert_eq!(fs::read_to_string(&copy).unwrap(), PASSPHRASE);
+
+    // Removed after sudo, nothing typed.
+    let out = run(&["ws", "rm", "acme/github", "token"], "no", "yes", b"");
+    assert!(out.status.success() && stdout(&out) == "removed github/token from acme\n" && asked(&out) == 0, "{}", stderr(&out));
+    assert_eq!(stderr(&out), "halti: [test] sudo: yes\n");
+}
+
+#[test]
+fn storing_a_secret_is_never_approved_by_nothing() {
+    let env = Env::new();
+    let (text, why) = if cfg!(target_os = "macos") {
+        (with_keychain_secrets("touchid", "none", "none", "none"), "line 21: set can't be none. it can be passphrase, sudo or touchid")
+    } else {
+        (edited("set    = \"passphrase\"", "set    = \"none\""), "line 21: set can't be none. it can only be passphrase")
+    };
+    let out = config(&env, &text, "yes");
+    let refused = format!("halti: {}, {why}\nnothing was approved. fix it with: halti config\n", config_file(&env).display());
+    assert!(!out.status.success() && stderr(&out) == refused && stdout(&out).is_empty(), "{}", stderr(&out));
+    assert!(!approved_copy(&env).exists());
+    // So a store still asks for the passphrase.
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let out = ws_with(&env, PASSPHRASE, &["ws", "set", "acme/github", "token"], VALUE.as_bytes());
+    assert!(out.status.success() && asked(&out) == 1, "{}", stderr(&out));
+}
+
 // --- halti config ---
 
 /// The person's settings file in a test's debug-build home.
@@ -1081,12 +1374,14 @@ const BOX_SECTIONS: &str = "\n[box]\nengine = \"container\"          # container
 /// The template a debug build has on this system.
 fn template() -> String {
     let (default, config, boxes) = if cfg!(target_os = "macos") { ("sudo | touchid | passphrase", "sudo | touchid", BOX_SECTIONS) } else { ("sudo | passphrase", "sudo", "") };
-    let (managers, ws) = if cfg!(target_os = "macos") { ("none | keychain", "passphrase | sudo | touchid | none") } else { ("none", "passphrase") };
+    let (managers, ws, set) =
+        if cfg!(target_os = "macos") { ("none | keychain", "passphrase | sudo | touchid | none", "passphrase | sudo | touchid") } else { ("none", "passphrase", "passphrase") };
     format!(
         "# halti config. edit with: halti config\n\n[approval]\ndefault = \"sudo\"              # {default}\nconfig  = \"sudo\"              # a change to this file: {config}\n\n\
          [paths]\nworkspaces = \"~/{DEV_STORE_ROOT}/ws\"\n\n[passwords]\nmanager = \"none\"              # {managers}\n\n[secrets]\nstore = \"files\"               # files\n\n\
          [workspace]\npassphrase = \"own\"            # own | generate\n\n[workspace.approval]\n\
-         open   = \"passphrase\"         # opening a workspace: {ws}\ndelete = \"passphrase\"         # deleting a workspace: {ws}\n{boxes}"
+         open   = \"passphrase\"         # opening a workspace: {ws}\nset    = \"passphrase\"         # storing a secret in a workspace: {set}\n\
+         rm     = \"passphrase\"         # removing secrets from a workspace: {ws}\ndelete = \"passphrase\"         # deleting a workspace: {ws}\n{boxes}"
     )
 }
 
@@ -1119,7 +1414,7 @@ fn config_shows_the_template_and_what_is_in_effect() {
     let last = if cfg!(target_os = "macos") {
         "\n[box.approval]\nrun    = \"touchid\"\npolicy = \"touchid\"\nwrite  = \"touchid\"\nexport = \"touchid\"\ndelete = \"touchid\"\n"
     } else {
-        "\n[workspace.approval]\nopen   = \"passphrase\"\ndelete = \"passphrase\"\n"
+        "\n[workspace.approval]\nopen   = \"passphrase\"\nset    = \"passphrase\"\nrm     = \"passphrase\"\ndelete = \"passphrase\"\n"
     };
     assert!(stdout(&shown).ends_with(last), "{}", stdout(&shown));
     assert!(!config_file(&env).exists() && !approved_copy(&env).exists(), "showing writes nothing");
@@ -1328,6 +1623,11 @@ fn with_keychain(open: &str, delete: &str) -> String {
     edited("manager = \"none\"   ", "manager = \"keychain\"")
         .replace("open   = \"passphrase\"", &format!("open   = \"{open}\""))
         .replace("delete = \"passphrase\"", &format!("delete = \"{delete}\""))
+}
+
+/// As `with_keychain`, and storing and removing secrets approved by `set` and `rm`.
+fn with_keychain_secrets(open: &str, set: &str, rm: &str, delete: &str) -> String {
+    with_keychain(open, delete).replace("set    = \"passphrase\"", &format!("set    = \"{set}\"")).replace("rm     = \"passphrase\"", &format!("rm     = \"{rm}\""))
 }
 
 /// Where the debug build's fake Keychain keeps the saved passphrase of the workspace `name`.
