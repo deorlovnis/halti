@@ -9,8 +9,8 @@
 //! approves opening one or listing its secrets, storing a secret, removing secrets, and deleting
 //! one: the passphrase typed, which core asks for, or, where a manager keeps it, the means their
 //! line names before halti takes it from there. With `--type` it is typed whatever they say. Each
-//! command asks once; a saved copy that can't be used is typed instead, once. A workspace opens
-//! with what it was made with, which its own records hold.
+//! command asks for one approval; a saved copy that can't be used is typed instead, once. A
+//! workspace opens with what it was made with, which its own records hold.
 //!
 //! A secret's value is read only after the approval and the checks (`tty::read_value`), once, and
 //! is never printed. Only `open` saves a typed passphrase again.

@@ -1271,13 +1271,84 @@ fn a_wrong_passphrase_stores_lists_and_removes_nothing() {
     }
 }
 
+/// A pseudo-terminal: the side a person types into, and the terminal a program is given.
+fn pty() -> (fs::File, fs::File) {
+    use std::os::fd::FromRawFd;
+    let (mut person, mut terminal) = (0, 0);
+    let made = unsafe { libc::openpty(&mut person, &mut terminal, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+    assert_eq!(made, 0, "openpty: {}", std::io::Error::last_os_error());
+    unsafe { (fs::File::from_raw_fd(person), fs::File::from_raw_fd(terminal)) }
+}
+
+#[test]
+fn a_value_pasted_in_more_lines_is_refused_and_the_shell_reads_none_of_it() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let before = ws_files(&env);
+    let (person, terminal) = pty();
+    let left = env.dir.join("left");
+    // halti runs under a shell that owns the terminal, as a person's does, and that then reads whatever halti left there.
+    let mut shell = Command::new("/bin/sh");
+    shell.args(["-c", "\"$@\"; done=$?; stty -icanon min 0 time 0; cat > \"$LEFT\"; exit $done", "sh", HALTI, "ws", "set", "acme/github", "key"]);
+    let halti = env.command();
+    for (name, value) in halti.get_envs() {
+        match value {
+            Some(value) => shell.env(name, value),
+            None => shell.env_remove(name),
+        };
+    }
+    shell.env("HALTI_TEST_PASSPHRASE", PASSPHRASE).env("LEFT", &left).current_dir(&env.dir);
+    shell.stdin(terminal.try_clone().unwrap()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    unsafe {
+        shell.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = shell.spawn().unwrap();
+    // What the terminal shows, read as it comes: a shell leaving a terminal waits for that.
+    let mut shown = person.try_clone().unwrap();
+    let screen = thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut buf = [0; 1024];
+        while let Ok(n @ 1..) = shown.read(&mut buf) {
+            seen.extend_from_slice(&buf[..n]);
+        }
+        seen
+    });
+    // Pasted once the value's question has turned echo off, as a person pastes after it.
+    let echoing = || {
+        let mut now: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(terminal.as_raw_fd(), &mut now) }, 0);
+        now.c_lflag & libc::ECHO != 0
+    };
+    let start = std::time::Instant::now();
+    while echoing() && child.try_wait().unwrap().is_none() && start.elapsed().as_secs() < 30 {
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    (&person).write_all(b"-----BEGIN TEST KEY-----\nYWNtZSBnaXRodWIga2V5\n-----END TEST KEY-----").unwrap();
+    drop(terminal);
+    let out = child.wait_with_output().unwrap();
+    let refused = "halti: a value of more than one line can't be typed, so nothing was stored. pipe it in instead\n";
+    assert!(!out.status.success() && stderr(&out).ends_with(refused) && stdout(&out).is_empty(), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(text(&fs::read(&left).unwrap()), "", "the shell reads none of it");
+    let screen = text(&screen.join().unwrap());
+    assert!(screen.contains("value for github/key: ") && !screen.contains("TEST KEY") && !screen.contains("YWNt"), "{screen}");
+    assert!(ws_files(&env) == before, "nothing was stored");
+}
+
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "the keychain is only on a mac")]
 fn a_saved_passphrase_stores_lists_and_removes_with_nothing_typed() {
     let env = Env::new();
-    assert!(config(&env, &with_keychain_secrets("touchid", "touchid", "sudo", "passphrase"), "yes").status.success());
+    // Each line names its own means, so each command is seen to follow its own line.
+    assert!(config(&env, &with_keychain_secrets("none", "touchid", "sudo", "passphrase"), "yes").status.success());
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
-    // No passphrase is given: Touch ID, or sudo, releases the saved copy.
+    // No passphrase is given: Touch ID, sudo or nothing releases the saved copy.
     let run = |args: &[&str], approve: &str, sudo: &str, input: &[u8]| {
         let mut child = env
             .command()
@@ -1296,9 +1367,10 @@ fn a_saved_passphrase_stores_lists_and_removes_with_nothing_typed() {
     assert!(out.status.success() && stdout(&out) == "stored github/token in acme\n" && asked(&out) == 0, "{}", stderr(&out));
     assert_eq!(stderr(&out), "halti: [test] [DEV, not protected] store a secret in workspace acme: yes\n");
     assert!(quiet(&out, VALUE) && quiet(&out, PASSPHRASE));
-    let out = run(&["ws", "ls", "acme"], "yes", "no", b"");
+    // Listing follows the open line, which asks nothing.
+    let out = run(&["ws", "ls", "acme"], "no", "no", b"");
     assert!(out.status.success() && stdout(&out) == "RESOURCE         FIELDS\ngithub           token\n" && asked(&out) == 0, "{}", stderr(&out));
-    assert_eq!(stderr(&out), "halti: [test] [DEV, not protected] open workspace acme: yes\n");
+    assert_eq!(stderr(&out), "");
 
     // Declined: nothing is read or stored, and halti says how to type the passphrase instead.
     let before = ws_files(&env);
@@ -1314,6 +1386,27 @@ fn a_saved_passphrase_stores_lists_and_removes_with_nothing_typed() {
     // With --type it is typed, and nothing else is asked.
     let out = env.command().args(["ws", "ls", "acme", "--type"]).env("HALTI_TEST_APPROVE", "no").env("HALTI_TEST_PASSPHRASE", PASSPHRASE).output().unwrap();
     assert!(out.status.success() && asked(&out) == 1 && !stderr(&out).contains("open workspace acme: "), "{}", stderr(&out));
+    let typed = |args: &[&str], input: &[u8]| {
+        let mut child = env
+            .command()
+            .args(args)
+            .env("HALTI_TEST_APPROVE", "no")
+            .env("HALTI_TEST_SUDO", "no")
+            .env("HALTI_TEST_PASSPHRASE", PASSPHRASE)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(input);
+        child.wait_with_output().unwrap()
+    };
+    let out = typed(&["ws", "set", "acme/gitlab", "token", "--type"], b"acme gitlab token");
+    assert!(out.status.success() && stdout(&out) == "stored gitlab/token in acme\n" && asked(&out) == 1, "{}", stderr(&out));
+    assert!(!stderr(&out).contains("store a secret in workspace acme: "), "{}", stderr(&out));
+    let out = typed(&["ws", "rm", "acme/gitlab", "--type"], b"");
+    assert!(out.status.success() && stdout(&out) == "removed gitlab from acme\n" && asked(&out) == 1, "{}", stderr(&out));
+    assert!(!stderr(&out).contains("sudo: "), "{}", stderr(&out));
 
     // A copy that can't be used: typed once, and left for `halti open` to save again.
     let copy = saved_copy(&env, "acme");

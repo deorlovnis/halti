@@ -76,17 +76,17 @@ A **workspace** keeps one client's secrets apart from another's, sealed in files
 
 ```sh
 halti ws new acme                          # asks for a new passphrase (or makes one: --generate)
-halti ws set acme/github token             # asks for the passphrase, then the value, typed unseen
-pbpaste | halti ws set acme/github token   # or the value piped in; the passphrase is still asked
-halti ws ls acme                           # the resources and fields stored in acme (asks for the passphrase)
+halti ws set acme/github token             # asks as [workspace.approval] says, then the value, typed unseen
+pbpaste | halti ws set acme/github token   # or the value piped in; the approval is still asked
+halti ws ls acme                           # the resources and fields stored in acme (asks as for open)
 halti ws rm acme/github token              # one field; `halti ws rm acme/github` removes every field of github
 halti ws ls                                # the workspaces (asks nothing)
 halti open acme                            # checks the passphrase and the files
 halti ws delete acme                       # the workspace and everything in it
 ```
 
-- Each command asks once, as `[workspace.approval]` says (see Settings), and `--type` has you type the passphrase whatever it says. The value is read only after that, and never shown, logged or taken from an argument.
-- A value is text of 1 to 65536 bytes with no control characters but tab and line feed; binary goes in as base64. From a pipe, one trailing line break is dropped and nothing else.
+- Each command asks for one approval, as `[workspace.approval]` says (see Settings), and if a saved passphrase can't be read, has you type it once more; `--type` has you type the passphrase whatever it says. The value is read only after that, and never shown, logged or taken from an argument.
+- A value is text of 1 to 65536 bytes with no control characters but tab and line feed; binary goes in as base64. From a pipe, one trailing line break is dropped and nothing else. Typed, a value is one line, and the tab and escape keys type nothing; pipe in a value that has a line break or a tab.
 - Values are kept as `[secrets] store` says: files, one per secret, sealed and named by 64 hex characters, beside a sealed list of what is stored. `halti ws ls acme` says if a secret's file is missing or isn't the one the list names, and how to set it again.
 - **Limit:** older copies of a workspace's files, put back together with its pin file, read as they were, older secrets included.
 

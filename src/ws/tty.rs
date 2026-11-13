@@ -20,7 +20,8 @@
 //! A secret's value (`read_value`) is read here too, once the workspace is approved and checked:
 //! piped in on standard input, or typed unseen at the terminal when standard input is one. Unlike
 //! the passphrase it can be piped, so a script can store a value but never approve the store. It is
-//! never echoed, and never answered by the test variable, which is for passphrases only.
+//! never echoed, and never answered by the test variable, which is for passphrases only. Typed, it
+//! is one line: a paste of more is refused and thrown away, so the shell never reads the rest.
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
@@ -288,8 +289,10 @@ impl KeyHolder for TtyPassphrase {
 const NO_VALUE: &str = "no value was given, so nothing was stored";
 
 /// A secret's value: piped in on standard input when that isn't a terminal, else typed at the
-/// terminal unseen after "value for KEY: ". Nothing piped or typed, Ctrl-C or Ctrl-D, stores
-/// nothing. A value a secret can't hold is `Refusal::BadSecret`, which says nothing of it.
+/// terminal unseen after "value for KEY: ". Typed, a value is one line, and the tab and escape keys
+/// type nothing, so a value with a line break or a tab is piped in. Nothing piped or typed, Ctrl-C
+/// or Ctrl-D, stores nothing. A value a secret can't hold is `Refusal::BadSecret`, which says
+/// nothing of it.
 pub fn read_value(key: &ItemKey) -> Result<Secret> {
     let stdin = io::stdin();
     let bytes = if stdin.is_terminal() { typed_value(key)? } else { piped(stdin.lock())? };
@@ -300,16 +303,49 @@ pub fn read_value(key: &ItemKey) -> Result<Secret> {
 }
 
 /// What is typed at the terminal after the value's question, unseen, with typeahead thrown away
-/// first. rpassword reads each byte that isn't UTF-8 as U+FFFD, so an answer with one is refused
-/// rather than stored as other text than was typed.
+/// first. rpassword ends the answer at the first line break and drops the tab and escape keys, so a
+/// typed value is one line without them. A paste of more lines is refused, and its other lines are
+/// thrown away: left there, the shell would read them, shown and run, once halti ends.
 fn typed_value(key: &ItemKey) -> Result<Zeroizing<Vec<u8>>> {
     let tty = OpenOptions::new().read(true).write(true).open("/dev/tty").map_err(|_| anyhow!("there is no terminal to type the value in. pipe it in instead"))?;
     unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) };
-    let mut typed = match crate::util::sigint_ignored(|| rpassword::prompt_password(format!("value for {key}: "))) {
+    let read = crate::util::sigint_ignored(|| rpassword::prompt_password(format!("value for {key}: ")));
+    let more = flushed(&tty);
+    let typed = match read {
         Ok(typed) => Zeroizing::new(typed),
         Err(e) if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::Interrupted) => bail!(NO_VALUE),
         Err(e) => return Err(anyhow::Error::from(e).context("reading the value")),
     };
+    if more {
+        bail!("a value of more than one line can't be typed, so nothing was stored. pipe it in instead");
+    }
+    typed_text(typed)
+}
+
+/// Throws away whatever is waiting to be read at the terminal, and says whether anything was. It
+/// looks with the terminal not waiting for a whole line, so a last line with no line break counts
+/// too, then puts the terminal back.
+fn flushed(tty: &File) -> bool {
+    let fd = tty.as_raw_fd();
+    let mut was: libc::termios = unsafe { std::mem::zeroed() };
+    let got = unsafe { libc::tcgetattr(fd, &mut was) } == 0;
+    if got {
+        let mut raw = was;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) };
+    }
+    let mut waiting: libc::c_int = 0;
+    let looked = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut waiting) } == 0;
+    unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
+    if got {
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &was) };
+    }
+    looked && waiting > 0
+}
+
+/// What was typed, if it can be a value. rpassword reads each byte that isn't UTF-8 as U+FFFD, so
+/// an answer with one is refused rather than stored as other text than was typed.
+fn typed_text(mut typed: Zeroizing<String>) -> Result<Zeroizing<Vec<u8>>> {
     if typed.contains('\u{FFFD}') {
         bail!("what was typed isn't UTF-8 text, so it wasn't stored (set the terminal to UTF-8)");
     }
@@ -432,6 +468,14 @@ mod tests {
         let error = usable(Zeroizing::new("acme passphrase \u{FFFD}ne".to_string())).unwrap_err();
         assert!(error.to_string().contains("isn't UTF-8 text") && error.downcast_ref::<Refusal>().is_none(), "{error:#}");
         assert_eq!(usable(Zeroizing::new("acme passphrase \u{f6}ne".to_string())).unwrap().as_str(), "acme passphrase \u{f6}ne");
+    }
+
+    #[test]
+    fn a_typed_value_is_refused_when_the_terminal_sent_no_utf8() {
+        let error = typed_text(Zeroizing::new("acme github \u{FFFD}oken".to_string())).unwrap_err();
+        assert!(error.to_string().contains("isn't UTF-8 text") && error.downcast_ref::<Refusal>().is_none(), "{error:#}");
+        assert!(!format!("{error:#}").contains("acme github"), "nothing of the value is said");
+        assert_eq!(typed_text(Zeroizing::new("acme github t\u{f6}ken".to_string())).unwrap().as_slice(), "acme github t\u{f6}ken".as_bytes());
     }
 
     #[test]
