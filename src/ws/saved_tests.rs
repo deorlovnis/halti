@@ -393,4 +393,12 @@ fn the_approve_window_names_the_policies() {
     let said = policies::approve_with(&f.here, &name("acme"), None, &way(&world, &copies, None), &typing(ACME)).unwrap();
     assert_eq!(said.out.iter().filter(|line| line.ends_with("was approved already")).count(), 5);
     assert!(world.calls().is_empty());
+    // A policy added to the five unchanged ones: the window names only what approving changes.
+    assert!(files.create("zeta", &text("zeta")).unwrap());
+    let said = policies::approve_with(&f.here, &name("acme"), None, &way(&world, &copies, Some(Means::TouchId)), &typing("not the passphrase")).unwrap();
+    assert!(said.out.contains(&"approved the policy for zeta in acme".to_string()), "{:?}", said.out);
+    assert_eq!(world.calls(), [format!("touch id: [DEV, not protected] approve policies zeta {} in workspace acme", hash("zeta"))]);
+    // With none changed, every one is named.
+    policies::approve_with(&f.here, &name("acme"), None, &way(&world, &copies, Some(Means::TouchId)), &typing("not the passphrase")).unwrap();
+    assert_eq!(world.calls(), [format!("touch id: [DEV, not protected] approve policies github {github}, linear {linear}, slack {slack} and 3 more in workspace acme")]);
 }

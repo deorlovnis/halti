@@ -13,8 +13,8 @@
 //! the copy is what was approved, so a policy a program planted or changed can't be swept in with
 //! the others. Approving one shows its whole text.
 //!
-//! A policy in a workspace is plain ASCII, can't refresh yet, and keeps `[run]` and `[agent]` as an
-//! empty policy has them (`policy::in_workspace`). Of the binary's policy module only what reaches
+//! A policy in a workspace isn't empty, is plain ASCII outside lines that are only a comment, can't
+//! refresh yet, and keeps `[run]` and `[agent]` as an empty policy has them (`policy::in_workspace`). Of the binary's policy module only what reaches
 //! no source is used here: the workspace's place comes later.
 
 use std::io::{self, IsTerminal};
@@ -99,10 +99,12 @@ fn edit_with(here: &Here, name: &WsName, resource: &str, approve_now: &dyn Fn(Ve
     // A path there that isn't a plain file, or is too large, is refused before the editor opens it.
     files.read(resource)?;
     let path = files.path(resource);
-    let copy = files.approved_copy(resource)?.filter(|copy| std::str::from_utf8(copy).is_ok());
+    // A copy that can't be read, or isn't text, is taken as none: the edit is then approved as new,
+    // which core refuses if the policy has an approval.
+    let copy = files.approved_copy(resource).ok().flatten().filter(|copy| std::str::from_utf8(copy).is_ok());
     let read = |_: &std::path::Path| files.read(resource)?.ok_or_else(|| no_file(name, resource));
     let check = |text: &str| policy::in_workspace(text.as_bytes(), &policy::Policy::parse(text)?);
-    let shown_against = copy.as_deref().map(|copy| std::str::from_utf8(copy).expect("checked above"));
+    let shown_against = || copy.as_deref().map(|copy| String::from_utf8_lossy(copy).into_owned());
     let Some(bytes) = policy::edit_against(&path, read, shown_against, &format!("{resource} in {name}"), check)? else { return Ok(()) };
     policy::offer_approval(&path, &format!("halti ws policy approve {name}/{resource}"), || approve_now(bytes, copy))
 }
@@ -137,7 +139,8 @@ impl Prepared {
 }
 
 /// A policy's bytes, read once and checked: none if there is no file. A text that doesn't parse,
-/// that isn't plain ASCII or that holds what a workspace's policy can't, is refused with its path.
+/// that is empty, isn't plain ASCII or holds what a workspace's policy can't, is refused with its
+/// path.
 fn read_checked(files: &PolicyFiles, resource: &str) -> Result<Option<Vec<u8>>> {
     let Some(bytes) = files.read(resource)? else { return Ok(None) };
     let path = files.path(resource);
@@ -147,22 +150,21 @@ fn read_checked(files: &PolicyFiles, resource: &str) -> Result<Option<Vec<u8>>> 
     Ok(Some(bytes))
 }
 
-/// `resource`'s policy, read and checked, as one to approve. With `whole`, its whole text is shown;
-/// otherwise it is shown against the approved copy.
+/// `resource`'s policy, read and checked, as one to approve. With `whole`, its whole text is shown,
+/// and no word from the approved copy, since core checks that copy only when it is shown against
+/// it. Otherwise it is shown against the copy: one that can't be read is taken as none, so the
+/// policy is shown as new, which core refuses if it has an approval.
 fn prepared(files: &PolicyFiles, name: &WsName, resource: &str, whole: bool) -> Result<Prepared> {
     let text = read_checked(files, resource)?.ok_or_else(|| no_file(name, resource))?;
-    let copy = files.approved_copy(resource)?;
-    let word = match &copy {
-        None => "new",
-        Some(copy) if *copy == text => "unchanged",
-        Some(_) => "changed",
-    };
     let mut prepared = Prepared { resource: resource.to_string(), text, against: Against::Whole, shown: String::new() };
     let sha12 = prepared.sha12();
     let head = format!("Policy for {resource} in {name} ({})", files.path(resource).display());
     let utf8 = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim_end().to_string();
-    prepared.shown = match copy {
-        _ if whole => format!("{head}, {word}:\n\n{}\n\nsha256 {sha12}\n\n", utf8(&prepared.text)),
+    if whole {
+        prepared.shown = format!("{head}:\n\n{}\n\nsha256 {sha12}\n\n", utf8(&prepared.text));
+        return Ok(prepared);
+    }
+    prepared.shown = match files.approved_copy(resource).ok().flatten() {
         None => {
             prepared.against = Against::New;
             format!("{head}, new:\n\n{}\n\nsha256 {sha12}\n\n", utf8(&prepared.text))
@@ -203,7 +205,7 @@ pub(super) fn approve_with(here: &Here, name: &WsName, which: Option<&str>, way:
 }
 
 /// Approves what `ws policy edit` read: after a diff against the approved copy only its hash is
-/// shown, and a policy shown with no diff is shown whole.
+/// shown, and a policy shown with no diff is shown whole as new, which core checks.
 fn approve_edited(here: &Here, name: &WsName, resource: &str, text: Vec<u8>, copy: Option<Vec<u8>>, way: &Way<'_>) -> Result<Said> {
     let files = policies_of(here, name)?;
     let mut edited = Prepared { resource: resource.to_string(), text, against: Against::Whole, shown: String::new() };
@@ -214,6 +216,7 @@ fn approve_edited(here: &Here, name: &WsName, resource: &str, text: Vec<u8>, cop
             format!("sha256 {sha12}\n\n")
         }
         None => {
+            edited.against = Against::New;
             let path = files.path(resource);
             format!("Policy for {resource} in {name} ({}), new:\n\n{}\n\nsha256 {sha12}\n\n", path.display(), String::from_utf8_lossy(&edited.text).trim_end())
         }
@@ -258,11 +261,15 @@ fn approve_shown(here: &Here, name: &WsName, files: &PolicyFiles, all: &[Prepare
     Ok(said)
 }
 
-/// What the Touch ID window or sudo names: each policy and the start of its hash, the first few
-/// of them, then how many more.
+/// What the Touch ID window or sudo names: each policy that approving changes, as it was shown (not
+/// unchanged), and the start of its hash, the first few of them, then how many more. When none
+/// changes, every one is named.
 fn detail(all: &[Prepared]) -> String {
-    let named: Vec<String> = all.iter().take(NAMED).map(|prepared| format!("{} {}", prepared.resource, prepared.sha12())).collect();
-    let more = all.len().saturating_sub(NAMED);
+    let unchanged = |prepared: &&Prepared| matches!(&prepared.against, Against::Copy(copy) if *copy == prepared.text);
+    let changing: Vec<&Prepared> = all.iter().filter(|prepared| !unchanged(prepared)).collect();
+    let named_from = if changing.is_empty() { all.iter().collect() } else { changing };
+    let named: Vec<String> = named_from.iter().take(NAMED).map(|prepared| format!("{} {}", prepared.resource, prepared.sha12())).collect();
+    let more = named_from.len().saturating_sub(NAMED);
     if more == 0 { named.join(", ") } else { format!("{} and {more} more", named.join(", ")) }
 }
 

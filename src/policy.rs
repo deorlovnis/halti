@@ -840,24 +840,30 @@ pub fn edit(res: &str) -> Result<()> {
 /// what the edit changed (false if nothing); a new one is shown whole when approved.
 pub fn edit_file(key: &str, p: &Path, check: impl FnOnce(&str) -> Result<()>) -> Result<bool> {
     let read = |p: &Path| Ok(fs::read_to_string(p)?.into_bytes());
-    Ok(edit_against(p, read, approved_text(key).as_deref(), &label(key), check)?.is_some())
+    Ok(edit_against(p, read, || approved_text(key), &label(key), check)?.is_some())
 }
 
-/// Opens the file in $EDITOR, then reads it once with `read` and checks it. If there is an
-/// `approved` text, what the edit changed from it is shown, and an edit that changed nothing says
-/// so and gives none; `label` names the policy in that line. The bytes read are what was checked
-/// and shown, so they are what an approval that follows may take.
-pub fn edit_against(p: &Path, read: impl Fn(&Path) -> Result<Vec<u8>>, approved: Option<&str>, label: &str, check: impl FnOnce(&str) -> Result<()>) -> Result<Option<Vec<u8>>> {
+/// Opens the file in $EDITOR, then reads it once with `read` and checks it. Only then is the
+/// `approved` text asked for: if there is one, what the edit changed from it is shown, and an edit
+/// that changed nothing says so and gives none; `label` names the policy in that line. The bytes
+/// read are what was checked and shown, so they are what an approval that follows may take.
+pub fn edit_against(
+    p: &Path,
+    read: impl Fn(&Path) -> Result<Vec<u8>>,
+    approved: impl FnOnce() -> Option<String>,
+    label: &str,
+    check: impl FnOnce(&str) -> Result<()>,
+) -> Result<Option<Vec<u8>>> {
     run_editor(p)?;
     let bytes = read(p)?;
     let text = std::str::from_utf8(&bytes).with_context(|| format!("{} isn't UTF-8", p.display()))?;
     check(text).with_context(|| p.display().to_string())?;
-    if let Some(old) = approved {
+    if let Some(old) = approved() {
         if old == text {
             println!("no change from the approved policy for {label}");
             return Ok(None);
         }
-        println!("{}", diff(old, text, io::stdout().is_terminal()));
+        println!("{}", diff(&old, text, io::stdout().is_terminal()));
     }
     Ok(Some(bytes))
 }
@@ -882,21 +888,46 @@ pub fn offer_approval(p: &Path, approve_cmd: &str, approve_now: impl FnOnce() ->
 }
 
 /// Whether a policy may be approved in a workspace, where it is kept apart from the Keychain's.
-/// Its text is plain: printable ASCII, tab and line feed, so nothing in it reads as other than it
-/// is (a look-alike letter in a host, a control that reorders a line). And it uses only what the
-/// workspace's commands keep to: no `[refresh]` yet, and `[run]` and `[agent]` as an empty policy
-/// has them, so nothing approved now takes effect unseen once a later command honours it.
+/// It isn't empty. Its text is plain: printable ASCII, tab and line feed, so nothing in it reads as
+/// other than it is (a look-alike letter in a host, a control that reorders a line). A line that is
+/// only a comment may also have other letters and signs, as the Keychain's template does, but no
+/// control or invisible character; a text with a multi-line string has none of those lines, since
+/// a line in such a string may only look like a comment. And it uses only what the workspace's
+/// commands keep to: no `[refresh]` yet, and `[run]` and `[agent]` as an empty policy has them, so
+/// nothing approved now takes effect unseen once a later command honours it.
 pub fn in_workspace(text: &[u8], policy: &Policy) -> Result<()> {
+    if text.is_empty() {
+        bail!("an empty policy can't be approved");
+    }
     let plain = |byte: &u8| matches!(byte, b' '..=b'~' | b'\t' | b'\n');
-    if let Some(at) = text.iter().position(|byte| !plain(byte)) {
-        let line = 1 + text[..at].iter().filter(|byte| **byte == b'\n').count();
-        bail!("line {line} has a character that isn't plain ASCII. write a host with other letters in its xn-- form");
+    let multi_line = text.windows(3).any(|three| three == b"\"\"\"" || three == b"'''");
+    for (at, line) in text.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        if line.iter().all(plain) {
+            continue;
+        }
+        let comment = !multi_line && line.iter().find(|byte| !matches!(byte, b' ' | b'\t')) == Some(&b'#');
+        match std::str::from_utf8(line) {
+            Ok(line) if comment => {
+                if line.chars().any(|c| if c.is_ascii() { !plain(&(c as u8)) } else { hidden(c) }) {
+                    bail!("line {} has a control or invisible character", at + 1);
+                }
+            }
+            _ => bail!("line {} has a character that isn't plain ASCII. write a host with other letters in its xn-- form", at + 1),
+        }
     }
     let empty = Policy::default();
     if !policy.refresh.is_empty() || policy.run != empty.run || policy.agent != empty.agent {
         bail!("in a workspace, [refresh] can't be used yet, and [run] and [agent] must keep their defaults");
     }
     Ok(())
+}
+
+/// A character that isn't seen, or that changes how the text around it reads: a control (C0, C1,
+/// delete), a format character (bidi, zero-width, soft hyphen, tags) or a line or paragraph
+/// separator.
+fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}')
 }
 
 /// The policy `ws policy edit` starts from. RES becomes the resource, WS the workspace. Only what a
@@ -1138,16 +1169,17 @@ mod tests {
             let error = in_a_workspace(text).unwrap_err().to_string();
             assert_eq!(error, "in a workspace, [refresh] can't be used yet, and [run] and [agent] must keep their defaults", "{text}");
         }
-        // Today's template with a resource filled in holds only what an empty policy has: [run] and [agent] as their
-        // defaults. Its one line that isn't plain ASCII is a comment, with an ellipsis; written with dots, it passes.
+        // Today's template with a resource filled in passes as it is: [run] and [agent] as their defaults, and its
+        // one line that isn't plain ASCII a comment, with an ellipsis.
         let keychain = TEMPLATE.replace("CONFIG", names::CONFIG_DIR).replace("RES", "github");
-        assert_eq!(in_a_workspace(&keychain).unwrap_err().to_string(), "line 15 has a character that isn't plain ASCII. write a host with other letters in its xn-- form");
-        let keychain = keychain.replace('\u{2026}', "...");
+        assert!(!keychain.is_ascii());
         let workspace = WORKSPACE_TEMPLATE.replace("RES", "github").replace("WS", "acme");
         let defaults = "[run]\nmode = \"deny\"\nexport = {}\n\n[agent]\nconsent = \"session\"\nconsent_minutes = 240\n\n[refresh]\n";
-        for text in [keychain.as_str(), workspace.as_str(), "", "[fetch]\nhosts = [\"https://api.github.com\"]\n", defaults] {
+        for text in [keychain.as_str(), workspace.as_str(), "\n", "[fetch]\nhosts = [\"https://api.github.com\"]\n", defaults] {
             in_a_workspace(text).unwrap_or_else(|e| panic!("{text}: {e:#}"));
         }
+        // An empty one parses, but has nothing to approve.
+        assert_eq!(in_a_workspace("").unwrap_err().to_string(), "an empty policy can't be approved");
         assert!(workspace.starts_with("# halti policy for github in acme. It takes effect only once approved: halti ws policy approve acme/github\n"));
         assert!(!workspace.contains("[run]") && !workspace.contains("[agent]") && !workspace.contains("refresh"), "{workspace}");
         let (empty, parsed) = (Policy::default(), Policy::parse("").unwrap());
@@ -1163,16 +1195,32 @@ mod tests {
         assert_eq!(in_a_workspace(look_alike).unwrap_err().to_string(), refused(2));
         let empty = Policy::default();
         for (text, line) in [
-            ("# reads the other way \u{202e}moc.buhtig\n", 1),
             ("[fetch]\nhosts = [\"https://api.github.com\u{200b}\"]\n", 2),
-            ("# one\n# two\n# a control of U+0080 to U+009F \u{85}\n", 3),
-            ("# a carriage return\r\n", 1),
-            ("# delete \x7f\n", 1),
-            ("# caf\u{e9}\n", 1),
+            ("[fetch]\nhosts = [\"https://api.github.com\"] # reads the other way \u{202e}moc.buhtig\n", 2),
+            ("[[tool]]\nname = \"item\"\nabout = \"caf\u{e9}\"\n", 3),
+            ("[fetch]\nhosts = [\"https://api.github.com\"]\nwrites = \"deny\"\r\n", 3),
+            // In a multi-line string, a line that looks like a comment is the string's.
+            ("[[tool]]\nname = \"item\"\nabout = \"\"\"\n# caf\u{e9}\n\"\"\"\n", 4),
+            ("[[tool]]\nname = \"item\"\nabout = '''\n  # \u{2026}\n'''\n", 4),
         ] {
             assert_eq!(in_workspace(text.as_bytes(), &empty).unwrap_err().to_string(), refused(line), "{text:?}");
         }
         assert_eq!(in_workspace(b"# not text \xff\n", &empty).unwrap_err().to_string(), refused(1));
+        // A line that is only a comment may have other letters and signs, but nothing that hides or reorders text.
+        let hidden = |line: usize| format!("line {line} has a control or invisible character");
+        for (text, line) in [
+            ("# reads the other way \u{202e}moc.buhtig\n", 1),
+            ("# one\n# two\n# a control of U+0080 to U+009F \u{85}\n", 3),
+            ("# a carriage return\r\n", 1),
+            ("# delete \x7f\n", 1),
+            ("# zero\u{200b}width\n", 1),
+            ("# caf\u{e9}\u{2028}hosts = [\"https://evil.example\"]\n", 1),
+        ] {
+            assert_eq!(in_workspace(text.as_bytes(), &empty).unwrap_err().to_string(), hidden(line), "{text:?}");
+        }
+        for text in ["# caf\u{e9}\n", "[fetch]\n  # firefox-cookie:\u{2026} reads a cookie\nhosts = [\"https://api.github.com\"]\n"] {
+            in_a_workspace(text).unwrap_or_else(|e| panic!("{text}: {e:#}"));
+        }
         in_a_workspace("[fetch]\nhosts = [\"https://xn--bcher-kva.example\"]\n\twrites = \"deny\"\n").unwrap();
     }
 

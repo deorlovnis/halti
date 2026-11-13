@@ -415,6 +415,21 @@ fn policy_edit_shows_a_diff_against_the_approved_version() {
     assert!(stdout(&edit(&env)).contains("no change from the approved policy"));
 }
 
+/// The approved policy is read once the editor has closed: one revoked while it was open is offered
+/// for approval again, not said to be unchanged.
+#[test]
+fn policy_edit_reads_the_approval_after_the_editor_closes() {
+    let env = Env::new();
+    env.policy("app", "[run]\nmode = \"ask\"\n");
+    let approval = env.dir.join("keychain/app._policy");
+    assert!(approval.exists());
+    // The "editor" leaves the file as it is and removes the approval meanwhile.
+    let out = env.command().args(["policy", "edit", "app"]).env("EDITOR", format!("rm {}; :", approval.display())).env_remove("VISUAL").output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let shown = stdout(&out);
+    assert!(!shown.contains("no change") && shown.contains("takes effect once approved: halti policy approve app"), "{shown}");
+}
+
 // --- rm, reseal, check and describe ---
 
 /// Every item in the fake Keychain, by its file name, with its bytes.
@@ -1765,10 +1780,9 @@ fn a_workspace_policy_is_edited_approved_and_shown() {
     // Edited to the same text: nothing to approve, and nothing more is said.
     let out = ws_policy_edit(&env, "acme/github", POLICY_TEXT);
     assert!(out.status.success() && stdout(&out) == "no change from the approved policy for github in acme\n" && prompted(&out) == 0, "{}{}", stdout(&out), stderr(&out));
-    // Approving one shows its whole text, whatever its copy says.
+    // Approving one shows its whole text, and nothing its copy says.
     let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme/github"]);
-    let said =
-        format!("Policy for github in acme ({path}), unchanged:\n\n{}\n\nsha256 {POLICY_SHA}\n\nthe policy for github in acme was approved already\n", POLICY_TEXT.trim_end());
+    let said = format!("Policy for github in acme ({path}):\n\n{}\n\nsha256 {POLICY_SHA}\n\nthe policy for github in acme was approved already\n", POLICY_TEXT.trim_end());
     assert!(out.status.success() && stdout(&out) == said && asked(&out) == 1, "{}{}", stdout(&out), stderr(&out));
     assert!(ws_files(&env) == before, "approved already: nothing written");
 
@@ -1847,8 +1861,7 @@ fn approve_all_shows_new_changed_and_unchanged() {
     assert!(ws_files(&env) == before, "nothing was written");
     // Approved alone, its whole text is shown, and the copy is written again.
     let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme/linear"]);
-    let said =
-        format!("Policy for linear in acme ({}), changed:\n\n{}\n\nsha256 {}\n\napproved the policy for linear in acme\n", path("linear"), narrower.trim_end(), sha12(&narrower));
+    let said = format!("Policy for linear in acme ({}):\n\n{}\n\nsha256 {}\n\napproved the policy for linear in acme\n", path("linear"), narrower.trim_end(), sha12(&narrower));
     assert!(out.status.success() && stdout(&out) == said, "{}{}", stdout(&out), stderr(&out));
     assert_eq!(fs::read_to_string(dir.join("approved/linear.toml")).unwrap(), narrower);
     let out = ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme"]);
@@ -1881,6 +1894,14 @@ fn edit_then_y_approves_the_bytes_it_diffed() {
     fs::write(&file, &wider).unwrap();
     let out = ws(&env, PASSPHRASE, &["ws", "policy", "show", "acme/github"]);
     assert!(stdout(&out).starts_with(&format!("{path} (approved)\n\n")), "{}", stdout(&out));
+    // With its copy gone, an edit is shown whole as new, and core holds it to that: approved before, it is refused.
+    fs::remove_file(&approved).unwrap();
+    let before = ws_files(&env);
+    let out = ws_policy_edit_then_y(&env, "acme/github", &planted, || {});
+    assert!(stdout(&out).contains(&format!("Policy for github in acme ({path}), new:\n\n")), "{}", stdout(&out));
+    refused_with(&out, "the approved copy of github in acme isn't what was approved, so nothing was approved. approve it alone: halti ws policy approve acme/github");
+    assert_eq!(asked(&out), 1);
+    assert!(ws_files(&env).iter().filter(|(path, _)| !path.ends_with("github.toml")).eq(before.iter().filter(|(path, _)| !path.ends_with("github.toml"))), "nothing sealed");
 }
 
 #[test]
@@ -1925,6 +1946,21 @@ fn approving_twice_writes_nothing_the_second_time() {
     let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme/github"]);
     assert!(out.status.success() && stdout(&out).ends_with("the policy for github in acme was approved already\n"), "{}", stderr(&out));
     assert!(ws_files(&env) == before, "the copy is back, and nothing else changed");
+    // A copy that can't be read, a link here, is taken as none: editing still opens, approving all is refused after
+    // the passphrase, and approving it alone writes a plain copy over the link.
+    fs::remove_file(&copy).unwrap();
+    let elsewhere = env.dir.join("elsewhere.toml");
+    fs::write(&elsewhere, POLICY_TEXT).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &copy).unwrap();
+    let out = ws_policy_edit(&env, "acme/github", POLICY_TEXT);
+    let saved = format!("saved {path} — it takes effect once approved: halti ws policy approve acme/github\n");
+    assert!(out.status.success() && stdout(&out) == saved, "{}{}", stdout(&out), stderr(&out));
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme"]);
+    refused_with(&out, "the approved copy of github in acme isn't what was approved, so nothing was approved. approve it alone: halti ws policy approve acme/github");
+    assert_eq!(asked(&out), 1);
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme/github"]);
+    assert!(out.status.success() && stdout(&out).ends_with("the policy for github in acme was approved already\n"), "{}", stderr(&out));
+    assert!(!fs::symlink_metadata(&copy).unwrap().file_type().is_symlink() && fs::read_to_string(&copy).unwrap() == POLICY_TEXT);
 }
 
 #[test]
@@ -1943,8 +1979,9 @@ fn a_workspace_policy_can_t_refresh() {
         refused_with(&out, &why);
         assert_eq!(prompted(&out), 0, "{args:?}: nothing asked");
     }
-    // Nor [run] or [agent] other than their defaults, nor a host in other letters.
+    // Nor an empty one, [run] or [agent] other than their defaults, or a host in other letters.
     for (text, why) in [
+        (String::new(), format!("{}: an empty policy can't be approved", file.display())),
         ("[run]\nmode = \"allow\"\n".to_string(), why.clone()),
         ("[agent]\nconsent = \"none\"\n".to_string(), why.clone()),
         (
@@ -1999,6 +2036,10 @@ fn a_planted_or_copied_approval_approves_nothing() {
     assert!(!out.status.success() && prompted(&out) == 0 && asked(&out) == 0, "{}", stderr(&out));
     fs::remove_file(&planted).unwrap();
     assert!(show().contains("(not approved)"), "{}", show());
+    // Approved alone, with the planted copy still there, its whole text is shown, and nothing the copy says.
+    let out = ws(&env, PASSPHRASE, &["ws", "policy", "approve", "acme/github"]);
+    let path = dir.join("github.toml").display().to_string();
+    assert!(out.status.success() && stdout(&out).starts_with(&format!("Policy for github in acme ({path}):\n\n")) && !stdout(&out).contains("unchanged"), "{}", stdout(&out));
 }
 
 #[test]
