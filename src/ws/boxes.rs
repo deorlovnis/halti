@@ -113,6 +113,10 @@ fn shown_whole(found: &Found, how: &str, text: &[u8]) -> String {
 /// `halti ws box new WS/BOX [--type]`: the policy in the editor (the workspace's template if there
 /// is no file), then one approval as `[workspace.approval] policy` says, which stores the box's key,
 /// approves its policy and, for `keep = true`, makes its store.
+///
+/// A box approved to keep a store it hasn't got (made to keep nothing and changed since, or
+/// approved before it was made) is made here too, against its approved copy. One approved to keep
+/// nothing is made already.
 pub fn new(target_text: &str, type_it: bool) -> Result<()> {
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
@@ -121,7 +125,12 @@ pub fn new(target_text: &str, type_it: bool) -> Result<()> {
     let found = find(&here, &name, box_name)?;
     let rule = MountRule::workspace(&settings);
     found.layout.prepare()?;
-    if found.layout.bundle(box_name).exists() || found.files.approved_copy(box_name)?.is_some() {
+    if found.layout.bundle(box_name).exists() {
+        return Err(exists(&found.shown));
+    }
+    let copy = found.files.approved_copy(box_name)?;
+    let keeps = |copy: &[u8]| std::str::from_utf8(copy).ok().and_then(|text| BoxPolicy::parse_in(text, &rule).ok()).is_some_and(|parsed| parsed.keep);
+    if copy.as_deref().is_some_and(|copy| !keeps(copy)) {
         return Err(exists(&found.shown));
     }
     if found.files.read(box_name)?.is_none() {
@@ -133,17 +142,20 @@ pub fn new(target_text: &str, type_it: bool) -> Result<()> {
     let (text, parsed) = read_checked(&found, &rule)?.ok_or_else(|| no_box(&found.shown))?;
     memory::harden();
     let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsPolicy, type_it), detail: None };
-    make_with(&here, &found, &text, parsed.keep, &way, &|| TtyPassphrase::new(false), &boxes::store::create)?.print();
+    make_with(&here, &found, &text, copy.as_deref(), parsed.keep, &way, &|| TtyPassphrase::new(false), &boxes::store::create)?.print();
     Ok(())
 }
 
-/// Makes the box `found` with the policy `text`, shown whole as new, approved the way `way` says. For
-/// a box that `keep`s a store, a key is drawn and `create` makes the store with it once core has the
-/// approval and has checked the box isn't there; a failure after that shreds the store.
+/// Makes the box `found` with the policy `text`, shown whole as new, approved the way `way` says,
+/// in place of `copy` if the box's policy was approved before it was made. For a box that `keep`s
+/// a store, a key is drawn and `create` makes the store with it once core has the approval and has
+/// checked the box isn't there; a failure after that shreds the store.
+#[allow(clippy::too_many_arguments)]
 fn make_with(
     here: &Here,
     found: &Found,
     text: &[u8],
+    copy: Option<&[u8]>,
     keep: bool,
     way: &Way<'_>,
     typing: &dyn Fn() -> TtyPassphrase,
@@ -154,7 +166,7 @@ fn make_with(
     let key = if keep { Some(BoxKey::from_bytes(random::<32>()?)) } else { None };
     let bundle = found.layout.bundle(box_name);
     let made = Cell::new(false);
-    let proposal = Proposal { kind: Kind::Box, name: box_name, text, base: Base::New };
+    let proposal = Proposal { kind: Kind::Box, name: box_name, text, base: copy.map_or(Base::New, Base::Copy) };
     let make = |machine: &Machine<'_>| {
         let store = || {
             if let Some(key) = &key {
@@ -172,6 +184,8 @@ fn make_with(
             let _ = boxes::store::shred(&bundle);
         }
         return Err(match error.downcast_ref::<Refusal>() {
+            // Its key is listed and its store is gone: only removing it makes room for a new one.
+            Some(Refusal::BoxExists { .. }) if !bundle.exists() => anyhow!("box {shown} has a key but no store. remove it with: halti ws box rm {shown}"),
             Some(Refusal::BoxExists { .. } | Refusal::NotTheBase { .. }) => exists(shown),
             _ => error,
         });
@@ -631,7 +645,7 @@ mod tests {
         let way = |means| Way { world: &world, copies: &copies, means: Some(means), detail: None };
         let sha = sha12(SCRATCH.as_bytes());
 
-        let said = make_with(&here, &found, SCRATCH.as_bytes(), false, &way(Means::TouchId), &not_typed, &never_made).unwrap();
+        let said = make_with(&here, &found, SCRATCH.as_bytes(), None, false, &way(Means::TouchId), &not_typed, &never_made).unwrap();
         assert_eq!(said.out, ["made box acme/scratch. it keeps nothing between runs. run it with: halti ws run acme/scratch"]);
         assert_eq!(world.calls(), [format!("touch id: [DEV, not protected] make box scratch {sha} in workspace acme")]);
         assert_eq!(found.files.approved_copy("scratch").unwrap().as_deref(), Some(SCRATCH.as_bytes()));
@@ -653,9 +667,35 @@ mod tests {
         // A no makes nothing, and says how to type the passphrase instead.
         let no = Fake::answering(false, false);
         let declined = Way { world: &no, copies: &copies, means: Some(Means::TouchId), detail: None };
-        let error = make_with(&here, &found, SCRATCH.as_bytes(), false, &declined, &not_typed, &never_made).unwrap_err();
+        let error = make_with(&here, &found, SCRATCH.as_bytes(), None, false, &declined, &not_typed, &never_made).unwrap_err();
         assert_eq!(error.to_string(), "box acme/scratch was not made. to type the passphrase instead: halti ws box new acme/scratch --type");
         assert_eq!(found.files.approved_copy("scratch").unwrap(), None);
+    }
+
+    #[test]
+    fn a_make_that_fails_once_the_store_is_made_shreds_it() {
+        let dir = TempDir::new("halti-ws-box-shred").unwrap();
+        let here = Here::at(&dir.0.join("ws"));
+        let acme = WsName::parse("acme").unwrap();
+        let copies = OneCopy(Cell::new(None));
+        new_with(&here, &acme, &TtyPassphrase::new(false).answering(ACME).saving(), &copies).unwrap();
+        let found = find(&here, &acme, "dev").unwrap();
+        found.layout.prepare().unwrap();
+        let world = Fake::answering(true, true);
+        let way = Way { world: &world, copies: &copies, means: Some(Means::TouchId), detail: None };
+        let next = here.root.join(found.id.to_string()).join("manifest.next");
+        // The store is made, then the workspace's new list can't be written: a folder is in its way.
+        let create = |_: &Layout, bundle: &Path, _: &str| {
+            fs::create_dir_all(bundle)?;
+            fs::write(bundle.join("bands"), b"x")?;
+            fs::create_dir_all(next.join("in-the-way"))?;
+            Ok(())
+        };
+        let text = b"run = [\"claude\"]\nkeep = true\n";
+        assert!(make_with(&here, &found, text, None, true, &way, &not_typed, &create).is_err());
+        assert!(next.join("in-the-way").exists(), "it failed after the store was made");
+        assert!(!found.layout.bundle("dev").exists(), "the store is shredded");
+        assert_eq!(found.files.approved_copy("dev").unwrap(), None);
     }
 
     #[test]

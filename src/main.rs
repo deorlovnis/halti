@@ -900,8 +900,10 @@ fn cmd_run(resources: Vec<String>, command: Vec<String>) -> Result<u8> {
 }
 
 /// Where a command finds and keeps secrets. Workspaces, the settings and how halti was built reach
-/// only the machine's own items, so they choose no place: a lookup there fails instead of reading
-/// the Keychain. Every other command keeps its secrets in the Keychain.
+/// only the machine's own items, so they choose no place here: a lookup there fails instead of
+/// reading the Keychain. `ws run` chooses its workspace itself, once it is opened, when it starts a
+/// box; no other workspace command chooses one. Every other command keeps its secrets in the
+/// Keychain.
 fn source_for(cmd: &Cmd) -> Option<source::Source> {
     match cmd {
         Cmd::Ws { .. } | Cmd::Open { .. } | Cmd::Close { .. } | Cmd::Config { .. } | Cmd::BuildInfo => None,

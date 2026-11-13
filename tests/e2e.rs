@@ -2906,6 +2906,23 @@ fn ws_run_refuses_before_asking() {
     refused(&env.ws_box(PASSPHRASE, "true", &["ws", "box", "log", "acme/dev"]), "box acme/dev has no store. make one with: halti ws box new acme/dev");
     refused(&env.ws_box(PASSPHRASE, "true", &["ws", "stop", "acme/dev"]), "box acme/dev isn't running");
     refused(&env.ws_box(PASSPHRASE, "true", &["ws", "run", "globex/dev"]), "there is no workspace named globex");
+    // That hint works: the box approved before it was made gets its key and store.
+    let store = wsdir(&env, "acme").join("boxes/dev.sparsebundle");
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "new", "acme/dev"]);
+    assert!(out.status.success() && stdout(&out).ends_with("made box acme/dev. run it with: halti ws run acme/dev\n") && asked(&out) == 1, "{}", stderr(&out));
+    assert!(store.join("bands").is_dir() && items(&env, "acme").len() == 1);
+    // Its store gone by hand, its key still listed: only removing it gets out.
+    fs::remove_dir_all(&store).unwrap();
+    refused(&run(), "box acme/dev has no store. make one with: halti ws box new acme/dev");
+    let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "new", "acme/dev"]);
+    let why = "halti: box acme/dev has a key but no store. remove it with: halti ws box rm acme/dev\n";
+    assert!(!out.status.success() && stderr(&out).ends_with(why) && !store.exists(), "{}", stderr(&out));
+    assert!(env.ws_box(PASSPHRASE, "true", &["ws", "box", "rm", "acme/dev"]).status.success());
+    assert!(items(&env, "acme").is_empty());
+    // A box approved to keep nothing is made already.
+    fs::write(&path, box_text(false)).unwrap();
+    assert!(env.ws_box(PASSPHRASE, "true", &["ws", "box", "approve", "acme/dev"]).status.success());
+    refused(&env.ws_box(PASSPHRASE, "true", &["ws", "box", "new", "acme/dev"]), "box acme/dev exists already. change it with: halti ws box edit acme/dev");
 }
 
 #[test]
