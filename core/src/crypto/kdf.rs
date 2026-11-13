@@ -18,6 +18,8 @@ pub(crate) const KEM_ID: &[u8] = b"KEM\x01";
 pub(crate) const SEAL_ID: &[u8] = b"SEAL\x01";
 /// The id of a workspace's working keys. Its last byte is the version of their derivation.
 pub(crate) const KEYS_ID: &[u8] = b"KEYS\x01";
+/// The id of a pin's hashes. Its last byte is the pin's format.
+pub(crate) const PIN_ID: &[u8] = b"PIN\x01";
 
 // Under any id: a scalar from 32 bytes.
 const DKP_PRK: &[u8] = b"dkp_prk";
@@ -41,6 +43,11 @@ pub(crate) const LOGS: &[u8] = b"logs";
 pub(crate) const SESSIONS: &[u8] = b"sessions";
 pub(crate) const STORE: &[u8] = b"store";
 pub(crate) const ITEM_NAMES: &[u8] = b"item_names";
+
+// Under `PIN_ID`: what each of a pin's hashes covers. They are SHA-384s, not derivations (`anchor`).
+pub(crate) const PIN_KEY_REF: &[u8] = b"key_ref";
+pub(crate) const PIN_PUBLIC_KEY: &[u8] = b"public_key";
+pub(crate) const PIN_STATE: &[u8] = b"state";
 
 /// HKDF-Extract. The parts of `ikm` are fed in order, as if joined. An empty salt is 48 zero bytes
 /// (RFC 5869 section 2.2).
@@ -165,6 +172,9 @@ mod tests {
             assert_eq!(label, text.as_bytes());
         }
         assert_eq!((SESSIONS, STORE, ITEM_NAMES), (b"sessions".as_slice(), b"store".as_slice(), b"item_names".as_slice()));
+        // A pin's hashes: its id ends in the pin's format, 0x01.
+        assert_eq!((PIN_ID, PIN_KEY_REF, PIN_PUBLIC_KEY, PIN_STATE), (b"PIN\x01".as_slice(), b"key_ref".as_slice(), b"public_key".as_slice(), b"state".as_slice()));
+        assert_eq!(PIN_ID.last(), Some(&0x01));
 
         // The one suite's tag, which the ids of the key pair and of sealing end in.
         let tag = Suite::MlKem1024P256V1.tag();
@@ -174,14 +184,15 @@ mod tests {
             assert_eq!(Suite::from_tag(byte), if byte == tag { Ok(Suite::MlKem1024P256V1) } else { Err(Refusal::Unreadable) }, "tag {byte}");
         }
 
-        // No id and label, joined, starts another: no two derivations can be fed the same bytes.
-        let used: [(&[u8], &[&[u8]]); 3] = [
+        // No id and label, joined, starts another: no two derivations or hashes can be fed the same bytes.
+        let used: [(&[u8], &[&[u8]]); 4] = [
             (KEM_ID, &[DKP_PRK, CANDIDATE, EAE_PRK, SHARED_SECRET]),
             (SEAL_ID, &[PSK_ID_HASH, INFO_HASH, SECRET, KEY, BASE_NONCE]),
             (KEYS_ID, &[DKP_PRK, CANDIDATE, INNER, SECRETS, LOGS, SESSIONS, STORE, ITEM_NAMES]),
+            (PIN_ID, &[PIN_KEY_REF, PIN_PUBLIC_KEY, PIN_STATE]),
         ];
         let joined: Vec<Vec<u8>> = used.iter().flat_map(|(id, labels)| labels.iter().map(move |label| [*id, *label].concat())).collect();
-        assert_eq!(joined.len(), 17);
+        assert_eq!(joined.len(), 20);
         for (i, one) in joined.iter().enumerate() {
             for (j, other) in joined.iter().enumerate() {
                 assert!(i == j || !other.starts_with(one), "{one:?} starts {other:?}");

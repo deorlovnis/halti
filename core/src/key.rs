@@ -4,8 +4,9 @@
 //! never returns it unwrapped.
 //!
 //! Opening a workspace is: take the ciphertext out of a wrap, have the key holder turn it into
-//! shares, unwrap, and derive `OpenKeys`. What an open workspace holds can check a policy's
-//! signature but cannot make one: signing a policy needs the inner key again, and so its holder.
+//! shares, unwrap, and derive `OpenKeys`, which split at once into the parts each place holds. What
+//! an open workspace holds can check a policy's signature but cannot make one: signing a policy
+//! needs the inner key again, and so its holder.
 
 use std::fmt;
 
@@ -14,8 +15,12 @@ use zeroize::Zeroizing;
 use crate::crypto::kdf::{INNER, ITEM_NAMES, KEYS_ID, LOGS, SECRETS, SESSIONS, STORE, derive_scalar, labeled_expand, labeled_extract};
 use crate::crypto::kem::{Purpose, open_with, seal_to};
 use crate::crypto::sign::{SigningKey, VerifyingKey};
+use crate::holder::Commitment;
 use crate::ids::WsId;
 use crate::refusal::Refusal;
+
+/// The length of a wrap of an inner key. Any other length is refused before a key holder is asked.
+pub const WRAP_LEN: usize = 1683;
 
 /// Which algorithms a key or ciphertext is for. A new scheme is a new value, never a new meaning
 /// for this one.
@@ -50,6 +55,28 @@ pub struct PublicKey {
     pub suite: Suite,
     pub mlkem: Box<[u8; 1568]>,
     pub p256: [u8; 65],
+}
+
+impl PublicKey {
+    /// The length of its bytes.
+    pub const LEN: usize = 1634;
+
+    /// Suite tag, then the ML-KEM key, then the P-256 point.
+    pub fn to_bytes(&self) -> [u8; PublicKey::LEN] {
+        let mut bytes = [0; PublicKey::LEN];
+        bytes[0] = self.suite.tag();
+        bytes[1..1569].copy_from_slice(self.mlkem.as_slice());
+        bytes[1569..].copy_from_slice(&self.p256);
+        bytes
+    }
+
+    /// Refuses any other length or an unknown suite. Points are checked when used.
+    pub fn from_bytes(bytes: &[u8]) -> Result<PublicKey, Refusal> {
+        let [suite, rest @ ..] = bytes else { return Err(Refusal::Unreadable) };
+        let Some((mlkem, p256)) = rest.split_first_chunk::<1568>() else { return Err(Refusal::Unreadable) };
+        let p256: [u8; 65] = p256.try_into().map_err(|_| Refusal::Unreadable)?;
+        Ok(PublicKey { suite: Suite::from_tag(*suite)?, mlkem: Box::new(*mlkem), p256 })
+    }
 }
 
 /// What the key holder decapsulates: an ML-KEM ciphertext and an ephemeral P-256 point.
@@ -95,16 +122,25 @@ impl WrapKind {
 /// A workspace's root secret. Wiped on drop, as far as the language allows; it can't be cloned,
 /// compared or written out, and printing it shows nothing of it.
 ///
-/// Only this crate can get the key that signs policies from it:
+/// Only this crate can get the key that signs policies from it, open a wrap into one, or derive
+/// the keys an open workspace holds:
 ///
 /// ```compile_fail
 /// let _ = halti_core::key::InnerKey::policy_signer;
 /// ```
 ///
-/// (That fails because `policy_signer` is private, as this, which is public, does not.)
+/// ```compile_fail
+/// let _ = halti_core::key::InnerKey::unwrap_with;
+/// ```
+///
+/// ```compile_fail
+/// let _ = halti_core::key::InnerKey::open_keys;
+/// ```
+///
+/// (Those fail because the three are private to this crate, as this, which is public, does not.)
 ///
 /// ```
-/// let _ = halti_core::key::InnerKey::open_keys;
+/// let _ = halti_core::key::InnerKey::wrap_to;
 /// ```
 pub struct InnerKey(Zeroizing<[u8; 32]>);
 
@@ -116,7 +152,7 @@ impl InnerKey {
 
     /// The keys an open workspace holds. The workspace's id is no part of the derivation: two
     /// workspaces have different keys because each has its own random inner key.
-    pub fn open_keys(&self) -> OpenKeys {
+    pub(crate) fn open_keys(&self) -> OpenKeys {
         let prk = labeled_extract(&[], KEYS_ID, INNER, &[self.0.as_slice()]);
         let key = |label: &[u8]| {
             let mut out = Zeroizing::new([0; 32]);
@@ -130,6 +166,12 @@ impl InnerKey {
     #[cfg_attr(not(test), expect(dead_code, reason = "approving a change is its first caller outside tests"))]
     pub(crate) fn policy_signer(&self) -> SigningKey {
         self.signer()
+    }
+
+    /// What a key holder keeps to prove a wrap is this workspace's own: the policy verifying key's
+    /// 65 bytes. A wrap of any other inner key gives another.
+    pub(crate) fn commitment(&self) -> Commitment {
+        Commitment::from_bytes(self.signer().verifying_key().to_bytes())
     }
 
     /// The signing key, derived as a scalar from the inner key under the working keys' id.
@@ -152,7 +194,7 @@ impl InnerKey {
     /// Opens a wrap with the shares its key holder returned for `crypto::kem::ciphertext_of` it.
     /// Refuses, without saying why, a wrap for another workspace, kind or key, wrong shares, or
     /// any changed byte.
-    pub fn unwrap_with(blob: &[u8], to: &PublicKey, ws: WsId, kind: WrapKind, shares: &KemShares) -> Result<InnerKey, Refusal> {
+    pub(crate) fn unwrap_with(blob: &[u8], to: &PublicKey, ws: WsId, kind: WrapKind, shares: &KemShares) -> Result<InnerKey, Refusal> {
         let plain = open_with(blob, to, kind.purpose(), ws.as_bytes(), shares)?;
         if plain.len() != 32 {
             return Err(Refusal::Unreadable);
@@ -171,6 +213,8 @@ impl fmt::Debug for InnerKey {
 
 /// What an open workspace holds. There is deliberately no policy signing key here. Wiped on drop,
 /// as far as the language allows; it can't be cloned, and printing it shows nothing of it.
+///
+/// No function outside this crate returns one: a caller gets the keys only as `split` parts them.
 pub struct OpenKeys {
     secrets: Zeroizing<[u8; 32]>,
     logs: Zeroizing<[u8; 32]>,
@@ -210,11 +254,88 @@ impl OpenKeys {
     pub fn policy_verify(&self) -> &VerifyingKey {
         &self.policy_verify
     }
+
+    /// Gives each key to the one place that uses it: the door, the disk layer, and the host's verbs
+    /// that name items. Outside this crate no value of this type can be had, so the working keys
+    /// reach a caller only as these three parts.
+    pub fn split(self) -> (DoorKeys, StoreKey, NamesKey) {
+        let OpenKeys { secrets, logs, sessions, store, item_names, policy_verify } = self;
+        (DoorKeys { secrets, logs, sessions, policy_verify }, StoreKey(store), NamesKey(item_names))
+    }
 }
 
 impl fmt::Debug for OpenKeys {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("OpenKeys(..)")
+    }
+}
+
+/// What the door holds: the keys for secrets, logs and sessions, and the policy verifier. Wiped on
+/// drop, as far as the language allows; it can't be cloned, and printing it shows nothing of it.
+pub struct DoorKeys {
+    secrets: Zeroizing<[u8; 32]>,
+    logs: Zeroizing<[u8; 32]>,
+    sessions: Zeroizing<[u8; 32]>,
+    policy_verify: VerifyingKey,
+}
+
+impl DoorKeys {
+    /// The key accepted items are sealed under.
+    pub fn secrets(&self) -> &[u8; 32] {
+        &self.secrets
+    }
+
+    /// The key the workspace's log is chained with.
+    pub fn logs(&self) -> &[u8; 32] {
+        &self.logs
+    }
+
+    /// The key for the door's sessions.
+    pub fn sessions(&self) -> &[u8; 32] {
+        &self.sessions
+    }
+
+    /// Checks this workspace's policies; it cannot sign them.
+    pub fn policy_verify(&self) -> &VerifyingKey {
+        &self.policy_verify
+    }
+}
+
+impl fmt::Debug for DoorKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DoorKeys(..)")
+    }
+}
+
+/// What the disk layer holds: the key the store is encrypted with. Wiped on drop, as far as the
+/// language allows; it can't be cloned, and printing it shows nothing of it.
+pub struct StoreKey(Zeroizing<[u8; 32]>);
+
+impl StoreKey {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for StoreKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StoreKey(..)")
+    }
+}
+
+/// What the host's verbs name items with. Wiped on drop, as far as the language allows; it can't
+/// be cloned, and printing it shows nothing of it.
+pub struct NamesKey(Zeroizing<[u8; 32]>);
+
+impl NamesKey {
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for NamesKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NamesKey(..)")
     }
 }
 
@@ -225,10 +346,13 @@ mod tests {
     use crate::crypto::kem::{DecapKey, ciphertext_of, combine, encapsulate};
     use crate::crypto::sign::Signature;
     use crate::crypto::vectors::{
-        KAT_HARDWARE_WRAP, KAT_KEY_ITEM_NAMES, KAT_KEY_LOGS, KAT_KEY_SECRETS, KAT_KEY_SESSIONS, KAT_KEY_STORE, KAT_POLICY_SCALAR, KAT_POLICY_VERIFY, KAT_RECOVERY_COMBINED,
-        KAT_RECOVERY_P256_EPH, KAT_RECOVERY_SS_M, KAT_RECOVERY_SS_P, KAT_RECOVERY_WRAP_BODY, hardware_rand, hardware_seed, hex, inner_bytes, recovery_rand, recovery_seed,
-        ws_bytes,
+        KAT_HARDWARE_EK_FIRST, KAT_HARDWARE_EK_LAST, KAT_HARDWARE_P256, KAT_HARDWARE_WRAP, KAT_KEY_ITEM_NAMES, KAT_KEY_LOGS, KAT_KEY_SECRETS, KAT_KEY_SESSIONS, KAT_KEY_STORE,
+        KAT_PASSPHRASE_RECORD, KAT_POLICY_SCALAR, KAT_POLICY_VERIFY, KAT_RECOVERY_COMBINED, KAT_RECOVERY_P256_EPH, KAT_RECOVERY_SS_M, KAT_RECOVERY_SS_P, KAT_RECOVERY_WRAP_BODY,
+        PASSPHRASE, hardware_rand, hardware_seed, hex, inner_bytes, recovery_rand, recovery_seed, ws_bytes,
     };
+    use crate::holder::{KeyRef, Released};
+    use crate::passphrase::{Passphrase, PassphraseRecord};
+    use crate::verbs::Opened;
 
     const GLOBEX: WsId = WsId::from_bytes([2; 16]);
 
@@ -449,6 +573,71 @@ mod tests {
         // Nor does a field of the one secret type whose fields are public.
         let field = format!("{:?}", shares.mlkem);
         assert!(!field.contains("ab") && !field.contains("171"), "{field}");
+
+        // Nor the parts an open workspace is split into, what a key holder gives back, a passphrase or its sealed record.
+        let (door, store, names) = key.open_keys().split();
+        let opened = {
+            let (door, store, names) = key.open_keys().split();
+            Opened { door, store, names }
+        };
+        let released = Released { shares, commitment: key.commitment() };
+        let passphrase = Passphrase::new(Zeroizing::new(PASSPHRASE.to_string())).unwrap();
+        let record = PassphraseRecord::from_key_ref(&KeyRef(hex(KAT_PASSPHRASE_RECORD))).unwrap();
+        let key_ref = record.to_key_ref();
+        let parts: [&dyn fmt::Debug; 8] = [&door, &store, &names, &opened, &released, &passphrase, &record, &key_ref];
+        let plain = parts.map(|part| format!("{part:?}"));
+        assert_eq!(plain, ["DoorKeys(..)", "StoreKey(..)", "NamesKey(..)", "Opened(..)", "Released(..)", "Passphrase(..)", "PassphraseRecord(..)", "KeyRef(1855 bytes)"]);
+        assert_eq!(parts.map(|part| format!("{part:#?}")), plain);
+    }
+
+    #[test]
+    fn the_commitment_is_the_policy_verifying_key() {
+        let key = inner();
+        assert_eq!(key.commitment().as_bytes().as_slice(), hex(KAT_POLICY_VERIFY));
+        assert_eq!(*key.commitment().as_bytes(), key.open_keys().policy_verify().to_bytes());
+        // Another inner key, as a planted wrap holds, gives another: that is what refuses one.
+        let planted = InnerKey::from_bytes(Zeroizing::new([0x21; 32]));
+        assert_ne!(planted.commitment(), key.commitment());
+        assert_eq!(planted.commitment(), InnerKey::from_bytes(Zeroizing::new([0x21; 32])).commitment(), "the same each time");
+    }
+
+    #[test]
+    fn a_public_key_is_its_suite_then_both_keys() {
+        let public = hardware().public();
+        let bytes = public.to_bytes();
+        assert_eq!((bytes.len(), PublicKey::LEN), (1634, 1634));
+        assert_eq!(bytes[0], 0x01, "the suite");
+        assert_eq!(bytes[1..17], hex(KAT_HARDWARE_EK_FIRST), "the ML-KEM key");
+        assert_eq!(bytes[1553..1569], hex(KAT_HARDWARE_EK_LAST));
+        assert_eq!(bytes[1569..], hex(KAT_HARDWARE_P256), "the P-256 point");
+        assert_eq!(PublicKey::from_bytes(&bytes), Ok(public));
+        // Any other length, or a suite this build does not know, is refused.
+        for len in [0, 1, 1569, 1633] {
+            assert_eq!(PublicKey::from_bytes(&bytes[..len]), Err(Refusal::Unreadable), "cut to {len} bytes");
+        }
+        let mut longer = bytes.to_vec();
+        longer.push(0x04);
+        assert_eq!(PublicKey::from_bytes(&longer), Err(Refusal::Unreadable), "one byte more");
+        let mut other = bytes;
+        other[0] = 0x02;
+        assert_eq!(PublicKey::from_bytes(&other), Err(Refusal::Unreadable), "suite 0x02");
+        // The points are checked when used, not here: one that is not on the curve reads, and nothing can be sealed to it.
+        let mut off_curve = bytes;
+        off_curve[1633] ^= 0x01;
+        let read = PublicKey::from_bytes(&off_curve).unwrap();
+        assert_eq!(inner().wrap_to(&read, acme(), WrapKind::Hardware, &hardware_rand()).unwrap_err(), Refusal::Unreadable);
+    }
+
+    #[test]
+    fn the_split_gives_the_door_three_keys_and_the_verifier_and_the_disk_layer_one() {
+        let (door, store, names) = inner().open_keys().split();
+        assert_eq!(door.secrets().as_slice(), hex(KAT_KEY_SECRETS));
+        assert_eq!(door.logs().as_slice(), hex(KAT_KEY_LOGS));
+        assert_eq!(door.sessions().as_slice(), hex(KAT_KEY_SESSIONS));
+        assert_eq!(door.policy_verify().to_bytes().as_slice(), hex(KAT_POLICY_VERIFY));
+        assert_eq!(store.as_bytes().as_slice(), hex(KAT_KEY_STORE));
+        // The key items are named with goes to neither: the host's verbs keep it.
+        assert_eq!(names.as_bytes().as_slice(), hex(KAT_KEY_ITEM_NAMES));
     }
 
     #[test]

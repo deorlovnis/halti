@@ -104,6 +104,12 @@ opt-level = 3
 [profile.dev.package.sha2]
 opt-level = 3
 
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 # The binary (this package) and core are one workspace; the binary doesn't use core yet. Naming
 # "." as a member would undo the exclude. The shim keeps its own lock, since the agent images
 # build it on its own.
