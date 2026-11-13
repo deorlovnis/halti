@@ -89,6 +89,48 @@ impl Word for Store {
     }
 }
 
+/// What runs a box's VMs: Apple's container, which is only on a Mac. Another engine is one more
+/// variant, and one more arm where a box picks it (`boxes::vms`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Engine {
+    Container,
+}
+
+impl Word for Engine {
+    const ALL: &'static [Engine] = &[Engine::Container];
+
+    fn name(self) -> &'static str {
+        match self {
+            Engine::Container => "container",
+        }
+    }
+
+    fn on(self, os: Os) -> bool {
+        os == Os::Macos
+    }
+}
+
+/// Where a box's store key is kept: the Keychain, which is only on a Mac. Another place is one more
+/// variant, and one more arm where a box keeps its key (`boxes::KeyStore`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Keys {
+    Keychain,
+}
+
+impl Word for Keys {
+    const ALL: &'static [Keys] = &[Keys::Keychain];
+
+    fn name(self) -> &'static str {
+        match self {
+            Keys::Keychain => "keychain",
+        }
+    }
+
+    fn on(self, os: Os) -> bool {
+        os == Os::Macos
+    }
+}
+
 /// Whose passphrase a new workspace gets: one the person types, or one halti makes and shows once.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PassphraseMode {
@@ -134,6 +176,9 @@ pub struct Settings {
     pub manager: Manager,
     pub store: Store,
     pub passphrase: PassphraseMode,
+    /// None where no engine runs a box: there the `[box]` section has no lines.
+    pub engine: Option<Engine>,
+    pub keys: Option<Keys>,
 }
 
 impl Settings {
@@ -181,6 +226,8 @@ impl Settings {
             Slot::Manager => (self.manager.name(), list(&here::<Manager>(os))),
             Slot::Store => (self.store.name(), list(&here::<Store>(os))),
             Slot::Passphrase => (self.passphrase.name(), list(&here::<PassphraseMode>(os))),
+            Slot::Engine => (self.engine?.name(), list(&here::<Engine>(os))),
+            Slot::Keys => (self.keys?.name(), format!("where a box's key is kept: {}", list(&here::<Keys>(os)))),
         };
         Some((row.key, quoted(value), comment))
     }
@@ -201,9 +248,10 @@ fn here<W: Word>(os: Os) -> Vec<W> {
     W::ALL.iter().copied().filter(|word| word.on(os)).collect()
 }
 
-/// What `[approval] default` can be: each means some action accepts on this system.
+/// What `[approval] default` can be: each means some action outside `[box.approval]` accepts on
+/// this system. A box's missing line doesn't follow it.
 fn default_choices(os: Os) -> Vec<Means> {
-    Means::ALL.iter().copied().filter(|means| RULES.iter().any(|rule| rule.action.accepts(os).contains(means))).collect()
+    Means::ALL.iter().copied().filter(|means| RULES.iter().any(|rule| !rule.of_box() && rule.action.accepts(os).contains(means))).collect()
 }
 
 /// halti's template for this system, comments and all.
@@ -214,7 +262,7 @@ pub fn template(os: Os) -> String {
 // --- the schema ---
 
 /// The sections, in the template's order.
-const TABLES: [&str; 6] = ["approval", "paths", "passwords", "secrets", "workspace", "workspace.approval"];
+const TABLES: [&str; 8] = ["approval", "paths", "passwords", "secrets", "workspace", "workspace.approval", "box", "box.approval"];
 
 /// What a setting holds.
 #[derive(Clone, Copy)]
@@ -225,6 +273,8 @@ enum Slot {
     Manager,
     Store,
     Passphrase,
+    Engine,
+    Keys,
 }
 
 struct Row {
@@ -234,12 +284,14 @@ struct Row {
 }
 
 /// The settings that aren't an action's approval.
-const SETTINGS: [Row; 5] = [
+const SETTINGS: [Row; 7] = [
     Row { table: "approval", key: "default", slot: Slot::Default },
     Row { table: "paths", key: "workspaces", slot: Slot::Workspaces },
     Row { table: "passwords", key: "manager", slot: Slot::Manager },
     Row { table: "secrets", key: "store", slot: Slot::Store },
     Row { table: "workspace", key: "passphrase", slot: Slot::Passphrase },
+    Row { table: "box", key: "engine", slot: Slot::Engine },
+    Row { table: "box", key: "keys", slot: Slot::Keys },
 ];
 
 /// Every setting: those above and each action's approval, in the template's order.
@@ -275,8 +327,9 @@ fn refused(text: &str, at: usize, why: &str) -> Refused {
 }
 
 /// The settings a file's text says, on this system. A missing line takes the template's value, and
-/// a missing approval line is as `default` says, or else the first means its action accepts. Every
-/// problem is found, and the first in the file is the one refused.
+/// a missing approval line is as `default` says, or else the first means its action accepts; a box's
+/// is the first means it accepts, Touch ID, so a copy approved before `[box]` keeps what boxes did.
+/// Every problem is found, and the first in the file is the one refused.
 pub fn parse(text: &str, os: Os) -> Result<Settings, Refused> {
     // A control character could repaint the diff on a terminal; any other could look like another.
     if let Some((at, c)) = text.char_indices().find(|&(_, c)| !matches!(c, ' '..='~' | '\n' | '\t')) {
@@ -337,6 +390,8 @@ struct Given {
     manager: Option<Manager>,
     store: Option<Store>,
     passphrase: Option<PassphraseMode>,
+    engine: Option<Engine>,
+    keys: Option<Keys>,
 }
 
 impl Given {
@@ -346,7 +401,8 @@ impl Given {
         for rule in RULES {
             let accepts = rule.action.accepts(os);
             let line = self.means.get(&rule.action).copied();
-            let chosen = line.or_else(|| accepts.contains(&default).then_some(default)).or_else(|| accepts.iter().copied().find(|means| *means != Means::None));
+            let wanted = if rule.of_box() { accepts.first().copied() } else { Some(default) };
+            let chosen = line.or_else(|| wanted.filter(|means| accepts.contains(means))).or_else(|| accepts.iter().copied().find(|means| *means != Means::None));
             if let Some(chosen) = chosen {
                 means.insert(rule.action, chosen);
             }
@@ -358,6 +414,8 @@ impl Given {
             manager: self.manager.unwrap_or(Manager::None),
             store: self.store.unwrap_or(Store::Files),
             passphrase: self.passphrase.unwrap_or(PassphraseMode::Own),
+            engine: self.engine.or_else(|| here::<Engine>(os).first().copied()),
+            keys: self.keys.or_else(|| here::<Keys>(os).first().copied()),
         }
     }
 }
@@ -400,6 +458,8 @@ fn take(row: &Row, value: &DeValue<'_>, os: Os, given: &mut Given) -> Result<(),
         Slot::Manager => given.manager = Some(word(key, value, &here::<Manager>(os), os)?),
         Slot::Store => given.store = Some(word(key, value, &here::<Store>(os), os)?),
         Slot::Passphrase => given.passphrase = Some(word(key, value, &here::<PassphraseMode>(os), os)?),
+        Slot::Engine => given.engine = Some(word(key, value, &here::<Engine>(os), os)?),
+        Slot::Keys => given.keys = Some(word(key, value, &here::<Keys>(os), os)?),
     }
     Ok(())
 }
@@ -750,18 +810,28 @@ mod tests {
 
     const BOTH: [Os; 2] = [Os::Macos, Os::Linux];
 
+    /// The box sections of a Mac's template. No box runs on Linux, so its template has none.
+    const BOX_SECTIONS: &str = "\n[box]\nengine = \"container\"          # container\nkeys   = \"keychain\"           # where a box's key is kept: keychain\n\n\
+                                [box.approval]\nrun    = \"touchid\"            # opening a box: touchid | sudo | none\n\
+                                policy = \"touchid\"            # approving a changed box policy: touchid | sudo | none\n\
+                                write  = \"touchid\"            # a write the box's policy says to ask about: touchid | none\n\
+                                export = \"touchid\"            # copying files out of a box: touchid | sudo | none\n\
+                                delete = \"touchid\"            # deleting a box: touchid | sudo | none\n";
+
+    const BOX_ACTIONS: [Action; 5] = [Action::BoxRun, Action::BoxPolicy, Action::BoxWrite, Action::BoxExport, Action::BoxDelete];
+
     /// The template a debug build has, as the person sees it.
     fn expected(os: Os) -> String {
-        let (default, config) = match os {
-            Os::Macos => ("sudo | touchid | passphrase", "sudo | touchid"),
-            Os::Linux => ("sudo | passphrase", "sudo"),
+        let (default, config, boxes) = match os {
+            Os::Macos => ("sudo | touchid | passphrase", "sudo | touchid", BOX_SECTIONS),
+            Os::Linux => ("sudo | passphrase", "sudo", ""),
         };
         format!(
             "# halti config. edit with: halti config\n\n[approval]\ndefault = \"sudo\"              # {default}\n\
              config  = \"sudo\"              # a change to this file: {config}\n\n[paths]\nworkspaces = \"~/{}/ws\"\n\n\
              [passwords]\nmanager = \"none\"              # none\n\n[secrets]\nstore = \"files\"               # files\n\n\
              [workspace]\npassphrase = \"own\"            # own | generate\n\n[workspace.approval]\n\
-             open   = \"passphrase\"         # opening a workspace: passphrase\ndelete = \"passphrase\"         # deleting a workspace: passphrase\n",
+             open   = \"passphrase\"         # opening a workspace: passphrase\ndelete = \"passphrase\"         # deleting a workspace: passphrase\n{boxes}",
             util::DEV_STORE_ROOT
         )
     }
@@ -791,10 +861,14 @@ mod tests {
         let builtin = Settings::builtin(Os::Macos);
         let means = [Action::Config, Action::WsOpen, Action::WsDelete].map(|action| builtin.means(action));
         assert_eq!(means, [Some(Means::Sudo), Some(Means::Passphrase), Some(Means::Passphrase)]);
+        assert_eq!(BOX_ACTIONS.map(|action| builtin.means(action)), [Some(Means::TouchId); 5], "a box asks for Touch ID, as it always did");
+        assert_eq!((builtin.engine, builtin.keys), (Some(Engine::Container), Some(Keys::Keychain)));
         assert_eq!(builtin.workspaces.path, util::store_root().join(names::WS_DIR), "where workspaces always were");
         let shown = format!(
             "\n[approval]\ndefault = \"sudo\"\nconfig  = \"sudo\"\n\n[paths]\nworkspaces = \"~/{}/ws\"\n\n[passwords]\nmanager = \"none\"\n\n[secrets]\nstore = \"files\"\n\n\
-             [workspace]\npassphrase = \"own\"\n\n[workspace.approval]\nopen   = \"passphrase\"\ndelete = \"passphrase\"\n",
+             [workspace]\npassphrase = \"own\"\n\n[workspace.approval]\nopen   = \"passphrase\"\ndelete = \"passphrase\"\n\n\
+             [box]\nengine = \"container\"\nkeys   = \"keychain\"\n\n[box.approval]\nrun    = \"touchid\"\npolicy = \"touchid\"\nwrite  = \"touchid\"\n\
+             export = \"touchid\"\ndelete = \"touchid\"\n",
             util::DEV_STORE_ROOT
         );
         assert_eq!(builtin.render(Os::Macos), shown);
@@ -822,6 +896,18 @@ mod tests {
             ("[passwords]\nmanager = \"keychain\"\n", Os::Macos, 2, "manager can only be none"),
             ("[secrets]\nstore = \"keychain\"\n", Os::Macos, 2, "store can only be files"),
             ("[workspace]\npassphrase = \"typed\"\n", Os::Macos, 2, "passphrase can be own or generate"),
+            ("[box]\nengine = \"tart\"\n", Os::Macos, 2, "engine can only be container"),
+            ("[box]\nengine = \"container\"\n", Os::Linux, 2, "engine can't be set on this system"),
+            ("[box]\nkeys = \"files\"\n", Os::Macos, 2, "keys can only be keychain"),
+            ("[box]\nkeys = \"keychain\"\n", Os::Linux, 2, "keys can't be set on this system"),
+            ("[box]\nrun = \"touchid\"\n", Os::Macos, 2, "[box] has no setting with this name"),
+            ("[box.nope]\n", Os::Macos, 1, "halti has no section with this name"),
+            ("[box.approval]\nopen = \"touchid\"\n", Os::Macos, 2, "[box.approval] has no setting with this name"),
+            ("[box.approval]\nrun = \"passphrase\"\n", Os::Macos, 2, "run can't be passphrase. it can be touchid, sudo or none"),
+            ("[box.approval]\nwrite = \"sudo\"\n", Os::Macos, 2, "write can't be sudo. it can be touchid or none"),
+            ("[box.approval]\nwrite = \"passphrase\"\n", Os::Macos, 2, "write can't be passphrase. it can be touchid or none"),
+            ("[box.approval]\nexport = \"always\"\n", Os::Macos, 2, "export can be touchid, sudo or none"),
+            ("[box.approval]\nrun = \"sudo\"\n", Os::Linux, 2, "run can't be set on this system"),
             ("[paths]\nworkspaces = \"work/ws\"\n", Os::Macos, 2, "workspaces has to start with ~/ or /"),
             ("[paths]\nworkspaces = \"~root/ws\"\n", Os::Macos, 2, "workspaces has to start with ~/ or /"),
             ("[paths]\nworkspaces = \"~/\"\n", Os::Macos, 2, "workspaces has to name a folder below ~/ or /"),
@@ -898,6 +984,33 @@ mod tests {
         assert_eq!(odd.workspaces.written, "/srv/my ws's #1");
         assert_eq!(parse(&format!("{HEADER}\n{}", odd.lines(Os::Linux, true)), Os::Linux), Ok(odd.clone()));
         assert_eq!(parse(&odd.render(Os::Linux), Os::Linux), Ok(odd));
+    }
+
+    #[test]
+    fn a_copy_from_before_the_box_lines_keeps_touch_id_for_boxes() {
+        let before = template(Os::Macos).split("\n[box]").next().unwrap().to_string();
+        assert!(before.ends_with("deleting a workspace: passphrase\n") && !before.contains("box"), "{before}");
+        assert_eq!(parse(&before, Os::Macos), Ok(Settings::builtin(Os::Macos)));
+        // Whatever `default` says, a box's missing line is Touch ID, as boxes asked before they had lines.
+        for default in ["sudo", "touchid", "passphrase"] {
+            let settings = parse(&before.replace("default = \"sudo\"", &format!("default = \"{default}\"")), Os::Macos).unwrap();
+            assert_eq!(BOX_ACTIONS.map(|action| settings.means(action)), [Some(Means::TouchId); 5], "{default}");
+            assert_eq!((settings.engine, settings.keys), (Some(Engine::Container), Some(Keys::Keychain)));
+        }
+        // No box runs on Linux: no lines, and nothing approves a box's action.
+        let linux = Settings::builtin(Os::Linux);
+        assert_eq!((linux.engine, linux.keys), (None, None));
+        assert_eq!(BOX_ACTIONS.map(|action| linux.means(action)), [None; 5]);
+        assert!(!template(Os::Linux).contains("box") && !linux.render(Os::Linux).contains("box"));
+        assert_eq!(default_choices(Os::Macos), [Means::Sudo, Means::TouchId, Means::Passphrase], "a box's none isn't a default");
+
+        // A line says otherwise, and what is shown reads back the same.
+        let mine = parse("[box]\nengine = \"container\"\n\n[box.approval]\nrun = \"sudo\"\nwrite = \"none\"\nexport = \"none\"\n", Os::Macos).unwrap();
+        let said = BOX_ACTIONS.map(|action| mine.means(action));
+        assert_eq!(said, [Some(Means::Sudo), Some(Means::TouchId), Some(Means::None), Some(Means::None), Some(Means::TouchId)]);
+        assert_ne!(mine, Settings::builtin(Os::Macos));
+        assert_eq!(parse(&mine.render(Os::Macos), Os::Macos), Ok(mine.clone()));
+        assert_eq!(parse(&format!("{HEADER}\n{}", mine.lines(Os::Macos, true)), Os::Macos), Ok(mine));
     }
 
     #[test]

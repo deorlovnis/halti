@@ -24,6 +24,7 @@ use super::addr::Net as Dial;
 use super::http::{self, Body, Head};
 use super::inspect::{Caller, Ctx, Net, RETRY_BODY, serve};
 use super::{Config, Shared};
+use crate::approval::Means;
 use crate::chain::Chain;
 use crate::policy::{self, Mode};
 use crate::util::TempDir;
@@ -313,15 +314,21 @@ fn store(res: &str, field: &str, value: &str) {
     keychain::set(res, field, value).unwrap();
 }
 
-/// A door's shared state with these write rules, logging to `dir/<name>.log`.
+/// A door's shared state with these write rules, logging to `dir/<name>.log`; a write `[net]` asks
+/// about is asked with Touch ID.
 fn shared(dir: &Path, name: &str, writes: Mode, allow_writes: &[&str]) -> Arc<Shared> {
+    shared_asking(dir, name, writes, allow_writes, Some(Means::TouchId))
+}
+
+/// The same, with a write `[net]` asks about approved by `ask` (`[box.approval] write`).
+fn shared_asking(dir: &Path, name: &str, writes: Mode, allow_writes: &[&str], ask: Option<Means>) -> Arc<Shared> {
     let config = Config {
         name: "testbox".into(),
         socket: dir.join("unused.sock"),
         allow: vec!["*".into()],
         model: None,
         sites: vec!["app".into(), "readonly".into(), "askme".into(), "pending".into()],
-        net: Net { writes, allow_writes: allow_writes.iter().map(|p| p.to_string()).collect() },
+        net: Net { writes, allow_writes: allow_writes.iter().map(|p| p.to_string()).collect(), ask },
         log: dir.join(format!("{name}.log")),
         log_key: LOG_KEY,
         browser: None,
@@ -357,6 +364,11 @@ fn scenario(dir: &Path, yes: bool) {
     site_hosts(&deny, yes);
     the_site_closes_idle_connections(&deny);
     net_asks(&shared(dir, "ask", Mode::Ask, &[]), yes);
+    net_asks_nothing(&shared_asking(dir, "none", Mode::Ask, &[], Some(Means::None)));
+    // Nothing here can approve it, and a means asked on the terminal, which the agent holds, never does.
+    for (name, ask) in [("nowhere", None), ("sudo", Some(Means::Sudo)), ("passphrase", Some(Means::Passphrase))] {
+        net_cannot_ask(&shared_asking(dir, name, Mode::Ask, &[], ask));
+    }
     net_allows(&shared(dir, "allow", Mode::Allow, &[]));
     the_log_chains(dir, yes);
 }
@@ -686,6 +698,31 @@ fn net_asks(sh: &Arc<Shared>, yes: bool) {
     assert_eq!(approve::take_answers(), [yes]);
 }
 
+/// `[net] writes = "ask"` with `[box.approval] write = "none"`: the write passes and nothing is asked.
+fn net_asks_nothing(sh: &Arc<Shared>) {
+    approve::take_answers();
+    let host = "web.example.com";
+    let mut rig = Rig::new(sh, host);
+    let (reply, body) = rig.guest.post(host, "/submit", &[], "data");
+    assert_eq!(reply.status, 200, "{body}");
+    assert_eq!(rig.reached().len(), 1);
+    rig.finish();
+    assert!(approve::take_answers().is_empty(), "nothing was asked");
+}
+
+/// With nothing on this system that can approve it, a write `[net]` asks about is refused, saying so.
+fn net_cannot_ask(sh: &Arc<Shared>) {
+    approve::take_answers();
+    let host = "web.example.com";
+    let mut rig = Rig::new(sh, host);
+    let (reply, body) = rig.guest.post(host, "/submit", &[], "data");
+    assert_eq!(reply.status, 403, "{body}");
+    assert!(body.contains("wasn't approved: a write the box's policy says to ask about needs an approval this system can't give"), "{body}");
+    assert!(rig.reached().is_empty());
+    rig.finish();
+    assert!(approve::take_answers().is_empty(), "nothing was asked");
+}
+
 /// `[net] writes = "allow"`: everything passes, and the log says so.
 fn net_allows(sh: &Arc<Shared>) {
     let host = "web.example.com";
@@ -735,6 +772,9 @@ fn the_log_chains(dir: &Path, yes: bool) {
     assert_eq!(find("GET", "blocked:writes", "web.example.com")["url"], "https://web.example.com/plain", "an upgrade is refused as a write");
     the_log_chains_check(dir, "ask", 2);
     the_log_chains_check(dir, "allow", 3);
+    // `[box.approval] write`: none lets the write through unasked; with no means here it is refused.
+    let decisions = ["none", "nowhere", "sudo", "passphrase"].map(|name| log_lines(dir, name).iter().map(|l| l["decision"].clone()).collect::<Vec<_>>());
+    assert_eq!(decisions, [vec![json!("allowed")], vec![json!("asked:no")], vec![json!("asked:no")], vec![json!("asked:no")]]);
 
     // Changing a line shows, wherever it is; so does taking one out of the middle.
     let path = dir.join("deny.log");

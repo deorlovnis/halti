@@ -608,6 +608,13 @@ fn box_policy_approve_with_no_names_covers_boxes_too() {
     fs::write(env.box_policy_path("app-box"), "").unwrap();
 
     let out = env.halti(&["policy", "approve"]);
+    if cfg!(not(target_os = "macos")) {
+        // No box runs here, so nothing can approve a box's policy, and halti says so.
+        let said = stderr(&out);
+        assert!(!out.status.success() && said.contains("approving a changed box policy needs an approval this system can't give"), "{said}");
+        assert!(!stdout(&out).contains("approved the policy"), "nothing is approved");
+        return;
+    }
     let shown = stdout(&out);
     assert!(out.status.success(), "{}", stderr(&out));
     for expected in ["approved the policy for app\n", "approved the policy for box alpha", "approved the policy for box beta", "approved the policy for box app-box"] {
@@ -1063,14 +1070,22 @@ fn approved_copy(env: &Env) -> PathBuf {
     env.dir.join("home").join(DEV_CONFIG_DIR).join("approved").join(format!("{uid}.toml"))
 }
 
+/// The box sections of a Mac's template. No box runs on Linux, so its template has none.
+const BOX_SECTIONS: &str = "\n[box]\nengine = \"container\"          # container\nkeys   = \"keychain\"           # where a box's key is kept: keychain\n\n\
+                            [box.approval]\nrun    = \"touchid\"            # opening a box: touchid | sudo | none\n\
+                            policy = \"touchid\"            # approving a changed box policy: touchid | sudo | none\n\
+                            write  = \"touchid\"            # a write the box's policy says to ask about: touchid | none\n\
+                            export = \"touchid\"            # copying files out of a box: touchid | sudo | none\n\
+                            delete = \"touchid\"            # deleting a box: touchid | sudo | none\n";
+
 /// The template a debug build has on this system.
 fn template() -> String {
-    let (default, config) = if cfg!(target_os = "macos") { ("sudo | touchid | passphrase", "sudo | touchid") } else { ("sudo | passphrase", "sudo") };
+    let (default, config, boxes) = if cfg!(target_os = "macos") { ("sudo | touchid | passphrase", "sudo | touchid", BOX_SECTIONS) } else { ("sudo | passphrase", "sudo", "") };
     format!(
         "# halti config. edit with: halti config\n\n[approval]\ndefault = \"sudo\"              # {default}\nconfig  = \"sudo\"              # a change to this file: {config}\n\n\
          [paths]\nworkspaces = \"~/{DEV_STORE_ROOT}/ws\"\n\n[passwords]\nmanager = \"none\"              # none\n\n[secrets]\nstore = \"files\"               # files\n\n\
          [workspace]\npassphrase = \"own\"            # own | generate\n\n[workspace.approval]\n\
-         open   = \"passphrase\"         # opening a workspace: passphrase\ndelete = \"passphrase\"         # deleting a workspace: passphrase\n"
+         open   = \"passphrase\"         # opening a workspace: passphrase\ndelete = \"passphrase\"         # deleting a workspace: passphrase\n{boxes}"
     )
 }
 
@@ -1100,7 +1115,12 @@ fn config_shows_the_template_and_what_is_in_effect() {
     let settings = "\n[approval]\ndefault = \"sudo\"\nconfig  = \"sudo\"\n\n[paths]\n";
     let expected = format!("no settings of yours are approved yet, so halti uses its template\n{settings}{WORKSPACES}\n\n[passwords]\nmanager = \"none\"\n");
     assert!(shown.status.success() && stdout(&shown).starts_with(&expected) && stderr(&shown).is_empty(), "{}{}", stdout(&shown), stderr(&shown));
-    assert!(stdout(&shown).ends_with("\n[workspace.approval]\nopen   = \"passphrase\"\ndelete = \"passphrase\"\n"), "{}", stdout(&shown));
+    let last = if cfg!(target_os = "macos") {
+        "\n[box.approval]\nrun    = \"touchid\"\npolicy = \"touchid\"\nwrite  = \"touchid\"\nexport = \"touchid\"\ndelete = \"touchid\"\n"
+    } else {
+        "\n[workspace.approval]\nopen   = \"passphrase\"\ndelete = \"passphrase\"\n"
+    };
+    assert!(stdout(&shown).ends_with(last), "{}", stdout(&shown));
     assert!(!config_file(&env).exists() && !approved_copy(&env).exists(), "showing writes nothing");
     assert!(!env.halti(&["config", "--show", "--default"]).status.success());
     // halti setup is gone, and a setup.toml an earlier build left is never read.
@@ -1214,6 +1234,40 @@ fn a_copy_others_could_change_is_not_used() {
     assert!(out.status.success() && said.starts_with(&again) && said.ends_with("approved. these settings are in effect now\n"), "{said}{}", stderr(&out));
     let shown = env.halti(&["config", "--show"]);
     assert!(stderr(&shown).is_empty() && stdout(&shown).starts_with("your settings, approved with sudo"), "{}{}", stdout(&shown), stderr(&shown));
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+fn a_box_asks_as_its_approval_settings_say() {
+    let env = Env::new();
+    env.new_box("research");
+    let note = env.dir.join("note.txt");
+    fs::write(&note, "hello box\n").unwrap();
+    assert!(env.boxed("true", &["import", "research", note.to_str().unwrap()]).status.success());
+
+    // Copying out asks nothing, and deleting asks for sudo: settings approved with sudo, as any change.
+    let changed = edited("export = \"touchid\"", "export = \"none\"").replace("delete = \"touchid\"", "delete = \"sudo\"");
+    let out = config(&env, &changed, "yes");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let shown = stdout(&env.halti(&["config", "--show"]));
+    assert!(shown.contains("\nwrite  = \"touchid\"\nexport = \"none\"\ndelete = \"sudo\"\n"), "{shown}");
+
+    // Touch ID would say no, but nothing asks it: the file comes out.
+    let out_dir = env.dir.join("out");
+    fs::create_dir(&out_dir).unwrap();
+    let out = env.command().args(["box", "export", "research", "work/note.txt", "--to"]).arg(&out_dir).env("HALTI_TEST_APPROVE", "no").output().unwrap();
+    assert!(out.status.success() && !stderr(&out).contains("[test] export"), "{}", stderr(&out));
+    assert_eq!(fs::read_to_string(out_dir.join("note.txt")).unwrap(), "hello box\n");
+
+    // Deleting asks sudo, not Touch ID: a no keeps the box, a yes deletes it.
+    let rm = |sudo: &str| env.command().args(["box", "rm", "research"]).env("HALTI_TEST_APPROVE", "no").env("HALTI_TEST_SUDO", sudo).output().unwrap();
+    let out = rm("no");
+    assert!(!out.status.success() && stderr(&out).contains("halti: [test] sudo: no"), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("[test] delete box"), "Touch ID isn't asked: {}", stderr(&out));
+    assert!(env.box_key_path("research").exists() && env.box_store("research").exists(), "nothing is deleted");
+    let out = rm("yes");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!env.box_key_path("research").exists() && !env.box_store("research").exists());
 }
 
 #[test]

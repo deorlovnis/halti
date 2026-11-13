@@ -96,13 +96,25 @@ passphrase = "own"            # own | generate
 [workspace.approval]
 open   = "passphrase"         # opening a workspace: passphrase
 delete = "passphrase"         # deleting a workspace: passphrase
+
+[box]
+engine = "container"          # container
+keys   = "keychain"           # where a box's key is kept: keychain
+
+[box.approval]
+run    = "touchid"            # opening a box: touchid | sudo | none
+policy = "touchid"            # approving a changed box policy: touchid | sudo | none
+write  = "touchid"            # a write the box's policy says to ask about: touchid | none
+export = "touchid"            # copying files out of a box: touchid | sudo | none
+delete = "touchid"            # deleting a box: touchid | sudo | none
 ```
 
 - The file is plain ascii text: names without quotes, values in double quotes on one line, and no backslash.
 - An edit has no effect until approved, and `[approval] config` says how. `sudo`, the default, asks for your password and writes the approved copy as root to `/Library/Application Support/halti/approved/<uid>.toml` (`/etc/halti/approved/` on Linux), where a program running as you can't change it. `touchid` (on a Mac) approves later changes with Touch ID, kept in the Keychain like a policy's approval; if that approval goes missing, the settings last approved with sudo are back in effect. It can't be `none`.
 - `halti config` shows what your edit changed, on the terminal where sudo asks, then approves it. `halti config --show` prints the settings in effect, `halti config --default` the template. Until a change is approved, every workspace command says so.
 - With no approved copy, or one someone other than root could change, the template is in effect.
-- `[approval] default` is for any action without its own line. A workspace opens and is deleted with its own passphrase. `[paths] workspaces` is where new workspaces go: a folder that isn't there yet, an empty one only you can open, or one halti made. Ones already made stay where they are, and aren't listed until you move them there. `[workspace] passphrase` says whether `halti ws new` asks for a passphrase of your own or makes one (`--own` and `--generate` say otherwise).
+- `[approval] default` is for any action without its own line, except a box's. A workspace opens and is deleted with its own passphrase. `[paths] workspaces` is where new workspaces go: a folder that isn't there yet, an empty one only you can open, or one halti made. Ones already made stay where they are, and aren't listed until you move them there. `[workspace] passphrase` says whether `halti ws new` asks for a passphrase of your own or makes one (`--own` and `--generate` say otherwise).
+- `[box]` names what runs a box (Apple's `container`) and where its key is kept (the Keychain). `[box.approval]` says what you answer before a box opens, before its changed policy counts, before a write its policy says to ask about, before files are copied out of it, and before it is deleted: Touch ID, your password through sudo, or nothing (`none`). A write is asked while the agent has the terminal, so only Touch ID or `none` can approve it. A box line you leave out is Touch ID, whatever `default` says. A running box keeps the write approval it opened with. On Linux no box runs, so the template has no `[box]` section.
 
 ## Policies
 
@@ -202,8 +214,8 @@ A **box** is an isolated, encrypted place where an agent works: a Linux VM with 
 
 ```sh
 halti box new research             # policy template in $EDITOR, a new key in the Keychain, an empty store
-halti box approve research         # Touch ID; until then the box can't open
-halti box run research             # Touch ID opens it; you're in Claude Code, inside the box
+halti box approve research         # Touch ID (or as [box.approval] policy says); until then the box can't open
+halti box run research             # Touch ID (or as [box.approval] run says) opens it; you're in Claude Code, inside the box
 halti box run research -- bash     # a shell in the same box (joins it if it's running)
 halti box run --temp research      # a throwaway box with research's policy, gone when it stops
 halti box ls                       # open or locked, policy status, size, sites, last used, sites with a sealed browser session
@@ -211,13 +223,13 @@ halti box login research           # sign in to the box's sites by hand, in a wi
 halti box login research app       # just one site;  --all signs in again to sites that have a session already
 halti box log research             # what went through the door: a line per request, chained
 halti box log research --verify    # checks the chain; names the first line that was changed or removed
-halti box export research work/report.md --to ~/Desktop  # Touch ID; lists each file with size and sha256
+halti box export research work/report.md --to ~/Desktop  # Touch ID (or [box.approval] export); lists each file with size and sha256
 halti box import research ~/data.csv                     # copy a file or folder into work/ (box stopped)
 halti box stop research            # stop and lock; also happens when `run` ends or on Ctrl-C
-halti box rm research              # Touch ID; deletes the key, then the store
+halti box rm research              # Touch ID (or [box.approval] delete); deletes the key, then the store
 ```
 
-`halti policy approve` with no names approves your boxes too, so `install.sh` still needs one Touch ID.
+`halti policy approve` with no names approves your boxes too, so `install.sh` still needs one Touch ID. If `[box.approval] policy` says otherwise, the resources take Touch ID and the boxes are then asked for that way.
 
 `~/.config/halti/box/<name>.toml`:
 
@@ -247,8 +259,8 @@ mode = "clone"                          # clone: the agent works on its own copy
 ```
 
 - A box policy works like a resource policy: no effect until approved, a change blocks the box until approved again, and `halti box edit` shows a diff against the approved version. The approval is kept under the Keychain name `box.NAME` (resource names can't contain a dot, so it never collides with a resource).
-- One Touch ID at `run` opens the box and covers consent for its `sites`. Their own policies still decide hosts, writes and what may be browsed. `model` names a resource with a `[fetch]` policy: halti forwards the agent's model calls to its host with the real key, and the agent only has a stand-in. Joining a running box (`run NAME -- CMD` from another terminal) asks nothing more.
-- **Reads and writes.** The door ends TLS for the agent's connections, with a certificate authority made for that box and trusted only inside it (its key is sealed in the box's store, in a folder no VM mounts, and installed in the VM on each run), and judges each request. Sites are still verified against the usual public roots: one whose certificate doesn't check out gets a `502`. Reads (GET, HEAD, OPTIONS, and the POST that `git fetch` and `git clone` send to `.../git-upload-pack`) go to any site `allow` lets the box reach. Every other request is a write, and so is anything that asks to switch protocols (WebSocket). A write to a host no `sites` entry covers follows `[net] writes`; `allow_writes` lists URL prefixes that may receive writes whatever `writes` says (`https://api.example.com/search` covers `/search` and `/search/x`, not `/searching` or another host that starts alike; `/..` is resolved first). A refused request gets a `403` that says why, and the connection stays usable. With `ask`, a write waits for your Touch ID, which names the box, the method and the URL with secrets masked. A WebSocket can't be carried through the door yet, so it is refused even where writes are allowed. `rw` mounts aren't offered: files come in with `clone` or `import` and go out with `export`.
+- One Touch ID at `run` (or what `[box.approval] run` says) opens the box and covers consent for its `sites`. Their own policies still decide hosts, writes and what may be browsed. `model` names a resource with a `[fetch]` policy: halti forwards the agent's model calls to its host with the real key, and the agent only has a stand-in. Joining a running box (`run NAME -- CMD` from another terminal) asks nothing more.
+- **Reads and writes.** The door ends TLS for the agent's connections, with a certificate authority made for that box and trusted only inside it (its key is sealed in the box's store, in a folder no VM mounts, and installed in the VM on each run), and judges each request. Sites are still verified against the usual public roots: one whose certificate doesn't check out gets a `502`. Reads (GET, HEAD, OPTIONS, and the POST that `git fetch` and `git clone` send to `.../git-upload-pack`) go to any site `allow` lets the box reach. Every other request is a write, and so is anything that asks to switch protocols (WebSocket). A write to a host no `sites` entry covers follows `[net] writes`; `allow_writes` lists URL prefixes that may receive writes whatever `writes` says (`https://api.example.com/search` covers `/search` and `/search/x`, not `/searching` or another host that starts alike; `/..` is resolved first). A refused request gets a `403` that says why, and the connection stays usable. With `ask`, a write to such a host waits for your Touch ID, which names the box, the method and the URL with secrets masked (`[box.approval] write = "none"` lets it through without asking). A WebSocket can't be carried through the door yet, so it is refused even where writes are allowed. `rw` mounts aren't offered: files come in with `clone` or `import` and go out with `export`.
 - **Credentials for any tool.** On the hosts of a `sites` entry (its `[fetch] hosts`), the door adds the site's `auth` header and fixed `headers` to every request, whatever tool sent it, replacing anything the agent sent; the site's `writes` rule decides writes there instead of `[net]`. The agent never holds the token: `standins` sets variables such as `GH_TOKEN` to `cred-managed` so tools that insist on one start, and the door puts the real credential on the wire. The site's policy is read from its approved copy at each request: a policy that changed or was revoked gives no credentials, and its writes fall back to `[net]`. Answers from those hosts are masked with the site's stored values as they stream (a value split across reads is still found), are sent chunked because masking changes their length, and are asked for uncompressed; a site that compresses anyway is refused with a `502`, since halti can't mask what it can't read. Other hosts' answers pass as they are.
 - **The log.** `halti box log` shows one line per request (time, host, method, URL with tokens and long ids masked, status, bytes, decision: `allowed`, `asked:yes`, `asked:no`, `blocked:<why>`), never headers or bodies, along with a line per connection and per export and import. Each line carries an HMAC over itself and the line before, with a key derived from the box key, so `--verify` shows a line that was edited or taken out of the middle. Cutting off the end can't be seen. A log from before it was chained stays readable; its lines are reported as unchecked.
 - The `Host` header of every request must be the host the connection is for; otherwise the request is refused and the connection ends, so a connection to one allowed host can't be used to ask another.

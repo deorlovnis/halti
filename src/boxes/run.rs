@@ -1,12 +1,13 @@
 //! `halti box run`: open the box, start its VM and door, work in it, and put everything away.
 //!
-//! The order is the point. Opening needs a lock (one halti per open box), Touch ID, the key and
-//! the store; then the folders are set up while no VM has them mounted, then the VM and the door
-//! start. Ending runs the other way round: the VM stops first, then the door, then the store is
-//! detached (and deleted, for a box that isn't kept). Each step is held by a guard object, so an
-//! error, a panic or a signal (see `catch_signals`) unwinds the same way.
+//! The order is the point. Opening needs a lock (one halti per open box), the person's yes (as
+//! `[box.approval] run` says), the key and the store; then the folders are set up while no VM has
+//! them mounted, then the VM and the door start. Ending runs the other way round: the VM stops
+//! first, then the door, then the store is detached (and deleted, for a box that isn't kept). Each
+//! step is held by a guard object, so an error, a panic or a signal (see `catch_signals`) unwinds
+//! the same way.
 //!
-//! Everything outside halti (Touch ID, the engine, the door) is reached through `World`, so the
+//! Everything outside halti (the approval, the engine, the door) is reached through `World`, so the
 //! sequence can be tested with fakes while the store is real.
 
 use std::any::Any;
@@ -27,10 +28,13 @@ use serde_json::{Map, Value, json};
 use super::browser_vm::BrowserVm;
 use super::sessions::{InBox, Launch, Sessions};
 use super::store::{self, Layout};
-use super::{BoxPolicy, MountPolicy, mount_problem};
+use super::{BoxPolicy, KeyStore, MountPolicy, mount_problem};
+use crate::approval::{self, Action, Means};
 use crate::chain::{self, Chain};
+use crate::config::Settings;
+use crate::engine::{self, Vms};
 use crate::index::Index;
-use crate::{approve, door, engine, keychain, names, policy, seal};
+use crate::{door, keychain, names, policy, seal};
 
 /// Where the store's folders appear in the VM, and where `ro` folders go.
 const GUEST_HOME: &str = "/home/agent";
@@ -44,6 +48,7 @@ const WATCH_EVERY: Duration = Duration::from_millis(100);
 
 /// What a run needs from outside halti.
 pub trait World: Sync {
+    /// The person's yes to opening the box.
     fn confirm(&self, reason: &str) -> Result<()>;
     fn available(&self) -> Result<()>;
     fn running(&self, vm: &str) -> bool;
@@ -73,28 +78,33 @@ pub trait World: Sync {
     fn exec(&self, vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus>;
 }
 
-/// The real thing.
-pub struct Real;
+/// The real thing, as the settings say: the engine `[box] engine` picked, where `[box] keys` keeps
+/// the key, and `[box.approval] run`.
+pub struct Real<'a> {
+    pub(super) vms: &'static dyn Vms,
+    pub(super) keys: KeyStore,
+    pub(super) settings: &'a Settings,
+}
 
-impl World for Real {
+impl World for Real<'_> {
     fn confirm(&self, reason: &str) -> Result<()> {
-        approve::confirm(reason)
+        super::ask_for(&approval::Real, self.settings, Action::BoxRun, reason)
     }
 
     fn available(&self) -> Result<()> {
-        engine::available()
+        self.vms.available()
     }
 
     fn running(&self, vm: &str) -> bool {
-        engine::running(vm)
+        self.vms.running(vm)
     }
 
     fn start_vm(&self, spec: &engine::VmSpec) -> Result<()> {
-        engine::run(spec)
+        self.vms.run(spec)
     }
 
     fn stop_vm(&self, vm: &str) {
-        if let Err(e) = engine::stop(vm) {
+        if let Err(e) = self.vms.stop(vm) {
             eprintln!("halti: stopping {vm}: {e:#}");
         }
     }
@@ -110,15 +120,15 @@ impl World for Real {
     }
 
     fn browser_image(&self) -> Result<String> {
-        engine::image_digest(engine::BROWSER_IMAGE)
+        self.vms.image_digest(engine::BROWSER_IMAGE)
     }
 
     fn install_ca(&self, vm: &str, pem: &str) -> Result<()> {
-        engine::install_ca(vm, pem)
+        self.vms.install_ca(vm, pem)
     }
 
     fn start_docker(&self, vm: &str) -> Result<()> {
-        engine::start_docker(vm)
+        self.vms.start_docker(vm)
     }
 
     fn model_uses_bearer(&self, model: &str) -> Result<bool> {
@@ -134,7 +144,7 @@ impl World for Real {
     }
 
     fn key(&self, name: &str) -> Result<String> {
-        keychain::get(&super::key(name), super::KEY_FIELD).ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (halti box rm {name})"))
+        self.keys.open_key(name)
     }
 
     fn record_sessions(&self, name: &str, sites: &[String]) -> Result<()> {
@@ -146,7 +156,7 @@ impl World for Real {
     }
 
     fn exec(&self, vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus> {
-        let status = engine::exec(vm, env, cmd, tty);
+        let status = self.vms.exec(vm, env, cmd, tty);
         // `container exec` shares the terminal and may leave it non-blocking.
         crate::util::blocking_stdio();
         status
@@ -170,6 +180,9 @@ pub struct Request<'a> {
     pub tty: bool,
     /// Set (by a signal) to stop the box.
     pub stop: &'a AtomicBool,
+    /// How the door approves a write the box's policy says to ask about (`[box.approval] write`):
+    /// read as the box opens, and kept while it runs. None: this system has no means for it.
+    pub write: Option<Means>,
 }
 
 pub fn vm_name(id: &str) -> String {
@@ -298,7 +311,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         allow: policy.allow(),
         model: policy.model.clone(),
         sites: policy.sites.clone(),
-        net: door::inspect::Net { writes: policy.net.writes, allow_writes: policy.net.allow_writes.clone() },
+        net: door::inspect::Net { writes: policy.net.writes, allow_writes: policy.net.allow_writes.clone(), ask: req.write },
         log: store::door_log(&mnt),
         ca: Some(ca.clone()),
         log_key,
@@ -566,7 +579,7 @@ mod tests {
 
     type SpecSeen = (String, String, u32, String, PathBuf, Vec<(PathBuf, String, bool)>, bool);
     type DoorSeen = (Vec<String>, Option<String>, Vec<String>, PathBuf);
-    type NetSeen = (policy::Mode, Vec<String>, [u8; 32]);
+    type NetSeen = (policy::Mode, Vec<String>, [u8; 32], Option<Means>);
     type ExecSeen = (Vec<(String, String)>, Vec<String>, bool);
     type Hook = Box<dyn Fn(&Path) + Sync + Send>;
     /// Runs in exec with the door's browser and the store's mount point.
@@ -661,7 +674,7 @@ mod tests {
             }
             let mut seen = self.seen.lock().unwrap();
             seen.door_ca = cfg.ca.as_ref().map(|ca| ca.cert_pem());
-            seen.net = Some((cfg.net.writes, cfg.net.allow_writes, cfg.log_key));
+            seen.net = Some((cfg.net.writes, cfg.net.allow_writes, cfg.log_key, cfg.net.ask));
             seen.door = Some((cfg.allow, cfg.model, cfg.sites, cfg.log));
             seen.browser = cfg.browser;
             Ok(Box::new(()))
@@ -757,7 +770,7 @@ mod tests {
     }
 
     fn request<'a>(s: &'a Setup, policy: &'a BoxPolicy, persistent: bool) -> Request<'a> {
-        Request { name: "r", id: "r".into(), policy, policy_sha: "sha-1".into(), persistent, unique: false, command: None, tty: false, stop: &s.stop }
+        Request { name: "r", id: "r".into(), policy, policy_sha: "sha-1".into(), persistent, unique: false, command: None, tty: false, stop: &s.stop, write: Some(Means::TouchId) }
     }
 
     fn policy(s: &Setup, extra: &str) -> BoxPolicy {
@@ -846,8 +859,9 @@ mod tests {
             assert!(env.iter().any(|(k, v)| k == var && v.starts_with("/")), "{var} in {env:?}");
         }
         assert!(env.contains(&("GH_TOKEN".into(), names::STANDIN.into())), "the policy's stand-ins: {env:?}");
-        let (writes, allow_writes, _) = seen.net.clone().unwrap();
+        let (writes, allow_writes, _, ask) = seen.net.clone().unwrap();
         assert_eq!((writes, allow_writes), (policy::Mode::Ask, vec!["https://api.example.com/search".to_string()]));
+        assert_eq!(ask, Some(Means::TouchId), "the door asks about writes as the box opened with");
         assert_eq!(&cmd[..2], ["sh", "-c"]);
         assert!(cmd[2].starts_with("cd /work && exec"), "{}", cmd[2]);
         assert_eq!(&cmd[3..], ["bash", "-l"]);

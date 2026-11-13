@@ -6,6 +6,10 @@
 //! An action raised while an agent holds the terminal accepts only a means that shows its own
 //! window: the agent could answer what is asked on the terminal, or eat the keystrokes.
 //!
+//! A box's actions have their lines in `[box.approval]`. Where halti runs no box, nothing approves
+//! them, and a missing line is Touch ID whatever `[approval] default` says: they asked for Touch ID
+//! before they had lines.
+//!
 //! Adding an action is one variant and one rule; its line in the settings follows from the rule.
 
 use std::ffi::OsStr;
@@ -20,16 +24,23 @@ use anyhow::{Context, Result, anyhow, bail};
 use halti_core::platform::Os;
 
 use crate::config::approved::{self, Found, Place};
-use crate::config::{Settings, Word};
+use crate::config::{Engine, Settings, Word};
 use crate::{approve, policy, util};
 
-/// What can ask for an approval. Later: storing a secret, and the box's actions.
+/// What can ask for an approval. Later: storing a secret.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Action {
     /// A change to halti's settings.
     Config,
     WsOpen,
     WsDelete,
+    BoxRun,
+    /// Approving a box's policy, new or changed.
+    BoxPolicy,
+    /// A write the box's `[net] writes = "ask"` asks about, raised by the door while the agent works.
+    BoxWrite,
+    BoxExport,
+    BoxDelete,
 }
 
 /// What approves an action. Written in full everywhere: `Means::None` isn't `Option::None`.
@@ -88,13 +99,36 @@ pub struct Rule {
     agent_at_terminal: bool,
 }
 
+/// The section of a box's approvals.
+const BOX: &str = "box.approval";
+
+/// What a box's action accepts when the person has the terminal. A box has no passphrase: its key
+/// is kept for it (`[box] keys`).
+const BOX_MEANS: &[Means] = &[Means::TouchId, Means::Sudo, Means::None];
+
+/// What a box's write accepts: the agent has the terminal, so only Touch ID's window, or nothing.
+const BOX_WRITE_MEANS: &[Means] = &[Means::TouchId, Means::None];
+
 /// Config takes only what a program running as the person can't answer: the sudo password, or the
-/// Touch ID window. A workspace unlocks with its passphrase, which core demands anyway.
+/// Touch ID window. A workspace unlocks with its passphrase, which core demands anyway. A box's
+/// write is asked while the agent has the terminal, so only Touch ID's window, or nothing, answers it.
 pub const RULES: &[Rule] = &[
     Rule { action: Action::Config, table: "approval", key: "config", about: "a change to this file", accepts: &[Means::Sudo, Means::TouchId], agent_at_terminal: false },
     Rule { action: Action::WsOpen, table: "workspace.approval", key: "open", about: "opening a workspace", accepts: &[Means::Passphrase], agent_at_terminal: false },
     Rule { action: Action::WsDelete, table: "workspace.approval", key: "delete", about: "deleting a workspace", accepts: &[Means::Passphrase], agent_at_terminal: false },
+    Rule { action: Action::BoxRun, table: BOX, key: "run", about: "opening a box", accepts: BOX_MEANS, agent_at_terminal: false },
+    Rule { action: Action::BoxPolicy, table: BOX, key: "policy", about: "approving a changed box policy", accepts: BOX_MEANS, agent_at_terminal: false },
+    Rule { action: Action::BoxWrite, table: BOX, key: "write", about: "a write the box's policy says to ask about", accepts: BOX_WRITE_MEANS, agent_at_terminal: true },
+    Rule { action: Action::BoxExport, table: BOX, key: "export", about: "copying files out of a box", accepts: BOX_MEANS, agent_at_terminal: false },
+    Rule { action: Action::BoxDelete, table: BOX, key: "delete", about: "deleting a box", accepts: BOX_MEANS, agent_at_terminal: false },
 ];
+
+impl Rule {
+    /// A box's action: its line is in `[box.approval]`.
+    pub fn of_box(&self) -> bool {
+        self.table == BOX
+    }
+}
 
 impl Action {
     pub fn rule(self) -> &'static Rule {
@@ -108,7 +142,11 @@ impl Action {
 }
 
 /// A rule's means that this system has, without those asked on the terminal when an agent holds it.
+/// A box's action has none where no box engine is.
 fn kept(rule: &Rule, os: Os) -> Vec<Means> {
+    if rule.of_box() && !Engine::ALL.iter().any(|engine| engine.on(os)) {
+        return Vec::new();
+    }
     rule.accepts.iter().copied().filter(|means| means.on(os) && (!rule.agent_at_terminal || !means.asks_on_terminal())).collect()
 }
 
@@ -130,8 +168,14 @@ pub fn approve(settings: &Settings, action: Action, reason: &str) -> Result<Gran
 }
 
 pub fn approve_with(world: &dyn World, settings: &Settings, action: Action, reason: &str) -> Result<Granted> {
-    match settings.means(action) {
-        None => bail!("{} can't be approved on this system", action.rule().about),
+    ask_by(world, settings.means(action), action, reason)
+}
+
+/// Asks for `action` by `means`, read from the settings earlier: none when this system has no means
+/// the action accepts. The door keeps the means a box opened with this way.
+pub fn ask_by(world: &dyn World, means: Option<Means>, action: Action, reason: &str) -> Result<Granted> {
+    match means {
+        None => bail!("{} needs an approval this system can't give", action.rule().about),
         Some(Means::Sudo) => world.sudo(reason).map(|()| Granted::Now),
         Some(Means::TouchId) => world.touch_id(reason).map(|()| Granted::Now),
         Some(Means::Passphrase) => Ok(Granted::ByPassphrase),
@@ -290,7 +334,8 @@ mod tests {
     fn every_rule_keeps_its_whole_list_where_its_means_are() {
         for rule in RULES {
             assert_eq!(rule.action.accepts(Os::Macos), rule.accepts, "{:?}", rule.action);
-            let linux: Vec<Means> = rule.accepts.iter().copied().filter(|means| *means != Means::TouchId).collect();
+            // No box runs on Linux, so nothing there approves a box's action.
+            let linux: Vec<Means> = rule.accepts.iter().copied().filter(|means| *means != Means::TouchId && !rule.of_box()).collect();
             assert_eq!(rule.action.accepts(Os::Linux), linux, "{:?}", rule.action);
             assert!(!rule.agent_at_terminal || rule.accepts.iter().all(|means| !means.asks_on_terminal()), "{:?} lists a means an agent could answer", rule.action);
             assert!(!rule.accepts.is_empty() && rule.action.rule().key == rule.key);
@@ -300,9 +345,41 @@ mod tests {
     #[test]
     fn with_an_agent_at_the_terminal_only_a_window_is_kept() {
         let accepts = &[Means::Sudo, Means::TouchId, Means::Passphrase];
-        let rule = Rule { action: Action::Config, table: "box.approval", key: "write", about: "a write", accepts, agent_at_terminal: true };
+        let rule = Rule { action: Action::Config, table: "approval", key: "write", about: "a write", accepts, agent_at_terminal: true };
         assert_eq!((kept(&rule, Os::Macos), kept(&rule, Os::Linux)), (vec![Means::TouchId], vec![]));
         assert_eq!(Means::ALL.iter().filter(|means| means.asks_on_terminal()).count(), 2);
+    }
+
+    #[test]
+    fn a_box_s_actions_take_touch_id_sudo_or_nothing_and_its_writes_no_terminal() {
+        let boxes: Vec<(Action, Vec<Means>)> = RULES.iter().filter(|rule| rule.of_box()).map(|rule| (rule.action, rule.action.accepts(Os::Macos))).collect();
+        let any = vec![Means::TouchId, Means::Sudo, Means::None];
+        let expected = [
+            (Action::BoxRun, any.clone()),
+            (Action::BoxPolicy, any.clone()),
+            (Action::BoxWrite, vec![Means::TouchId, Means::None]),
+            (Action::BoxExport, any.clone()),
+            (Action::BoxDelete, any),
+        ];
+        assert_eq!(boxes, expected);
+        assert!(RULES.iter().filter(|rule| rule.of_box()).all(|rule| !rule.accepts.contains(&Means::Passphrase)), "a box has no passphrase");
+        assert!(Action::BoxWrite.rule().agent_at_terminal && RULES.iter().filter(|rule| rule.agent_at_terminal).count() == 1);
+        assert!(RULES.iter().filter(|rule| rule.of_box()).all(|rule| rule.table == "box.approval" && rule.action.accepts(Os::Linux).is_empty()));
+        assert!(!Action::Config.rule().of_box() && !Action::WsDelete.rule().of_box());
+    }
+
+    #[test]
+    fn an_action_with_no_means_here_says_so() {
+        let fake = Fake::answering(true, true);
+        let error = ask_by(&fake, None, Action::BoxRun, "open box research").unwrap_err();
+        assert_eq!(error.to_string(), "opening a box needs an approval this system can't give");
+        let linux = config::Settings::builtin(Os::Linux);
+        let error = approve_with(&fake, &linux, Action::BoxWrite, "let box research send POST https://x.example").unwrap_err();
+        assert_eq!(error.to_string(), "a write the box's policy says to ask about needs an approval this system can't give");
+        assert!(fake.calls().is_empty(), "nothing is asked");
+        assert_eq!(ask_by(&fake, Some(Means::None), Action::BoxWrite, "a write").unwrap(), Granted::Now);
+        assert_eq!(ask_by(&fake, Some(Means::TouchId), Action::BoxWrite, "a write").unwrap(), Granted::Now);
+        assert_eq!(fake.calls(), ["touch id: a write"]);
     }
 
     #[test]
