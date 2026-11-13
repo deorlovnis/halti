@@ -369,6 +369,10 @@ fn scenario(dir: &Path, yes: bool) {
     for (name, ask) in [("nowhere", None), ("sudo", Some(Means::Sudo)), ("passphrase", Some(Means::Passphrase))] {
         net_cannot_ask(&shared_asking(dir, name, Mode::Ask, &[], ask));
     }
+    // `[box.approval] write` is for `[net]` only: a site's own `writes = "ask"` still asks Touch ID
+    // on a door that lets `[net]` writes through unasked, and on one with nothing to ask `[net]` by.
+    site_asks(&shared_asking(dir, "site-none", Mode::Ask, &[], Some(Means::None)), yes);
+    site_asks(&shared_asking(dir, "site-nowhere", Mode::Ask, &[], None), yes);
     net_allows(&shared(dir, "allow", Mode::Allow, &[]));
     the_log_chains(dir, yes);
 }
@@ -589,22 +593,7 @@ fn site_hosts(sh: &Arc<Shared>, yes: bool) {
     assert_eq!(rig.reached()[0].header("authorization"), Some(format!("Bearer {SECRET}").as_str()));
     rig.finish();
 
-    // A site whose policy asks: Touch ID's answer decides.
-    let ask = "ask.example.com";
-    let mut rig = Rig::new(sh, ask);
-    let (reply, body) = rig.guest.post(ask, "/submit?id=1", &[], "data");
-    if yes {
-        assert_eq!((reply.status, body.as_str()), (200, "got data"));
-        assert_eq!(rig.reached().len(), 1);
-    } else {
-        assert_eq!(reply.status, 403);
-        assert!(body.contains("wasn't approved"), "{body}");
-        assert!(rig.reached().is_empty());
-        assert_eq!(rig.guest.get(ask, "/plain", &[]).0.status, 200, "the connection goes on");
-    }
-    rig.finish();
-    let answers = approve::take_answers();
-    assert_eq!(answers, [yes], "one prompt for the one write, none for reads");
+    site_asks(sh, yes);
 
     // A site whose policy isn't approved gets no credentials, and its writes follow [net].
     let pending = "pending.example.com";
@@ -624,6 +613,26 @@ fn site_hosts(sh: &Arc<Shared>, yes: bool) {
     rig.guest.get(ro, "/plain", &[]);
     assert_eq!(rig.reached()[0].header("authorization"), None);
     rig.finish();
+}
+
+/// A site whose policy asks (`askme`, `[fetch] writes = "ask"`): Touch ID's answer decides, whatever
+/// the door's `[box.approval] write` is, which covers `[net]` only.
+fn site_asks(sh: &Arc<Shared>, yes: bool) {
+    let ask = "ask.example.com";
+    let mut rig = Rig::new(sh, ask);
+    let (reply, body) = rig.guest.post(ask, "/submit?id=1", &[], "data");
+    if yes {
+        assert_eq!((reply.status, body.as_str()), (200, "got data"));
+        assert_eq!(rig.reached().len(), 1);
+    } else {
+        assert_eq!(reply.status, 403);
+        assert!(body.contains("wasn't approved"), "{body}");
+        assert!(rig.reached().is_empty());
+        assert_eq!(rig.guest.get(ask, "/plain", &[]).0.status, 200, "the connection goes on");
+    }
+    rig.finish();
+    let answers = approve::take_answers();
+    assert_eq!(answers, [yes], "one prompt for the one write, none for reads");
 }
 
 /// The site closes connections the door keeps for it; the door makes a new one, once, and only
@@ -775,6 +784,11 @@ fn the_log_chains(dir: &Path, yes: bool) {
     // `[box.approval] write`: none lets the write through unasked; with no means here it is refused.
     let decisions = ["none", "nowhere", "sudo", "passphrase"].map(|name| log_lines(dir, name).iter().map(|l| l["decision"].clone()).collect::<Vec<_>>());
     assert_eq!(decisions, [vec![json!("allowed")], vec![json!("asked:no")], vec![json!("asked:no")], vec![json!("asked:no")]]);
+    // A site's own `writes = "ask"` was asked about on both, and answered as Touch ID said.
+    for name in ["site-none", "site-nowhere"] {
+        let posts: Vec<_> = log_lines(dir, name).iter().filter(|l| l["method"] == "POST").map(|l| l["decision"].clone()).collect();
+        assert_eq!(posts, [json!(if yes { "asked:yes" } else { "asked:no" })], "{name}");
+    }
 
     // Changing a line shows, wherever it is; so does taking one out of the middle.
     let path = dir.join("deny.log");

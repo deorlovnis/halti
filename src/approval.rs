@@ -3,6 +3,10 @@
 //! person's password, asked by sudo on the terminal), touchid (the Touch ID window, macOS only),
 //! passphrase (a workspace's own passphrase, which core asks for anyway) or none.
 //!
+//! A workspace's lines take passphrase, or another means where a password manager keeps its
+//! passphrase (`[passwords] manager`): then the person approves that way, or not at all, and halti
+//! takes the passphrase from the manager. Where this system has no manager, they take passphrase only.
+//!
 //! An action raised while an agent holds the terminal accepts only a means that shows its own
 //! window: the agent could answer what is asked on the terminal, or eat the keystrokes.
 //!
@@ -24,7 +28,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use halti_core::platform::Os;
 
 use crate::config::approved::{self, Found, Place};
-use crate::config::{Engine, Settings, Word};
+use crate::config::{Engine, Manager, Settings, Word};
 use crate::{approve, policy, util};
 
 /// What can ask for an approval. Later: storing a secret.
@@ -97,6 +101,10 @@ pub struct Rule {
     accepts: &'static [Means],
     /// Raised while an agent holds the terminal: then only a means with its own window is kept.
     agent_at_terminal: bool,
+    /// A workspace's: any means but the passphrase releases the passphrase a password manager keeps,
+    /// so it is kept only where this system has a manager. A missing line is the passphrase,
+    /// whatever `[approval] default` says.
+    pub manager: bool,
 }
 
 /// The section of a box's approvals.
@@ -109,18 +117,34 @@ const BOX_MEANS: &[Means] = &[Means::TouchId, Means::Sudo, Means::None];
 /// What a box's write accepts: the agent has the terminal, so only Touch ID's window, or nothing.
 const BOX_WRITE_MEANS: &[Means] = &[Means::TouchId, Means::None];
 
+/// What a change to the settings accepts: what a program running as the person can't answer.
+const CONFIG_MEANS: &[Means] = &[Means::Sudo, Means::TouchId];
+
+/// What opening or deleting a workspace accepts: its passphrase typed, as it always was; or, where a
+/// password manager keeps it, the person's password, Touch ID, or nothing before it is taken from there.
+const WS_MEANS: &[Means] = &[Means::Passphrase, Means::Sudo, Means::TouchId, Means::None];
+
 /// Config takes only what a program running as the person can't answer: the sudo password, or the
-/// Touch ID window. A workspace unlocks with its passphrase, which core demands anyway. A box's
-/// write is asked while the agent has the terminal, so only Touch ID's window, or nothing, answers it.
+/// Touch ID window. A workspace unlocks with its passphrase, which core demands anyway, or with the
+/// passphrase a password manager keeps, released by the means its line names. A box's write is
+/// asked while the agent has the terminal, so only Touch ID's window, or nothing, answers it.
 pub const RULES: &[Rule] = &[
-    Rule { action: Action::Config, table: "approval", key: "config", about: "a change to this file", accepts: &[Means::Sudo, Means::TouchId], agent_at_terminal: false },
-    Rule { action: Action::WsOpen, table: "workspace.approval", key: "open", about: "opening a workspace", accepts: &[Means::Passphrase], agent_at_terminal: false },
-    Rule { action: Action::WsDelete, table: "workspace.approval", key: "delete", about: "deleting a workspace", accepts: &[Means::Passphrase], agent_at_terminal: false },
-    Rule { action: Action::BoxRun, table: BOX, key: "run", about: "opening a box", accepts: BOX_MEANS, agent_at_terminal: false },
-    Rule { action: Action::BoxPolicy, table: BOX, key: "policy", about: "approving a changed box policy", accepts: BOX_MEANS, agent_at_terminal: false },
-    Rule { action: Action::BoxWrite, table: BOX, key: "write", about: "a write the box's policy says to ask about", accepts: BOX_WRITE_MEANS, agent_at_terminal: true },
-    Rule { action: Action::BoxExport, table: BOX, key: "export", about: "copying files out of a box", accepts: BOX_MEANS, agent_at_terminal: false },
-    Rule { action: Action::BoxDelete, table: BOX, key: "delete", about: "deleting a box", accepts: BOX_MEANS, agent_at_terminal: false },
+    Rule { action: Action::Config, table: "approval", key: "config", about: "a change to this file", accepts: CONFIG_MEANS, agent_at_terminal: false, manager: false },
+    Rule { action: Action::WsOpen, table: "workspace.approval", key: "open", about: "opening a workspace", accepts: WS_MEANS, agent_at_terminal: false, manager: true },
+    Rule { action: Action::WsDelete, table: "workspace.approval", key: "delete", about: "deleting a workspace", accepts: WS_MEANS, agent_at_terminal: false, manager: true },
+    Rule { action: Action::BoxRun, table: BOX, key: "run", about: "opening a box", accepts: BOX_MEANS, agent_at_terminal: false, manager: false },
+    Rule { action: Action::BoxPolicy, table: BOX, key: "policy", about: "approving a changed box policy", accepts: BOX_MEANS, agent_at_terminal: false, manager: false },
+    Rule {
+        action: Action::BoxWrite,
+        table: BOX,
+        key: "write",
+        about: "a write the box's policy says to ask about",
+        accepts: BOX_WRITE_MEANS,
+        agent_at_terminal: true,
+        manager: false,
+    },
+    Rule { action: Action::BoxExport, table: BOX, key: "export", about: "copying files out of a box", accepts: BOX_MEANS, agent_at_terminal: false, manager: false },
+    Rule { action: Action::BoxDelete, table: BOX, key: "delete", about: "deleting a box", accepts: BOX_MEANS, agent_at_terminal: false, manager: false },
 ];
 
 impl Rule {
@@ -142,12 +166,15 @@ impl Action {
 }
 
 /// A rule's means that this system has, without those asked on the terminal when an agent holds it.
-/// A box's action has none where no box engine is.
+/// A box's action has none where no box engine is, and a workspace's only the passphrase where no
+/// password manager is.
 fn kept(rule: &Rule, os: Os) -> Vec<Means> {
     if rule.of_box() && !Engine::ALL.iter().any(|engine| engine.on(os)) {
         return Vec::new();
     }
-    rule.accepts.iter().copied().filter(|means| means.on(os) && (!rule.agent_at_terminal || !means.asks_on_terminal())).collect()
+    let managed = Manager::ALL.iter().any(|manager| *manager != Manager::None && manager.on(os));
+    let here = |means: &Means| means.on(os) && (!rule.agent_at_terminal || !means.asks_on_terminal()) && (!rule.manager || managed || *means == Means::Passphrase);
+    rule.accepts.iter().copied().filter(here).collect()
 }
 
 /// sudo, or the person, said no.
@@ -163,10 +190,6 @@ impl fmt::Display for Declined {
 impl std::error::Error for Declined {}
 
 /// Asks for `action` as the settings say. `reason` says what is approved, in a few words.
-pub fn approve(settings: &Settings, action: Action, reason: &str) -> Result<Granted> {
-    approve_with(&Real, settings, action, reason)
-}
-
 pub fn approve_with(world: &dyn World, settings: &Settings, action: Action, reason: &str) -> Result<Granted> {
     ask_by(world, settings.means(action), action, reason)
 }
@@ -334,8 +357,10 @@ mod tests {
     fn every_rule_keeps_its_whole_list_where_its_means_are() {
         for rule in RULES {
             assert_eq!(rule.action.accepts(Os::Macos), rule.accepts, "{:?}", rule.action);
-            // No box runs on Linux, so nothing there approves a box's action.
-            let linux: Vec<Means> = rule.accepts.iter().copied().filter(|means| *means != Means::TouchId && !rule.of_box()).collect();
+            // No box runs on Linux, so nothing there approves a box's action; and no password manager is there, so a
+            // workspace's action takes its passphrase only.
+            let linux = |means: &Means| *means != Means::TouchId && !rule.of_box() && (!rule.manager || *means == Means::Passphrase);
+            let linux: Vec<Means> = rule.accepts.iter().copied().filter(linux).collect();
             assert_eq!(rule.action.accepts(Os::Linux), linux, "{:?}", rule.action);
             assert!(!rule.agent_at_terminal || rule.accepts.iter().all(|means| !means.asks_on_terminal()), "{:?} lists a means an agent could answer", rule.action);
             assert!(!rule.accepts.is_empty() && rule.action.rule().key == rule.key);
@@ -343,9 +368,19 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_takes_any_means_where_a_password_manager_is_and_its_passphrase_elsewhere() {
+        for action in [Action::WsOpen, Action::WsDelete] {
+            assert!(action.rule().manager && action.rule().table == "workspace.approval");
+            assert_eq!(action.accepts(Os::Macos), [Means::Passphrase, Means::Sudo, Means::TouchId, Means::None], "{action:?}");
+            assert_eq!(action.accepts(Os::Linux), [Means::Passphrase], "{action:?}");
+        }
+        assert_eq!(RULES.iter().filter(|rule| rule.manager).count(), 2, "only a workspace's passphrase is kept by a manager");
+    }
+
+    #[test]
     fn with_an_agent_at_the_terminal_only_a_window_is_kept() {
         let accepts = &[Means::Sudo, Means::TouchId, Means::Passphrase];
-        let rule = Rule { action: Action::Config, table: "approval", key: "write", about: "a write", accepts, agent_at_terminal: true };
+        let rule = Rule { action: Action::Config, table: "approval", key: "write", about: "a write", accepts, agent_at_terminal: true, manager: false };
         assert_eq!((kept(&rule, Os::Macos), kept(&rule, Os::Linux)), (vec![Means::TouchId], vec![]));
         assert_eq!(Means::ALL.iter().filter(|means| means.asks_on_terminal()).count(), 2);
     }

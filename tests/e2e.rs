@@ -1081,11 +1081,12 @@ const BOX_SECTIONS: &str = "\n[box]\nengine = \"container\"          # container
 /// The template a debug build has on this system.
 fn template() -> String {
     let (default, config, boxes) = if cfg!(target_os = "macos") { ("sudo | touchid | passphrase", "sudo | touchid", BOX_SECTIONS) } else { ("sudo | passphrase", "sudo", "") };
+    let (managers, ws) = if cfg!(target_os = "macos") { ("none | keychain", "passphrase | sudo | touchid | none") } else { ("none", "passphrase") };
     format!(
         "# halti config. edit with: halti config\n\n[approval]\ndefault = \"sudo\"              # {default}\nconfig  = \"sudo\"              # a change to this file: {config}\n\n\
-         [paths]\nworkspaces = \"~/{DEV_STORE_ROOT}/ws\"\n\n[passwords]\nmanager = \"none\"              # none\n\n[secrets]\nstore = \"files\"               # files\n\n\
+         [paths]\nworkspaces = \"~/{DEV_STORE_ROOT}/ws\"\n\n[passwords]\nmanager = \"none\"              # {managers}\n\n[secrets]\nstore = \"files\"               # files\n\n\
          [workspace]\npassphrase = \"own\"            # own | generate\n\n[workspace.approval]\n\
-         open   = \"passphrase\"         # opening a workspace: passphrase\ndelete = \"passphrase\"         # deleting a workspace: passphrase\n{boxes}"
+         open   = \"passphrase\"         # opening a workspace: {ws}\ndelete = \"passphrase\"         # deleting a workspace: {ws}\n{boxes}"
     )
 }
 
@@ -1319,6 +1320,133 @@ fn ws_new_takes_whose_passphrase_from_the_settings_unless_told() {
     assert!(own.status.success() && (prompted(&own), asked(&own)) == (1, 2), "{}", stderr(&own));
     let made = ws(&env, PASSPHRASE, &["ws", "new", "umbrella", "--generate"]);
     assert!(made.status.success() && (prompted(&made), asked(&made)) == (1, 0), "{}", stderr(&made));
+}
+
+/// The template with the keychain as the password manager, and opening and deleting a workspace
+/// approved by `open` and `delete`.
+fn with_keychain(open: &str, delete: &str) -> String {
+    edited("manager = \"none\"   ", "manager = \"keychain\"")
+        .replace("open   = \"passphrase\"", &format!("open   = \"{open}\""))
+        .replace("delete = \"passphrase\"", &format!("delete = \"{delete}\""))
+}
+
+/// Where the debug build's fake Keychain keeps the saved passphrase of the workspace `name`.
+fn saved_copy(env: &Env, name: &str) -> PathBuf {
+    env.dir.join("keychain").join(format!("halti-ws.{}", ws_id(env, name)))
+}
+
+/// Whether neither stdout nor stderr holds `passphrase`.
+fn keeps_quiet(out: &Output, passphrase: &str) -> bool {
+    !text(&out.stdout).contains(passphrase) && !text(&out.stderr).contains(passphrase)
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "the keychain is only on a mac")]
+fn a_saved_passphrase_is_taken_from_the_keychain_after_the_approval_in_effect() {
+    let env = Env::new();
+    let out = config(&env, &with_keychain("touchid", "sudo"), "yes");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let made = ws(&env, PASSPHRASE, &["ws", "new", "acme"]);
+    assert!(made.status.success() && keeps_quiet(&made, PASSPHRASE), "{}", stderr(&made));
+    let said = "created workspace acme\nits passphrase is saved in the keychain\nopen it with: halti open acme\ndebug build: this workspace opens only with a debug build\n";
+    assert_eq!(stdout(&made), said);
+    let copy = saved_copy(&env, "acme");
+    assert_eq!(fs::read_to_string(&copy).unwrap(), PASSPHRASE);
+    let opened = "passphrase correct\nworkspaces can't stay open yet, so acme was closed again\n";
+
+    // Touch ID, then the copy: no passphrase is given, and none is asked for.
+    let open = |approve: &str| env.command().args(["open", "acme"]).env("HALTI_TEST_APPROVE", approve).output().unwrap();
+    let out = open("yes");
+    assert!(out.status.success() && stdout(&out) == opened && keeps_quiet(&out, PASSPHRASE), "{}{}", stdout(&out), stderr(&out));
+    assert_eq!(stderr(&out), "halti: [test] [DEV, not protected] open workspace acme: yes\n");
+    // Touch ID says no: nothing opens, and halti says how to type it instead.
+    let out = open("no");
+    assert!(!out.status.success() && stdout(&out).is_empty(), "{}", stdout(&out));
+    assert!(stderr(&out).ends_with("halti: acme was not opened. to type the passphrase instead: halti open acme --type\n"), "{}", stderr(&out));
+    // With --type it is typed, and Touch ID isn't asked.
+    let out = env.command().args(["open", "acme", "--type"]).env("HALTI_TEST_APPROVE", "no").env("HALTI_TEST_PASSPHRASE", PASSPHRASE).output().unwrap();
+    assert!(out.status.success() && stdout(&out) == opened && asked(&out) == 1, "{}", stderr(&out));
+    assert!(!stderr(&out).contains("open workspace acme: ") && keeps_quiet(&out, PASSPHRASE), "{}", stderr(&out));
+
+    // A copy that can't be used: said, typed once, and saved again. Then one that is gone: nothing to approve, and the
+    // usual question.
+    for change in [Some("acme passphrase two"), None] {
+        match change {
+            Some(other) => fs::write(&copy, other).unwrap(),
+            None => fs::remove_file(&copy).unwrap(),
+        }
+        let out = ws(&env, PASSPHRASE, &["open", "acme"]);
+        assert!(out.status.success() && asked(&out) == 1 && keeps_quiet(&out, PASSPHRASE), "{change:?}: {}", stderr(&out));
+        let once = stderr(&out).contains("\nthe saved passphrase of acme can't be read. type it once.\n");
+        assert_eq!(once, change.is_some(), "{change:?}: {}", stderr(&out));
+        assert_eq!(stderr(&out).contains("open workspace acme: yes"), change.is_some(), "{change:?}: {}", stderr(&out));
+        let again = "passphrase correct\nsaved the passphrase of acme in the keychain again\nworkspaces can't stay open yet, so acme was closed again\n";
+        assert_eq!(stdout(&out), again, "{change:?}");
+        assert_eq!(fs::read_to_string(&copy).unwrap(), PASSPHRASE, "{change:?}");
+    }
+
+    // Deleting asks sudo: a no keeps the workspace and its copy, a yes takes both. Nothing is typed.
+    let delete = |sudo: &str| {
+        let mut command = env.command();
+        command.args(["ws", "delete", "acme"]).env("HALTI_TEST_APPROVE", "no").env("HALTI_TEST_SUDO", sudo).env("HALTI_TEST_PASSPHRASE", "not the passphrase");
+        command.output().unwrap()
+    };
+    let out = delete("no");
+    let refused = "halti: acme was not deleted. to type the passphrase instead: halti ws delete acme --type\n";
+    assert!(!out.status.success() && stderr(&out).ends_with(refused), "{}", stderr(&out));
+    assert!(ws_dir(&env).join("dir/acme").exists() && copy.exists());
+    let out = delete("yes");
+    assert!(out.status.success() && stdout(&out) == "deleted workspace acme\n" && asked(&out) == 0, "{}", stderr(&out));
+    let said = stderr(&out);
+    assert!(said.contains("this deletes workspace acme and everything in it. it can't be undone.\nhalti: [test] sudo: yes\n"), "{said}");
+    assert!(!ws_dir(&env).join("dir/acme").exists() && !copy.exists() && keeps_quiet(&out, PASSPHRASE));
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "the keychain is only on a mac")]
+fn a_workspace_made_before_the_manager_is_typed_and_a_passphrase_line_types_it() {
+    let env = Env::new();
+    // Made while nothing kept a passphrase, as every workspace before the manager was.
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert!(config(&env, &with_keychain("touchid", "touchid"), "yes").status.success());
+    let out = ws(&env, PASSPHRASE, &["open", "acme"]);
+    assert!(out.status.success() && asked(&out) == 1 && !stderr(&out).contains("open workspace acme: "), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("saved passphrase"), "no copy, so the usual question: {}", stderr(&out));
+    let each_time = "passphrase correct\nacme was made without a saved passphrase, so it is typed each time\nworkspaces can't stay open yet, so acme was closed again\n";
+    assert_eq!(stdout(&out), each_time);
+    assert!(!saved_copy(&env, "acme").exists(), "nothing is saved for it");
+
+    // Lines back to passphrase: a new workspace's passphrase is still saved, and opening and deleting type it.
+    assert!(config(&env, &with_keychain("passphrase", "passphrase"), "yes").status.success());
+    let globex = "globex passphrase one";
+    let made = ws(&env, globex, &["ws", "new", "globex"]);
+    assert!(made.status.success() && stdout(&made).contains("\nits passphrase is saved in the keychain\n"), "{}", stdout(&made));
+    let copy = saved_copy(&env, "globex");
+    let typed = |args: &[&str]| env.command().args(args).env("HALTI_TEST_APPROVE", "no").env("HALTI_TEST_PASSPHRASE", globex).output().unwrap();
+    let out = typed(&["open", "globex"]);
+    assert!(out.status.success() && asked(&out) == 1 && !stderr(&out).contains("open workspace globex: "), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("saved passphrase") && copy.exists());
+    let out = typed(&["ws", "delete", "globex"]);
+    assert!(out.status.success() && stdout(&out) == "deleted workspace globex\n" && asked(&out) == 1, "{}", stderr(&out));
+    assert!(!copy.exists(), "the copy goes with the workspace");
+}
+
+#[test]
+fn a_workspace_line_that_needs_a_password_manager_is_refused_without_one() {
+    let env = Env::new();
+    let (to, why) = if cfg!(target_os = "macos") {
+        ("open   = \"touchid\"", "line 20: open can't be touchid while [passwords] manager is none")
+    } else {
+        ("open   = \"sudo\"", "line 20: open can't be sudo. it can only be passphrase")
+    };
+    let out = config(&env, &edited("open   = \"passphrase\"", to), "yes");
+    let refused = format!("halti: {}, {why}\nnothing was approved. fix it with: halti config\n", config_file(&env).display());
+    assert!(!out.status.success() && stderr(&out) == refused && stdout(&out).is_empty(), "{}", stderr(&out));
+    assert!(!approved_copy(&env).exists());
+    // Nothing changed: a workspace is made, opened and deleted with its passphrase, as before.
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let out = ws(&env, PASSPHRASE, &["open", "acme"]);
+    assert!(out.status.success() && asked(&out) == 1 && stdout(&out).starts_with("passphrase correct\n"), "{}", stderr(&out));
 }
 
 #[test]

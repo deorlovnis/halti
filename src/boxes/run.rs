@@ -770,7 +770,7 @@ mod tests {
     }
 
     fn request<'a>(s: &'a Setup, policy: &'a BoxPolicy, persistent: bool) -> Request<'a> {
-        Request { name: "r", id: "r".into(), policy, policy_sha: "sha-1".into(), persistent, unique: false, command: None, tty: false, stop: &s.stop, write: Some(Means::TouchId) }
+        Request { name: "r", id: "r".into(), policy, policy_sha: "sha-1".into(), persistent, unique: false, command: None, tty: false, stop: &s.stop, write: Some(Means::None) }
     }
 
     fn policy(s: &Setup, extra: &str) -> BoxPolicy {
@@ -861,7 +861,9 @@ mod tests {
         assert!(env.contains(&("GH_TOKEN".into(), names::STANDIN.into())), "the policy's stand-ins: {env:?}");
         let (writes, allow_writes, _, ask) = seen.net.clone().unwrap();
         assert_eq!((writes, allow_writes), (policy::Mode::Ask, vec!["https://api.example.com/search".to_string()]));
-        assert_eq!(ask, Some(Means::TouchId), "the door asks about writes as the box opened with");
+        // Not the door's default (Touch ID), so a request whose means were dropped would fail here.
+        assert_ne!(Some(Means::None), door::inspect::Net::default().ask);
+        assert_eq!(ask, Some(Means::None), "the door asks about writes as the box opened with");
         assert_eq!(&cmd[..2], ["sh", "-c"]);
         assert!(cmd[2].starts_with("cd /work && exec"), "{}", cmd[2]);
         assert_eq!(&cmd[3..], ["bash", "-l"]);

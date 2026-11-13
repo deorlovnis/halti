@@ -33,10 +33,22 @@ pub fn home() -> PathBuf {
     passwd_home().filter(|h| h.is_absolute()).unwrap_or_default()
 }
 
-/// The home folder in the passwd entry of the user halti runs as.
-fn passwd_home() -> Option<PathBuf> {
-    use std::ffi::CStr;
+/// The home folder in the passwd entry of the user halti runs as, whatever `HOME` says, in every build.
+pub fn passwd_home() -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
+
+    passwd_field(|entry| entry.pw_dir).map(|dir| PathBuf::from(std::ffi::OsStr::from_bytes(&dir)))
+}
+
+/// The name of the user halti runs as, from the passwd entry of its uid: never `USER` or any other
+/// variable, so the environment can't change it.
+pub fn user_name() -> Option<String> {
+    passwd_field(|entry| entry.pw_name).and_then(|name| String::from_utf8(name).ok()).filter(|name| !name.is_empty())
+}
+
+/// One text field of the passwd entry of the user halti runs as, picked by `field`.
+fn passwd_field(field: fn(&libc::passwd) -> *mut libc::c_char) -> Option<Vec<u8>> {
+    use std::ffi::CStr;
 
     let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
     let mut found = std::ptr::null_mut();
@@ -49,11 +61,12 @@ fn passwd_home() -> Option<PathBuf> {
             _ => return None,
         }
     }
-    if found.is_null() || entry.pw_dir.is_null() {
+    let text = field(&entry);
+    if found.is_null() || text.is_null() {
         return None;
     }
-    let dir = unsafe { CStr::from_ptr(entry.pw_dir) };
-    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+    // Copied out while `buf`, which the entry's fields point into, is still there.
+    Some(unsafe { CStr::from_ptr(text) }.to_bytes().to_vec())
 }
 
 pub fn config_dir() -> PathBuf {
@@ -168,6 +181,9 @@ mod tests {
     fn the_passwd_home_is_a_folder() {
         let home = super::passwd_home().unwrap();
         assert!(home.is_absolute() && home.is_dir(), "{}", home.display());
+        // The user's name comes from the same entry, whatever the environment says.
+        let name = super::user_name().unwrap();
+        assert!(!name.is_empty() && !name.contains(['/', '\0', '\n']), "{name:?}");
     }
 
     #[test]

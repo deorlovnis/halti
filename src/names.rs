@@ -26,6 +26,11 @@ pub const SIGN_IDENTITY: &str = "halti code signing";
 /// and `_audit/hmac`.
 pub const KEYCHAIN_PREFIX: &str = "halti:";
 
+/// The Keychain service prefix of a workspace's saved passphrase, `halti-ws:<id>` (the id in 32 hex
+/// characters). Not under `KEYCHAIN_PREFIX`, so no resource and field of any command, index or
+/// policy can name it. Renaming it loses every saved passphrase, which are then typed once again.
+pub const WS_KEYCHAIN_PREFIX: &str = "halti-ws:";
+
 /// The config folder under the home directory: index.json, audit.log, policy/, box/, and the
 /// refresh scripts that approved policies name by path (a dangling one blocks every re-approval).
 pub const CONFIG_DIR: &str = ".config/halti";
@@ -112,7 +117,8 @@ mod tests {
     fn the_names_are_unchanged() {
         assert_eq!((CODESIGN_IDENTIFIER, SIGN_IDENTITY), ("com.deorlovnis.halti", "halti code signing"));
         assert_eq!((KEYCHAIN_PREFIX, CONFIG_DIR, STORE_ROOT, WS_DIR), ("halti:", ".config/halti", "Library/Application Support/halti", "ws"));
-        assert_eq!((CONFIG_FILE, CONFIG_KEY_PREFIX), ("config.toml", "config."));
+        assert_eq!((CONFIG_FILE, CONFIG_KEY_PREFIX, WS_KEYCHAIN_PREFIX), ("config.toml", "config.", "halti-ws:"));
+        assert!(!WS_KEYCHAIN_PREFIX.starts_with(KEYCHAIN_PREFIX), "a saved passphrase is apart from every resource");
         assert_eq!((APPROVED_MACOS, APPROVED_LINUX), ("/Library/Application Support/halti/approved", "/etc/halti/approved"));
         assert_eq!([AGENT_IMAGE, AGENT_IMAGE_JVM, AGENT_IMAGE_RUST, BROWSER_IMAGE], ["halti-agent", "halti-agent-jvm", "halti-agent-rust", "halti-browser"]);
         assert_eq!((SHIM, SHIM_PATH), ("halti-shim", "/usr/local/bin/halti-shim"));

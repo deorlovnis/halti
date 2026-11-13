@@ -301,10 +301,11 @@ impl Build {
 }
 
 /// The Weaker adapters a release build admits on `os`. A release build admits every Production
-/// adapter and never a Dev one; a debug build admits all three.
+/// adapter and never a Dev one; a debug build admits all three. Only a Mac has a keychain to keep a
+/// copy of a passphrase in (`keychain-passphrase-key`).
 pub const fn release_accepts(os: Os) -> &'static [&'static str] {
     match os {
-        Os::Macos => &["passphrase-key", "file-anchor", "dir-files", "file-keystore"],
+        Os::Macos => &["passphrase-key", "keychain-passphrase-key", "file-anchor", "dir-files", "file-keystore"],
         Os::Linux => &["passphrase-key", "file-anchor", "dir-files", "file-keystore"],
     }
 }
@@ -454,8 +455,18 @@ mod tests {
     /// Byte for byte: a release build's labels must use these names, and a workspace records them.
     #[test]
     fn the_release_lists_are_unchanged() {
-        assert_eq!(release_accepts(Os::Macos), ["passphrase-key", "file-anchor", "dir-files", "file-keystore"]);
+        assert_eq!(release_accepts(Os::Macos), ["passphrase-key", "keychain-passphrase-key", "file-anchor", "dir-files", "file-keystore"]);
         assert_eq!(release_accepts(Os::Linux), ["passphrase-key", "file-anchor", "dir-files", "file-keystore"]);
+    }
+
+    /// A passphrase key with a copy kept in the keychain runs in a release build on a Mac, and nowhere else.
+    #[test]
+    fn a_release_build_runs_a_keychain_copy_of_a_passphrase_only_on_a_mac() {
+        let keychain = labelled("keychain-passphrase-key", Grade::Weaker);
+        assert_eq!(admit(&[keychain], Build::Release, Os::Macos), Ok(()));
+        let refused = Refusal::NotAdmitted { adapter: "keychain-passphrase-key", grade: Grade::Weaker };
+        assert_eq!(admit(&[keychain], Build::Release, Os::Linux), Err(refused));
+        assert_eq!(admit(&[keychain], Build::Dev, Os::Linux), Ok(()), "a debug build admits every adapter");
     }
 
     #[test]

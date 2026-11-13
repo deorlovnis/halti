@@ -12,7 +12,12 @@
 //! typed again to confirm.
 //!
 //! A program running as you can type into a terminal it opened, or capture what you type.
+//!
+//! Where a password manager keeps the passphrase (`saved`), the holder that makes a workspace is
+//! this one, recorded as made with the saved copy, and it keeps what was typed until `ws new` has
+//! saved it. A typed open of such a workspace keeps it too, to save it again.
 
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -26,23 +31,111 @@ use halti_core::platform::{Adapter, Build, Label};
 use halti_core::refusal::Refusal;
 use zeroize::Zeroizing;
 
-use super::random;
+use super::{random, saved};
 
 /// RFC 4648's base32 alphabet, in lowercase: easy to read out and to type.
 const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
-/// The passphrase key holder. It keeps nothing between calls: the record is the key ref, which the
-/// workspace's files hold.
+/// The passphrase key holder. It keeps nothing between commands: the record is the key ref, which
+/// the workspace's files hold.
 pub struct TtyPassphrase {
     /// `ws new` makes the passphrase and shows it once, instead of asking for one of the person's own.
     generate: bool,
+    /// What a workspace made with it records: typed each time, or with a saved copy.
+    label: Label,
+    /// Said before the passphrase is asked for, if it is.
+    before: Option<String>,
+    /// Whether it keeps the passphrase it read, for `take`.
+    keep: bool,
+    kept: RefCell<Option<Zeroizing<String>>>,
+    /// In a debug build, the answer to every question, as the test variable gives one.
+    #[cfg(halti_dev)]
+    answer: Option<Zeroizing<String>>,
 }
 
 impl TtyPassphrase {
     /// Nothing is read until a passphrase is asked for.
     pub fn new(generate: bool) -> TtyPassphrase {
-        TtyPassphrase { generate }
+        TtyPassphrase {
+            generate,
+            label: passphrase::LABEL,
+            before: None,
+            keep: false,
+            kept: RefCell::new(None),
+            #[cfg(halti_dev)]
+            answer: None,
+        }
     }
+
+    /// For a workspace whose passphrase a password manager keeps: it records the saved copy's label,
+    /// and keeps what was typed for `take`.
+    pub fn saving(self) -> TtyPassphrase {
+        TtyPassphrase { label: saved::LABEL, keep: true, ..self }
+    }
+
+    /// Keeps what is typed for `take`, to be saved again once it has opened the workspace.
+    pub fn keeping(self) -> TtyPassphrase {
+        TtyPassphrase { keep: true, ..self }
+    }
+
+    /// Says `line` before the passphrase is asked for, if it is.
+    pub fn telling(self, line: String) -> TtyPassphrase {
+        TtyPassphrase { before: Some(line), ..self }
+    }
+
+    /// Answers every question with `text`, as the test variable does: for unit tests.
+    #[cfg(all(test, halti_dev))]
+    pub fn answering(self, text: &str) -> TtyPassphrase {
+        TtyPassphrase { answer: Some(Zeroizing::new(text.to_string())), ..self }
+    }
+
+    /// The passphrase it read last, once, if it keeps them. Wiped when dropped.
+    pub fn take(&self) -> Option<Zeroizing<String>> {
+        self.kept.take()
+    }
+
+    fn remember(&self, text: &Zeroizing<String>) {
+        if self.keep {
+            *self.kept.borrow_mut() = Some(text.clone());
+        }
+    }
+
+    /// Where the passphrase is typed for `prompt`: the terminal, or a debug build's answer.
+    fn terminal(&self, prompt: &Prompt) -> Result<Terminal> {
+        #[cfg(halti_dev)]
+        if let Some(answer) = &self.answer {
+            eprintln!("halti: [test] {}", prompt.text());
+            return Ok(Terminal::Test(answer.clone()));
+        }
+        Terminal::open(prompt)
+    }
+}
+
+/// Shows `line` to the person: on the terminal, or on stderr when there is none (and in a debug
+/// build answered by its test variable, or in a unit test).
+pub fn tell(line: &str) {
+    #[cfg(halti_dev)]
+    if cfg!(test) || crate::util::dev_var("HALTI_TEST_PASSPHRASE").is_some() {
+        eprintln!("{line}");
+        return;
+    }
+    match open_tty() {
+        Ok(mut tty) => {
+            let _ = writeln!(tty, "{line}");
+        }
+        Err(_) => eprintln!("{line}"),
+    }
+}
+
+/// What the terminal says before a workspace is deleted.
+pub fn deleting(name: &WsName) -> String {
+    format!("this deletes workspace {name} and everything in it. it can't be undone.")
+}
+
+/// Opens a workspace's passphrase record with `passphrase` for `prompt`: the one place the binary
+/// unseals one. A wrong passphrase is `Refusal::Unreadable`.
+pub fn unseal(record: &PassphraseRecord, prompt: &Prompt, passphrase: &Passphrase, ct: &KemCiphertext) -> Result<Released, Refusal> {
+    record.decapsulate(prompt, passphrase, ct)
 }
 
 /// Whether a passphrase can be asked here: the terminal, or in a debug build the test variable.
@@ -136,7 +229,7 @@ fn usable(typed: Zeroizing<String>) -> Result<Zeroizing<String>> {
 
 impl Adapter for TtyPassphrase {
     fn label(&self) -> Label {
-        passphrase::LABEL
+        self.label
     }
 }
 
@@ -147,8 +240,10 @@ impl KeyHolder for TtyPassphrase {
 
     /// Asks for a new passphrase (the person's own unless `generate`), then seals a seed drawn here under it.
     fn create(&self, prompt: &Prompt, commitment: &Commitment) -> Result<(KeyRef, PublicKey)> {
-        let mut terminal = Terminal::open(prompt)?;
-        let passphrase = if self.generate { made(&mut terminal, prompt.name())? } else { own(&mut terminal, prompt.name())? };
+        let mut terminal = self.terminal(prompt)?;
+        let text = if self.generate { made(&mut terminal, prompt.name())? } else { own(&mut terminal, prompt.name())? };
+        self.remember(&text);
+        let passphrase = Passphrase::new(text)?;
         let (seed, salt, nonce) = (random::<96>()?, random::<16>()?, random::<12>()?);
         let record = PassphraseRecord::seal_seed(prompt, &passphrase, seed, commitment, KdfParams::DEFAULT, &salt, &nonce)?;
         Ok((record.to_key_ref(), record.public().clone()))
@@ -158,19 +253,23 @@ impl KeyHolder for TtyPassphrase {
         Ok(PassphraseRecord::from_key_ref(key)?.public().clone())
     }
 
-    /// Asks once, after saying what a delete removes; core's record does the rest. An answer too
-    /// short to be a passphrase is a wrong one, refused as any other is: the length rule is for
-    /// choosing a passphrase.
+    /// Asks once, after saying what it was told to and what a delete removes; core's record does
+    /// the rest. An answer too short to be a passphrase is a wrong one, refused as any other is: the
+    /// length rule is for choosing a passphrase.
     fn decapsulate(&self, key: &KeyRef, prompt: &Prompt, ct: &KemCiphertext) -> Result<Released> {
         let record = PassphraseRecord::from_key_ref(key)?;
         let name = prompt.name();
-        let mut terminal = Terminal::open(prompt)?;
+        let mut terminal = self.terminal(prompt)?;
+        if let Some(before) = &self.before {
+            tell(before);
+        }
         if prompt.change() == Change::Delete {
-            terminal.say(&format!("this deletes workspace {name} and everything in it. it can't be undone."))?;
+            terminal.say(&deleting(name))?;
         }
         let typed = terminal.ask(&format!("passphrase for workspace {name}: "))?;
+        self.remember(&typed);
         let passphrase = Passphrase::new(typed).map_err(|_| Refusal::Unreadable)?;
-        Ok(record.decapsulate(prompt, &passphrase, ct)?)
+        Ok(unseal(&record, prompt, &passphrase, ct)?)
     }
 
     /// The record is the key ref, which the workspace's files hold: there is nothing else to forget.
@@ -180,10 +279,10 @@ impl KeyHolder for TtyPassphrase {
 }
 
 /// Makes the passphrase and shows it once, then has it typed again, so it is known to be written down right.
-fn made(terminal: &mut Terminal, name: &WsName) -> Result<Passphrase> {
+fn made(terminal: &mut Terminal, name: &WsName) -> Result<Zeroizing<String>> {
     #[cfg(halti_dev)]
     if let Terminal::Test(answer) = terminal {
-        return Ok(Passphrase::new(answer.clone())?);
+        return Ok(answer.clone());
     }
     let passphrase = grouped(random::<20>()?.as_slice());
     // Built at its final length too, so no copy of the passphrase is left behind as it grows.
@@ -195,7 +294,7 @@ fn made(terminal: &mut Terminal, name: &WsName) -> Result<Passphrase> {
     terminal.say("")?;
     for left in (0..3).rev() {
         if *terminal.ask("type it again to confirm: ")? == *passphrase {
-            return Ok(Passphrase::new(passphrase)?);
+            return Ok(passphrase);
         }
         if left > 0 {
             terminal.say("that doesn't match, try again")?;
@@ -207,16 +306,16 @@ fn made(terminal: &mut Terminal, name: &WsName) -> Result<Passphrase> {
 /// Has a passphrase of the person's own typed twice, then says to write it down: nothing else can
 /// open the workspace. One too short or too long is asked for again. After three tries the error
 /// says what was wrong with the last.
-fn own(terminal: &mut Terminal, name: &WsName) -> Result<Passphrase> {
+fn own(terminal: &mut Terminal, name: &WsName) -> Result<Zeroizing<String>> {
     let question = format!("new passphrase for workspace {name} (at least {} characters): ", Passphrase::MIN_CHARS);
     let mut why = String::new();
     for left in (0..3).rev() {
         let first = terminal.ask(&question)?;
         let retry = match Passphrase::new(first.clone()) {
-            Ok(passphrase) => {
+            Ok(_) => {
                 if *terminal.ask("type it again to confirm: ")? == *first {
                     terminal.say(&format!("write this passphrase down and keep it safe. without it, {name} can't be opened."))?;
-                    return Ok(passphrase);
+                    return Ok(first);
                 }
                 why = "the two passphrases didn't match".to_string();
                 "that doesn't match"

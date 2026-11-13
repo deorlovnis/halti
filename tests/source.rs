@@ -347,6 +347,9 @@ fn the_macos_only_code_is_frozen() {
     for (path, starts, sha256) in [
         ("src/approve.rs", "fn ask_person(", "b7b125f8ba2dabaa2481bdfea29cfc6d779a96ab8f3542fe7c9dadfb55db2bdf"),
         ("src/keychain.rs", "mod backend {", "c3d98940a584a9742da7b7320e60843eca9ea2387779635ef6027c2b3442a3b8"),
+        // A workspace's saved passphrase: in the login keychain only, opened by its path under the
+        // passwd entry's home, and written only as a new item, never an update of one that is there.
+        ("src/keychain.rs", "mod saved_copy {", "709aff6cb20f81f21912db410ba21348adcc29e9372ec5b2e1046d0a7f2f057c"),
     ] {
         let block = macos_block(path, starts);
         let digest: String = Sha256::digest(block.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
@@ -484,10 +487,14 @@ fn only_core_binds_a_keystore() {
 
 /// The binary reaches a workspace's keys only through core's verbs: it never unseals a passphrase
 /// record or a wrap of its own. It names nothing of core's cryptography and no type that holds a
-/// private or inner key, and only the passphrase key holder calls a record's `decapsulate`, once.
+/// private or inner key, and only the passphrase key holder calls a record's `decapsulate`, once,
+/// in `tty::unseal` (src/ws/tty.rs). `tty::unseal` is called from two places only: the typed
+/// holder's `decapsulate` (`TtyPassphrase`, src/ws/tty.rs) and the saved-copy holder's
+/// `decapsulate` (`KeychainPassphrase`, src/ws/saved.rs), once each. Any other caller fails.
 #[test]
 fn only_core_unseals_a_workspace() {
     const NAMED: &[&str] = &["DecapKey", "InnerKey", "KemShares", "OpenKeys", "unwrap_with", "open_keys", "policy_signer"];
+    const HOLDERS: &[&str] = &["src/ws/tty.rs", "src/ws/saved.rs"];
     let mut found = Vec::new();
     for (path, text) in sources(&["src"]) {
         let Some(code) = release_code(&path, &text) else { continue };
@@ -496,13 +503,51 @@ fn only_core_unseals_a_workspace() {
             if line.contains("halti_core") && line.contains("crypto") {
                 why.push("halti_core's cryptography");
             }
-            if line.contains("decapsulate(") && path != "src/ws/tty.rs" {
+            if line.contains("decapsulate(") && path != "src/ws/tty.rs" && (path != "src/ws/saved.rs" || !line.contains("fn decapsulate(")) {
                 why.push("decapsulate(");
+            }
+            // Called, imported (renamed or not) or passed as a function outside the two holders.
+            if idents(line, "unseal") > 0 && !HOLDERS.contains(&path.as_str()) {
+                why.push("unseal");
             }
             found.extend(why.iter().map(|w| format!("{path}:{}: {w}", n + 1)));
         }
     }
     let holder = release_code("src/ws/tty.rs", &fs::read_to_string(root().join("src/ws/tty.rs")).unwrap()).unwrap();
-    assert_eq!(holder.matches("decapsulate(").count(), 2, "src/ws/tty.rs: the holder's own method and its one call of the record's");
+    assert_eq!(holder.matches("decapsulate(").count(), 2, "src/ws/tty.rs: the holder's own method and unseal's one call of the record's");
+    assert_eq!(idents(&holder, "unseal"), 2, "src/ws/tty.rs: unseal itself and the typed holder's one call");
+    assert_eq!(holder.matches("pub fn unseal(").count(), 1, "src/ws/tty.rs: unseal is defined here");
+    assert_eq!(method(&holder, "    fn decapsulate(").matches("unseal(").count(), 1, "src/ws/tty.rs: the typed holder's decapsulate calls unseal once");
+    let saved = release_code("src/ws/saved.rs", &fs::read_to_string(root().join("src/ws/saved.rs")).unwrap()).unwrap();
+    assert_eq!(saved.matches("decapsulate(").count(), 1, "src/ws/saved.rs: the holder's own method only");
+    assert_eq!(idents(&saved, "unseal"), 1, "src/ws/saved.rs: unseal is named only in the saved-copy holder's one call");
+    assert_eq!(method(&saved, "    fn decapsulate(").matches("tty::unseal(").count(), 1, "src/ws/saved.rs: the call is in the holder's decapsulate");
     assert!(found.is_empty(), "the binary opens a workspace only through core's verbs:\n{}", found.join("\n"));
+}
+
+/// The text of the method of `code` whose first line starts with `header` (an `impl` block's
+/// method, indented four spaces), up to its closing brace.
+fn method<'a>(code: &'a str, header: &str) -> &'a str {
+    let start = code.find(header).unwrap_or_else(|| panic!("no `{}`", header.trim()));
+    let end = code[start..].find("\n    }\n").map_or(code.len(), |end| start + end);
+    &code[start..end]
+}
+
+/// How many times `name` stands in `code` as a whole identifier, not as part of a longer word
+/// (`unseals`, `unseal_all`).
+fn idents(code: &str, name: &str) -> usize {
+    let part = |c: char| c.is_alphanumeric() || c == '_';
+    code.match_indices(name).filter(|&(at, _)| !code[..at].ends_with(part) && !code[at + name.len()..].starts_with(part)).count()
+}
+
+#[test]
+fn an_identifier_is_counted_whole() {
+    assert_eq!(idents("use tty::{unseal as open}; it unseals; unseal_all(); x_unseal; tty::unseal(r)", "unseal"), 2);
+}
+
+#[test]
+fn a_method_ends_at_its_own_closing_brace() {
+    let code = "impl A {\n    fn one() {\n        if x {\n            b(1);\n        }\n    }\n\n    fn two() {\n        b(2);\n    }\n}";
+    assert_eq!(method(code, "    fn one(").matches("b(").count(), 1);
+    assert_eq!(method(code, "    fn two(").matches("b(").count(), 1);
 }

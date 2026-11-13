@@ -187,6 +187,9 @@ enum Cmd {
     Open {
         /// The workspace; may be left out when there is only one
         name: Option<String>,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
     },
     /// Close a workspace (workspaces can't stay open yet, so there is nothing to close)
     Close {
@@ -336,8 +339,13 @@ enum WsCmd {
     /// List workspaces (asks for nothing)
     #[command(visible_alias = "list")]
     Ls,
-    /// Delete a workspace and everything in it; it can't be undone (asks for its passphrase)
-    Delete { name: String },
+    /// Delete a workspace and everything in it; it can't be undone (asks as halti config says)
+    Delete {
+        name: String,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
+    },
 }
 
 /// Whose passphrase `ws new` gives the workspace, if its flags say.
@@ -803,9 +811,9 @@ fn main() -> ExitCode {
         Cmd::Ws { action } => ok(match action {
             WsCmd::New { name, own, generate } => ws::new(&name, passphrase_choice(own, generate)),
             WsCmd::Ls => ws::ls(),
-            WsCmd::Delete { name } => ws::delete(&name),
+            WsCmd::Delete { name, type_it } => ws::delete(&name, type_it),
         }),
-        Cmd::Open { name } => ok(ws::open(name.as_deref())),
+        Cmd::Open { name, type_it } => ok(ws::open(name.as_deref(), type_it)),
         Cmd::Close { name } => ok(ws::close(name.as_deref())),
         Cmd::BuildInfo => {
             cmd_build_info();

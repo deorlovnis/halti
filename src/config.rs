@@ -28,7 +28,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use halti_core::platform::Os;
 use toml::de::{DeTable, DeValue};
 
-use crate::approval::{self, Action, Declined, Means, RULES, Real, World};
+use crate::approval::{self, Action, Declined, Means, RULES, Real, Rule, World};
 use crate::ws::{self, OS};
 use crate::{names, policy, util};
 use approved::{Found, Place};
@@ -57,19 +57,27 @@ pub trait Word: Copy + PartialEq + 'static {
     }
 }
 
-/// Where passwords are kept for halti's use. Only nowhere yet.
+/// Where a workspace's passphrase is kept for halti's use: nowhere, so it is typed each time, or the
+/// Keychain, which is only on a Mac. With a manager, `ws new` saves the passphrase there, and a
+/// workspace's approval lines can name another means than the passphrase.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Manager {
     None,
+    Keychain,
 }
 
 impl Word for Manager {
-    const ALL: &'static [Manager] = &[Manager::None];
+    const ALL: &'static [Manager] = &[Manager::None, Manager::Keychain];
 
     fn name(self) -> &'static str {
         match self {
             Manager::None => "none",
+            Manager::Keychain => "keychain",
         }
+    }
+
+    fn on(self, os: Os) -> bool {
+        self == Manager::None || os == Os::Macos
     }
 }
 
@@ -249,9 +257,11 @@ fn here<W: Word>(os: Os) -> Vec<W> {
 }
 
 /// What `[approval] default` can be: each means some action outside `[box.approval]` accepts on
-/// this system. A box's missing line doesn't follow it.
+/// this system, a workspace's taken as its passphrase alone, as it was before a password manager
+/// could release one. A box's missing line doesn't follow it, nor does a workspace's.
 fn default_choices(os: Os) -> Vec<Means> {
-    Means::ALL.iter().copied().filter(|means| RULES.iter().any(|rule| !rule.of_box() && rule.action.accepts(os).contains(means))).collect()
+    let accepted = |rule: &Rule, means: &Means| !rule.of_box() && rule.action.accepts(os).contains(means) && (!rule.manager || *means == Means::Passphrase);
+    Means::ALL.iter().copied().filter(|means| RULES.iter().any(|rule| accepted(rule, means))).collect()
 }
 
 /// halti's template for this system, comments and all.
@@ -328,8 +338,10 @@ fn refused(text: &str, at: usize, why: &str) -> Refused {
 
 /// The settings a file's text says, on this system. A missing line takes the template's value, and
 /// a missing approval line is as `default` says, or else the first means its action accepts; a box's
-/// is the first means it accepts, Touch ID, so a copy approved before `[box]` keeps what boxes did.
-/// Every problem is found, and the first in the file is the one refused.
+/// is the first means it accepts, Touch ID, so a copy approved before `[box]` keeps what boxes did,
+/// and a workspace's is its passphrase, as it always was. A workspace's line that releases the
+/// passphrase from a password manager needs one. Every problem is found, and the first in the file
+/// is the one refused.
 pub fn parse(text: &str, os: Os) -> Result<Settings, Refused> {
     // A control character could repaint the diff on a terminal; any other could look like another.
     if let Some((at, c)) = text.char_indices().find(|&(_, c)| !matches!(c, ' '..='~' | '\n' | '\t')) {
@@ -343,6 +355,7 @@ pub fn parse(text: &str, os: Os) -> Result<Settings, Refused> {
     let mut given = Given::default();
     let mut problems: Vec<(usize, String)> = spelling(text).into_iter().collect();
     walk(table.get_ref(), None, os, &mut given, &mut problems);
+    problems.extend(given.without_manager());
     match problems.into_iter().min_by_key(|(at, _)| *at) {
         Some((at, why)) => Err(refused(text, at, &why)),
         None => Ok(given.settings(os)),
@@ -386,6 +399,8 @@ fn spelling(text: &str) -> Option<(usize, String)> {
 struct Given {
     default: Option<Means>,
     means: BTreeMap<Action, Means>,
+    /// Where each approval line's value is.
+    means_at: BTreeMap<Action, usize>,
     workspaces: Option<Workspaces>,
     manager: Option<Manager>,
     store: Option<Store>,
@@ -395,13 +410,24 @@ struct Given {
 }
 
 impl Given {
+    /// Each workspace line that releases the passphrase from a password manager while the file
+    /// names none, with where its value is and why it is refused.
+    fn without_manager(&self) -> Vec<(usize, String)> {
+        if self.manager.unwrap_or(Manager::None) != Manager::None {
+            return Vec::new();
+        }
+        let releasing = self.means.iter().filter(|(action, means)| action.rule().manager && **means != Means::Passphrase);
+        let why = |action: &Action, means: &Means| format!("{} can't be {} while [passwords] manager is none", action.rule().key, means.name());
+        releasing.map(|(action, means)| (self.means_at.get(action).copied().unwrap_or(0), why(action, means))).collect()
+    }
+
     fn settings(self, os: Os) -> Settings {
         let default = self.default.unwrap_or(Means::Sudo);
         let mut means = BTreeMap::new();
         for rule in RULES {
             let accepts = rule.action.accepts(os);
             let line = self.means.get(&rule.action).copied();
-            let wanted = if rule.of_box() { accepts.first().copied() } else { Some(default) };
+            let wanted = if rule.of_box() || rule.manager { accepts.first().copied() } else { Some(default) };
             let chosen = line.or_else(|| wanted.filter(|means| accepts.contains(means))).or_else(|| accepts.iter().copied().find(|means| *means != Means::None));
             if let Some(chosen) = chosen {
                 means.insert(rule.action, chosen);
@@ -431,6 +457,8 @@ fn walk(table: &DeTable<'_>, inside: Option<&'static str>, os: Os, given: &mut G
                 Some(row) => {
                     if let Err(why) = take(&row, value.get_ref(), os, given) {
                         problems.push((value.span().start, why));
+                    } else if let Slot::Means(action) = row.slot {
+                        given.means_at.insert(action, value.span().start);
                     }
                     continue;
                 }
@@ -822,18 +850,26 @@ mod tests {
 
     /// The template a debug build has, as the person sees it.
     fn expected(os: Os) -> String {
-        let (default, config, boxes) = match os {
-            Os::Macos => ("sudo | touchid | passphrase", "sudo | touchid", BOX_SECTIONS),
-            Os::Linux => ("sudo | passphrase", "sudo", ""),
+        let (default, config, managers, ws, boxes) = match os {
+            Os::Macos => ("sudo | touchid | passphrase", "sudo | touchid", "none | keychain", "passphrase | sudo | touchid | none", BOX_SECTIONS),
+            Os::Linux => ("sudo | passphrase", "sudo", "none", "passphrase", ""),
         };
         format!(
             "# halti config. edit with: halti config\n\n[approval]\ndefault = \"sudo\"              # {default}\n\
              config  = \"sudo\"              # a change to this file: {config}\n\n[paths]\nworkspaces = \"~/{}/ws\"\n\n\
-             [passwords]\nmanager = \"none\"              # none\n\n[secrets]\nstore = \"files\"               # files\n\n\
+             [passwords]\nmanager = \"none\"              # {managers}\n\n[secrets]\nstore = \"files\"               # files\n\n\
              [workspace]\npassphrase = \"own\"            # own | generate\n\n[workspace.approval]\n\
-             open   = \"passphrase\"         # opening a workspace: passphrase\ndelete = \"passphrase\"         # deleting a workspace: passphrase\n{boxes}",
+             open   = \"passphrase\"         # opening a workspace: {ws}\ndelete = \"passphrase\"         # deleting a workspace: {ws}\n{boxes}",
             util::DEV_STORE_ROOT
         )
+    }
+
+    /// The template the build before a password manager could be named had: no manager, and a
+    /// workspace's lines taking its passphrase alone.
+    fn before_managers(os: Os) -> String {
+        let ws = if os == Os::Macos { "passphrase | sudo | touchid | none" } else { "passphrase" };
+        let text = template(os).replace("# none | keychain", "# none");
+        text.replace(&format!("opening a workspace: {ws}"), "opening a workspace: passphrase").replace(&format!("deleting a workspace: {ws}"), "deleting a workspace: passphrase")
     }
 
     /// The template with `config` and `workspaces` changed.
@@ -891,9 +927,17 @@ mod tests {
             ("[approval]\nconfig = \"none\"\n", Os::Linux, 2, "config can't be none. it can only be sudo"),
             ("[approval]\nconfig = \"passphrase\"\n", Os::Macos, 2, "config can't be passphrase. it can be sudo or touchid"),
             ("[approval]\nconfig = \"touchid\"\n", Os::Linux, 2, "touchid is only on a mac"),
-            ("[workspace.approval]\nopen = \"sudo\"\n", Os::Macos, 2, "open can't be sudo. it can only be passphrase"),
-            ("[workspace.approval]\ndelete = \"none\"\n", Os::Macos, 2, "delete can't be none. it can only be passphrase"),
-            ("[passwords]\nmanager = \"keychain\"\n", Os::Macos, 2, "manager can only be none"),
+            ("[workspace.approval]\nopen = \"sudo\"\n", Os::Linux, 2, "open can't be sudo. it can only be passphrase"),
+            ("[workspace.approval]\ndelete = \"none\"\n", Os::Linux, 2, "delete can't be none. it can only be passphrase"),
+            ("[workspace.approval]\nopen = \"touchid\"\n", Os::Linux, 2, "touchid is only on a mac"),
+            ("[workspace.approval]\nopen = \"always\"\n", Os::Macos, 2, "open can be passphrase, sudo, touchid or none"),
+            // A workspace's line that takes the passphrase from a password manager, where the file names none.
+            ("[workspace.approval]\nopen = \"sudo\"\n", Os::Macos, 2, "open can't be sudo while [passwords] manager is none"),
+            ("[workspace.approval]\ndelete = \"none\"\n", Os::Macos, 2, "delete can't be none while [passwords] manager is none"),
+            ("[passwords]\nmanager = \"none\"\n[workspace.approval]\ndelete = \"touchid\"\n", Os::Macos, 4, "delete can't be touchid while [passwords] manager is none"),
+            ("[passwords]\nmanager = \"keychain\"\n", Os::Linux, 2, "keychain is only on a mac"),
+            ("[passwords]\nmanager = \"vault\"\n", Os::Macos, 2, "manager can be none or keychain"),
+            ("[passwords]\nmanager = \"vault\"\n", Os::Linux, 2, "manager can only be none"),
             ("[secrets]\nstore = \"keychain\"\n", Os::Macos, 2, "store can only be files"),
             ("[workspace]\npassphrase = \"typed\"\n", Os::Macos, 2, "passphrase can be own or generate"),
             ("[box]\nengine = \"tart\"\n", Os::Macos, 2, "engine can only be container"),
@@ -989,7 +1033,7 @@ mod tests {
     #[test]
     fn a_copy_from_before_the_box_lines_keeps_touch_id_for_boxes() {
         let before = template(Os::Macos).split("\n[box]").next().unwrap().to_string();
-        assert!(before.ends_with("deleting a workspace: passphrase\n") && !before.contains("box"), "{before}");
+        assert!(before.ends_with("deleting a workspace: passphrase | sudo | touchid | none\n") && !before.contains("box"), "{before}");
         assert_eq!(parse(&before, Os::Macos), Ok(Settings::builtin(Os::Macos)));
         // Whatever `default` says, a box's missing line is Touch ID, as boxes asked before they had lines.
         for default in ["sudo", "touchid", "passphrase"] {
@@ -1011,6 +1055,51 @@ mod tests {
         assert_ne!(mine, Settings::builtin(Os::Macos));
         assert_eq!(parse(&mine.render(Os::Macos), Os::Macos), Ok(mine.clone()));
         assert_eq!(parse(&format!("{HEADER}\n{}", mine.lines(Os::Macos, true)), Os::Macos), Ok(mine));
+    }
+
+    #[test]
+    fn with_the_keychain_as_manager_a_workspace_is_approved_as_its_lines_say() {
+        let managed = |open: &str, delete: &str| format!("[passwords]\nmanager = \"keychain\"\n\n[workspace.approval]\nopen = \"{open}\"\ndelete = \"{delete}\"\n");
+        let ws = |settings: &Settings| (settings.manager, settings.means(Action::WsOpen), settings.means(Action::WsDelete));
+        for (open, delete, means) in [("sudo", "touchid", (Means::Sudo, Means::TouchId)), ("none", "passphrase", (Means::None, Means::Passphrase))] {
+            let settings = parse(&managed(open, delete), Os::Macos).unwrap();
+            assert_eq!(ws(&settings), (Manager::Keychain, Some(means.0), Some(means.1)), "{open} {delete}");
+            // What is shown reads back the same.
+            assert_eq!(parse(&settings.render(Os::Macos), Os::Macos), Ok(settings.clone()));
+        }
+        // The manager alone changes no approval: a workspace's missing line is its passphrase, whatever `default` says.
+        for default in ["sudo", "touchid", "passphrase"] {
+            let settings = parse(&format!("[approval]\ndefault = \"{default}\"\n\n[passwords]\nmanager = \"keychain\"\n"), Os::Macos).unwrap();
+            assert_eq!(ws(&settings), (Manager::Keychain, Some(Means::Passphrase), Some(Means::Passphrase)), "{default}");
+        }
+        // The line that says the manager is the one that counts, wherever it is in the file.
+        let after = "[workspace.approval]\nopen = \"touchid\"\n\n[passwords]\nmanager = \"keychain\"\n";
+        assert_eq!(parse(after, Os::Macos).unwrap().means(Action::WsOpen), Some(Means::TouchId));
+        assert_eq!(parse(&after.replace("keychain", "none"), Os::Macos), Err(Refused { line: 2, why: "open can't be touchid while [passwords] manager is none".into() }));
+        // Linux has no manager: the keychain is refused, and so is any means but the passphrase.
+        let refused = parse(&managed("passphrase", "passphrase"), Os::Linux).unwrap_err();
+        assert_eq!(refused, Refused { line: 2, why: "keychain is only on a mac".into() });
+        assert_eq!(parse("[workspace.approval]\nopen = \"passphrase\"\n", Os::Linux).unwrap().means(Action::WsOpen), Some(Means::Passphrase));
+    }
+
+    #[test]
+    fn a_copy_approved_by_the_build_before_managers_still_reads() {
+        for os in BOTH {
+            let before = before_managers(os);
+            assert!(before.contains("manager = \"none\"              # none\n") && before.contains("opening a workspace: passphrase\n"), "{before}");
+            assert_eq!(parse(&before, os), Ok(Settings::builtin(os)), "{os:?}");
+            // With any `default` it took, a workspace still opens and is deleted with its passphrase typed.
+            for default in default_choices(os) {
+                let settings = parse(&before.replace("default = \"sudo\"", &format!("default = \"{}\"", default.name())), os).unwrap();
+                assert_eq!((settings.means(Action::WsOpen), settings.means(Action::WsDelete)), (Some(Means::Passphrase), Some(Means::Passphrase)), "{os:?} {default:?}");
+                assert_eq!(settings.manager, Manager::None);
+            }
+        }
+        // As the approved copy: in effect, with nothing said about it.
+        let fake = Fake::answering(true, true);
+        *fake.anchor.borrow_mut() = Some(before_managers(Os::Macos));
+        let now = in_effect(&fake, &place(), Os::Macos);
+        assert_eq!((now.source, now.notes.len(), now.settings), (Source::Sudo, 0, Settings::builtin(Os::Macos)));
     }
 
     #[test]

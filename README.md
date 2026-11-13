@@ -85,7 +85,7 @@ config  = "sudo"              # a change to this file: sudo | touchid
 workspaces = "~/Library/Application Support/halti/ws"
 
 [passwords]
-manager = "none"              # none
+manager = "none"              # none | keychain
 
 [secrets]
 store = "files"               # files
@@ -94,8 +94,8 @@ store = "files"               # files
 passphrase = "own"            # own | generate
 
 [workspace.approval]
-open   = "passphrase"         # opening a workspace: passphrase
-delete = "passphrase"         # deleting a workspace: passphrase
+open   = "passphrase"         # opening a workspace: passphrase | sudo | touchid | none
+delete = "passphrase"         # deleting a workspace: passphrase | sudo | touchid | none
 
 [box]
 engine = "container"          # container
@@ -113,7 +113,8 @@ delete = "touchid"            # deleting a box: touchid | sudo | none
 - An edit has no effect until approved, and `[approval] config` says how. `sudo`, the default, asks for your password and writes the approved copy as root to `/Library/Application Support/halti/approved/<uid>.toml` (`/etc/halti/approved/` on Linux), where a program running as you can't change it. `touchid` (on a Mac) approves later changes with Touch ID, kept in the Keychain like a policy's approval; if that approval goes missing, the settings last approved with sudo are back in effect. It can't be `none`.
 - `halti config` shows what your edit changed, on the terminal where sudo asks, then approves it. `halti config --show` prints the settings in effect, `halti config --default` the template. Until a change is approved, every workspace command says so.
 - With no approved copy, or one someone other than root could change, the template is in effect.
-- `[approval] default` is for any action without its own line, except a box's. A workspace opens and is deleted with its own passphrase. `[paths] workspaces` is where new workspaces go: a folder that isn't there yet, an empty one only you can open, or one halti made. Ones already made stay where they are, and aren't listed until you move them there. `[workspace] passphrase` says whether `halti ws new` asks for a passphrase of your own or makes one (`--own` and `--generate` say otherwise).
+- `[approval] default` is for any action without its own line, except a box's and a workspace's. `[paths] workspaces` is where new workspaces go: a folder that isn't there yet, an empty one only you can open, or one halti made. Ones already made stay where they are, and aren't listed until you move them there. `[workspace] passphrase` says whether `halti ws new` asks for a passphrase of your own or makes one (`--own` and `--generate` say otherwise).
+- `[passwords] manager = "keychain"` (on a Mac) saves each new workspace's passphrase in your login Keychain once `halti ws new` has made it. `[workspace.approval]` says how you approve opening and deleting a workspace: `passphrase`, the default, has you type it, and the saved copy isn't used; `sudo`, `touchid` or `none` has you approve that way, or not at all, and halti takes the passphrase from the Keychain. Those three need a manager. `halti open NAME --type` and `halti ws delete NAME --type` always have you type it. The copy is kept in your login Keychain only, whatever your default keychain is. If the saved copy can't be read (after a halti update, say, or while your login Keychain is locked), halti asks you to type it once and saves it again. A workspace made before its passphrase could be saved stays typed each time; to have one saved, make the workspace again. halti never shows a Keychain window for a saved passphrase: if one asks to use an item named `halti-ws:...`, choose Deny.
 - `[box]` names what runs a box (Apple's `container`) and where its key is kept (the Keychain). `[box.approval]` says what you answer before a box opens, before its changed policy counts, before a write its policy says to ask about, before files are copied out of it, and before it is deleted: Touch ID, your password through sudo, or nothing (`none`). A write is asked while the agent has the terminal, so only Touch ID or `none` can approve it. A box line you leave out is Touch ID, whatever `default` says. A running box keeps the write approval it opened with. On Linux no box runs, so the template has no `[box]` section.
 
 ## Policies
