@@ -46,7 +46,7 @@ impl TtyPassphrase {
 }
 
 /// Whether a passphrase can be asked here: the terminal, or in a debug build the test variable.
-/// `ws new` checks this first, so with no terminal nothing is set up or made.
+/// `ws new` checks this first, so with no terminal nothing is made.
 pub fn ready() -> Result<()> {
     #[cfg(halti_dev)]
     if crate::util::dev_var("HALTI_TEST_PASSPHRASE").is_some() {
@@ -112,26 +112,13 @@ impl Terminal {
         };
         // Typeahead meant for something else must not answer this.
         unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) };
-        let typed = match sigint_ignored(|| rpassword::prompt_password(question)) {
+        let typed = match crate::util::sigint_ignored(|| rpassword::prompt_password(question)) {
             Ok(typed) => Zeroizing::new(typed),
             Err(e) if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::Interrupted) => return Err(Refusal::Declined.into()),
             Err(e) => return Err(anyhow::Error::from(e).context("reading the passphrase")),
         };
         usable(typed)
     }
-}
-
-/// Runs `read` with SIGINT ignored, then puts back what was there. rpassword reads Ctrl-C as a key
-/// and raises SIGINT itself before it says the read was interrupted: by default that ends halti
-/// there and then, with the terminal left raw and an unfinished workspace's record left behind.
-/// The terminal sends no SIGINT of its own while rpassword reads, so no other Ctrl-C is lost.
-fn sigint_ignored<T>(read: impl FnOnce() -> T) -> T {
-    let before = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
-    let got = read();
-    if before != libc::SIG_ERR {
-        unsafe { libc::signal(libc::SIGINT, before) };
-    }
-    got
 }
 
 /// What was typed, if it can be a passphrase: nothing typed is a "no". rpassword reads each byte
@@ -276,16 +263,6 @@ mod tests {
         let made = grouped(&[0xff; 20]);
         assert_eq!((made.as_str(), made.len()), ("7777-7777-7777-7777-7777", 24));
         assert!(Passphrase::new(made).is_ok(), "longer than core's minimum");
-    }
-
-    /// What rpassword does on Ctrl-C, raising SIGINT, ends the read and not the process, and what
-    /// SIGINT did before is back after.
-    #[test]
-    fn ctrl_c_at_a_prompt_ends_the_question_not_halti() {
-        let was = unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
-        let (raised, during) = sigint_ignored(|| unsafe { (libc::raise(libc::SIGINT), libc::signal(libc::SIGINT, libc::SIG_IGN)) });
-        let after = unsafe { libc::signal(libc::SIGINT, was) };
-        assert_eq!((raised, during, after), (0, libc::SIG_IGN, libc::SIG_DFL));
     }
 
     #[test]

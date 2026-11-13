@@ -42,6 +42,7 @@ would ask to approve the policies in $config/policy and $config/box, if any
 the installed halti keeps its own, and no others:
   files in $config
   files in $store
+  your approved settings, /Library/Application Support/halti/approved/$(id -u).toml (written through sudo, when you approve them)
   sockets in /tmp/halti-$(id -u)
   Keychain items named halti:...
   VMs named halti-box-... and halti-browser-...

@@ -1,0 +1,344 @@
+//! Approvals: which actions ask the person before they happen, and what answers. Each action has a
+//! line in halti's settings (`config`) naming its means, one of those its rule accepts: sudo (the
+//! person's password, asked by sudo on the terminal), touchid (the Touch ID window, macOS only),
+//! passphrase (a workspace's own passphrase, which core asks for anyway) or none.
+//!
+//! An action raised while an agent holds the terminal accepts only a means that shows its own
+//! window: the agent could answer what is asked on the terminal, or eat the keystrokes.
+//!
+//! Adding an action is one variant and one rule; its line in the settings follows from the rule.
+
+use std::ffi::OsStr;
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result, anyhow, bail};
+use halti_core::platform::Os;
+
+use crate::config::approved::{self, Found, Place};
+use crate::config::{Settings, Word};
+use crate::{approve, policy, util};
+
+/// What can ask for an approval. Later: storing a secret, and the box's actions.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Action {
+    /// A change to halti's settings.
+    Config,
+    WsOpen,
+    WsDelete,
+}
+
+/// What approves an action. Written in full everywhere: `Means::None` isn't `Option::None`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Means {
+    Sudo,
+    TouchId,
+    Passphrase,
+    None,
+}
+
+impl Word for Means {
+    const ALL: &'static [Means] = &[Means::Sudo, Means::TouchId, Means::Passphrase, Means::None];
+
+    fn name(self) -> &'static str {
+        match self {
+            Means::Sudo => "sudo",
+            Means::TouchId => "touchid",
+            Means::Passphrase => "passphrase",
+            Means::None => "none",
+        }
+    }
+
+    fn on(self, os: Os) -> bool {
+        self != Means::TouchId || os == Os::Macos
+    }
+}
+
+impl Means {
+    /// Whether it is asked on the terminal, where an agent holding it could answer.
+    pub fn asks_on_terminal(self) -> bool {
+        matches!(self, Means::Sudo | Means::Passphrase)
+    }
+}
+
+/// What an approval came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Granted {
+    /// Approved here and now (or nothing was to be asked).
+    Now,
+    /// Nothing was asked here: the workspace's own passphrase prompt, which core makes, is the approval.
+    ByPassphrase,
+}
+
+/// An action's line in the settings, and the means it accepts.
+pub struct Rule {
+    pub action: Action,
+    /// Its section and key in the settings.
+    pub table: &'static str,
+    pub key: &'static str,
+    /// What it is, as the template's comment and the screens say.
+    pub about: &'static str,
+    /// In order of preference.
+    accepts: &'static [Means],
+    /// Raised while an agent holds the terminal: then only a means with its own window is kept.
+    agent_at_terminal: bool,
+}
+
+/// Config takes only what a program running as the person can't answer: the sudo password, or the
+/// Touch ID window. A workspace unlocks with its passphrase, which core demands anyway.
+pub const RULES: &[Rule] = &[
+    Rule { action: Action::Config, table: "approval", key: "config", about: "a change to this file", accepts: &[Means::Sudo, Means::TouchId], agent_at_terminal: false },
+    Rule { action: Action::WsOpen, table: "workspace.approval", key: "open", about: "opening a workspace", accepts: &[Means::Passphrase], agent_at_terminal: false },
+    Rule { action: Action::WsDelete, table: "workspace.approval", key: "delete", about: "deleting a workspace", accepts: &[Means::Passphrase], agent_at_terminal: false },
+];
+
+impl Action {
+    pub fn rule(self) -> &'static Rule {
+        RULES.iter().find(|rule| rule.action == self).expect("every action has a rule")
+    }
+
+    /// The means it accepts on this system, in order of preference.
+    pub fn accepts(self, os: Os) -> Vec<Means> {
+        kept(self.rule(), os)
+    }
+}
+
+/// A rule's means that this system has, without those asked on the terminal when an agent holds it.
+fn kept(rule: &Rule, os: Os) -> Vec<Means> {
+    rule.accepts.iter().copied().filter(|means| means.on(os) && (!rule.agent_at_terminal || !means.asks_on_terminal())).collect()
+}
+
+/// sudo, or the person, said no.
+#[derive(Debug)]
+pub struct Declined;
+
+impl fmt::Display for Declined {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("not approved")
+    }
+}
+
+impl std::error::Error for Declined {}
+
+/// Asks for `action` as the settings say. `reason` says what is approved, in a few words.
+pub fn approve(settings: &Settings, action: Action, reason: &str) -> Result<Granted> {
+    approve_with(&Real, settings, action, reason)
+}
+
+pub fn approve_with(world: &dyn World, settings: &Settings, action: Action, reason: &str) -> Result<Granted> {
+    match settings.means(action) {
+        None => bail!("{} can't be approved on this system", action.rule().about),
+        Some(Means::Sudo) => world.sudo(reason).map(|()| Granted::Now),
+        Some(Means::TouchId) => world.touch_id(reason).map(|()| Granted::Now),
+        Some(Means::Passphrase) => Ok(Granted::ByPassphrase),
+        Some(Means::None) => Ok(Granted::Now),
+    }
+}
+
+/// What an approval reaches outside halti: the approved copy of the settings, sudo, the Touch ID
+/// window and the Keychain's approval records. Tests have one in memory (`fake_tests`).
+pub trait World {
+    /// The approved copy of the settings.
+    fn read(&self, place: &Place) -> Found;
+    fn touch_id(&self, reason: &str) -> Result<()>;
+    /// A yes or no from sudo: the person's password, typed now.
+    fn sudo(&self, reason: &str) -> Result<()>;
+    /// Writes the approved copy as root: sudo's yes is the write itself.
+    fn sudo_write(&self, place: &Place, bytes: &[u8]) -> Result<()>;
+    /// The text of the Touch ID approval record under `key`, if halti reads it silently and it is whole.
+    fn pinned(&self, key: &str) -> Option<String>;
+    fn pin(&self, key: &str, text: &str) -> Result<()>;
+    fn unpin(&self, key: &str);
+}
+
+/// This machine.
+pub struct Real;
+
+impl World for Real {
+    fn read(&self, place: &Place) -> Found {
+        approved::read(place)
+    }
+
+    fn touch_id(&self, reason: &str) -> Result<()> {
+        approve::confirm(reason)
+    }
+
+    fn sudo(&self, reason: &str) -> Result<()> {
+        #[cfg(halti_dev)]
+        if let Some(yes) = hook() {
+            return if yes { Ok(()) } else { Err(Declined.into()) };
+        }
+        run(&prompt(reason), &[OsStr::new(TRUE)], None)
+    }
+
+    fn sudo_write(&self, place: &Place, bytes: &[u8]) -> Result<()> {
+        #[cfg(halti_dev)]
+        if let Some(yes) = hook() {
+            return if yes { approved::write_here(place, bytes) } else { Err(Declined.into()) };
+        }
+        if fs::symlink_metadata(&place.dir).is_err() {
+            let make = [OsStr::new(MKDIR), OsStr::new("-p"), OsStr::new("-m"), OsStr::new("0755"), place.dir.as_os_str()];
+            run(&prompt(&format!("make {}", place.dir.display())), &make, None)?;
+        }
+        if !approved::folders_safe(place) {
+            bail!("{} could be changed by someone other than {}, so nothing was approved", place.dir.display(), place.who());
+        }
+        run(&prompt("approve these settings"), &[OsStr::new(TEE), place.file.as_os_str()], Some(bytes))
+    }
+
+    fn pinned(&self, key: &str) -> Option<String> {
+        policy::pinned_text(key)
+    }
+
+    fn pin(&self, key: &str, text: &str) -> Result<()> {
+        policy::pin(key, &policy::Approval::of(text))
+    }
+
+    fn unpin(&self, key: &str) {
+        policy::revoke(key);
+    }
+}
+
+/// The only sudo halti runs, never one found on a PATH, and the commands it runs with it.
+const SUDO: &str = "/usr/bin/sudo";
+const MKDIR: &str = "/bin/mkdir";
+const TEE: &str = "/usr/bin/tee";
+const TRUE: &str = "/usr/bin/true";
+
+/// The debug hook's answer to sudo: yes, no, or none when it isn't set. Release builds don't contain this.
+#[cfg(halti_dev)]
+fn hook() -> Option<bool> {
+    let answer = util::dev_var("HALTI_TEST_SUDO")?;
+    eprintln!("halti: [test] sudo: {}", answer.to_string_lossy());
+    Some(answer == "yes")
+}
+
+/// Whether sudo can ask here: the terminal, or in a debug build the hook.
+pub fn terminal_ready() -> Result<()> {
+    #[cfg(halti_dev)]
+    if util::dev_var("HALTI_TEST_SUDO").is_some() {
+        return Ok(());
+    }
+    OpenOptions::new().read(true).write(true).open("/dev/tty").map(drop).map_err(|_| anyhow!("there is no terminal for sudo to ask in"))
+}
+
+/// What sudo shows on the terminal itself, so a redirect can't hide what the password is for.
+/// sudo expands `%` escapes in a prompt, so each `%` is doubled.
+pub fn prompt(what: &str) -> String {
+    format!("halti needs your password to {}: ", what.replace('%', "%%"))
+}
+
+/// `/usr/bin/sudo -k -p PROMPT -- COMMAND...`, with no environment, from `/`. `-k` with a command
+/// ignores a ticket cached earlier in this terminal and leaves none, so each approval is the person
+/// typing now. The command gets umask 022 (sudo takes the union with the caller's, so the copy is
+/// readable), and SIGINT back as default: halti ignores it while it waits, and an ignored signal
+/// would be inherited, so Ctrl-C couldn't end sudo.
+pub fn sudo_command(prompt: &str, command: &[&OsStr]) -> Command {
+    let mut sudo = Command::new(SUDO);
+    sudo.env_clear().current_dir("/").args(["-k", "-p", prompt, "--"]).args(command);
+    // Only async-signal-safe calls, between fork and exec.
+    unsafe {
+        sudo.pre_exec(|| {
+            libc::umask(0o022);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    sudo
+}
+
+/// Runs `command` through sudo with `input` on its standard input (or nothing), and waits. Ctrl-C
+/// ends sudo, and halti says it wasn't approved. A debug build never runs sudo.
+fn run(prompt: &str, command: &[&OsStr], input: Option<&[u8]>) -> Result<()> {
+    if cfg!(halti_dev) {
+        bail!("a debug build doesn't run sudo");
+    }
+    if !Path::new(SUDO).is_file() {
+        bail!("sudo isn't at {SUDO}, so this can't be approved. nothing changed");
+    }
+    let mut sudo = sudo_command(prompt, command);
+    sudo.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::null());
+    let status = util::sigint_ignored(|| -> io::Result<_> {
+        let mut child = sudo.spawn()?;
+        if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+            // When sudo isn't approved it ends without reading: the write fails, and the status says why.
+            let _ = stdin.write_all(bytes);
+        }
+        child.wait()
+    })
+    .context("running sudo")?;
+    if !status.success() {
+        return Err(Declined.into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub mod fake_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approval::fake_tests::Fake;
+    use crate::config;
+
+    #[test]
+    fn every_rule_keeps_its_whole_list_where_its_means_are() {
+        for rule in RULES {
+            assert_eq!(rule.action.accepts(Os::Macos), rule.accepts, "{:?}", rule.action);
+            let linux: Vec<Means> = rule.accepts.iter().copied().filter(|means| *means != Means::TouchId).collect();
+            assert_eq!(rule.action.accepts(Os::Linux), linux, "{:?}", rule.action);
+            assert!(!rule.agent_at_terminal || rule.accepts.iter().all(|means| !means.asks_on_terminal()), "{:?} lists a means an agent could answer", rule.action);
+            assert!(!rule.accepts.is_empty() && rule.action.rule().key == rule.key);
+        }
+    }
+
+    #[test]
+    fn with_an_agent_at_the_terminal_only_a_window_is_kept() {
+        let accepts = &[Means::Sudo, Means::TouchId, Means::Passphrase];
+        let rule = Rule { action: Action::Config, table: "box.approval", key: "write", about: "a write", accepts, agent_at_terminal: true };
+        assert_eq!((kept(&rule, Os::Macos), kept(&rule, Os::Linux)), (vec![Means::TouchId], vec![]));
+        assert_eq!(Means::ALL.iter().filter(|means| means.asks_on_terminal()).count(), 2);
+    }
+
+    #[test]
+    fn a_passphrase_asks_nothing_here_and_the_others_ask_their_way() {
+        let yes = Fake::answering(true, true);
+        let builtin = config::Settings::builtin(Os::Macos);
+        for action in [Action::WsOpen, Action::WsDelete] {
+            assert_eq!(approve_with(&yes, &builtin, action, "open workspace acme").unwrap(), Granted::ByPassphrase);
+        }
+        assert!(yes.calls().is_empty(), "core asks for the passphrase");
+        assert_eq!(approve_with(&yes, &builtin, Action::Config, "change it").unwrap(), Granted::Now);
+        let touch_id = config::parse("[approval]\nconfig = \"touchid\"\n", Os::Macos).unwrap();
+        assert_eq!(approve_with(&yes, &touch_id, Action::Config, "change it again").unwrap(), Granted::Now);
+        assert_eq!(yes.calls(), ["sudo: change it", "touch id: change it again"]);
+
+        let no = Fake::answering(false, false);
+        assert!(approve_with(&no, &builtin, Action::Config, "change it").unwrap_err().is::<Declined>());
+        assert!(approve_with(&no, &touch_id, Action::Config, "change it").is_err());
+        assert_eq!(no.calls(), ["sudo: change it", "touch id: change it"]);
+    }
+
+    #[test]
+    fn sudo_runs_only_from_its_own_path_with_the_prompt_on_its_command_line() {
+        let file = OsStr::new("/etc/halti/approved/501.toml");
+        let sudo = sudo_command(&prompt("approve these settings"), &[OsStr::new(TEE), file]);
+        assert_eq!(sudo.get_program(), "/usr/bin/sudo");
+        let args: Vec<&OsStr> = sudo.get_args().collect();
+        assert_eq!(args, ["-k", "-p", "halti needs your password to approve these settings: ", "--", "/usr/bin/tee", "/etc/halti/approved/501.toml"]);
+        assert_eq!(sudo.get_current_dir(), Some(Path::new("/")));
+        assert_eq!(prompt("open 100% of it"), "halti needs your password to open 100%% of it: ");
+    }
+
+    #[test]
+    #[cfg(halti_dev)]
+    fn a_debug_build_never_runs_sudo() {
+        let error = run(&prompt("approve these settings"), &[OsStr::new(TRUE)], None).unwrap_err();
+        assert_eq!(error.to_string(), "a debug build doesn't run sudo");
+    }
+}

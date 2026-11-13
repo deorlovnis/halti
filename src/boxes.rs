@@ -35,7 +35,7 @@ use crate::chain::{self, Chain};
 use crate::door::inspect::parse_prefix;
 use crate::policy::{self, Approval, Mode, Site, Status};
 use crate::util::{config_dir, expand_home, home, store_root};
-use crate::{approve, engine, keychain, legacy, names, parse_env, parse_resource};
+use crate::{approve, config, engine, keychain, legacy, names, parse_env, parse_resource};
 pub use login::login;
 use store::Layout;
 
@@ -211,12 +211,20 @@ impl MountPolicy {
     }
 }
 
-/// Why a folder can't be handed to a box: it holds halti's own files, or everything.
+/// Why a folder can't be handed to a box: it holds halti's own files (its config, its store, the
+/// workspaces folder in effect), or everything.
 pub fn mount_problem(path: &Path) -> Option<String> {
+    mount_problem_among(path, &[config_dir(), store_root(), config::workspaces_in_effect()])
+}
+
+/// The same, with `own` as halti's folders. Each is compared as written and as its real path, since
+/// a mount is checked both ways too.
+fn mount_problem_among(path: &Path, own: &[PathBuf]) -> Option<String> {
     if path == Path::new("/") || path == home() {
         return Some("is too broad".into());
     }
-    [config_dir(), store_root()].iter().any(|own| path.starts_with(own) || own.starts_with(path)).then(|| "holds halti's own files".into())
+    let mut all = own.iter().cloned().chain(own.iter().filter_map(|dir| fs::canonicalize(dir).ok()));
+    all.any(|dir| path.starts_with(&dir) || dir.starts_with(path)).then(|| "holds halti's own files".into())
 }
 
 impl BoxPolicy {
@@ -877,6 +885,17 @@ mod tests {
             assert!(e.contains("too broad") || e.contains("halti's own"), "{text}: {e}");
         }
         assert!(BoxPolicy::parse(&format!("[[mount]]\npath = \"{}\"", home().join("Git/project").display())).is_ok());
+    }
+
+    #[test]
+    fn keeps_the_workspaces_folder_in_effect_out_of_boxes() {
+        let ws = home().join("work/ws");
+        let own = [config_dir(), store_root(), ws.clone()];
+        for path in [ws.clone(), ws.join("acme"), home().join("work")] {
+            assert_eq!(mount_problem_among(&path, &own).as_deref(), Some("holds halti's own files"), "{}", path.display());
+        }
+        assert_eq!(mount_problem_among(&home().join("work/project"), &own), None);
+        assert!(mount_problem(&config::workspaces_in_effect()).is_some(), "wherever it is");
     }
 
     #[test]

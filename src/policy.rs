@@ -629,6 +629,17 @@ fn record(res: &str) -> Option<Approval> {
     serde_json::from_str(&keychain::get_silently(res, APPROVAL)?).ok()
 }
 
+/// The text an approval record under this Keychain name keeps, if its sha256 is the one approved.
+pub fn pinned_text(key: &str) -> Option<String> {
+    let record = record(key)?;
+    record.text.filter(|text| sha256_hex(text.as_bytes()) == record.policy)
+}
+
+/// Keep `approval` under this Keychain name, in a new item only the running halti reads silently.
+pub fn pin(key: &str, approval: &Approval) -> Result<()> {
+    keychain::replace(key, APPROVAL, &serde_json::to_string(approval)?)
+}
+
 pub fn status(res: &str) -> Status {
     status_of(res, &path(res))
 }
@@ -764,9 +775,14 @@ pub fn show(res: &str) -> Result<()> {
 /// What changed from the approved text to the current one, as a unified diff. Colored
 /// (ANSI) for a terminal.
 fn diff(old: &str, new: &str, color: bool) -> String {
+    diff_from("approved", old, new, color)
+}
+
+/// What changed from `old`, which `label` names, to `new`, as a unified diff. Colored (ANSI) for a terminal.
+pub fn diff_from(label: &str, old: &str, new: &str, color: bool) -> String {
     let body = TextDiff::from_lines(old, new).unified_diff().context_radius(3).to_string();
     let paint = |code: &str, line: &str| if color { format!("\x1b[{code}m{line}\x1b[0m\n") } else { format!("{line}\n") };
-    let mut out = paint("1", "--- approved") + &paint("1", "+++ now");
+    let mut out = paint("1", &format!("--- {label}")) + &paint("1", "+++ now");
     for line in body.lines() {
         out += &paint(
             match line.as_bytes().first() {
@@ -796,11 +812,7 @@ pub fn edit(res: &str) -> Result<()> {
 /// Open an approvable file in $EDITOR and check what was saved. A file approved before shows
 /// what the edit changed (false if nothing); a new one is shown whole when approved.
 pub fn edit_file(key: &str, p: &Path, check: impl FnOnce(&str) -> Result<()>) -> Result<bool> {
-    let editor = env::var("VISUAL").or_else(|_| env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
-    let status = Command::new("sh").args(["-c", &format!("{editor} \"$1\""), "sh"]).arg(p).status()?;
-    if !status.success() {
-        bail!("{editor} exited with {status}");
-    }
+    run_editor(p)?;
     let text = fs::read_to_string(p)?;
     check(&text).with_context(|| p.display().to_string())?;
     if let Some(old) = approved_text(key) {
@@ -811,6 +823,16 @@ pub fn edit_file(key: &str, p: &Path, check: impl FnOnce(&str) -> Result<()>) ->
         println!("{}", diff(&old, &text, io::stdout().is_terminal()));
     }
     Ok(true)
+}
+
+/// Opens the file in $VISUAL, else $EDITOR, else vi, and waits for it to end.
+pub fn run_editor(p: &Path) -> Result<()> {
+    let editor = env::var("VISUAL").or_else(|_| env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
+    let status = Command::new("sh").args(["-c", &format!("{editor} \"$1\""), "sh"]).arg(p).status()?;
+    if !status.success() {
+        bail!("{editor} exited with {status}");
+    }
+    Ok(())
 }
 
 /// Say that an edited file takes effect once approved, and offer to approve it now.
@@ -972,6 +994,7 @@ mod tests {
         assert_eq!(plain, "--- approved\n+++ now\n@@ -1,2 +1,2 @@\n [run]\n-mode = \"ask\"\n+mode = \"allow\"\n");
         let colored = diff(old, new, true);
         assert!(colored.contains("\x1b[31m-mode = \"ask\"\x1b[0m\n") && colored.contains("\x1b[32m+mode = \"allow\"\x1b[0m\n"));
+        assert!(diff_from("template", old, new, false).starts_with("--- template\n+++ now\n@@ -1,2 +1,2 @@\n"));
     }
 
     #[test]

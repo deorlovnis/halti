@@ -1,8 +1,9 @@
 //! End-to-end tests: the built `halti` binary, driven the way a person and an agent drive it.
 //!
-//! The debug binary keeps Keychain items in a temp folder (HALTI_TEST_KEYCHAIN) and answers
-//! Touch ID prompts from HALTI_TEST_APPROVE, so these tests need no human and never touch the
-//! real Keychain. Run them with `mise run e2e`. Two groups need more, and are opt-in:
+//! The debug binary keeps Keychain items in a temp folder (HALTI_TEST_KEYCHAIN), answers Touch ID
+//! prompts from HALTI_TEST_APPROVE and sudo from HALTI_TEST_SUDO (it never runs sudo, and keeps the
+//! approved settings in the test's home), so these tests need no human and never touch the real
+//! Keychain or the system's folders. Run them with `mise run e2e`. Two groups need more, and are opt-in:
 //!
 //!   HALTI_E2E_BROWSER=1      the sandboxed browser (needs `npm ci` in runner/ and Chromium)
 //!   HALTI_E2E_INTERACTIVE=1  a real Touch ID approval in the real Keychain (a human taps)
@@ -11,7 +12,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1048,67 +1049,260 @@ fn names_are_checked_never_swapped_and_an_unfinished_workspace_is_cleared() {
     assert!(!dir.join("dir/globex").exists() && !dir.join(&id).exists());
 }
 
-/// The setup file of a test's debug-build home.
-fn setup_file(env: &Env) -> PathBuf {
-    env.dir.join("home").join(DEV_CONFIG_DIR).join("setup.toml")
+// --- halti config ---
+
+/// The person's settings file in a test's debug-build home.
+fn config_file(env: &Env) -> PathBuf {
+    env.dir.join("home").join(DEV_CONFIG_DIR).join("config.toml")
 }
 
-/// What `halti setup` writes today, on either system.
-const SETUP_WRITTEN: &str = "# halti setup: where new workspaces keep things. change it with: halti setup\nversion = 1\npassphrase = \"typed\"\nsecrets = \"files\"\n";
+/// The approved copy of the settings: a debug build keeps it in its own config folder, where its
+/// hook writes it as sudo would.
+fn approved_copy(env: &Env) -> PathBuf {
+    let uid = fs::metadata(&env.dir).unwrap().uid();
+    env.dir.join("home").join(DEV_CONFIG_DIR).join("approved").join(format!("{uid}.toml"))
+}
+
+/// The template a debug build has on this system.
+fn template() -> String {
+    let (default, config) = if cfg!(target_os = "macos") { ("sudo | touchid | passphrase", "sudo | touchid") } else { ("sudo | passphrase", "sudo") };
+    format!(
+        "# halti config. edit with: halti config\n\n[approval]\ndefault = \"sudo\"              # {default}\nconfig  = \"sudo\"              # a change to this file: {config}\n\n\
+         [paths]\nworkspaces = \"~/{DEV_STORE_ROOT}/ws\"\n\n[passwords]\nmanager = \"none\"              # none\n\n[secrets]\nstore = \"files\"               # files\n\n\
+         [workspace]\npassphrase = \"own\"            # own | generate\n\n[workspace.approval]\n\
+         open   = \"passphrase\"         # opening a workspace: passphrase\ndelete = \"passphrase\"         # deleting a workspace: passphrase\n"
+    )
+}
+
+/// The template with one line changed.
+fn edited(from: &str, to: &str) -> String {
+    let text = template();
+    assert!(text.contains(from), "{from}");
+    text.replace(from, to)
+}
+
+/// `halti config` with an "editor" that writes `text` into the file, and the sudo hook answering
+/// `sudo` (yes or no). No test runs the real sudo: a debug build refuses to.
+fn config(env: &Env, text: &str, sudo: &str) -> Output {
+    let file = env.dir.join("edited-config.toml");
+    fs::write(&file, text).unwrap();
+    env.command().arg("config").env("EDITOR", format!("cp {}", file.display())).env_remove("VISUAL").env("HALTI_TEST_SUDO", sudo).output().unwrap()
+}
+
+const WORKSPACES: &str = "workspaces = \"~/Library/Application Support/halti-dev/ws\"";
 
 #[test]
-fn the_first_ws_new_saves_the_setup_and_halti_setup_shows_it() {
+fn config_shows_the_template_and_what_is_in_effect() {
     let env = Env::new();
-    let place = if cfg!(target_os = "macos") { "mac" } else { "system" };
-    let lines = format!("halti setup for this {place}\n  passphrase  typed each time you open a workspace\n  secrets     kept in halti's files on this {place}\n");
-    let saved = format!("{lines}saved. change it with: halti setup\n");
-    let shown = env.halti(&["setup", "--show"]);
-    assert!(!shown.status.success() && stdout(&shown).is_empty(), "{}", stdout(&shown));
-    assert_eq!(stderr(&shown), "halti: nothing is set up yet. run: halti setup\n");
-    // A name that can't be one is refused before setup runs.
-    assert!(!ws(&env, PASSPHRASE, &["ws", "new", "Acme"]).status.success());
-    assert!(!setup_file(&env).exists());
-
-    // The first `ws new` saves the setup and says so on stderr, asking nothing; stdout is as ever.
+    let out = env.halti(&["config", "--default"]);
+    assert!(out.status.success() && stdout(&out) == template() && stderr(&out).is_empty(), "{}{}", stdout(&out), stderr(&out));
+    let shown = env.halti(&["config", "--show"]);
+    let settings = "\n[approval]\ndefault = \"sudo\"\nconfig  = \"sudo\"\n\n[paths]\n";
+    let expected = format!("no settings of yours are approved yet, so halti uses its template\n{settings}{WORKSPACES}\n\n[passwords]\nmanager = \"none\"\n");
+    assert!(shown.status.success() && stdout(&shown).starts_with(&expected) && stderr(&shown).is_empty(), "{}{}", stdout(&shown), stderr(&shown));
+    assert!(stdout(&shown).ends_with("\n[workspace.approval]\nopen   = \"passphrase\"\ndelete = \"passphrase\"\n"), "{}", stdout(&shown));
+    assert!(!config_file(&env).exists() && !approved_copy(&env).exists(), "showing writes nothing");
+    assert!(!env.halti(&["config", "--show", "--default"]).status.success());
+    // halti setup is gone, and a setup.toml an earlier build left is never read.
+    assert!(!env.halti(&["setup"]).status.success());
+    fs::create_dir_all(env.dir.join("home").join(DEV_CONFIG_DIR)).unwrap();
+    fs::write(env.dir.join("home").join(DEV_CONFIG_DIR).join("setup.toml"), "version = 1\npassphrase = \"/bin/sh\"\n").unwrap();
     let made = ws(&env, PASSPHRASE, &["ws", "new", "acme"]);
-    assert!(made.status.success() && stderr(&made).starts_with(&saved), "{}", stderr(&made));
-    assert_eq!(stdout(&made), "created workspace acme\nopen it with: halti open acme\ndebug build: this workspace opens only with a debug build\n");
-    assert_eq!(fs::read_to_string(setup_file(&env)).unwrap(), SETUP_WRITTEN);
-    assert_eq!(fs::metadata(setup_file(&env)).unwrap().permissions().mode() & 0o777, 0o600);
-    assert!(!env.dir.join("home/.config/halti").exists(), "a debug build never writes an installed halti's config");
-    let again = ws(&env, PASSPHRASE, &["ws", "new", "globex"]);
-    assert!(again.status.success() && !stderr(&again).contains("halti setup for this"), "{}", stderr(&again));
+    assert!(made.status.success() && !stderr(&made).contains("setup"), "{}", stderr(&made));
+    assert!(ws_dir(&env).join("dir/acme").exists());
+}
 
-    // Shown, and run again: nothing else to choose yet.
-    let shown = env.halti(&["setup", "--show"]);
-    assert!(shown.status.success() && stdout(&shown) == lines, "{}{}", stdout(&shown), stderr(&shown));
-    let run = env.halti(&["setup"]);
-    assert!(run.status.success() && stdout(&run) == format!("{lines}there is nothing else to choose yet\n"), "{}{}", stdout(&run), stderr(&run));
-    for template in ["mac", "linux", "custom"] {
-        let out = env.halti(&["setup", template]);
-        assert!(out.status.success() && stdout(&out) == saved, "{template}: {}{}", stdout(&out), stderr(&out));
-        assert_eq!(fs::read_to_string(setup_file(&env)).unwrap(), SETUP_WRITTEN);
-    }
-    for wrong in [&["setup", "windows"][..], &["setup", "mac", "--show"]] {
-        let out = env.halti(wrong);
-        assert!(!out.status.success() && stdout(&out).is_empty(), "{wrong:?}");
-    }
+#[test]
+fn config_approved_with_sudo_moves_where_workspaces_are() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let home = env.dir.join("home");
+    let moved = edited(WORKSPACES, "workspaces = \"~/work/ws\"");
+    let out = config(&env, &moved, "yes");
+    let said = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(said.starts_with("--- template\n+++ now\n") && !said.contains('\x1b'), "{said}");
+    assert!(said.contains(&format!("-{WORKSPACES}\n+workspaces = \"~/work/ws\"\n")), "{said}");
+    let moving = format!(
+        "workspaces in {} won't be listed after this: acme. to keep using them, move them to {}\n",
+        home.join(DEV_STORE_ROOT).join("ws").display(),
+        home.join("work/ws").display()
+    );
+    assert!(said.ends_with(&format!("{moving}approved. these settings are in effect now\n")), "{said}");
+    assert_eq!(stderr(&out), "halti: [test] sudo: yes\n");
+    // The file was made from the template, private; the approved copy holds exactly what was approved.
+    assert_eq!(fs::read_to_string(config_file(&env)).unwrap(), moved);
+    assert_eq!(fs::metadata(config_file(&env)).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::read_to_string(approved_copy(&env)).unwrap(), moved);
+    assert_eq!(fs::metadata(approved_copy(&env)).unwrap().permissions().mode() & 0o022, 0);
 
-    // A file halti didn't write: `ws new` makes nothing, the workspaces there still open, and `halti setup` writes it again.
-    let broken = "version = 1\npassphrase = \"/bin/sh\"\nsecrets = \"files\"\n";
-    fs::write(setup_file(&env), broken).unwrap();
-    let refused = ws(&env, PASSPHRASE, &["ws", "new", "initech"]);
-    let why = format!("halti: workspace initech was not created: {} isn't a setup file halti wrote. write it again with: halti setup\n", setup_file(&env).display());
-    assert!(!refused.status.success() && stderr(&refused) == why && stdout(&refused).is_empty(), "{}", stderr(&refused));
-    assert!(!stdout(&ws(&env, PASSPHRASE, &["ws", "ls"])).contains("initech") && !ws_dir(&env).join("dir/initech").exists());
-    assert_eq!(fs::read_to_string(setup_file(&env)).unwrap(), broken);
-    assert!(ws(&env, PASSPHRASE, &["open", "acme"]).status.success());
-    assert!(!env.halti(&["setup", "--show"]).status.success());
-    let run = env.halti(&["setup"]);
-    let rewritten = format!("{} couldn't be read, so halti sets it up again\n{saved}", setup_file(&env).display());
-    assert!(run.status.success() && stdout(&run) == rewritten, "{}{}", stdout(&run), stderr(&run));
-    assert_eq!(fs::read_to_string(setup_file(&env)).unwrap(), SETUP_WRITTEN);
-    assert!(ws(&env, PASSPHRASE, &["ws", "new", "initech"]).status.success());
+    // New workspaces go there now, and acme, left where it was, isn't listed.
+    let made = ws(&env, PASSPHRASE, &["ws", "new", "globex"]);
+    assert!(made.status.success() && stderr(&made).lines().all(|l| l.starts_with("halti: [test] ")), "{}", stderr(&made));
+    assert!(home.join("work/ws/dir/globex").exists());
+    let listed = stdout(&ws(&env, PASSPHRASE, &["ws", "ls"]));
+    assert!(listed.contains("globex") && !listed.contains("acme"), "{listed}");
+    let shown = stdout(&env.halti(&["config", "--show"]));
+    assert!(shown.starts_with(&format!("your settings, approved with sudo ({})\n\n", approved_copy(&env).display())), "{shown}");
+    assert!(shown.contains("\nworkspaces = \"~/work/ws\"\n"), "{shown}");
+
+    // The same again, or with a comment changed: nothing to approve, and sudo isn't asked.
+    for text in [moved.clone(), format!("# mine\n{moved}")] {
+        let out = config(&env, &text, "yes");
+        assert!(out.status.success() && stdout(&out) == "no change to the settings in effect\n" && stderr(&out).is_empty(), "{}{}", stdout(&out), stderr(&out));
+    }
+}
+
+#[test]
+fn a_config_not_approved_or_refused_changes_nothing() {
+    let env = Env::new();
+    let file = config_file(&env);
+    let moved = edited(WORKSPACES, "workspaces = \"~/work/ws\"");
+    let out = config(&env, &moved, "no");
+    let declined = format!("halti: [test] sudo: no\nhalti: not approved, so nothing changed. your edits stay in {}. approve them with: halti config\n", file.display());
+    assert!(!out.status.success() && stderr(&out) == declined, "{}", stderr(&out));
+    assert!(!stdout(&out).contains("approved."), "{}", stdout(&out));
+    assert!(!approved_copy(&env).exists());
+    // Until approved, the edit has no effect, and every workspace command says so.
+    let pending = format!("halti: changes in {} aren't approved yet, so they have no effect. approve them with: halti config\n", file.display());
+    let listed = ws(&env, PASSPHRASE, &["ws", "ls"]);
+    assert_eq!(stderr(&listed), pending);
+    let made = ws(&env, PASSPHRASE, &["ws", "new", "acme"]);
+    assert!(made.status.success() && stderr(&made).starts_with(&pending) && ws_dir(&env).join("dir/acme").exists(), "{}", stderr(&made));
+    let shown = env.halti(&["config", "--show"]);
+    assert!(stderr(&shown) == pending && stdout(&shown).starts_with("no settings of yours are approved yet"), "{}", stderr(&shown));
+
+    // A setting that can't be: refused with its line, and nothing is asked.
+    let can = if cfg!(target_os = "macos") { "can be sudo or touchid" } else { "can only be sudo" };
+    let out = config(&env, &edited("config  = \"sudo\"", "config  = \"none\""), "yes");
+    let refused = format!("halti: {}, line 5: config can't be none. it {can}\nnothing was approved. fix it with: halti config\n", file.display());
+    assert!(!out.status.success() && stderr(&out) == refused && stdout(&out).is_empty(), "{}", stderr(&out));
+    let out = config(&env, "[approval\n", "yes");
+    let said = stderr(&out);
+    assert!(said.starts_with(&format!("halti: {}, line ", file.display())), "{said}");
+    assert!(said.ends_with(": this line isn't valid toml\nnothing was approved. fix it with: halti config\n"), "{said}");
+    // The broken file is said to be so, and the settings stay as they were.
+    let listed = ws(&env, PASSPHRASE, &["ws", "ls"]);
+    assert!(stderr(&listed).contains("can't be used (line ") && stderr(&listed).contains("so the settings stay as they were. fix it with: halti config"));
+    assert!(stdout(&listed).contains("acme"), "{}", stdout(&listed));
+    assert!(!approved_copy(&env).exists());
+}
+
+#[test]
+fn a_copy_others_could_change_is_not_used() {
+    let env = Env::new();
+    let moved = edited(WORKSPACES, "workspaces = \"~/work/ws\"");
+    assert!(config(&env, &moved, "yes").status.success());
+    assert!(stdout(&env.halti(&["config", "--show"])).starts_with("your settings, approved with sudo"));
+    fs::set_permissions(approved_copy(&env), fs::Permissions::from_mode(0o664)).unwrap();
+    let shown = env.halti(&["config", "--show"]);
+    let copy = approved_copy(&env).display().to_string();
+    let not_used = format!("halti: {copy} isn't used, because someone other than you could change it or a folder above it. halti's template is in effect\n");
+    assert!(stderr(&shown).starts_with(&not_used), "{}", stderr(&shown));
+    assert!(stdout(&shown).starts_with("no settings of yours are approved yet") && stdout(&shown).contains(WORKSPACES), "{}", stdout(&shown));
+    // So new workspaces are where the template says.
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert!(ws_dir(&env).join("dir/acme").exists() && !env.dir.join("home/work/ws").exists());
+
+    // A copy that isn't settings: approving the template's own writes it again, and then nothing more
+    // is said of it. The real tee keeps the mode of a copy already there, so only the hook mends one others could change.
+    fs::set_permissions(approved_copy(&env), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(approved_copy(&env), "[approval]\nconfig = \"none\"\n").unwrap();
+    let out = config(&env, &template(), "yes");
+    let again = format!("{copy} can't be used, so approving these settings writes it again\n");
+    let said = stdout(&out);
+    assert!(out.status.success() && said.starts_with(&again) && said.ends_with("approved. these settings are in effect now\n"), "{said}{}", stderr(&out));
+    let shown = env.halti(&["config", "--show"]);
+    assert!(stderr(&shown).is_empty() && stdout(&shown).starts_with("your settings, approved with sudo"), "{}{}", stdout(&shown), stderr(&shown));
+}
+
+#[test]
+fn a_folder_halti_did_not_make_is_never_taken_for_workspaces() {
+    let env = Env::new();
+    let mine = env.dir.join("home/work/ws");
+    fs::create_dir_all(&mine).unwrap();
+    fs::write(mine.join("notes.txt"), "mine").unwrap();
+    let moved = edited(WORKSPACES, "workspaces = \"~/work/ws\"");
+    let refused = |why: &str| format!("halti: the workspaces folder {why}, so halti won't use it\nnothing was approved. fix it with: halti config\n");
+    // Open to others, or holding files of someone else's: refused, and the folder is left as it is.
+    fs::set_permissions(&mine, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = config(&env, &moved, "yes");
+    assert!(!out.status.success() && stderr(&out) == refused("is open to other users"), "{}", stderr(&out));
+    assert_eq!(fs::metadata(&mine).unwrap().permissions().mode() & 0o777, 0o755);
+    fs::set_permissions(&mine, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = config(&env, &moved, "yes");
+    assert!(!out.status.success() && stderr(&out) == refused("holds files that aren't halti's"), "{}", stderr(&out));
+    assert!(!approved_copy(&env).exists() && fs::read_dir(&mine).unwrap().count() == 1);
+
+    // Empty, it is taken, and workspaces are made there.
+    fs::remove_file(mine.join("notes.txt")).unwrap();
+    assert!(config(&env, &moved, "yes").status.success());
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    assert!(mine.join("dir/acme").exists());
+    // A file of someone else's put there later: nothing more is written in it.
+    fs::write(mine.join("notes.txt"), "mine").unwrap();
+    let made = ws(&env, PASSPHRASE, &["ws", "new", "globex"]);
+    let said = stderr(&made);
+    assert!(!made.status.success() && said.contains("the workspaces folder holds files that aren't halti's, so halti didn't write in it"), "{said}");
+    assert!(!mine.join("dir/globex").exists() && stdout(&ws(&env, PASSPHRASE, &["ws", "ls"])).contains("acme"));
+}
+
+#[test]
+fn ws_new_takes_whose_passphrase_from_the_settings_unless_told() {
+    let env = Env::new();
+    let generate = edited("passphrase = \"own\"   ", "passphrase = \"generate\"");
+    assert!(config(&env, &generate, "yes").status.success());
+    // A made passphrase: the test variable is the one made, so nothing is typed back.
+    let made = ws(&env, PASSPHRASE, &["ws", "new", "acme"]);
+    assert!(made.status.success() && (prompted(&made), asked(&made)) == (1, 0), "{}", stderr(&made));
+    let own = ws(&env, PASSPHRASE, &["ws", "new", "globex", "--own"]);
+    assert!(own.status.success() && (prompted(&own), asked(&own)) == (1, 2), "{}", stderr(&own));
+    let both = ws(&env, PASSPHRASE, &["ws", "new", "initech", "--own", "--generate"]);
+    assert!(!both.status.success() && prompted(&both) == 0);
+
+    assert!(config(&env, &template(), "yes").status.success());
+    let own = ws(&env, PASSPHRASE, &["ws", "new", "initech"]);
+    assert!(own.status.success() && (prompted(&own), asked(&own)) == (1, 2), "{}", stderr(&own));
+    let made = ws(&env, PASSPHRASE, &["ws", "new", "umbrella", "--generate"]);
+    assert!(made.status.success() && (prompted(&made), asked(&made)) == (1, 0), "{}", stderr(&made));
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "Touch ID is only on a mac")]
+fn config_approved_with_touch_id_keeps_its_record_under_the_sudo_copy() {
+    let env = Env::new();
+    let touch_id = edited("config  = \"sudo\"", "config  = \"touchid\"");
+    let out = config(&env, &touch_id, "yes");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let record = env.dir.join("keychain").join(format!("config.{}._policy", &sha256(touch_id.as_bytes())[..16]));
+    assert!(record.exists(), "sudo approved this text, so its record is made at once");
+    assert_eq!(fs::read_to_string(approved_copy(&env)).unwrap(), touch_id);
+
+    // Now Touch ID approves a change, sudo isn't asked, and the copy stays as sudo wrote it.
+    let moved = touch_id.replace(WORKSPACES, "workspaces = \"~/work/ws\"");
+    let out = config(&env, &moved, "no");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "halti: [test] approve your changed settings: yes\n");
+    assert_eq!(fs::read_to_string(approved_copy(&env)).unwrap(), touch_id);
+    assert!(fs::read_to_string(&record).unwrap().contains("work/ws"));
+    let shown = stdout(&env.halti(&["config", "--show"]));
+    assert!(shown.starts_with("your settings, approved with touch id\n\n") && shown.contains("\nworkspaces = \"~/work/ws\"\n"), "{shown}");
+
+    // The record removed: the copy sudo approved is in effect again, and halti says so.
+    fs::remove_file(&record).unwrap();
+    let shown = env.halti(&["config", "--show"]);
+    assert!(stderr(&shown).starts_with("halti: the touch id approval of your settings is missing, so the settings last approved with sudo are in effect."));
+    assert!(stdout(&shown).starts_with("your settings, approved with sudo") && stdout(&shown).contains(WORKSPACES), "{}", stdout(&shown));
+}
+
+#[test]
+#[cfg_attr(target_os = "macos", ignore = "Touch ID is there on a mac")]
+fn config_refuses_touch_id_where_there_is_none() {
+    let env = Env::new();
+    let out = config(&env, &edited("config  = \"sudo\"", "config  = \"touchid\""), "yes");
+    let refused = format!("halti: {}, line 5: touchid is only on a mac\nnothing was approved. fix it with: halti config\n", config_file(&env).display());
+    assert!(!out.status.success() && stderr(&out) == refused, "{}", stderr(&out));
+    assert!(!approved_copy(&env).exists());
 }
 
 // --- opt-in: the browser and the real Touch ID ---

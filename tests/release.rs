@@ -16,11 +16,12 @@ use std::{env, fs};
 const DEBUG: &str = env!("CARGO_BIN_EXE_halti");
 
 /// Every variable a debug build reads to switch a protection off or move its files.
-const HOOKS: [&str; 10] = [
+const HOOKS: [&str; 11] = [
     "HALTI_TEST_APPROVE",
     "HALTI_TEST_KEYCHAIN",
     "HALTI_TEST_LOGIN_RUNNER",
     "HALTI_TEST_PASSPHRASE",
+    "HALTI_TEST_SUDO",
     "HALTI_AUDIT_KEY",
     "HALTI_RUNNER_DIR",
     "HALTI_INDEX",
@@ -63,7 +64,7 @@ impl Dirs {
     }
 
     /// `bin ARGS` as namespace root, in a session with no terminal, with /root replaced by `home` and
-    /// every hook set.
+    /// every hook set. An editor is named that changes nothing.
     fn run(&self, bin: &Path, args: &[&str]) -> Output {
         let hooks = self.path("hooks");
         Command::new("setsid")
@@ -76,12 +77,15 @@ impl Dirs {
             .env("XDG_CONFIG_HOME", self.path("xdg"))
             .env("HALTI_TEST_APPROVE", "yes")
             .env("HALTI_TEST_PASSPHRASE", "acme passphrase one")
+            .env("HALTI_TEST_SUDO", "yes")
             .env("HALTI_TEST_KEYCHAIN", hooks.join("keychain"))
             .env("HALTI_INDEX", hooks.join("index.json"))
             .env("HALTI_POLICY_DIR", hooks.join("policy"))
             .env("HALTI_BOX_DIR", hooks.join("box"))
             .env("HALTI_AUDIT", hooks.join("audit.log"))
             .env("HALTI_AUDIT_KEY", "test-key")
+            .env("EDITOR", "true")
+            .env_remove("VISUAL")
             .env_remove("HALTI_REFRESHING")
             .env_remove("CRED_REFRESHING")
             .stdin(Stdio::null())
@@ -238,25 +242,12 @@ fn without_a_passwd_home_nothing_runs() {
 fn no_variable_answers_a_passphrase() {
     let dirs = Dirs::new();
     let store = "home/Library/Application Support/halti";
-    let refused = |dirs: &Dirs| {
-        let out = dirs.run(&release(), &["ws", "new", "acme"]);
-        let said = text(&out.stderr);
-        assert!(!out.status.success() && said.contains("read only from a terminal") && !said.contains("[test]"), "{said}");
-        // With no terminal, nothing is set up or made: no setup, and nothing under the store root.
-        assert!(!said.contains("halti setup for") && !dirs.path(store).exists(), "{said}");
-    };
-    refused(&dirs);
+    let out = dirs.run(&release(), &["ws", "new", "acme"]);
+    let said = text(&out.stderr);
+    assert!(!out.status.success() && said.contains("read only from a terminal") && !said.contains("[test]"), "{said}");
+    // With no terminal nothing is made: nothing under the store root, and the config folder as it was.
+    assert!(!dirs.path(store).exists(), "{said}");
     assert_eq!(dirs.names("home/.config/halti"), ["policy"]);
-    // Setup asks nothing, as there is nothing to choose: it is saved in the passwd home's config folder.
-    let setup = "halti setup for this system\n  passphrase  typed each time you open a workspace\n  secrets     kept in halti's files on this system\n";
-    let out = dirs.run(&release(), &["setup"]);
-    assert!(out.status.success() && text(&out.stdout) == format!("{setup}saved. change it with: halti setup\n"), "{}", text(&out.stderr));
-    assert_eq!(dirs.names("home/.config/halti"), ["policy", "setup.toml"]);
-    let written = fs::read_to_string(dirs.path("home/.config/halti/setup.toml")).unwrap();
-    assert_eq!(written, "# halti setup: where new workspaces keep things. change it with: halti setup\nversion = 1\npassphrase = \"typed\"\nsecrets = \"files\"\n");
-    assert_eq!(text(&dirs.run(&release(), &["setup", "--show"]).stdout), setup);
-    // Set up, it still takes no answer from a variable, and makes nothing.
-    refused(&dirs);
     let listed = text(&dirs.run(&release(), &["ws", "ls"]).stdout);
     assert!(listed.contains("no workspaces yet"), "the name is free: {listed}");
     assert!(dirs.names("env_home").is_empty() && dirs.names("xdg").is_empty(), "HOME and XDG_* are not where it writes");
@@ -265,4 +256,36 @@ fn no_variable_answers_a_passphrase() {
 
     let out = dirs.run(Path::new(DEBUG), &["ws", "new", "acme"]);
     assert!(out.status.success() && text(&out.stderr).contains("[test] [DEV, not protected] create workspace acme"), "{}", text(&out.stderr));
+}
+
+/// The template a release build has on Linux.
+const TEMPLATE: &str = "# halti config. edit with: halti config\n\n[approval]\ndefault = \"sudo\"              # sudo | passphrase\n\
+                        config  = \"sudo\"              # a change to this file: sudo\n\n[paths]\nworkspaces = \"~/Library/Application Support/halti/ws\"\n\n\
+                        [passwords]\nmanager = \"none\"              # none\n\n[secrets]\nstore = \"files\"               # files\n\n[workspace]\n\
+                        passphrase = \"own\"            # own | generate\n\n[workspace.approval]\nopen   = \"passphrase\"         # opening a workspace: passphrase\n\
+                        delete = \"passphrase\"         # deleting a workspace: passphrase\n";
+
+#[test]
+#[ignore = "needs a ci-release binary: HALTI_RELEASE_BIN=<path>, as check.sh sets"]
+fn no_variable_answers_sudo() {
+    let dirs = Dirs::new();
+    // With no terminal, sudo can't ask: refused before the editor, and nothing is written.
+    let out = dirs.run(&release(), &["config"]);
+    let said = text(&out.stderr);
+    assert!(!out.status.success() && said.contains("halti config needs a terminal, for sudo to ask for your password") && !said.contains("[test]"), "{said}");
+    assert_eq!(dirs.names("home/.config/halti"), ["policy"]);
+    assert!(dirs.names("env_home").is_empty() && dirs.names("xdg").is_empty(), "{said}");
+
+    let template = dirs.run(&release(), &["config", "--default"]);
+    assert!(template.status.success() && text(&template.stdout) == TEMPLATE, "{}", text(&template.stdout));
+    let shown = dirs.run(&release(), &["config", "--show"]);
+    let said = text(&shown.stdout);
+    assert!(shown.status.success() && said.starts_with("no settings of yours are approved yet, so halti uses its template\n\n[approval]\n"), "{said}");
+    assert!(said.contains("workspaces = \"~/Library/Application Support/halti/ws\"\n"), "{said}");
+    assert_eq!(dirs.names("home/.config/halti"), ["policy"], "showing writes nothing");
+
+    // The debug binary, with the same variables, gets past the terminal: its hook answers for sudo.
+    let out = dirs.run(Path::new(DEBUG), &["config"]);
+    let said = text(&out.stderr);
+    assert!(out.status.success() && text(&out.stdout) == "no change to the settings in effect\n" && !said.contains("needs a terminal"), "{said}");
 }

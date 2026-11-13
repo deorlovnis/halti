@@ -11,12 +11,14 @@
 #[cfg(all(halti_dev, any(halti_release, not(debug_assertions))))]
 compile_error!("halti_dev is only for debug-profile builds: a release build or one without debug assertions must not have the test hooks");
 
+mod approval;
 mod approve;
 mod audit;
 mod boxes;
 mod browse;
 mod browser;
 mod chain;
+mod config;
 mod door;
 mod engine;
 mod fetch;
@@ -34,7 +36,6 @@ mod refresh;
 #[cfg(all(halti_dev, target_os = "linux"))]
 mod sandbox;
 mod seal;
-mod setup;
 mod util;
 mod ws;
 
@@ -168,14 +169,14 @@ enum Cmd {
         #[command(subcommand)]
         action: BoxCmd,
     },
-    /// Choose where new workspaces keep their passphrase and their secrets, or show it
-    Setup {
-        /// mac or linux for a ready-made setup, custom to choose each setting
-        #[arg(value_parser = ["mac", "linux", "custom"])]
-        template: Option<String>,
-        /// Show the setup and change nothing
-        #[arg(long, conflicts_with = "template")]
+    /// Edit halti's settings and approve them (--show: the settings in effect, --default: the template)
+    Config {
+        /// Show the settings in effect and change nothing
+        #[arg(long, conflicts_with = "default")]
         show: bool,
+        /// Print halti's template and change nothing
+        #[arg(long)]
+        default: bool,
     },
     /// Workspaces, each opened with its own passphrase: create, list and delete them
     Ws {
@@ -322,10 +323,13 @@ enum PolicyCmd {
 
 #[derive(Subcommand)]
 enum WsCmd {
-    /// Create a workspace with a passphrase of your own (--generate to have one made and shown once)
+    /// Create a workspace with its own passphrase (yours, or one halti makes: as halti config says, unless --own or --generate)
     New {
         name: String,
-        /// Have halti make the passphrase and show it once, instead of typing your own
+        /// Type a passphrase of your own
+        #[arg(long, conflicts_with = "generate")]
+        own: bool,
+        /// Have halti make the passphrase and show it once
         #[arg(long)]
         generate: bool,
     },
@@ -334,6 +338,15 @@ enum WsCmd {
     Ls,
     /// Delete a workspace and everything in it; it can't be undone (asks for its passphrase)
     Delete { name: String },
+}
+
+/// Whose passphrase `ws new` gives the workspace, if its flags say.
+fn passphrase_choice(own: bool, generate: bool) -> Option<config::PassphraseMode> {
+    match (own, generate) {
+        (true, _) => Some(config::PassphraseMode::Own),
+        (_, true) => Some(config::PassphraseMode::Generate),
+        _ => None,
+    }
 }
 
 fn parse_resource(s: &str) -> Result<String, String> {
@@ -786,9 +799,9 @@ fn main() -> ExitCode {
             #[cfg(all(halti_dev, target_os = "linux"))]
             BoxCmd::Sh { engine: _, tools, command } => sandbox::sh(tools, command),
         },
-        Cmd::Setup { template, show } => ok(setup::run(template.as_deref(), show)),
+        Cmd::Config { show, default } => ok(config::command(show, default)),
         Cmd::Ws { action } => ok(match action {
-            WsCmd::New { name, generate } => ws::new(&name, generate),
+            WsCmd::New { name, own, generate } => ws::new(&name, passphrase_choice(own, generate)),
             WsCmd::Ls => ws::ls(),
             WsCmd::Delete { name } => ws::delete(&name),
         }),

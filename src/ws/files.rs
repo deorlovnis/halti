@@ -1,6 +1,7 @@
 //! Where a workspace's files are on this machine, and the three adapters over them: halti's own
 //! files (`DirFiles`), the pins (`FileAnchor`) and stored items (`FileKeystore`). The same on macOS
-//! and Linux, all under the `ws` folder of the store root:
+//! and Linux, all under the workspaces folder (`[paths] workspaces`, by default the `ws` folder of
+//! the store root):
 //!
 //! ```text
 //! ws/                    0700
@@ -12,10 +13,13 @@
 //!   ID/items/ITEM        0600   one stored item, named by 64 hex characters
 //! ```
 //!
-//! A folder is made private before anything is written in it, and one already there must be this
-//! user's and not a link. Files are opened without following a link, and replaced whole: the bytes
-//! go to a new file beside the old one, are flushed to disk, and are renamed over it. A name
-//! starting with a dot is such a file in the making, never a record or an item.
+//! The workspaces folder is used only if it isn't there yet, or is this user's alone and holds
+//! nothing or only what halti puts there (`root_problem`): a folder halti didn't make is never
+//! changed or filled. Every folder below it is made private before anything is written in it, and
+//! one already there must be this user's and not a link. Files are opened without following a link,
+//! and replaced whole: the bytes go to a new file beside the old one, are flushed to disk, and are
+//! renamed over it. A name starting with a dot is such a file in the making, never a record or an
+//! item.
 //!
 //! None of this keeps out a program running as you: it can do all of it too. It keeps out other
 //! users, accidents and a link planted to make halti write somewhere else, and the labels say no
@@ -54,8 +58,40 @@ pub const ANCHOR: Label = Label {
 pub const KEYSTORE: Label =
     Label { adapter: "file-keystore", grade: Grade::Weaker, lacks: Lacks::of(&[Property::OthersCantTouch]), why: "keystore: files; a program running as you can delete items" };
 
+/// Why halti won't use `root` as the workspaces folder, if it won't. It may not be there yet; one
+/// that is must be this user's, not a link, only they can enter it, and it holds nothing or only
+/// what halti puts there: `dir`, `pins`, `locks`, a folder for each workspace's id, an earlier
+/// build's `mark`, and Finder's `.DS_Store`.
+pub fn root_problem(root: &Path) -> Option<&'static str> {
+    let meta = match fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(_) => return Some("the workspaces folder can't be read"),
+    };
+    if !meta.is_dir() || meta.uid() != unsafe { libc::getuid() } {
+        return Some("the workspaces folder isn't a folder of yours");
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Some("the workspaces folder is open to other users");
+    }
+    let Ok(mut found) = fs::read_dir(root) else { return Some("the workspaces folder can't be read") };
+    let halti_s = |name: &str| matches!(name, "dir" | "pins" | "locks" | "mark" | ".DS_Store") || unhex::<16>(name).is_some();
+    let only_halti_s = found.all(|entry| entry.is_ok_and(|entry| entry.file_name().to_str().is_some_and(halti_s)));
+    (!only_halti_s).then_some("the workspaces folder holds files that aren't halti's")
+}
+
+/// The workspaces folder, before anything is written in it: made, private, if it isn't there, and
+/// otherwise used as it is, only if `root_problem` finds nothing wrong with it.
+fn ready_root(root: &Path) -> Result<()> {
+    if let Some(why) = root_problem(root) {
+        bail!("{why}, so halti didn't write in it. change it with: halti config");
+    }
+    private_dir(root)
+}
+
 /// A folder only this user can enter, made if it isn't there (with any folders above it that
-/// aren't). One that is there must be this user's and not a link, and is made private if it isn't.
+/// aren't). One that is there must be this user's and not a link, and is made private if it isn't:
+/// only ever one below the workspaces folder, which `ready_root` has checked.
 fn private_dir(dir: &Path) -> Result<()> {
     if let Some(parent) = dir.parent().filter(|p| !p.exists()) {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -263,7 +299,7 @@ pub struct DirFiles {
 }
 
 impl DirFiles {
-    /// Over the `ws` folder `root`. Nothing is made until something is written.
+    /// Over the workspaces folder `root`. Nothing is made until something is written.
     pub fn at(root: &Path) -> DirFiles {
         DirFiles { root: root.to_path_buf() }
     }
@@ -282,7 +318,7 @@ impl DirFiles {
 
     /// Makes the root and the file's folder private, before anything is written in them.
     fn folder_of(&self, path: &Path) -> Result<()> {
-        private_dir(&self.root)?;
+        ready_root(&self.root)?;
         private_dir(path.parent().expect("every file is in a folder under the root"))
     }
 
@@ -376,7 +412,7 @@ pub struct FileAnchor {
 }
 
 impl FileAnchor {
-    /// Over the `ws` folder `root`.
+    /// Over the workspaces folder `root`.
     pub fn at(root: &Path) -> FileAnchor {
         FileAnchor { root: root.to_path_buf() }
     }
@@ -406,7 +442,7 @@ impl Anchor for FileAnchor {
             bail!("pin version {} of workspace {ws} is not above {kept}", pin.version);
         }
         let path = self.path(ws);
-        private_dir(&self.root)?;
+        ready_root(&self.root)?;
         private_dir(path.parent().expect("a pin is in the pins folder"))?;
         replace(&path, &pin.to_bytes())
     }
@@ -422,7 +458,7 @@ pub struct FileKeystore {
 }
 
 impl FileKeystore {
-    /// Over the `ws` folder `root`.
+    /// Over the workspaces folder `root`.
     pub fn at(root: &Path) -> FileKeystore {
         FileKeystore { root: root.to_path_buf() }
     }
@@ -445,7 +481,8 @@ impl KeystoreBackend for FileKeystore {
 
     fn put(&self, ws: WsId, name: &ItemName, blob: &[u8]) -> Result<()> {
         let items = self.items(ws);
-        for folder in [self.root.as_path(), items.parent().expect("items are in a workspace's folder"), items.as_path()] {
+        ready_root(&self.root)?;
+        for folder in [items.parent().expect("items are in a workspace's folder"), items.as_path()] {
             private_dir(folder)?;
         }
         replace(&items.join(name.to_string()), blob)
@@ -578,6 +615,44 @@ mod tests {
         assert!(files.lock(acme).is_err());
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
         assert_eq!(fs::read(&file).unwrap(), b"not halti's");
+    }
+
+    #[test]
+    fn a_workspaces_folder_halti_did_not_make_is_never_changed_or_filled() {
+        let dir = TempDir::new("halti-ws-root").unwrap();
+        let root = dir.0.join("ws");
+        let (acme, globex) = (WsId::from_bytes([0x10; 16]), WsId::from_bytes([0x02; 16]));
+        // Not there yet, or there, private and empty: used.
+        assert_eq!(root_problem(&root), None);
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(root_problem(&root), None);
+        // Holding only what halti puts there: used.
+        DirFiles::at(&root).write_atomic(&FileKey::DirRecord(WsName::parse("acme").unwrap()), b"record").unwrap();
+        DirFiles::at(&root).write_atomic(&FileKey::KeyRef(acme), b"key").unwrap();
+        FileAnchor::at(&root).advance(acme, &Pin { version: 1, key_ref: [1; 48], public_key: [2; 48], state: [3; 48] }).unwrap();
+        drop(DirFiles::at(&root).lock(acme).unwrap());
+        fs::write(root.join(".DS_Store"), b"finder's").unwrap();
+        assert_eq!(root_problem(&root), None);
+        // A file of someone else's in it: nothing more is written there.
+        fs::write(root.join("notes.txt"), b"mine").unwrap();
+        assert_eq!(root_problem(&root), Some("the workspaces folder holds files that aren't halti's"));
+        let error = DirFiles::at(&root).write_atomic(&FileKey::KeyRef(globex), b"key").unwrap_err();
+        assert_eq!(error.to_string(), "the workspaces folder holds files that aren't halti's, so halti didn't write in it. change it with: halti config");
+        assert!(!root.join(globex.to_string()).exists());
+
+        // One open to others is refused, and left open and empty.
+        let shared = dir.0.join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(root_problem(&shared), Some("the workspaces folder is open to other users"));
+        assert!(DirFiles::at(&shared).lock(acme).is_err());
+        assert!(FileAnchor::at(&shared).advance(acme, &Pin { version: 1, key_ref: [1; 48], public_key: [2; 48], state: [3; 48] }).is_err());
+        assert!(FileKeystore::at(&shared).put(acme, &ItemName::from_bytes([0x07; 32]), b"acme's").is_err());
+        assert_eq!((fs::symlink_metadata(&shared).unwrap().mode() & 0o777, fs::read_dir(&shared).unwrap().count()), (0o755, 0));
+        // A file in its place is no folder of yours.
+        fs::write(dir.0.join("plain"), b"").unwrap();
+        assert_eq!(root_problem(&dir.0.join("plain")), Some("the workspaces folder isn't a folder of yours"));
     }
 
     #[test]

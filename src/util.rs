@@ -114,6 +114,20 @@ impl Drop for TempDir {
     }
 }
 
+/// Runs `read` with SIGINT ignored, then puts back what was there. rpassword reads Ctrl-C as a key
+/// and raises SIGINT itself before it says the read was interrupted: by default that ends halti
+/// there and then, with the terminal left raw and an unfinished workspace's record left behind.
+/// The terminal sends no SIGINT of its own while rpassword reads, so no other Ctrl-C is lost. While
+/// sudo runs, Ctrl-C ends sudo alone, which puts SIGINT back to default for itself.
+pub fn sigint_ignored<T>(read: impl FnOnce() -> T) -> T {
+    let before = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    let got = read();
+    if before != libc::SIG_ERR {
+        unsafe { libc::signal(libc::SIGINT, before) };
+    }
+    got
+}
+
 /// Put stdin, stdout and stderr back in blocking mode. A program that shared the terminal
 /// (`container`'s progress display, say) can leave it non-blocking, and then a long print fails
 /// with EAGAIN, which panics before any prompt is shown.
@@ -164,6 +178,16 @@ mod tests {
     #[test]
     fn environment_variables_have_the_new_name_first() {
         assert_eq!(super::env_names("WARN_DAYS"), ["HALTI_WARN_DAYS".to_string(), format!("{}WARN_DAYS", crate::legacy::ENV_PREFIX)]);
+    }
+
+    /// What rpassword does on Ctrl-C, raising SIGINT, ends the read and not the process, and what
+    /// SIGINT did before is back after.
+    #[test]
+    fn ctrl_c_at_a_prompt_ends_the_question_not_halti() {
+        let was = unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+        let (raised, during) = super::sigint_ignored(|| unsafe { (libc::raise(libc::SIGINT), libc::signal(libc::SIGINT, libc::SIG_IGN)) });
+        let after = unsafe { libc::signal(libc::SIGINT, was) };
+        assert_eq!((raised, during, after), (0, libc::SIG_IGN, libc::SIG_DFL));
     }
 
     #[test]
