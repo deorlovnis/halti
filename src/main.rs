@@ -35,6 +35,7 @@ mod refresh;
 mod sandbox;
 mod seal;
 mod util;
+mod ws;
 
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::process::ExitStatusExt;
@@ -166,6 +167,21 @@ enum Cmd {
         #[command(subcommand)]
         action: BoxCmd,
     },
+    /// Workspaces, each opened with its own passphrase: create, list and delete them
+    Ws {
+        #[command(subcommand)]
+        action: WsCmd,
+    },
+    /// Check a workspace's passphrase and files (workspaces can't stay open yet)
+    Open {
+        /// The workspace; may be left out when there is only one
+        name: Option<String>,
+    },
+    /// Close a workspace (workspaces can't stay open yet, so there is nothing to close)
+    Close {
+        /// The workspace; may be left out when there is only one
+        name: Option<String>,
+    },
     /// How this binary was built: whether it has the test hooks, its target, and where it keeps its files
     #[command(name = "build-info", hide = true)]
     BuildInfo,
@@ -292,6 +308,22 @@ enum PolicyCmd {
         #[arg(value_parser = parse_resource)]
         resources: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum WsCmd {
+    /// Create a workspace, with a generated passphrase shown once (--own-passphrase to type your own)
+    New {
+        name: String,
+        /// Type a passphrase of your own instead of a generated one
+        #[arg(long)]
+        own_passphrase: bool,
+    },
+    /// List workspaces (asks for nothing)
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Delete a workspace and everything in it; it can't be undone (asks for its passphrase)
+    Delete { name: String },
 }
 
 fn parse_resource(s: &str) -> Result<String, String> {
@@ -744,6 +776,13 @@ fn main() -> ExitCode {
             #[cfg(all(halti_dev, target_os = "linux"))]
             BoxCmd::Sh { engine: _, tools, command } => sandbox::sh(tools, command),
         },
+        Cmd::Ws { action } => ok(match action {
+            WsCmd::New { name, own_passphrase } => ws::new(&name, own_passphrase),
+            WsCmd::Ls => ws::ls(),
+            WsCmd::Delete { name } => ws::delete(&name),
+        }),
+        Cmd::Open { name } => ok(ws::open(name.as_deref())),
+        Cmd::Close { name } => ok(ws::close(name.as_deref())),
         Cmd::BuildInfo => {
             cmd_build_info();
             Ok(0)

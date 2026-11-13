@@ -30,9 +30,13 @@ pub const KEYCHAIN_PREFIX: &str = "halti:";
 /// refresh scripts that approved policies name by path (a dangling one blocks every re-approval).
 pub const CONFIG_DIR: &str = ".config/halti";
 
-/// The store root under the home directory: box stores, mount points and locks (`box/`) and
-/// downloads (`downloads/`). A box that is open holds its lock here.
+/// The store root under the home directory: box stores, mount points and locks (`box/`),
+/// downloads (`downloads/`) and workspaces (`ws/`). A box that is open holds its lock here.
 pub const STORE_ROOT: &str = "Library/Application Support/halti";
+
+/// The workspaces folder under the store root: each workspace's key file, wrap, sealed manifest
+/// and pin, and the directory of their names. Lose it and the workspaces are gone.
+pub const WS_DIR: &str = "ws";
 
 // The guest contract: compiled into the shim of every agent image that a box policy pins by
 // digest (install.sh doesn't re-pin), so the host has to keep speaking it.
@@ -94,7 +98,7 @@ mod tests {
     #[test]
     fn the_names_are_unchanged() {
         assert_eq!((CODESIGN_IDENTIFIER, SIGN_IDENTITY), ("com.deorlovnis.halti", "halti code signing"));
-        assert_eq!((KEYCHAIN_PREFIX, CONFIG_DIR, STORE_ROOT), ("halti:", ".config/halti", "Library/Application Support/halti"));
+        assert_eq!((KEYCHAIN_PREFIX, CONFIG_DIR, STORE_ROOT, WS_DIR), ("halti:", ".config/halti", "Library/Application Support/halti", "ws"));
         assert_eq!([AGENT_IMAGE, AGENT_IMAGE_JVM, AGENT_IMAGE_RUST, BROWSER_IMAGE], ["halti-agent", "halti-agent-jvm", "halti-agent-rust", "halti-browser"]);
         assert_eq!((SHIM, SHIM_PATH), ("halti-shim", "/usr/local/bin/halti-shim"));
         assert_eq!((DOOR_SOCKET, LOCAL_SOCKET, DOOR_KIND), ("/run/halti/door.sock", "/run/halti/local.sock", "halti"));

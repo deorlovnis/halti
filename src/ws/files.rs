@@ -1,0 +1,702 @@
+//! Where a workspace's files are on this machine, and the three adapters over them: halti's own
+//! files (`DirFiles`), the pins (`FileAnchor`) and stored items (`FileKeystore`). The same on macOS
+//! and Linux, all under the `ws` folder of the store root:
+//!
+//! ```text
+//! ws/                    0700
+//!   dir/NAME             0600   a directory record
+//!   pins/ID              0600   a pin, its 153 bytes
+//!   locks/ID             0600   the workspace's lock, held with flock; left in place but
+//!                               for the id of a create that failed
+//!   ID/                  0700   key, wrap, manifest, policy, log
+//!   ID/items/ITEM        0600   one stored item, named by 64 hex characters
+//! ```
+//!
+//! A folder is made private before anything is written in it, and one already there must be this
+//! user's and not a link. Files are opened without following a link, and replaced whole: the bytes
+//! go to a new file beside the old one, are flushed to disk, and are renamed over it. A name
+//! starting with a dot is such a file in the making, never a record or an item.
+//!
+//! None of this keeps out a program running as you: it can do all of it too. It keeps out other
+//! users, accidents and a link planted to make halti write somewhere else, and the labels say no
+//! more than that.
+
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use anyhow::{Context, Result, anyhow, bail};
+use halti_core::anchor::{Anchor, Pin};
+use halti_core::ids::{WsId, WsName};
+use halti_core::platform::{Adapter, Grade, Label, Lacks, Property};
+use halti_core::store::{FileKey, Files, Held, ItemName, KeystoreBackend, KeystoreKind};
+
+/// What `DirFiles` says of itself.
+pub const FILES: Label = Label {
+    adapter: "dir-files",
+    grade: Grade::Weaker,
+    lacks: Lacks::of(&[Property::OthersCantTouch, Property::RollbackProof]),
+    why: "files in a private folder: a program running as you can read, change or remove them, or put back older copies",
+};
+
+/// What `FileAnchor` says of itself.
+pub const ANCHOR: Label = Label {
+    adapter: "file-anchor",
+    grade: Grade::Weaker,
+    lacks: Lacks::of(&[Property::OthersCantTouch, Property::RollbackProof]),
+    why: "rollback not prevented: the pin is a file, and a program running as you can rewrite it or put back older files",
+};
+
+/// What `FileKeystore` says of itself.
+pub const KEYSTORE: Label =
+    Label { adapter: "file-keystore", grade: Grade::Weaker, lacks: Lacks::of(&[Property::OthersCantTouch]), why: "keystore: files; a program running as you can delete items" };
+
+/// A folder only this user can enter, made if it isn't there (with any folders above it that
+/// aren't). One that is there must be this user's and not a link, and is made private if it isn't.
+fn private_dir(dir: &Path) -> Result<()> {
+    if let Some(parent) = dir.parent().filter(|p| !p.exists()) {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+    }
+    let meta = fs::symlink_metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::getuid() } {
+        bail!("{} isn't a folder of yours", dir.display());
+    }
+    if meta.mode() & 0o077 != 0 {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| format!("making {} private", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// The most bytes a file is read with: far more than any file halti writes holds.
+const MOST: u64 = 16 << 20;
+
+/// The file's bytes, or none if it isn't there. A link is refused, not followed, and so is
+/// anything that isn't a plain file: opening never waits, so a pipe planted in its place is
+/// refused at once instead of hanging the command.
+fn read(path: &Path) -> Result<Option<Vec<u8>>> {
+    let file = match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    plain(&file, path)?;
+    let mut bytes = Vec::new();
+    file.take(MOST + 1).read_to_end(&mut bytes).with_context(|| format!("reading {}", path.display()))?;
+    if bytes.len() as u64 > MOST {
+        bail!("{} is larger than any file halti writes", path.display());
+    }
+    Ok(Some(bytes))
+}
+
+/// Refuses an open file that isn't a plain file: a pipe, a device or a folder.
+fn plain(file: &File, path: &Path) -> Result<()> {
+    if !file.metadata().with_context(|| format!("reading {}", path.display()))?.is_file() {
+        bail!("{} isn't a plain file", path.display());
+    }
+    Ok(())
+}
+
+/// Numbers the files in the making of this process.
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// A new 0600 file beside `path` with `bytes` in it, flushed to disk. Its name starts with a dot.
+/// A name already taken, by a run cut short that had this process's number, is left alone and the
+/// next one tried: only a file this call made is ever removed.
+fn beside(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    let name = path.file_name().and_then(|name| name.to_str()).expect("halti names its own files");
+    let mut tries = 0;
+    let (new, mut file) = loop {
+        let new = path.with_file_name(format!(".{name}.{}-{}", process::id(), COUNT.fetch_add(1, Ordering::Relaxed)));
+        match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&new) {
+            Ok(file) => break (new, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries < 16 => tries += 1,
+            Err(e) => return Err(e).with_context(|| format!("writing {}", new.display())),
+        }
+    };
+    if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(&new);
+        return Err(e).with_context(|| format!("writing {}", new.display()));
+    }
+    Ok(new)
+}
+
+/// Replaces the file whole, or leaves it as it was.
+fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    let new = beside(path, bytes)?;
+    if let Err(e) = fs::rename(&new, path) {
+        let _ = fs::remove_file(&new);
+        return Err(e).with_context(|| format!("writing {}", path.display()));
+    }
+    sync_folder(path);
+    Ok(())
+}
+
+/// Writes the file whole only if there is none, and says whether it did. A link, not a rename, puts
+/// it in place, so a file already there (or a link) is never replaced.
+fn create_new(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let new = beside(path, bytes)?;
+    let linked = fs::hard_link(&new, path);
+    let _ = fs::remove_file(&new);
+    match linked {
+        Ok(()) => {
+            sync_folder(path);
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("writing {}", path.display())),
+    }
+}
+
+/// Makes a rename or link in the file's folder last through a crash, as far as the system lets a
+/// folder be flushed.
+fn sync_folder(path: &Path) {
+    if let Some(folder) = path.parent() {
+        let _ = File::open(folder).and_then(|folder| folder.sync_all());
+    }
+}
+
+/// Adds the line and a newline to the end of the file, making it if it isn't there. As for a read,
+/// a link or anything that isn't a plain file is refused, at once.
+fn append(path: &Path, line: &[u8]) -> Result<()> {
+    let file = OpenOptions::new().append(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path);
+    let mut file = file.with_context(|| format!("opening {}", path.display()))?;
+    plain(&file, path)?;
+    file.write_all(&[line, b"\n".as_slice()].concat()).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Removes the file, and says whether it was there. Its folder must be this user's and not a link,
+/// as for a write, so a link planted in place of a folder never takes a file elsewhere with it.
+fn remove(path: &Path) -> Result<bool> {
+    let folder = path.parent().expect("every file is in a folder under the root");
+    match fs::symlink_metadata(folder) {
+        Ok(meta) if meta.is_dir() && meta.uid() == unsafe { libc::getuid() } => {}
+        Ok(_) => bail!("{} isn't a folder of yours", folder.display()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", folder.display())),
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// After `remove` of the file at `path`: what is left of it in the making (`.NAME.*`, from a run
+/// cut short) and Finder's `.DS_Store` go, then the folder if nothing else is in it. A folder
+/// still holding other files stays; any other failure is said, so nothing claims it gone.
+fn tidy(path: &Path) -> Result<()> {
+    let folder = path.parent().expect("every file is in a folder under the root");
+    let name = path.file_name().and_then(|name| name.to_str()).expect("halti names its own files");
+    let making = format!(".{name}.");
+    let found = match fs::read_dir(folder) {
+        Ok(found) => found,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", folder.display())),
+    };
+    for entry in found {
+        let entry = entry.with_context(|| format!("reading {}", folder.display()))?;
+        let left = entry.file_name().to_str().is_some_and(|file| file.starts_with(&making) || file == ".DS_Store");
+        if left && entry.file_type().with_context(|| format!("reading {}", folder.display()))?.is_file() {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing {}", entry.path().display())),
+            }
+        }
+    }
+    match fs::remove_dir(folder) {
+        Ok(()) => Ok(()),
+        // POSIX lets a system say a folder isn't empty with EEXIST too.
+        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists) => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", folder.display())),
+    }
+}
+
+/// The names in a folder, sorted, without those starting with a dot. A folder that isn't there has
+/// none; anything in it that isn't a plain file fails the call.
+fn entries(dir: &Path) -> Result<Vec<String>> {
+    let found = match fs::read_dir(dir) {
+        Ok(found) => found,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut names = Vec::new();
+    for entry in found {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        let name = entry.file_name().into_string().map_err(|_| anyhow!("{} holds a file whose name isn't text", dir.display()))?;
+        if name.starts_with('.') {
+            continue;
+        }
+        if !entry.file_type().with_context(|| format!("reading {}", dir.display()))?.is_file() {
+            bail!("{} isn't a plain file", entry.path().display());
+        }
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// 2N lowercase hex characters as N bytes, as ids and item names print.
+fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    let text = text.as_bytes();
+    if text.len() != 2 * N || !text.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut bytes = [0; N];
+    for (byte, pair) in bytes.iter_mut().zip(text.chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(bytes)
+}
+
+/// Halti's own files of every workspace.
+pub struct DirFiles {
+    root: PathBuf,
+}
+
+impl DirFiles {
+    /// Over the `ws` folder `root`. Nothing is made until something is written.
+    pub fn at(root: &Path) -> DirFiles {
+        DirFiles { root: root.to_path_buf() }
+    }
+
+    fn path(&self, k: &FileKey) -> PathBuf {
+        let (ws, name) = match k {
+            FileKey::DirRecord(name) => return self.root.join("dir").join(name.as_str()),
+            FileKey::KeyRef(ws) => (ws, "key"),
+            FileKey::Wrap(ws) => (ws, "wrap"),
+            FileKey::Manifest(ws) => (ws, "manifest"),
+            FileKey::Policy(ws) => (ws, "policy"),
+            FileKey::Log(ws) => (ws, "log"),
+        };
+        self.root.join(ws.to_string()).join(name)
+    }
+
+    /// Makes the root and the file's folder private, before anything is written in them.
+    fn folder_of(&self, path: &Path) -> Result<()> {
+        private_dir(&self.root)?;
+        private_dir(path.parent().expect("every file is in a folder under the root"))
+    }
+
+    fn lock_path(&self, ws: WsId) -> PathBuf {
+        self.root.join("locks").join(ws.to_string())
+    }
+
+    /// Removes the workspace's lock file, holding the lock as it does, if the file is there and no
+    /// one holds it. Only for an id no record names and nothing else will lock: every other lock
+    /// file stays, as `lock` leaves it.
+    pub fn forget_lock(&self, ws: WsId) -> Result<()> {
+        let path = self.lock_path(ws);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+        let _held = self.lock(ws)?;
+        remove(&path).map(|_| ())
+    }
+}
+
+impl Adapter for DirFiles {
+    fn label(&self) -> Label {
+        FILES
+    }
+}
+
+/// Holds a workspace's lock: closing the file lets it go.
+struct Locked(#[allow(dead_code)] File);
+
+impl Held for Locked {}
+
+impl Files for DirFiles {
+    fn read(&self, k: &FileKey) -> Result<Option<Vec<u8>>> {
+        read(&self.path(k))
+    }
+
+    fn write_atomic(&self, k: &FileKey, bytes: &[u8]) -> Result<()> {
+        let path = self.path(k);
+        self.folder_of(&path)?;
+        replace(&path, bytes)
+    }
+
+    fn create_new(&self, k: &FileKey, bytes: &[u8]) -> Result<bool> {
+        let path = self.path(k);
+        self.folder_of(&path)?;
+        create_new(&path, bytes)
+    }
+
+    fn append(&self, k: &FileKey, line: &[u8]) -> Result<()> {
+        let path = self.path(k);
+        self.folder_of(&path)?;
+        append(&path, line)
+    }
+
+    /// A workspace's folder goes with its last file (see `tidy`).
+    fn remove(&self, k: &FileKey) -> Result<()> {
+        let path = self.path(k);
+        remove(&path)?;
+        if matches!(k, FileKey::DirRecord(_)) {
+            return Ok(());
+        }
+        tidy(&path)
+    }
+
+    fn names(&self) -> Result<Vec<WsName>> {
+        let dir = self.root.join("dir");
+        entries(&dir)?.iter().map(|name| WsName::parse(name).with_context(|| format!("{} holds a file that isn't a workspace's record", dir.display()))).collect()
+    }
+
+    /// Opening never waits: a pipe planted in the lock file's place is refused at once, with or
+    /// without a reader. Taking the lock (`flock`) doesn't wait either.
+    fn lock(&self, ws: WsId) -> Result<Box<dyn Held>> {
+        let path = self.lock_path(ws);
+        self.folder_of(&path)?;
+        let file = OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path);
+        let file = file.with_context(|| format!("opening {}", path.display()))?;
+        plain(&file, &path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Box::new(Locked(file))),
+            Err(TryLockError::WouldBlock) => bail!("workspace {ws} is locked: another halti is using it"),
+            Err(TryLockError::Error(e)) => Err(e).with_context(|| format!("locking {}", path.display())),
+        }
+    }
+}
+
+/// Pins in files, one per workspace: a program running as you can rewrite one, and the label says so.
+pub struct FileAnchor {
+    root: PathBuf,
+}
+
+impl FileAnchor {
+    /// Over the `ws` folder `root`.
+    pub fn at(root: &Path) -> FileAnchor {
+        FileAnchor { root: root.to_path_buf() }
+    }
+
+    fn path(&self, ws: WsId) -> PathBuf {
+        self.root.join("pins").join(ws.to_string())
+    }
+}
+
+impl Adapter for FileAnchor {
+    fn label(&self) -> Label {
+        ANCHOR
+    }
+}
+
+impl Anchor for FileAnchor {
+    fn read(&self, ws: WsId) -> Result<Option<Pin>> {
+        let path = self.path(ws);
+        let Some(bytes) = read(&path)? else { return Ok(None) };
+        let pin = Pin::from_bytes(&bytes).with_context(|| format!("{} isn't a pin halti wrote", path.display()))?;
+        Ok(Some(pin))
+    }
+
+    fn advance(&self, ws: WsId, pin: &Pin) -> Result<()> {
+        let kept = self.read(ws)?.map_or(0, |kept| kept.version);
+        if pin.version <= kept {
+            bail!("pin version {} of workspace {ws} is not above {kept}", pin.version);
+        }
+        let path = self.path(ws);
+        private_dir(&self.root)?;
+        private_dir(path.parent().expect("a pin is in the pins folder"))?;
+        replace(&path, &pin.to_bytes())
+    }
+
+    fn forget(&self, ws: WsId) -> Result<()> {
+        remove(&self.path(ws)).map(|_| ())
+    }
+}
+
+/// Stored items in files, one per item, in the workspace's folder.
+pub struct FileKeystore {
+    root: PathBuf,
+}
+
+impl FileKeystore {
+    /// Over the `ws` folder `root`.
+    pub fn at(root: &Path) -> FileKeystore {
+        FileKeystore { root: root.to_path_buf() }
+    }
+
+    fn items(&self, ws: WsId) -> PathBuf {
+        self.root.join(ws.to_string()).join("items")
+    }
+}
+
+impl Adapter for FileKeystore {
+    fn label(&self) -> Label {
+        KEYSTORE
+    }
+}
+
+impl KeystoreBackend for FileKeystore {
+    fn kind(&self) -> KeystoreKind {
+        KeystoreKind::Files
+    }
+
+    fn put(&self, ws: WsId, name: &ItemName, blob: &[u8]) -> Result<()> {
+        let items = self.items(ws);
+        for folder in [self.root.as_path(), items.parent().expect("items are in a workspace's folder"), items.as_path()] {
+            private_dir(folder)?;
+        }
+        replace(&items.join(name.to_string()), blob)
+    }
+
+    fn get(&self, ws: WsId, name: &ItemName) -> Result<Option<Vec<u8>>> {
+        read(&self.items(ws).join(name.to_string()))
+    }
+
+    /// The workspace's items folder goes with its last item (see `tidy`).
+    fn delete(&self, ws: WsId, name: &ItemName) -> Result<bool> {
+        let item = self.items(ws).join(name.to_string());
+        let removed = remove(&item)?;
+        tidy(&item)?;
+        Ok(removed)
+    }
+
+    fn list(&self, ws: WsId) -> Result<Vec<ItemName>> {
+        let items = self.items(ws);
+        entries(&items)?.iter().map(|name| unhex(name).map(ItemName::from_bytes).with_context(|| format!("{} holds a file that isn't an item", items.display()))).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+
+    use halti_core::contract::{anchor_contract, files_contract, keystore_contract};
+    use halti_core::refusal::Refusal;
+
+    use super::*;
+    use crate::util::TempDir;
+
+    #[test]
+    fn the_files_on_disk_keep_the_contract() {
+        let dir = TempDir::new("halti-ws-files").unwrap();
+        files_contract(&DirFiles::at(&dir.0.join("ws")));
+    }
+
+    #[test]
+    fn the_anchor_on_disk_keeps_the_contract() {
+        let dir = TempDir::new("halti-ws-anchor").unwrap();
+        anchor_contract(&FileAnchor::at(&dir.0.join("ws")));
+    }
+
+    #[test]
+    fn the_keystore_on_disk_keeps_the_contract() {
+        let dir = TempDir::new("halti-ws-keystore").unwrap();
+        keystore_contract(&FileKeystore::at(&dir.0.join("ws")));
+    }
+
+    #[test]
+    fn folders_and_files_are_private_and_a_planted_link_is_never_followed() {
+        let dir = TempDir::new("halti-ws-links").unwrap();
+        let root = dir.0.join("ws");
+        let files = DirFiles::at(&root);
+        let acme = WsId::from_bytes([0x10; 16]);
+        let folder = root.join(acme.to_string());
+        files.write_atomic(&FileKey::KeyRef(acme), b"key").unwrap();
+        let mode = |p: &Path| fs::symlink_metadata(p).unwrap().mode() & 0o777;
+        assert_eq!((mode(&root), mode(&folder), mode(&folder.join("key"))), (0o700, 0o700, 0o600));
+        // A link where a file is: reading refuses it, and a write replaces the link, never what it points at.
+        let outside = dir.0.join("outside");
+        fs::write(&outside, b"not halti's").unwrap();
+        symlink(&outside, folder.join("wrap")).unwrap();
+        assert!(files.read(&FileKey::Wrap(acme)).is_err());
+        assert!(!files.create_new(&FileKey::Wrap(acme), b"wrap").unwrap(), "a link is a file that is there");
+        files.write_atomic(&FileKey::Wrap(acme), b"wrap").unwrap();
+        assert_eq!((fs::read(&outside).unwrap(), fs::read(folder.join("wrap")).unwrap()), (b"not halti's".to_vec(), b"wrap".to_vec()));
+        // A link where a folder is: nothing is written through it.
+        let globex = WsId::from_bytes([0x02; 16]);
+        symlink(&dir.0, root.join(globex.to_string())).unwrap();
+        assert!(files.write_atomic(&FileKey::KeyRef(globex), b"key").is_err());
+        assert!(!dir.0.join("key").exists());
+        fs::write(dir.0.join("wrap"), b"not halti's").unwrap();
+        assert!(files.remove(&FileKey::Wrap(globex)).is_err());
+        assert!(dir.0.join("wrap").exists(), "nothing is removed through it either");
+        // No write leaves a file in the making behind, and a held lock says so at once.
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 2);
+        let held = files.lock(acme).unwrap();
+        assert!(files.lock(acme).err().unwrap().to_string().contains("is locked: another halti is using it"));
+        drop(held);
+    }
+
+    #[test]
+    fn with_the_ws_folder_a_link_nothing_is_written_through_it() {
+        let dir = TempDir::new("halti-ws-root-link").unwrap();
+        let (root, elsewhere) = (dir.0.join("ws"), dir.0.join("elsewhere"));
+        fs::create_dir(&elsewhere).unwrap();
+        symlink(&elsewhere, &root).unwrap();
+        let (files, anchor, keystore) = (DirFiles::at(&root), FileAnchor::at(&root), FileKeystore::at(&root));
+        let acme = WsId::from_bytes([0x10; 16]);
+        assert!(files.write_atomic(&FileKey::KeyRef(acme), b"key").is_err());
+        assert!(files.create_new(&FileKey::DirRecord(WsName::parse("acme").unwrap()), b"record").is_err());
+        assert!(files.append(&FileKey::Log(acme), b"line").is_err());
+        assert!(files.lock(acme).is_err());
+        assert!(anchor.advance(acme, &Pin { version: 1, key_ref: [1; 48], public_key: [2; 48], state: [3; 48] }).is_err());
+        assert!(keystore.put(acme, &ItemName::from_bytes([0x07; 32]), b"acme's").is_err());
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing was written through the link");
+        // Removing a pin or an item checks only the folder it is in, so through this link it would
+        // reach: what stops a delete is the workspace's lock, which core takes before either, and
+        // which is refused above.
+    }
+
+    #[test]
+    fn a_link_planted_at_any_folder_or_file_halti_writes_is_refused() {
+        let dir = TempDir::new("halti-ws-sub-links").unwrap();
+        let root = dir.0.join("ws");
+        let (files, anchor, keystore) = (DirFiles::at(&root), FileAnchor::at(&root), FileKeystore::at(&root));
+        let acme = WsId::from_bytes([0x10; 16]);
+        files.write_atomic(&FileKey::KeyRef(acme), b"key").unwrap();
+        let (outside, file) = (dir.0.join("outside"), dir.0.join("outside-file"));
+        fs::create_dir(&outside).unwrap();
+        fs::write(&file, b"not halti's").unwrap();
+        for folder in [root.join("dir"), root.join("pins"), root.join("locks"), root.join(acme.to_string()).join("items")] {
+            symlink(&outside, folder).unwrap();
+        }
+        symlink(&file, root.join(acme.to_string()).join("log")).unwrap();
+        assert!(files.write_atomic(&FileKey::DirRecord(WsName::parse("acme").unwrap()), b"record").is_err());
+        assert!(anchor.advance(acme, &Pin { version: 1, key_ref: [1; 48], public_key: [2; 48], state: [3; 48] }).is_err());
+        assert!(files.lock(acme).is_err());
+        assert!(keystore.put(acme, &ItemName::from_bytes([0x07; 32]), b"acme's").is_err());
+        assert!(files.append(&FileKey::Log(acme), b"line").is_err());
+        // A link where the lock file is.
+        fs::remove_file(root.join("locks")).unwrap();
+        fs::create_dir(root.join("locks")).unwrap();
+        symlink(&file, root.join("locks").join(acme.to_string())).unwrap();
+        assert!(files.lock(acme).is_err());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(fs::read(&file).unwrap(), b"not halti's");
+    }
+
+    #[test]
+    fn a_pipe_or_an_oversized_file_is_refused_at_once() {
+        let dir = TempDir::new("halti-ws-fifo").unwrap();
+        let root = dir.0.join("ws");
+        let files = DirFiles::at(&root);
+        let globex = WsId::from_bytes([0x02; 16]);
+        files.write_atomic(&FileKey::KeyRef(globex), b"key").unwrap();
+        fs::create_dir_all(root.join("dir")).unwrap();
+        fs::create_dir_all(root.join("locks")).unwrap();
+        // Pipes with no one at the other end: an open that waited would wait for good.
+        let fifo = |path: PathBuf| {
+            let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        };
+        fifo(root.join("dir/initech"));
+        fifo(root.join(globex.to_string()).join("log"));
+        fifo(root.join("locks").join(globex.to_string()));
+        let error = files.read(&FileKey::DirRecord(WsName::parse("initech").unwrap())).unwrap_err();
+        assert!(error.to_string().contains("isn't a plain file"), "{error:#}");
+        assert!(files.append(&FileKey::Log(globex), b"line").is_err());
+        assert!(files.lock(globex).is_err());
+        // A plain file larger than any halti writes is refused, not read whole.
+        File::create(root.join("dir/acme")).unwrap().set_len(MOST + 1).unwrap();
+        let error = files.read(&FileKey::DirRecord(WsName::parse("acme").unwrap())).unwrap_err();
+        assert!(error.to_string().contains("is larger than any file halti writes"), "{error:#}");
+    }
+
+    #[test]
+    fn a_file_in_the_making_left_by_a_run_with_this_number_is_never_removed() {
+        let dir = TempDir::new("halti-ws-strays").unwrap();
+        let files = DirFiles::at(&dir.0.join("ws"));
+        let acme = WsId::from_bytes([0x10; 16]);
+        files.write_atomic(&FileKey::KeyRef(acme), b"old").unwrap();
+        // Left under the next names this process takes, by a run cut short whose process had its number.
+        let folder = dir.0.join("ws").join(acme.to_string());
+        let next = COUNT.load(Ordering::Relaxed);
+        let strays: Vec<PathBuf> = (next..next + 4).map(|n| folder.join(format!(".key.{}-{n}", process::id()))).collect();
+        for stray in &strays {
+            fs::write(stray, b"not this run's").unwrap();
+        }
+        files.write_atomic(&FileKey::KeyRef(acme), b"new").unwrap();
+        assert_eq!(fs::read(folder.join("key")).unwrap(), b"new");
+        assert!(strays.iter().all(|stray| fs::read(stray).unwrap() == b"not this run's"), "each is left as it was");
+    }
+
+    #[test]
+    fn a_workspace_folder_goes_with_its_last_file_and_what_was_left_half_written() {
+        let dir = TempDir::new("halti-ws-tidy").unwrap();
+        let root = dir.0.join("ws");
+        let (files, keystore) = (DirFiles::at(&root), FileKeystore::at(&root));
+        let acme = WsId::from_bytes([0x10; 16]);
+        let all = [FileKey::Wrap(acme), FileKey::KeyRef(acme), FileKey::Manifest(acme), FileKey::Policy(acme), FileKey::Log(acme)];
+        for file in &all {
+            files.write_atomic(file, b"written").unwrap();
+        }
+        let item = ItemName::from_bytes([0x07; 32]);
+        keystore.put(acme, &item, b"acme's").unwrap();
+        // A key record cut short before its rename, an item's, and Finder's litter in both folders.
+        let folder = root.join(acme.to_string());
+        for left in [folder.join(".key.4242-0"), folder.join(".DS_Store"), folder.join("items/.DS_Store"), folder.join(format!("items/.{item}.4242-0"))] {
+            fs::write(left, b"left").unwrap();
+        }
+        assert!(keystore.delete(acme, &item).unwrap());
+        assert!(!folder.join("items").exists());
+        for file in &all {
+            files.remove(file).unwrap();
+        }
+        assert!(!folder.exists());
+        // A file that isn't halti's keeps the folder, and is left as it is.
+        files.write_atomic(&FileKey::KeyRef(acme), b"written").unwrap();
+        fs::write(folder.join("notes"), b"mine").unwrap();
+        files.remove(&FileKey::KeyRef(acme)).unwrap();
+        assert_eq!(fs::read(folder.join("notes")).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn a_lock_file_is_forgotten_only_while_no_one_holds_it() {
+        let dir = TempDir::new("halti-ws-forget-lock").unwrap();
+        let files = DirFiles::at(&dir.0.join("ws"));
+        let acme = WsId::from_bytes([0x10; 16]);
+        files.forget_lock(acme).unwrap();
+        assert!(!dir.0.join("ws").exists(), "with no lock file, nothing is made");
+        let path = dir.0.join("ws/locks").join(acme.to_string());
+        let held = files.lock(acme).unwrap();
+        assert!(files.forget_lock(acme).is_err() && path.exists(), "it is held");
+        drop(held);
+        files.forget_lock(acme).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_pin_file_is_its_153_bytes_and_any_other_is_refused() {
+        let dir = TempDir::new("halti-ws-pin").unwrap();
+        let anchor = FileAnchor::at(&dir.0.join("ws"));
+        let acme = WsId::from_bytes([0x10; 16]);
+        let pin = Pin { version: 1, key_ref: [1; 48], public_key: [2; 48], state: [3; 48] };
+        anchor.advance(acme, &pin).unwrap();
+        let path = dir.0.join("ws/pins").join(acme.to_string());
+        assert_eq!(fs::read(&path).unwrap(), pin.to_bytes());
+        fs::write(&path, &pin.to_bytes()[..152]).unwrap();
+        let error = anchor.read(acme).unwrap_err();
+        assert_eq!(error.downcast_ref::<Refusal>(), Some(&Refusal::Unreadable), "{error:#}");
+    }
+
+    #[test]
+    fn a_listing_skips_files_in_the_making_and_refuses_anything_else() {
+        let dir = TempDir::new("halti-ws-names").unwrap();
+        let files = DirFiles::at(&dir.0.join("ws"));
+        files.write_atomic(&FileKey::DirRecord(WsName::parse("acme").unwrap()), b"record").unwrap();
+        fs::write(dir.0.join("ws/dir/.acme.4242-0"), b"half").unwrap();
+        assert_eq!(files.names().unwrap(), [WsName::parse("acme").unwrap()]);
+        fs::write(dir.0.join("ws/dir/Globex"), b"record").unwrap();
+        assert!(files.names().is_err(), "a file that isn't a record fails the list, and never drops out of it");
+        let keystore = FileKeystore::at(&dir.0.join("ws"));
+        let acme = WsId::from_bytes([0x10; 16]);
+        keystore.put(acme, &ItemName::from_bytes([0x07; 32]), b"acme's").unwrap();
+        fs::write(dir.0.join("ws").join(acme.to_string()).join("items/initech"), b"").unwrap();
+        assert!(keystore.list(acme).is_err());
+    }
+}

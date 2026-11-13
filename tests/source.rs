@@ -23,6 +23,7 @@ const DEV: &[&str] = &[
     "HALTI_TEST_APPROVE",
     "HALTI_TEST_KEYCHAIN",
     "HALTI_TEST_LOGIN_RUNNER",
+    "HALTI_TEST_PASSPHRASE",
     "HALTI_AUDIT",
     "HALTI_AUDIT_KEY",
     "HALTI_RUNNER_DIR",
@@ -478,4 +479,29 @@ fn only_core_binds_a_keystore() {
     assert_eq!(binds, [("core/src/store.rs", "    pub(crate) fn bind(ws: WsId, backend: &'p dyn KeystoreBackend) -> Keystore<'p> {")]);
     let made: Vec<_> = lines().filter(|(_, l)| l.trim_start().starts_with("Keystore {")).map(|(path, _)| path).collect();
     assert_eq!(made, ["core/src/store.rs"]);
+}
+
+/// The binary reaches a workspace's keys only through core's verbs: it never unseals a passphrase
+/// record or a wrap of its own. It names nothing of core's cryptography and no type that holds a
+/// private or inner key, and only the passphrase key holder calls a record's `decapsulate`, once.
+#[test]
+fn only_core_unseals_a_workspace() {
+    const NAMED: &[&str] = &["DecapKey", "InnerKey", "KemShares", "OpenKeys", "unwrap_with", "open_keys", "policy_signer"];
+    let mut found = Vec::new();
+    for (path, text) in sources(&["src"]) {
+        let Some(code) = release_code(&path, &text) else { continue };
+        for (n, line) in code.lines().enumerate() {
+            let mut why: Vec<&str> = NAMED.iter().copied().filter(|name| line.contains(name)).collect();
+            if line.contains("halti_core") && line.contains("crypto") {
+                why.push("halti_core's cryptography");
+            }
+            if line.contains("decapsulate(") && path != "src/ws/tty.rs" {
+                why.push("decapsulate(");
+            }
+            found.extend(why.iter().map(|w| format!("{path}:{}: {w}", n + 1)));
+        }
+    }
+    let holder = release_code("src/ws/tty.rs", &fs::read_to_string(root().join("src/ws/tty.rs")).unwrap()).unwrap();
+    assert_eq!(holder.matches("decapsulate(").count(), 2, "src/ws/tty.rs: the holder's own method and its one call of the record's");
+    assert!(found.is_empty(), "the binary opens a workspace only through core's verbs:\n{}", found.join("\n"));
 }

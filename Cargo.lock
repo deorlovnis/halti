@@ -709,6 +709,7 @@ dependencies = [
  "cbc",
  "chacha20poly1305",
  "clap",
+ "halti-core",
  "jiff",
  "libc",
  "objc2",
@@ -732,6 +733,7 @@ dependencies = [
  "ureq",
  "url",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

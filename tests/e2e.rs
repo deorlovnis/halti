@@ -11,6 +11,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -885,6 +886,158 @@ fn box_rm_deletes_the_key_then_the_store_and_warns_about_backups() {
     let out = env.boxed("true", &["run", "research"]);
     assert!(!out.status.success() && stderr(&out).contains("isn't approved"));
     assert!(!env.boxed("true", &["rm", "nothing"]).status.success());
+}
+
+// --- workspaces ---
+
+/// What the passphrase tests type.
+const PASSPHRASE: &str = "acme passphrase one";
+
+/// `halti ARGS`, with HALTI_TEST_PASSPHRASE answering every passphrase question.
+fn ws(env: &Env, passphrase: &str, args: &[&str]) -> Output {
+    env.command().env("HALTI_TEST_PASSPHRASE", passphrase).args(args).output().unwrap()
+}
+
+/// The `ws` folder of a test's debug-build home.
+fn ws_dir(env: &Env) -> PathBuf {
+    env.dir.join("home").join(DEV_STORE_ROOT).join("ws")
+}
+
+/// A workspace's id, as its directory record holds it.
+fn ws_id(env: &Env, name: &str) -> String {
+    fs::read(ws_dir(env).join("dir").join(name)).unwrap()[1..17].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// How many passphrase questions a command asked: the test variable says each on stderr.
+fn asked(out: &Output) -> usize {
+    stderr(out).matches("halti: [test] asked: ").count()
+}
+
+/// How many passphrase prompts a command showed: the test variable says core's words for each, once
+/// each time core asked the key holder, however many questions followed.
+fn prompted(out: &Output) -> usize {
+    stderr(out).lines().filter(|line| line.starts_with("halti: [test] ") && !line.starts_with("halti: [test] asked: ")).count()
+}
+
+#[test]
+fn a_workspace_is_made_listed_opened_closed_and_deleted_with_one_passphrase_each() {
+    let env = Env::new();
+    let made = ws(&env, PASSPHRASE, &["ws", "new", "acme"]);
+    assert!(made.status.success(), "{}", stderr(&made));
+    // Nothing on stdout until it is created; then that it was, how to open it, and that a debug build made it. Never the passphrase.
+    let said = stdout(&made);
+    assert_eq!(said, "created workspace acme\nopen it with: halti open acme\ndebug build: this workspace opens only with a debug build\n");
+    assert!(!said.contains(PASSPHRASE));
+    assert_eq!((prompted(&made), asked(&made)), (1, 0), "the test variable is the passphrase made, so nothing is typed back");
+    assert!(stderr(&made).contains("halti: [test] [DEV, not protected] create workspace acme\n"), "{}", stderr(&made));
+    // The record names no client; the key file is the passphrase record; only this user can read any of it.
+    let (dir, id) = (ws_dir(&env), ws_id(&env, "acme"));
+    let record = fs::read(dir.join("dir/acme")).unwrap();
+    assert_eq!((record.len(), record[0], &record[17..]), (19, 0x01, &[0x05, 0x02][..]));
+    assert_eq!((fs::read(dir.join(&id).join("key")).unwrap().len(), fs::read(dir.join("pins").join(&id)).unwrap().len()), (1855, 153));
+    let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let pin = dir.join("pins").join(&id);
+    assert_eq!([mode(dir.clone()), mode(dir.join(&id)), mode(dir.join("dir/acme")), mode(pin)], [0o700, 0o700, 0o600, 0o600]);
+    assert!(!dir.join("mark").exists(), "no prompt mark is made");
+
+    // The table, with the id last, and nothing else; listing asks nothing, and there is no --labels.
+    let listing = ws(&env, PASSPHRASE, &["ws", "list"]);
+    let listed = stdout(&listing);
+    assert!(listed.starts_with("WORKSPACE        STATE      KEY        ID\n"), "{listed}");
+    assert!(listed.lines().any(|l| l.starts_with("acme ") && l.contains(" closed ") && l.contains(" passphrase ") && l.ends_with(&id)), "{listed}");
+    assert!(listed.lines().count() == 2 && prompted(&listing) == 0, "{listed}");
+    let labels = ws(&env, PASSPHRASE, &["ws", "ls", "--labels"]);
+    assert!(!labels.status.success() && stdout(&labels).is_empty(), "{}", stderr(&labels));
+    for args in [&["open", "acme"][..], &["open"]] {
+        let opened = ws(&env, PASSPHRASE, args);
+        let said = stdout(&opened);
+        assert!(opened.status.success() && said == "passphrase correct\nworkspaces can't stay open yet, so acme was closed again\n", "{said}{}", stderr(&opened));
+        assert_eq!((prompted(&opened), asked(&opened)), (1, 1), "{args:?}");
+        assert!(stderr(&opened).contains("halti: [test] asked: passphrase for workspace acme: \n"), "{}", stderr(&opened));
+    }
+    let closed = ws(&env, PASSPHRASE, &["close", "acme"]);
+    assert!(closed.status.success() && stdout(&closed) == "acme isn't open\n" && prompted(&closed) == 0);
+
+    let deleted = ws(&env, PASSPHRASE, &["ws", "delete", "acme"]);
+    assert!(deleted.status.success() && stdout(&deleted) == "deleted workspace acme\n", "{}", stderr(&deleted));
+    assert!(stderr(&deleted).contains("[test] [DEV, not protected] delete workspace acme") && asked(&deleted) == 1);
+    assert!(stderr(&deleted).contains("halti: [test] asked: passphrase for workspace acme: \n"), "{}", stderr(&deleted));
+    assert!(!dir.join("dir/acme").exists() && !dir.join(&id).exists() && !dir.join("pins").join(&id).exists());
+    assert_eq!(stdout(&ws(&env, PASSPHRASE, &["ws", "ls"])), "no workspaces yet. create one with: halti ws new NAME\n");
+}
+
+#[test]
+fn a_wrong_passphrase_or_a_changed_file_opens_nothing_and_deletes_nothing() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let (dir, id) = (ws_dir(&env), ws_id(&env, "acme"));
+    let files = [dir.join("dir/acme"), dir.join(&id).join("key"), dir.join(&id).join("wrap"), dir.join(&id).join("manifest"), dir.join("pins").join(&id)];
+    let before: Vec<Vec<u8>> = files.iter().map(|file| fs::read(file).unwrap()).collect();
+    // Another passphrase, and one too short to be any: each is a wrong one, asked once and not again.
+    for wrong in ["acme passphrase two", "short"] {
+        let out = ws(&env, wrong, &["open", "acme"]);
+        assert!(!out.status.success() && stderr(&out).contains("halti: that can't be opened (wrong key, or it was changed)"), "{wrong}: {}", stderr(&out));
+        assert_eq!((prompted(&out), asked(&out)), (1, 1), "{wrong}: asked once, and not again");
+        let out = ws(&env, wrong, &["ws", "delete", "acme"]);
+        let said = stderr(&out);
+        assert!(!out.status.success() && said.contains("halti: nothing was deleted: that can't be opened (wrong key"), "{wrong}: {said}");
+        assert!(said.contains("halti: [test] [DEV, not protected] delete workspace acme") && asked(&out) == 1, "{wrong}: {said}");
+        let after: Vec<Vec<u8>> = files.iter().map(|file| fs::read(file).unwrap()).collect();
+        assert!(after == before, "{wrong}: every file is as it was");
+    }
+    // One byte of the wrap changed: refused before anything is asked, and a delete removes nothing.
+    let wrap = dir.join(&id).join("wrap");
+    let mut bytes = fs::read(&wrap).unwrap();
+    bytes[1682] ^= 0x01;
+    fs::write(&wrap, &bytes).unwrap();
+    for args in [&["open", "acme"][..], &["ws", "delete", "acme"]] {
+        let out = ws(&env, PASSPHRASE, args);
+        assert!(!out.status.success() && stderr(&out).contains("can't be opened") && prompted(&out) == 0, "{args:?}: {}", stderr(&out));
+    }
+    assert!(stderr(&ws(&env, PASSPHRASE, &["ws", "delete", "acme"])).contains("halti: nothing was deleted: "));
+    assert!(ws_dir(&env).join("dir/acme").exists() && wrap.exists());
+}
+
+#[test]
+fn names_are_checked_never_swapped_and_an_unfinished_workspace_is_cleared() {
+    let env = Env::new();
+    let refused = ws(&env, PASSPHRASE, &["ws", "new", "Bad\x1b[2J"]);
+    assert!(stderr(&refused).contains("isn't a workspace name") && !stderr(&refused).contains("Bad"), "{}", stderr(&refused));
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let again = ws(&env, PASSPHRASE, &["ws", "new", "acme"]);
+    let said = stderr(&again);
+    assert!(said.contains("there is already a workspace named acme") && !said.contains("ws delete") && prompted(&again) == 0, "{said}");
+    assert!(stderr(&ws(&env, PASSPHRASE, &["open", "initech"])).contains("there is no workspace named initech"));
+    // A passphrase of one's own that is too short makes nothing, frees the name, and leaves no lock file for the id it drew.
+    let locks = || fs::read_dir(ws_dir(&env).join("locks")).unwrap().count();
+    assert_eq!(locks(), 1, "acme's");
+    let short = ws(&env, "short", &["ws", "new", "globex", "--own-passphrase"]);
+    assert!(stderr(&short).contains("halti: workspace globex was not created: a passphrase has at least 14 characters"), "{}", stderr(&short));
+    assert_eq!((prompted(&short), asked(&short), locks()), (1, 3, 1), "asked three times, and only acme's lock file is left");
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "globex"]).status.success());
+    // One of one's own, typed twice.
+    let own = ws(&env, PASSPHRASE, &["ws", "new", "initech", "--own-passphrase"]);
+    assert!(own.status.success(), "{}", stderr(&own));
+    assert_eq!((prompted(&own), asked(&own)), (1, 2));
+    for question in ["asked: new passphrase for workspace initech (at least 14 characters): \n", "asked: type it again to confirm: \n"] {
+        assert!(stderr(&own).contains(question), "{question}: {}", stderr(&own));
+    }
+    assert!(stderr(&ws(&env, PASSPHRASE, &["open"])).contains("there is more than one workspace (name one)"));
+    // globex's pin removed, as a program running as you could, or as a create cut short leaves it: listed as unfinished, its
+    // name says how to remove it, and its files go without a passphrase.
+    let (dir, id) = (ws_dir(&env), ws_id(&env, "globex"));
+    fs::remove_file(dir.join("pins").join(&id)).unwrap();
+    let listed = stdout(&ws(&env, PASSPHRASE, &["ws", "ls"]));
+    assert!(listed.lines().any(|l| l.starts_with("globex ") && l.contains(" unfinished ")), "{listed}");
+    assert!(listed.lines().any(|l| l == "globex was never fully created. remove it with: halti ws delete globex"), "{listed}");
+    let again = ws(&env, PASSPHRASE, &["ws", "new", "globex"]);
+    let said = stderr(&again);
+    let hint = "halti: globex was never fully created. remove it with: halti ws delete globex: there is already a workspace named globex";
+    assert!(said.contains(hint) && prompted(&again) == 0, "{said}");
+    let cleared = ws(&env, PASSPHRASE, &["ws", "delete", "globex"]);
+    let said = stdout(&cleared);
+    assert!(said == "removed workspace globex. it was never fully created, so no passphrase was asked\n" && prompted(&cleared) == 0, "{said}");
+    assert!(!dir.join("dir/globex").exists() && !dir.join(&id).exists());
 }
 
 // --- opt-in: the browser and the real Touch ID ---
