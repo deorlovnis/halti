@@ -234,6 +234,22 @@ impl Source {
         }
     }
 
+    /// Why `res` can't be used: it has no policy here.
+    pub fn no_policy(&self, res: &str) -> String {
+        match &self.place {
+            Place::Keychain(_) => format!("{res} has no policy (write one with: {})", self.hint(Hint::WritePolicy(res))),
+            Place::Workspace(w) => w.no_policy(res),
+        }
+    }
+
+    /// Why `res` can't be used: its policy here isn't approved.
+    pub fn unapproved(&self, res: &str) -> String {
+        match &self.place {
+            Place::Keychain(_) => format!("the policy for {res} isn't approved ({})", self.hint(Hint::ApprovePolicy(res))),
+            Place::Workspace(w) => w.unapproved(res),
+        }
+    }
+
     // Values, by the names `halti set` takes.
 
     pub fn value(&self, res: &str, field: &str) -> Option<String> {

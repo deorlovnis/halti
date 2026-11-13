@@ -545,8 +545,9 @@ fn vms(settings: &Settings) -> Result<&'static dyn Vms> {
     }
 }
 
-/// Where box keys are kept, as `[box] keys` says: the one place a box's store key is read, written
-/// and deleted. Another place is one more variant of `config::Keys` and one more arm in each.
+/// Where box keys are kept (see `Keys`): the one place a box's store key is read, written and
+/// deleted. Another keeper `[box] keys` can name is one more variant of `config::Keys`, and another
+/// place that keeps its own is one more `Keys` variant; each is one more arm in each method.
 #[derive(Clone, Copy)]
 struct KeyStore(Keys);
 

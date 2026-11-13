@@ -92,6 +92,14 @@ impl Opened {
         format!("{res} in {}", self.name)
     }
 
+    pub(super) fn no_policy(&self, res: &str) -> String {
+        format!("{res} has no policy in {}. write one with: {}", self.name, self.hint(Hint::WritePolicy(res)))
+    }
+
+    pub(super) fn unapproved(&self, res: &str) -> String {
+        format!("the policy for {} isn't approved. approve it with: {}", self.named(res), self.hint(Hint::ApprovePolicy(res)))
+    }
+
     // Values: read live, never written.
 
     /// A field that isn't one an item can have, or a value that can't be read, is none.

@@ -672,8 +672,8 @@ pub fn approved_at(key: &str, file: &Path) -> Result<String, Status> {
 pub fn load(res: &str) -> Result<Approved> {
     let (source, p) = (source::current(), path(res));
     let named = source.named(res);
-    let Some(text) = source.policy_text(res)? else { bail!("{named} has no policy (write one with: {})", source.hint(Hint::WritePolicy(res))) };
-    let record = record(res).ok_or_else(|| anyhow!("the policy for {named} isn't approved ({})", source.hint(Hint::ApprovePolicy(res))))?;
+    let Some(text) = source.policy_text(res)? else { bail!(source.no_policy(res)) };
+    let record = record(res).ok_or_else(|| anyhow!(source.unapproved(res)))?;
     if record.policy != sha256_hex(&text) {
         bail!("the policy for {named} changed since it was approved ({})", source.hint(Hint::ApprovePolicy(res)));
     }

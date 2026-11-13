@@ -83,6 +83,9 @@ fn settings_after_the_choice_are_the_copy() {
     // The machine's own items are closed, and the settings are the copy.
     assert!(!machine_open_in(&cell));
     assert_eq!(settings_in(&cell), Some(&read_before));
+    // And they are what the settings and the workspaces folder in effect are, with nothing read again.
+    assert_eq!(crate::config::settings_given(settings_in(&cell)), read_before);
+    assert_eq!(crate::config::workspaces_given(settings_in(&cell)), read_before.workspaces.path);
 }
 
 /// The workspace folder of the place.
@@ -160,4 +163,9 @@ fn the_hints_name_the_workspace_s_commands() {
     assert_eq!(hints(&acme), ["halti ws policy edit acme/github", "halti ws policy approve acme/github", "halti ws set acme/github token", "halti ws box rm acme/dev"]);
     assert_eq!(hints(&Source::keychain()), ["halti policy edit github", "halti policy approve github", "halti set github token", "halti box rm dev"]);
     assert_eq!((acme.named("github"), Source::keychain().named("github")), ("github in acme".to_string(), "github".to_string()));
+    // Why a box can't use a resource, in each place's words.
+    assert_eq!(acme.no_policy("github"), "github has no policy in acme. write one with: halti ws policy edit acme/github");
+    assert_eq!(acme.unapproved("anthropic"), "the policy for anthropic in acme isn't approved. approve it with: halti ws policy approve acme/anthropic");
+    assert_eq!(Source::keychain().no_policy("github"), "github has no policy (write one with: halti policy edit github)");
+    assert_eq!(Source::keychain().unapproved("github"), "the policy for github isn't approved (halti policy approve github)");
 }

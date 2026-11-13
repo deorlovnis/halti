@@ -621,7 +621,12 @@ pub fn in_effect(world: &dyn World, place: &Place, os: Os) -> InEffect {
 /// The workspaces folder in effect, with nothing said on stderr: for a check that only needs where it is.
 /// Once a workspace is chosen, the one in the settings read before.
 pub fn workspaces_in_effect() -> PathBuf {
-    if let Some(settings) = source::chosen_settings() {
+    workspaces_given(source::chosen_settings())
+}
+
+/// `workspaces_in_effect`, given the settings read before the choice, if a workspace is chosen.
+pub(crate) fn workspaces_given(chosen: Option<&Settings>) -> PathBuf {
+    if let Some(settings) = chosen {
         return settings.workspaces.path.clone();
     }
     in_effect(&Real, &Place::real(), OS).settings.workspaces.path
@@ -636,7 +641,12 @@ fn bad_copy(place: &Place, why: &str) -> String {
 /// before the choice, with nothing said: the approved settings' record can't be read then, so a
 /// second reading could differ from the first.
 pub fn settings() -> Settings {
-    if let Some(settings) = source::chosen_settings() {
+    settings_given(source::chosen_settings())
+}
+
+/// `settings`, given the settings read before the choice, if a workspace is chosen.
+pub(crate) fn settings_given(chosen: Option<&Settings>) -> Settings {
+    if let Some(settings) = chosen {
         return settings.clone();
     }
     let now = in_effect(&Real, &Place::real(), OS);
