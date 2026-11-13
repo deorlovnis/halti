@@ -551,3 +551,84 @@ fn a_method_ends_at_its_own_closing_brace() {
     assert_eq!(method(code, "    fn one(").matches("b(").count(), 1);
     assert_eq!(method(code, "    fn two(").matches("b(").count(), 1);
 }
+
+/// The one file that names the Keychain module outside the module itself.
+const KEYCHAIN_ITEMS: &str = "src/source/keychain_items.rs";
+
+/// halti's Keychain items and saved passphrases are reached only by the source: a lookup
+/// anywhere else could read a token whatever place the process chose.
+#[test]
+fn only_the_source_reaches_the_keychain() {
+    let mut found = Vec::new();
+    for (path, text) in sources(&["src"]) {
+        // The module itself, whose macOS code names `security_framework::os::macos::keychain::`.
+        if path == "src/keychain.rs" {
+            continue;
+        }
+        let Some(code) = release_code(&path, &text) else { continue };
+        if code.lines().any(|l| l.trim() == "mod keychain;") && path != "src/main.rs" {
+            found.push(format!("{path}: mod keychain;"));
+        }
+        if path == KEYCHAIN_ITEMS {
+            continue;
+        }
+        for (n, line) in code.lines().enumerate() {
+            if line.contains("keychain::") {
+                found.push(format!("{path}:{}: keychain::", n + 1));
+            }
+        }
+        // Imported, renamed or not, on one line or several.
+        for statement in uses(&code) {
+            if idents(statement, "keychain") > 0 {
+                found.push(format!("{path}: {}", statement.trim()));
+            }
+        }
+    }
+    let items = release_code(KEYCHAIN_ITEMS, &fs::read_to_string(root().join(KEYCHAIN_ITEMS)).unwrap()).unwrap();
+    assert!(uses(&items).iter().any(|s| idents(s, "keychain") > 0) && items.contains("keychain::"), "{KEYCHAIN_ITEMS} reaches the Keychain");
+    assert!(found.is_empty(), "only {KEYCHAIN_ITEMS} reaches the Keychain; go through crate::source:\n{}", found.join("\n"));
+}
+
+/// The `use` statements of `code`, each up to its semicolon.
+fn uses(code: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    for line in code.split_inclusive('\n') {
+        let statement = line.trim_start();
+        if ["use ", "pub use ", "pub(crate) use ", "pub(super) use "].iter().any(|u| statement.starts_with(u)) {
+            let start = at + line.len() - statement.len();
+            let end = code[start..].find(';').map_or(code.len(), |end| start + end);
+            found.push(&code[start..end]);
+        }
+        at += line.len();
+    }
+    found
+}
+
+#[test]
+fn a_use_statement_is_read_to_its_end() {
+    let code = "use std::fs;\n// use keychain here\nuse crate::{\n    approve, keychain,\n};\n    pub(crate) use super::keychain as k;";
+    assert_eq!(uses(code), ["use std::fs", "use crate::{\n    approve, keychain,\n}", "pub(crate) use super::keychain as k"]);
+}
+
+/// Lookup code never chooses where lookups go.
+#[test]
+fn lookup_code_never_chooses() {
+    const LOOKUP: &[&str] = &["policy", "index", "fetch", "browse", "browser", "refresh", "audit", "mcp", "boxes", "door"];
+    let mut found = Vec::new();
+    for (path, text) in sources(&["src"]) {
+        let Some(code) = release_code(&path, &text) else { continue };
+        // A file of its own, or one in the folder beside it.
+        let module = path.trim_start_matches("src/").trim_end_matches(".rs").split('/').next().unwrap_or_default();
+        let part = |c: char| c.is_alphanumeric() || c == '_';
+        if LOOKUP.contains(&module) && code.match_indices("choose(").any(|(at, _)| !code[..at].ends_with(part)) {
+            found.push(format!("{path}: choose("));
+        }
+        if code.contains("Source::keychain(") && !["src/main.rs", "src/source.rs"].contains(&path.as_str()) {
+            found.push(format!("{path}: Source::keychain("));
+        }
+    }
+    let main = fs::read_to_string(root().join("src/main.rs")).unwrap();
+    assert!(main.contains("source::choose(") && main.contains("Source::keychain("), "src/main.rs chooses the source");
+    assert!(found.is_empty(), "only main chooses where secrets are kept:\n{}", found.join("\n"));
+}

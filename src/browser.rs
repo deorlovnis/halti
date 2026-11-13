@@ -19,7 +19,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::keychain;
+use crate::source;
 use crate::util::{self, TempDir, home};
 
 #[derive(Clone, Copy)]
@@ -60,7 +60,7 @@ impl Source {
             Kind::FirefoxCookie => ("Firefox", firefox_cookies(&firefox_profile()?.join("cookies.sqlite"), &self.key)?),
             Kind::ChromeCookie => {
                 // macOS asks the user before halti may read this item.
-                let password = keychain::get_app_password("Chrome Safe Storage", "Chrome").context("reading the Chrome Safe Storage password from the Keychain")?;
+                let password = source::current().app_password("Chrome Safe Storage", "Chrome").context("reading the Chrome Safe Storage password from the Keychain")?;
                 ("Chrome", chrome_cookies(&chrome_cookie_db()?, &self.key, &chrome_key(&password))?)
             }
         };

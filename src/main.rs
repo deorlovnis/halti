@@ -36,6 +36,7 @@ mod refresh;
 #[cfg(all(halti_dev, target_os = "linux"))]
 mod sandbox;
 mod seal;
+mod source;
 mod util;
 mod ws;
 
@@ -470,7 +471,7 @@ fn cmd_set(res: &str, field: &str, expires: Option<Date>, mut meta: Meta) -> Res
 }
 
 fn cmd_update(res: &str, field: &str, expires: Option<Date>) -> Result<()> {
-    let Some(current) = keychain::get(res, field) else {
+    let Some(current) = source::current().value(res, field) else {
         bail!("{res}/{field} is not stored yet (add it with: halti set {res} {field})");
     };
     // Strip surrounding whitespace and newlines that come along when copying from a web page.
@@ -565,7 +566,7 @@ fn cmd_info(res: &str) -> Result<()> {
         None => {}
     }
     for (name, f) in &r.fields {
-        let mut parts = vec![if keychain::exists(res, name) { "stored" } else { "MISSING" }.to_string()];
+        let mut parts = vec![if source::current().has_value(res, name) { "stored" } else { "MISSING" }.to_string()];
         let export = approved.as_ref().and_then(|a| a.policy.run.export.get(name));
         parts.push(export.map_or("inside halti".to_string(), |v| format!("exported as {v}")));
         if let Some(t) = f.expiry_text() {
@@ -593,7 +594,7 @@ fn cmd_info(res: &str) -> Result<()> {
 
 /// A field's status label and how urgent it is (higher = worse), for picking a resource's status.
 fn field_status(res: &str, name: &str, f: &Field, auto: bool, warn: i64) -> (i64, String) {
-    if !keychain::exists(res, name) {
+    if !source::current().has_value(res, name) {
         return (i64::MAX, "MISSING".into());
     }
     if f.expired() {
@@ -672,7 +673,7 @@ fn cmd_rm(res: &str, field: Option<String>) -> Result<()> {
         None => idx.get(res)?.fields.keys().cloned().collect(),
     };
     for name in &names {
-        if !keychain::delete(res, name) {
+        if !source::current().remove_value(res, name) {
             eprintln!("halti: {res}/{name} not in Keychain");
         }
     }
@@ -693,7 +694,7 @@ fn cmd_rm(res: &str, field: Option<String>) -> Result<()> {
 }
 
 fn cmd_copy(res: &str, field: &str) -> Result<()> {
-    let Some(v) = keychain::get(res, field) else { bail!("{res}/{field} not found") };
+    let Some(v) = source::current().value(res, field) else { bail!("{res}/{field} not found") };
     approve::confirm(&format!("copy {res}/{field} to the clipboard"))?;
     pbcopy(v.trim_end_matches('\n'))?;
     println!("copied {res}/{field} to clipboard");
@@ -706,11 +707,11 @@ fn cmd_reseal(resources: Vec<String>) -> Result<()> {
     for res in &resources {
         for name in idx.get(res)?.fields.keys() {
             // Reading may ask for Keychain access once; the new item needs no approval.
-            let Some(value) = keychain::get(res, name) else {
+            let Some(value) = source::current().value(res, name) else {
                 eprintln!("halti: {res}/{name} not in Keychain, skipped");
                 continue;
             };
-            keychain::replace(res, name, &value).with_context(|| format!("{res}/{name} was removed but not stored again: set it with halti set {res} {name}"))?;
+            source::current().reseal_value(res, name, &value).with_context(|| format!("{res}/{name} was removed but not stored again: set it with halti set {res} {name}"))?;
             println!("resealed {res}/{name}");
         }
         // Approvals aren't carried over: one planted by another program must not become trusted.
@@ -758,7 +759,7 @@ fn cmd_run(resources: Vec<String>, command: Vec<String>) -> Result<u8> {
             Mode::Allow => {}
         }
         for (name, var) in &run.export {
-            let Some(v) = keychain::get(res, name) else { bail!("{res}/{name} not found in Keychain (add it with: halti set {res} {name})") };
+            let Some(v) = source::current().value(res, name) else { bail!("{res}/{name} not found in Keychain (add it with: halti set {res} {name})") };
             cmd.env(var, &v);
             if !v.is_empty() {
                 masks.push(v);
@@ -785,6 +786,32 @@ fn cmd_run(resources: Vec<String>, command: Vec<String>) -> Result<u8> {
     Ok(code as u8)
 }
 
+/// Where a command finds and keeps secrets. Workspaces, the settings and how halti was built reach
+/// only the machine's own items, so they choose no place: a lookup there fails instead of reading
+/// the Keychain. Every other command keeps its secrets in the Keychain.
+fn source_for(cmd: &Cmd) -> Option<source::Source> {
+    match cmd {
+        Cmd::Ws { .. } | Cmd::Open { .. } | Cmd::Close { .. } | Cmd::Config { .. } | Cmd::BuildInfo => None,
+        #[cfg(all(halti_dev, target_os = "linux"))]
+        Cmd::SandboxInit { .. } => None,
+        Cmd::Set { .. }
+        | Cmd::Update { .. }
+        | Cmd::Describe { .. }
+        | Cmd::Policy { .. }
+        | Cmd::Refresh { .. }
+        | Cmd::Info { .. }
+        | Cmd::Ls
+        | Cmd::Check { .. }
+        | Cmd::Rm { .. }
+        | Cmd::Copy { .. }
+        | Cmd::Run { .. }
+        | Cmd::Mcp
+        | Cmd::Audit { .. }
+        | Cmd::Reseal { .. }
+        | Cmd::Box { .. } => Some(source::Source::keychain()),
+    }
+}
+
 /// For installers and check.sh: a build to install must say that both flags are false.
 fn cmd_build_info() {
     println!("debug_assertions={} halti_dev={}", cfg!(debug_assertions), cfg!(halti_dev));
@@ -806,7 +833,11 @@ fn main() -> ExitCode {
     #[cfg(halti_dev)]
     eprintln!("halti: [DEV, not protected] a debug build: test variables can answer its prompts, and it keeps its files in {}", util::config_dir().display());
     let ok = |r: Result<()>| r.map(|_| 0);
-    let result = match Cli::parse().cmd {
+    let cmd = Cli::parse().cmd;
+    if let Some(source) = source_for(&cmd) {
+        source::choose(source).expect("halti chose where secrets are kept once");
+    }
+    let result = match cmd {
         Cmd::Set { resource, field, expires, meta } => ok(cmd_set(&resource, &field, expires, meta)),
         Cmd::Update { resource, field, expires } => ok(cmd_update(&resource, &field, expires)),
         Cmd::Describe { resource, meta } => ok(cmd_describe(&resource, meta)),

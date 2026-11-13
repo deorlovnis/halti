@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use crate::index::{Expiry, Index, Meta, store};
 use crate::policy::{self, Approved};
 use crate::util::{self, TempDir};
-use crate::{browser, keychain};
+use crate::{browser, source};
 
 /// Set while a refresh script runs (as `HALTI_REFRESHING` and `CRED_REFRESHING`), so a `halti`
 /// inside it doesn't refresh again and loop.
@@ -102,7 +102,7 @@ fn run_script(res: &str, approved: &Approved, field: &str) -> Result<String> {
     fields.extend(idx.map.get(res).into_iter().flat_map(|r| r.fields.keys()));
     let exported = &approved.policy.run.export;
     for name in fields.into_iter().filter(|n| !exported.contains_key(*n)) {
-        if let Some(v) = keychain::get(res, name) {
+        if let Some(v) = source::current().value(res, name) {
             for var in util::env_names(&name.to_uppercase()) {
                 command.env(var, &v);
             }

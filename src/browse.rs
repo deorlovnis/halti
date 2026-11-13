@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use crate::index::today;
 use crate::policy::{Approved, Browse, Mode, Policy};
 use crate::util::config_dir;
-use crate::{approve, keychain};
+use crate::{approve, source};
 
 /// Writes a site's pages tried without an `allow_writes` rule are remembered, up to this many per site.
 const BLOCKED_LIMIT: usize = 50;
@@ -197,7 +197,7 @@ enum Source<'a> {
 
 /// The cookies and Local Storage entries the policy builds from the site's stored fields.
 fn field_parts(site: &str, browse: &Browse) -> Result<(Vec<Value>, Vec<Value>)> {
-    let value = |field: &str| keychain::get(site, field).ok_or_else(|| anyhow!("{site}/{field} isn't stored"));
+    let value = |field: &str| source::current().value(site, field).ok_or_else(|| anyhow!("{site}/{field} isn't stored"));
     let mut cookies = Vec::new();
     for c in &browse.cookies {
         let host = c.domain.trim_start_matches('.');
@@ -326,7 +326,7 @@ pub fn fill_command(site: &str, approved: &Approved, element: &str, field: &str)
     if !allowed {
         bail!("the policy for {site} doesn't let halti type {field} into pages (list it in [browse] fill)");
     }
-    let value = keychain::get(site, field).ok_or_else(|| anyhow!("{site}/{field} isn't stored"))?;
+    let value = source::current().value(site, field).ok_or_else(|| anyhow!("{site}/{field} isn't stored"))?;
     Ok(json!({ "cmd": "fill", "ref": element, "value": value }))
 }
 

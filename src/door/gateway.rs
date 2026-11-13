@@ -17,9 +17,9 @@ use ureq::http::{self, Response};
 
 use super::http::{self as wire, Head};
 use super::{Entry, STANDIN, Shared};
-use crate::keychain;
 use crate::mask::Masker;
 use crate::policy::{self, METHODS, Mode};
+use crate::source;
 
 /// Request bodies (a long conversation with images) are read whole, up to this size.
 const MAX_BODY: usize = 128 * 1024 * 1024;
@@ -146,7 +146,7 @@ fn plan(sh: &Shared, head: &Head, method: &str, target: &str) -> Result<Plan, De
     let auth = match &fetch.auth {
         Some(template) => {
             let value = policy::fill(template, |field| {
-                let value = keychain::get(model, field).ok_or_else(|| anyhow::anyhow!("{model}/{field} isn't stored (halti set {model} {field})"))?;
+                let value = source::current().value(model, field).ok_or_else(|| anyhow::anyhow!("{model}/{field} isn't stored (halti set {model} {field})"))?;
                 secrets.push(value.clone());
                 Ok(value)
             });

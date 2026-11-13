@@ -34,7 +34,8 @@ use crate::chain::{self, Chain};
 use crate::config::Settings;
 use crate::engine::{self, Vms};
 use crate::index::Index;
-use crate::{door, keychain, names, policy, seal};
+use crate::source::{self, BoxItem};
+use crate::{door, names, policy, seal};
 
 /// Where the store's folders appear in the VM, and where `ro` folders go.
 const GUEST_HOME: &str = "/home/agent";
@@ -152,7 +153,7 @@ impl World for Real<'_> {
     }
 
     fn record_log_head(&self, name: &str, head: &chain::Head) -> Result<()> {
-        keychain::set(&super::key(name), super::LOG_HEAD_FIELD, &serde_json::to_string(head)?)
+        source::current().set_box_item(name, BoxItem::LogHead, &serde_json::to_string(head)?)
     }
 
     fn exec(&self, vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus> {

@@ -21,12 +21,10 @@ use url::{Host, Url};
 
 use crate::approval::{self, Action, Means, World};
 use crate::config::{self, Settings};
-use crate::util::{config_dir, expand_home, sha256_hex};
+use crate::util::{expand_home, sha256_hex};
 use crate::ws::OS;
-use crate::{ask, boxes, browser, interactive, keychain, names, parse_env, parse_field, parse_resource};
+use crate::{ask, boxes, browser, interactive, names, parse_env, parse_field, parse_resource, source};
 
-/// Keychain field of a resource's approval record. Field names can't start with "_".
-const APPROVAL: &str = "_policy";
 pub const METHODS: [&str; 6] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
 /// What a tool parameter may contain unencoded: RFC 3986 unreserved characters.
 const COMPONENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
@@ -604,12 +602,7 @@ impl Status {
 }
 
 pub fn dir() -> PathBuf {
-    // Tests keep their policies apart. Release builds don't contain this.
-    #[cfg(halti_dev)]
-    if let Some(dir) = crate::util::dev_var("HALTI_POLICY_DIR") {
-        return dir.into();
-    }
-    config_dir().join("policy")
+    source::current().policy_dir().to_path_buf()
 }
 
 pub fn path(res: &str) -> PathBuf {
@@ -629,7 +622,7 @@ pub fn names() -> Vec<String> {
 }
 
 fn record(res: &str) -> Option<Approval> {
-    serde_json::from_str(&keychain::get_silently(res, APPROVAL)?).ok()
+    serde_json::from_str(&source::record(res)?).ok()
 }
 
 /// The text an approval record under this Keychain name keeps, if its sha256 is the one approved.
@@ -640,7 +633,7 @@ pub fn pinned_text(key: &str) -> Option<String> {
 
 /// Keep `approval` under this Keychain name, in a new item only the running halti reads silently.
 pub fn pin(key: &str, approval: &Approval) -> Result<()> {
-    keychain::replace(key, APPROVAL, &serde_json::to_string(approval)?)
+    source::pin_record(key, &serde_json::to_string(approval)?)
 }
 
 pub fn status(res: &str) -> Status {
@@ -701,7 +694,7 @@ fn approved_text(key: &str) -> Option<String> {
 /// Forget an approval (a resource's, or a box's under its Keychain name); the file has no
 /// effect until approved again.
 pub fn revoke(key: &str) {
-    keychain::delete(key, APPROVAL);
+    source::remove_record(key);
 }
 
 /// Whether an approval's Keychain name is a box's.
@@ -764,7 +757,7 @@ pub fn approve(resources: &[String]) -> Result<()> {
 pub fn approve_prepared(prepared: Vec<(String, Approval)>, settings: &Settings) -> Result<()> {
     ask_to_approve(&approval::Real, settings, &prepared)?;
     for (key, approval) in prepared {
-        keychain::replace(&key, APPROVAL, &serde_json::to_string(&approval)?)?;
+        source::pin_record(&key, &serde_json::to_string(&approval)?)?;
         println!("approved the policy for {}", label(&key));
     }
     Ok(())
