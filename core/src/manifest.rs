@@ -492,6 +492,11 @@ mod tests {
         assert_eq!(decode(&plain), Some(full.clone()));
         let sealed = full.seal(&inner(), acme(), &ws_name("acme"), &manifest_nonce()).unwrap();
         assert_eq!(Manifest::open(&inner(), acme(), &ws_name("acme"), &sealed), Ok(full));
+        // One item as short as an item is: exactly the fewest bytes are left after the count, and it reads back.
+        let shortest = Manifest { items: vec![entry(0x07, 1, "a", "b")], ..release() };
+        let plain = encode(&shortest);
+        assert_eq!(plain.len(), 154 + MIN_ITEM);
+        assert_eq!(decode(&plain), Some(shortest));
     }
 
     #[test]

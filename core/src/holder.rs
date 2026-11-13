@@ -117,8 +117,8 @@ impl Prompt {
     }
 
     /// The words to show: `open workspace acme`, or `store a secret in workspace acme`, after
-    /// `[DEV, not protected] ` in a development build. The name is the only part that varies, and a name holds only a-z, 0-9 and `-`, so
-    /// the text holds no control or direction character.
+    /// `[DEV, not protected] ` in a development build. The name is the only part that varies, and
+    /// a name holds only a-z, 0-9 and `-`, so the text holds no control or direction character.
     pub fn text(&self) -> String {
         let dev = match self.build {
             Build::Dev => "[DEV, not protected] ",

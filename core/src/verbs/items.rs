@@ -115,9 +115,9 @@ pub fn ws_set(machine: &Machine<'_>, name: &WsName, key: &ItemKey, value: impl F
     })
 }
 
-/// Lists a workspace's secrets: one approval (`Change::Open`). Every listed secret, sorted by
-/// resource and then field, and whether its value opens; each value opened is wiped at once.
-/// Writes nothing, and leaves the pin where it was.
+/// Lists a workspace's secrets: one approval (`Change::Open`). Every listed secret, sorted by its
+/// text, and whether its value opens; each value opened is wiped at once. Writes nothing, and
+/// leaves the pin where it was.
 pub fn ws_items(machine: &Machine<'_>, name: &WsName) -> Result<Vec<Stored>> {
     with_list(machine, name, Change::Open, |ws, _, manifest, keys| {
         let items = Keystore::bind(ws, machine.keystore);
@@ -126,13 +126,14 @@ pub fn ws_items(machine: &Machine<'_>, name: &WsName) -> Result<Vec<Stored>> {
             let opens = items.get(&entry.name)?.is_some_and(|blob| open_value(keys.secrets(), ws, &entry.name, entry.version, &blob).is_ok());
             stored.push(Stored { key: entry.key, state: if opens { State::Readable } else { State::Unreadable } });
         }
-        stored.sort_by(|a, b| a.key.cmp(&b.key));
+        // As text, not by resource and then field: `github-ee/token` comes before `github/token`.
+        stored.sort_by_cached_key(|stored| stored.key.to_string());
         Ok(stored)
     })
 }
 
 /// Removes one field, or every field of a resource: one approval (`Change::Remove`). What it
-/// removed, sorted. Naming none is `Refusal::NoSecret`, after the approval and with nothing
+/// removed, sorted by its text. Naming none is `Refusal::NoSecret`, after the approval and with nothing
 /// written.
 ///
 /// The list is replaced first; then each value is deleted. Once the list is replaced the secrets
@@ -154,7 +155,7 @@ pub fn ws_remove(machine: &Machine<'_>, name: &WsName, which: &Which, manifest_n
             let _ = items.delete(&entry.name);
         }
         let mut removed: Vec<ItemKey> = gone.into_iter().map(|entry| entry.key).collect();
-        removed.sort();
+        removed.sort_by_cached_key(ToString::to_string);
         Ok(removed)
     })
 }
@@ -355,6 +356,16 @@ mod tests {
             (self.file(&FileKey::Manifest(ws)), self.file(&FileKey::NextManifest(ws)), self.anchor.read(ws).unwrap(), blobs)
         }
 
+        /// Seals `manifest` as acme's under acme's inner key, and moves the pin over it: what a program holding the inner
+        /// key could write.
+        fn plant(&self, manifest: &Manifest, nonce: [u8; 12]) {
+            let sealed = manifest.seal(&InnerKey::from_bytes(Zeroizing::new(inner_bytes())), acme(), &ws_name("acme"), &nonce).unwrap();
+            self.files.write_atomic(&FileKey::Manifest(acme()), &sealed).unwrap();
+            let pin = self.pin(acme());
+            let state = state_hash(acme(), &ws_name("acme"), &hex(KAT_HARDWARE_WRAP), &sealed, b"");
+            self.anchor.advance(acme(), &Pin { version: pin.version + 1, state, ..pin }).unwrap();
+        }
+
         /// acme with github/token, linear/token and github/user stored, in that order.
         fn three(self) -> World {
             for (resource, field) in [("github", "token"), ("linear", "token"), ("github", "user")] {
@@ -457,6 +468,17 @@ mod tests {
     }
 
     #[test]
+    fn the_list_is_in_the_order_of_its_text() {
+        let world = World::new();
+        for (resource, field) in [("github", "user"), ("github-ee", "token"), ("github", "token")] {
+            world.set("acme", &key(resource, field), "a value").unwrap();
+        }
+        // `-` comes before `/`, so github-ee's fields come before github's.
+        let listed = ["github-ee/token", "github/token", "github/user"].map(|text| (text.to_string(), State::Readable));
+        assert_eq!(shown(&world.items("acme").unwrap()), listed);
+    }
+
+    #[test]
     fn removing_a_field_or_a_resource() {
         let world = World::new().three();
         let version = world.pin(acme()).version;
@@ -539,6 +561,49 @@ mod tests {
     }
 
     #[test]
+    fn a_remove_cut_short_removes_nothing() {
+        let world = World::new().three();
+        let (manifest, _, pin, blobs) = world.kept(acme());
+        // The list is not replaced, so no value is deleted.
+        world.anchor.fail_next_advance();
+        assert!(world.remove("acme", &field("github", "token")).unwrap_err().to_string().contains("could not be written"));
+        let (after, _, pin_after, blobs_after) = world.kept(acme());
+        assert!((after, pin_after, blobs_after) == (manifest, pin, blobs), "only a manifest beside the old may be left");
+        let readable = [("github/token", State::Readable), ("github/user", State::Readable), ("linear/token", State::Readable)].map(|(text, state)| (text.to_string(), state));
+        assert_eq!(shown(&world.items("acme").unwrap()), readable);
+    }
+
+    #[test]
+    fn the_manifest_is_checked_before_the_value_is_asked_for() {
+        let world = World::new();
+        world.set("acme", &key("github", "token"), "acme github token").unwrap();
+        let machine = world.machine(&world.acme, Build::Dev);
+        let made = world.manifest(acme(), "acme", inner_bytes());
+        // Recorded as lacking nothing, where the adapters in memory lack everything.
+        let lacking_nothing: Vec<Recorded> = made.adapters.iter().map(|recorded| Recorded { lacks: Lacks::NONE, ..recorded.clone() }).collect();
+        let cases = [
+            (Manifest { adapters: lacking_nothing.clone(), ..made.clone() }, [0x45; 12], Refusal::Downgraded(Lacks::of(&Property::ALL))),
+            (Manifest { built_by: Build::Release, ..made.clone() }, [0x46; 12], Refusal::OtherBuild(Build::Release)),
+            // Both: which build made it is checked first.
+            (Manifest { built_by: Build::Release, adapters: lacking_nothing, ..made }, [0x47; 12], Refusal::OtherBuild(Build::Release)),
+        ];
+        for (manifest, nonce, refusal) in cases {
+            world.plant(&manifest, nonce);
+            let kept = world.kept(acme());
+            let called = Cell::new(false);
+            let value = || {
+                called.set(true);
+                Ok(secret("x"))
+            };
+            assert_eq!(refused(ws_set(&machine, &ws_name("acme"), &key("github", "user"), value, world.nonces())), refusal);
+            assert!(!called.get(), "{refusal}: the value is not asked for");
+            assert_eq!(refused(world.items("acme")), refusal);
+            assert_eq!(refused(world.remove("acme", &field("github", "token"))), refusal);
+            assert!(world.kept(acme()) == kept, "{refusal}: nothing was written");
+        }
+    }
+
+    #[test]
     fn secrets_of_one_workspace_never_reach_another() {
         let world = World::new().with_globex();
         world.set("acme", &key("github", "token"), "acme github token").unwrap();
@@ -561,15 +626,10 @@ mod tests {
     fn a_list_whose_names_and_secrets_disagree_is_tampered() {
         let world = World::new();
         world.set("acme", &key("github", "token"), "acme github token").unwrap();
-        // github/token listed under linear/token's name, sealed under acme's inner key, and the pin moved over it: what a
-        // program holding the inner key could write.
+        // github/token listed under linear/token's name.
         let mut manifest = world.manifest(acme(), "acme", inner_bytes());
         manifest.items[0].name = in_acme(&key("linear", "token"));
-        let sealed = manifest.seal(&InnerKey::from_bytes(Zeroizing::new(inner_bytes())), acme(), &ws_name("acme"), &[0x44; 12]).unwrap();
-        world.files.write_atomic(&FileKey::Manifest(acme()), &sealed).unwrap();
-        let pin = world.pin(acme());
-        let state = state_hash(acme(), &ws_name("acme"), &hex(KAT_HARDWARE_WRAP), &sealed, b"");
-        world.anchor.advance(acme(), &Pin { version: pin.version + 1, state, ..pin }).unwrap();
+        world.plant(&manifest, [0x44; 12]);
         let kept = world.kept(acme());
         let called = Cell::new(false);
         let value = || {

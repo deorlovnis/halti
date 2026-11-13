@@ -9,9 +9,11 @@
 //! The name is what the keystore keeps the blob under: 32 bytes that spell nothing, and differ in
 //! every workspace, since each has its own names key. The blob holds only the value; its workspace,
 //! name and version are bound by the associated data, so a blob copied from another workspace or
-//! name, or put back from before its last change, does not open. The version is the pin version
-//! of the change that stored it, and pin versions only rise, so no name and version is sealed for
-//! twice in a workspace's life.
+//! name, or put back from before its last completed change, does not open. The version is the pin
+//! version of the change that stored it, and pin versions only rise, so once a change has moved
+//! the pin, no later one seals that name at its version again. A store cut short before the pin
+//! moved is the exception: storing again seals the same name and version, and a copy of the
+//! cut-short value, put back, then opens in its place.
 
 use std::fmt;
 
