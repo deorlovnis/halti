@@ -20,7 +20,8 @@ const REFRESHING: &str = "REFRESHING";
 /// Refresh every field of the given resources that is due (or all with force), as their
 /// approved policies say. Returns false if anything failed.
 pub fn refresh_due(resources: &[String], force: bool, verbose: bool) -> bool {
-    if util::env_var(REFRESHING).is_some() {
+    // A workspace's policies have no refresh rules yet: nothing is due there.
+    if !source::current().refreshes() || util::env_var(REFRESHING).is_some() {
         return true;
     }
     let Ok(idx) = Index::load() else { return false };

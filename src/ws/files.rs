@@ -17,6 +17,8 @@
 //!   ID/policies/RES.toml          0600   a resource's policy, as the editor left it
 //!   ID/policies/approved/         0700
 //!   ID/policies/approved/RES.toml 0600   the text last approved, written once it was
+//!   ID/boxes/                     0700   the workspace's boxes: their stores and runs, and what
+//!                                        a run notes in plain files (`Reading`)
 //! ```
 //!
 //! A policy's file is read as halti's own are, and at most 64 KiB of it. Whether a policy is
@@ -523,6 +525,79 @@ impl KeystoreBackend for FileKeystore {
         let items = self.items(ws);
         entries(&items)?.iter().map(|name| unhex(name).map(ItemName::from_bytes).with_context(|| format!("{} holds a file that isn't an item", items.display()))).collect()
     }
+}
+
+/// What a process that has a workspace open reads it again with, and the plain files it keeps
+/// beside it: the three adapters over the workspaces folder, and the folders of one workspace. A
+/// sealed write goes through core's verbs, never through this.
+pub struct Reading {
+    files: DirFiles,
+    anchor: FileAnchor,
+    keystore: FileKeystore,
+    root: PathBuf,
+}
+
+impl Reading {
+    /// Over the workspaces folder `root`.
+    #[allow(dead_code)] // for running a workspace's box
+    pub fn at(root: &Path) -> Reading {
+        Reading { files: DirFiles::at(root), anchor: FileAnchor::at(root), keystore: FileKeystore::at(root), root: root.to_path_buf() }
+    }
+
+    pub fn files(&self) -> &dyn Files {
+        &self.files
+    }
+
+    pub fn anchor(&self) -> &dyn Anchor {
+        &self.anchor
+    }
+
+    pub fn keystore(&self) -> &dyn KeystoreBackend {
+        &self.keystore
+    }
+
+    /// The folder of the workspace `ws`: WSDIR.
+    pub fn dir(&self, ws: WsId) -> PathBuf {
+        self.root.join(ws.to_string())
+    }
+
+    /// The folder of its resources' policies: WSDIR/policies.
+    pub fn policy_dir(&self, ws: WsId) -> PathBuf {
+        PolicyFiles::resources(&self.root, ws).dir().to_path_buf()
+    }
+
+    /// A resource's policy, read as `PolicyFiles::read` reads one.
+    pub fn policy(&self, ws: WsId, resource: &str) -> Result<Option<Vec<u8>>> {
+        ItemKey::check_resource(resource)?;
+        PolicyFiles::resources(&self.root, ws).read(resource)
+    }
+
+    /// One of the plain files of its boxes' folder (`boxes_dir`), or none if it isn't there.
+    pub fn box_file(&self, ws: WsId, file: &str) -> Result<Option<Vec<u8>>> {
+        read(&boxes_dir(&self.root, ws).join(file))
+    }
+
+    /// Replaces one of the plain files of its boxes' folder whole, 0600: the workspaces folder,
+    /// the workspace's and the boxes' folders made private first.
+    pub fn put_box_file(&self, ws: WsId, file: &str, bytes: &[u8]) -> Result<()> {
+        let boxes = boxes_dir(&self.root, ws);
+        ready_root(&self.root)?;
+        for folder in [self.dir(ws), boxes.clone()] {
+            private_dir(&folder)?;
+        }
+        replace(&boxes.join(file), bytes)
+    }
+
+    /// Removes one of the plain files of its boxes' folder, and says whether it was there.
+    pub fn remove_box_file(&self, ws: WsId, file: &str) -> Result<bool> {
+        remove(&boxes_dir(&self.root, ws).join(file))
+    }
+}
+
+/// The folder of a workspace's boxes: WSDIR/boxes, in the workspaces folder `root`. Their
+/// policies, stores, locks, mount points, downloads and what their runs note are in it.
+pub fn boxes_dir(root: &Path, ws: WsId) -> PathBuf {
+    root.join(ws.to_string()).join("boxes")
 }
 
 /// One kind's policies in a workspace: DIR/RES.toml, and the copies last approved in

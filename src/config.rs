@@ -30,7 +30,7 @@ use toml::de::{DeTable, DeValue};
 
 use crate::approval::{self, Action, Declined, Means, RULES, Real, Rule, World};
 use crate::ws::{self, OS};
-use crate::{names, policy, util};
+use crate::{names, policy, source, util};
 use approved::{Found, Place};
 
 /// The template's first line.
@@ -619,7 +619,11 @@ pub fn in_effect(world: &dyn World, place: &Place, os: Os) -> InEffect {
 }
 
 /// The workspaces folder in effect, with nothing said on stderr: for a check that only needs where it is.
+/// Once a workspace is chosen, the one in the settings read before.
 pub fn workspaces_in_effect() -> PathBuf {
+    if let Some(settings) = source::chosen_settings() {
+        return settings.workspaces.path.clone();
+    }
     in_effect(&Real, &Place::real(), OS).settings.workspaces.path
 }
 
@@ -628,8 +632,13 @@ fn bad_copy(place: &Place, why: &str) -> String {
 }
 
 /// The settings in effect, for every command that uses them, with what halti says about them, and
-/// about the person's file, on stderr.
+/// about the person's file, on stderr. Once this process has chosen a workspace, the copy read
+/// before the choice, with nothing said: the approved settings' record can't be read then, so a
+/// second reading could differ from the first.
 pub fn settings() -> Settings {
+    if let Some(settings) = source::chosen_settings() {
+        return settings.clone();
+    }
     let now = in_effect(&Real, &Place::real(), OS);
     for note in now.notes.iter().chain(&person_notes(&file(), &now, OS)) {
         eprintln!("halti: {note}");

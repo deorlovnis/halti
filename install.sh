@@ -43,9 +43,10 @@ the installed halti keeps its own, and no others:
   files in $config
   files in $store
   your approved settings, /Library/Application Support/halti/approved/$(id -u).toml (written through sudo, when you approve them)
-  sockets in /tmp/halti-$(id -u)
+  sockets in /tmp/halti-$(id -u), and in its ws folder those of workspaces' boxes
   Keychain items named halti:...
-  VMs named halti-box-... and halti-browser-...
+  VMs named halti-box-... and halti-browser-..., and for workspaces' boxes halti-wsbox-... and halti-wsbrowser-...
+  workspaces' box stores, in each workspace's folder in the workspaces folder your settings name
 would not read or change anything of an install made by cred
 DRY
     exit 0

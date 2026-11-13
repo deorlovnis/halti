@@ -42,6 +42,7 @@ use crate::audit::mask_url;
 use crate::index::Index;
 use crate::mask::{Masker, Stream};
 use crate::policy::{self, Fetch, Mode};
+use crate::source::Hint;
 use crate::{approve, source};
 
 /// A refused request's body is read and dropped, if it is no longer than this; a longer one ends
@@ -248,7 +249,8 @@ fn site_of(name: &str, fetch: &Fetch) -> Result<Site> {
     let mut secrets = Index::load().map(|index| index.values(name)).unwrap_or_default();
     let mut headers: Vec<(String, String)> = fetch.headers.iter().map(|(n, v)| (n.clone(), v.clone())).collect();
     if let Some(template) = &fetch.auth {
-        let auth = policy::fill(template, |field| source::current().value(name, field).ok_or_else(|| anyhow!("{name}/{field} isn't stored (halti set {name} {field})")))?;
+        let source = source::current();
+        let auth = policy::fill(template, |field| source.value(name, field).ok_or_else(|| anyhow!("{name}/{field} isn't stored ({})", source.hint(Hint::SetValue(name, field)))))?;
         // The assembled header may hold the secret in a form no field has ("Basic <base64>").
         secrets.extend(auth.split_whitespace().map(str::to_string));
         secrets.push(auth.clone());

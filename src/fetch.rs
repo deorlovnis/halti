@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow, bail};
 use ureq::http;
 
 use crate::policy::{self, Approved, METHODS, Mode};
+use crate::source::Hint;
 use crate::{approve, source};
 
 /// Response bodies are cut off after this many bytes.
@@ -21,8 +22,9 @@ pub struct Request<'a> {
     pub content_type: Option<&'a str>,
 }
 
-/// Make the request and describe the response as text. The caller masks it.
-pub fn perform(res: &str, approved: &Approved, req: &Request) -> Result<String> {
+/// Make the request and describe the response as text. The caller masks it. `asking` is what a
+/// question about a write starts with: `box acme/dev: ` for a workspace's box, else empty.
+pub fn perform(res: &str, approved: &Approved, req: &Request, asking: &str) -> Result<String> {
     let fetch = approved.policy.fetch.as_ref().ok_or_else(|| anyhow!("the policy for {res} allows no requests (no [fetch] section)"))?;
     let method = req.method.to_ascii_uppercase();
     if !METHODS.contains(&method.as_str()) {
@@ -32,14 +34,15 @@ pub fn perform(res: &str, approved: &Approved, req: &Request) -> Result<String> 
     if !matches!(method.as_str(), "GET" | "HEAD") {
         match fetch.writes {
             Mode::Deny => bail!("the policy for {res} doesn't allow {method} requests"),
-            Mode::Ask => approve::confirm(&format!("send {method} {url} for {res}"))?,
+            Mode::Ask => approve::confirm(&format!("{asking}send {method} {url} for {res}"))?,
             Mode::Allow => {}
         }
     }
 
     let mut request = http::Request::builder().method(method.as_str()).uri(url.as_str());
     if let Some(template) = &fetch.auth {
-        let value = policy::fill(template, |field| source::current().value(res, field).ok_or_else(|| anyhow!("{res}/{field} isn't stored (halti set {res} {field})")))?;
+        let source = source::current();
+        let value = policy::fill(template, |field| source.value(res, field).ok_or_else(|| anyhow!("{res}/{field} isn't stored ({})", source.hint(Hint::SetValue(res, field)))))?;
         request = request.header(fetch.auth_header.as_str(), value);
     }
     for (name, value) in &fetch.headers {

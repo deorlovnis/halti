@@ -19,7 +19,6 @@ use serde_json::{Value, json};
 
 use crate::index::today;
 use crate::policy::{Approved, Browse, Mode, Policy};
-use crate::util::config_dir;
 use crate::{approve, source};
 
 /// Writes a site's pages tried without an `allow_writes` rule are remembered, up to this many per site.
@@ -74,19 +73,31 @@ pub struct Session {
     closed: bool,
     /// Values of the session put into this browser from a sealed state, for masking.
     pub secrets: Vec<String>,
+    /// What a question about a page's write starts with: `box acme/dev: ` for a workspace's box,
+    /// so the person sees which client asks; empty otherwise.
+    asking: String,
 }
 
 impl Session {
     /// Start a browser on the Mac for the site with its session in place (the Keychain fields
     /// its policy names), and open the start page.
     pub fn open(site: &str, approved: &Approved) -> Result<(Self, String)> {
-        Self::open_with(site, approved, mac_runner()?, None, None, None)
+        Self::open_with(site, approved, mac_runner()?, None, None, None, "")
     }
 
     /// The same over any runner process: `sealed` is the session to start from instead of the
     /// Keychain fields, `proxy` the (username, password) Chromium presents to the proxy in a box,
-    /// `downloads` the folder pages may save to (none: downloads are refused).
-    pub fn open_with(site: &str, approved: &Approved, mut child: Child, sealed: Option<&Value>, proxy: Option<(&str, &str)>, downloads: Option<String>) -> Result<(Self, String)> {
+    /// `downloads` the folder pages may save to (none: downloads are refused), `asking` what the
+    /// questions about its pages' writes start with.
+    pub fn open_with(
+        site: &str,
+        approved: &Approved,
+        mut child: Child,
+        sealed: Option<&Value>,
+        proxy: Option<(&str, &str)>,
+        downloads: Option<String>,
+        asking: &str,
+    ) -> Result<(Self, String)> {
         let mut config = config(site, &approved.policy, sealed.map_or(Source::Fields, Source::Sealed))?;
         if let Some((user, password)) = proxy.filter(|(_, password)| !password.is_empty()) {
             config["proxy"] = json!({ "server": BOX_PROXY, "username": user, "password": password });
@@ -97,7 +108,7 @@ impl Session {
         let stdin = child.stdin.take().expect("piped");
         let stdout = BufReader::new(child.stdout.take().expect("piped"));
         let secrets = sealed.map(state_values).unwrap_or_default();
-        let mut session = Self { site: site.to_string(), child, stdin, stdout, next_id: 0, closed: false, secrets };
+        let mut session = Self { site: site.to_string(), child, stdin, stdout, next_id: 0, closed: false, secrets, asking: asking.to_string() };
         let text = session.call(json!({ "cmd": "open", "config": config }))?;
         Ok((session, text))
     }
@@ -126,7 +137,7 @@ impl Session {
             if let Some(ask) = msg.get("ask") {
                 let method = msg["method"].as_str().unwrap_or("?");
                 let url = msg["url"].as_str().unwrap_or("?");
-                let allow = approve::confirm(&format!("let a {} page send {method} {url}", self.site)).is_ok();
+                let allow = approve::confirm(&format!("{}let a {} page send {method} {url}", self.asking, self.site)).is_ok();
                 writeln!(self.stdin, "{}", json!({ "answer": ask, "allow": allow }))?;
                 self.stdin.flush()?;
                 continue;
@@ -356,7 +367,7 @@ struct WriteSeen {
 }
 
 fn blocked_path(site: &str) -> PathBuf {
-    config_dir().join("blocked-writes").join(format!("{site}.json"))
+    source::current().blocked_dir().join(format!("{site}.json"))
 }
 
 /// Remember a write a page tried (method and URL without query, never a body). Best effort.
