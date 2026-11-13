@@ -11,12 +11,14 @@
 #[cfg(all(halti_dev, any(halti_release, not(debug_assertions))))]
 compile_error!("halti_dev is only for debug-profile builds: a release build or one without debug assertions must not have the test hooks");
 
+mod approval;
 mod approve;
 mod audit;
 mod boxes;
 mod browse;
 mod browser;
 mod chain;
+mod config;
 mod door;
 mod engine;
 mod fetch;
@@ -35,6 +37,7 @@ mod refresh;
 mod sandbox;
 mod seal;
 mod util;
+mod ws;
 
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::process::ExitStatusExt;
@@ -166,6 +169,33 @@ enum Cmd {
         #[command(subcommand)]
         action: BoxCmd,
     },
+    /// Edit halti's settings and approve them (--show: the settings in effect, --default: the template)
+    Config {
+        /// Show the settings in effect and change nothing
+        #[arg(long, conflicts_with = "default")]
+        show: bool,
+        /// Print halti's template and change nothing
+        #[arg(long)]
+        default: bool,
+    },
+    /// Workspaces, each opened with its own passphrase: create, list and delete them
+    Ws {
+        #[command(subcommand)]
+        action: WsCmd,
+    },
+    /// Check a workspace's passphrase and files (workspaces can't stay open yet)
+    Open {
+        /// The workspace; may be left out when there is only one
+        name: Option<String>,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
+    },
+    /// Close a workspace (workspaces can't stay open yet, so there is nothing to close)
+    Close {
+        /// The workspace; may be left out when there is only one
+        name: Option<String>,
+    },
     /// How this binary was built: whether it has the test hooks, its target, and where it keeps its files
     #[command(name = "build-info", hide = true)]
     BuildInfo,
@@ -292,6 +322,39 @@ enum PolicyCmd {
         #[arg(value_parser = parse_resource)]
         resources: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum WsCmd {
+    /// Create a workspace with its own passphrase (yours, or one halti makes: as halti config says, unless --own or --generate)
+    New {
+        name: String,
+        /// Type a passphrase of your own
+        #[arg(long, conflicts_with = "generate")]
+        own: bool,
+        /// Have halti make the passphrase and show it once
+        #[arg(long)]
+        generate: bool,
+    },
+    /// List workspaces (asks for nothing)
+    #[command(visible_alias = "list")]
+    Ls,
+    /// Delete a workspace and everything in it; it can't be undone (asks as halti config says)
+    Delete {
+        name: String,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
+    },
+}
+
+/// Whose passphrase `ws new` gives the workspace, if its flags say.
+fn passphrase_choice(own: bool, generate: bool) -> Option<config::PassphraseMode> {
+    match (own, generate) {
+        (true, _) => Some(config::PassphraseMode::Own),
+        (_, true) => Some(config::PassphraseMode::Generate),
+        _ => None,
+    }
 }
 
 fn parse_resource(s: &str) -> Result<String, String> {
@@ -744,6 +807,14 @@ fn main() -> ExitCode {
             #[cfg(all(halti_dev, target_os = "linux"))]
             BoxCmd::Sh { engine: _, tools, command } => sandbox::sh(tools, command),
         },
+        Cmd::Config { show, default } => ok(config::command(show, default)),
+        Cmd::Ws { action } => ok(match action {
+            WsCmd::New { name, own, generate } => ws::new(&name, passphrase_choice(own, generate)),
+            WsCmd::Ls => ws::ls(),
+            WsCmd::Delete { name, type_it } => ws::delete(&name, type_it),
+        }),
+        Cmd::Open { name, type_it } => ok(ws::open(name.as_deref(), type_it)),
+        Cmd::Close { name } => ok(ws::close(name.as_deref())),
         Cmd::BuildInfo => {
             cmd_build_info();
             Ok(0)

@@ -17,6 +17,7 @@ use anyhow::Result;
 
 use crate::ids::{WsId, WsName, write_hex};
 use crate::platform::Adapter;
+use crate::refusal::Refusal;
 
 /// The name a stored value goes by: 32 opaque bytes. It should never spell a client's name, and
 /// nothing here checks that yet (see the top of this file).
@@ -46,9 +47,41 @@ impl fmt::Debug for ItemName {
     }
 }
 
+/// What kind of keystore keeps a workspace's items. Tags are written into records, so they are
+/// fixed: 0x03 is kept for the Keychain, and 0x04 and up for vaults.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum KeystoreKind {
+    /// In memory, for tests.
+    Memory,
+    /// One file per item.
+    Files,
+}
+
+impl KeystoreKind {
+    /// The byte that names it in a record: 0x01 memory, 0x02 files.
+    pub const fn tag(self) -> u8 {
+        match self {
+            KeystoreKind::Memory => 0x01,
+            KeystoreKind::Files => 0x02,
+        }
+    }
+
+    /// Refuses a byte that names no kind this build knows.
+    pub fn from_tag(tag: u8) -> Result<KeystoreKind, Refusal> {
+        match tag {
+            0x01 => Ok(KeystoreKind::Memory),
+            0x02 => Ok(KeystoreKind::Files),
+            _ => Err(Refusal::Unreadable),
+        }
+    }
+}
+
 /// Where stored values are kept. Every call names its workspace. Only `Keystore`, the adapters and
 /// their contract should call it; nothing enforces that yet (see the top of this file).
 pub trait KeystoreBackend: Adapter {
+    /// What kind of keystore it is: written into each workspace's directory record and manifest.
+    fn kind(&self) -> KeystoreKind;
     /// Stores the blob, replacing any under that name in that workspace.
     fn put(&self, ws: WsId, name: &ItemName, blob: &[u8]) -> Result<()>;
     fn get(&self, ws: WsId, name: &ItemName) -> Result<Option<Vec<u8>>>;
@@ -78,7 +111,6 @@ pub struct Keystore<'p> {
 
 impl<'p> Keystore<'p> {
     /// Binds a backend to one workspace. Nothing rebinds it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "opening a workspace is its first caller outside tests"))]
     pub(crate) fn bind(ws: WsId, backend: &'p dyn KeystoreBackend) -> Keystore<'p> {
         Keystore { ws, backend }
     }
@@ -129,6 +161,9 @@ pub trait Files: Adapter {
     fn read(&self, k: &FileKey) -> Result<Option<Vec<u8>>>;
     /// Replaces the file whole, or not at all.
     fn write_atomic(&self, k: &FileKey, bytes: &[u8]) -> Result<()>;
+    /// Writes the file whole, only if there is none, and says whether it did: false if one was
+    /// there, which is left as it is. Two calls for one file at once never both return true.
+    fn create_new(&self, k: &FileKey, bytes: &[u8]) -> Result<bool>;
     /// Adds `line` and a newline to the end, making the file if it isn't there. `line` holds no
     /// newline of its own.
     fn append(&self, k: &FileKey, line: &[u8]) -> Result<()>;
@@ -208,6 +243,21 @@ mod tests {
         globex.list().unwrap();
         globex.delete(&TOKEN).unwrap();
         assert_eq!(backend.calls(), [GLOBEX; 4]);
+    }
+
+    /// Byte for byte: these go into a workspace's directory record and manifest.
+    #[test]
+    fn a_keystore_kind_is_written_as_its_fixed_tag() {
+        assert_eq!((KeystoreKind::Memory.tag(), KeystoreKind::Files.tag()), (0x01, 0x02));
+        for tag in 0..=255 {
+            let known = match tag {
+                0x01 => Ok(KeystoreKind::Memory),
+                0x02 => Ok(KeystoreKind::Files),
+                _ => Err(Refusal::Unreadable),
+            };
+            assert_eq!(KeystoreKind::from_tag(tag), known, "tag {tag}");
+        }
+        assert_eq!(MemKeystore::new().kind(), KeystoreKind::Memory);
     }
 
     #[test]

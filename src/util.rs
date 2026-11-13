@@ -33,10 +33,22 @@ pub fn home() -> PathBuf {
     passwd_home().filter(|h| h.is_absolute()).unwrap_or_default()
 }
 
-/// The home folder in the passwd entry of the user halti runs as.
-fn passwd_home() -> Option<PathBuf> {
-    use std::ffi::CStr;
+/// The home folder in the passwd entry of the user halti runs as, whatever `HOME` says, in every build.
+pub fn passwd_home() -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
+
+    passwd_field(|entry| entry.pw_dir).map(|dir| PathBuf::from(std::ffi::OsStr::from_bytes(&dir)))
+}
+
+/// The name of the user halti runs as, from the passwd entry of its uid: never `USER` or any other
+/// variable, so the environment can't change it.
+pub fn user_name() -> Option<String> {
+    passwd_field(|entry| entry.pw_name).and_then(|name| String::from_utf8(name).ok()).filter(|name| !name.is_empty())
+}
+
+/// One text field of the passwd entry of the user halti runs as, picked by `field`.
+fn passwd_field(field: fn(&libc::passwd) -> *mut libc::c_char) -> Option<Vec<u8>> {
+    use std::ffi::CStr;
 
     let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
     let mut found = std::ptr::null_mut();
@@ -49,11 +61,12 @@ fn passwd_home() -> Option<PathBuf> {
             _ => return None,
         }
     }
-    if found.is_null() || entry.pw_dir.is_null() {
+    let text = field(&entry);
+    if found.is_null() || text.is_null() {
         return None;
     }
-    let dir = unsafe { CStr::from_ptr(entry.pw_dir) };
-    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+    // Copied out while `buf`, which the entry's fields point into, is still there.
+    Some(unsafe { CStr::from_ptr(text) }.to_bytes().to_vec())
 }
 
 pub fn config_dir() -> PathBuf {
@@ -114,6 +127,20 @@ impl Drop for TempDir {
     }
 }
 
+/// Runs `read` with SIGINT ignored, then puts back what was there. rpassword reads Ctrl-C as a key
+/// and raises SIGINT itself before it says the read was interrupted: by default that ends halti
+/// there and then, with the terminal left raw and an unfinished workspace's record left behind.
+/// The terminal sends no SIGINT of its own while rpassword reads, so no other Ctrl-C is lost. While
+/// sudo runs, Ctrl-C ends sudo alone, which puts SIGINT back to default for itself.
+pub fn sigint_ignored<T>(read: impl FnOnce() -> T) -> T {
+    let before = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    let got = read();
+    if before != libc::SIG_ERR {
+        unsafe { libc::signal(libc::SIGINT, before) };
+    }
+    got
+}
+
 /// Put stdin, stdout and stderr back in blocking mode. A program that shared the terminal
 /// (`container`'s progress display, say) can leave it non-blocking, and then a long print fails
 /// with EAGAIN, which panics before any prompt is shown.
@@ -154,6 +181,9 @@ mod tests {
     fn the_passwd_home_is_a_folder() {
         let home = super::passwd_home().unwrap();
         assert!(home.is_absolute() && home.is_dir(), "{}", home.display());
+        // The user's name comes from the same entry, whatever the environment says.
+        let name = super::user_name().unwrap();
+        assert!(!name.is_empty() && !name.contains(['/', '\0', '\n']), "{name:?}");
     }
 
     #[test]
@@ -164,6 +194,16 @@ mod tests {
     #[test]
     fn environment_variables_have_the_new_name_first() {
         assert_eq!(super::env_names("WARN_DAYS"), ["HALTI_WARN_DAYS".to_string(), format!("{}WARN_DAYS", crate::legacy::ENV_PREFIX)]);
+    }
+
+    /// What rpassword does on Ctrl-C, raising SIGINT, ends the read and not the process, and what
+    /// SIGINT did before is back after.
+    #[test]
+    fn ctrl_c_at_a_prompt_ends_the_question_not_halti() {
+        let was = unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+        let (raised, during) = super::sigint_ignored(|| unsafe { (libc::raise(libc::SIGINT), libc::signal(libc::SIGINT, libc::SIG_IGN)) });
+        let after = unsafe { libc::signal(libc::SIGINT, was) };
+        assert_eq!((raised, during, after), (0, libc::SIG_IGN, libc::SIG_DFL));
     }
 
     #[test]

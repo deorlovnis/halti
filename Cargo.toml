@@ -12,6 +12,7 @@ base64 = "0.22"
 cbc = { version = "0.2", features = ["alloc"] }
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6", features = ["derive"] }
+halti-core = { path = "core" }
 jiff = { version = "0.2", features = ["serde"] }
 libc = "0.2"
 pbkdf2 = "0.13"
@@ -31,6 +32,7 @@ toml = "1.1"
 ureq = "3.5"
 url = "2.5"
 webpki-roots = "1"
+zeroize = "1.9"
 
 # Touch ID and the Keychain. Elsewhere (a box's Linux) halti builds and its tests run, but there's
 # nothing to keep secrets in: see `keychain::backend` and `approve`.
@@ -110,9 +112,9 @@ opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
 
-# The binary (this package) and core are one workspace; the binary doesn't use core yet. Naming
-# "." as a member would undo the exclude. The shim keeps its own lock, since the agent images
-# build it on its own.
+# The binary (this package) and core are one workspace: the binary's workspaces (src/ws.rs) are
+# core's. Naming "." as a member would undo the exclude. The shim keeps its own lock, since the
+# agent images build it on its own.
 [workspace]
 members = ["core"]
 exclude = ["box/shim"]

@@ -1,5 +1,6 @@
 //! A workspace's keys. One random inner key is the root of everything the workspace encrypts or
-//! signs: the working keys and the policy signing key are derived from it and from nothing else.
+//! signs: the working keys, the manifest's key and the policy signing key are derived from it and
+//! from nothing else.
 //! It rests wrapped to public keys (the workspace's hardware key, and a recovery key), and core
 //! never returns it unwrapped.
 //!
@@ -12,7 +13,7 @@ use std::fmt;
 
 use zeroize::Zeroizing;
 
-use crate::crypto::kdf::{INNER, ITEM_NAMES, KEYS_ID, LOGS, SECRETS, SESSIONS, STORE, derive_scalar, labeled_expand, labeled_extract};
+use crate::crypto::kdf::{INNER, ITEM_NAMES, KEYS_ID, LOGS, MANIFEST, SECRETS, SESSIONS, STORE, derive_scalar, labeled_expand, labeled_extract};
 use crate::crypto::kem::{Purpose, open_with, seal_to};
 use crate::crypto::sign::{SigningKey, VerifyingKey};
 use crate::holder::Commitment;
@@ -123,7 +124,7 @@ impl WrapKind {
 /// compared or written out, and printing it shows nothing of it.
 ///
 /// Only this crate can get the key that signs policies from it, open a wrap into one, or derive
-/// the keys an open workspace holds:
+/// the keys an open workspace holds or the key its manifest is sealed under:
 ///
 /// ```compile_fail
 /// let _ = halti_core::key::InnerKey::policy_signer;
@@ -137,7 +138,11 @@ impl WrapKind {
 /// let _ = halti_core::key::InnerKey::open_keys;
 /// ```
 ///
-/// (Those fail because the three are private to this crate, as this, which is public, does not.)
+/// ```compile_fail
+/// let _ = halti_core::key::InnerKey::manifest_key;
+/// ```
+///
+/// (Those fail because the four are private to this crate, as this, which is public, does not.)
 ///
 /// ```
 /// let _ = halti_core::key::InnerKey::wrap_to;
@@ -160,6 +165,16 @@ impl InnerKey {
             out
         };
         OpenKeys { secrets: key(SECRETS), logs: key(LOGS), sessions: key(SESSIONS), store: key(STORE), item_names: key(ITEM_NAMES), policy_verify: self.signer().verifying_key() }
+    }
+
+    /// The key this workspace's manifest is sealed under, derived as the working keys are. Never
+    /// part of `OpenKeys`: only a sequence holding the unwrapped inner key reads or writes the
+    /// manifest.
+    pub(crate) fn manifest_key(&self) -> Zeroizing<[u8; 32]> {
+        let prk = labeled_extract(&[], KEYS_ID, INNER, &[self.0.as_slice()]);
+        let mut out = Zeroizing::new([0; 32]);
+        labeled_expand(&prk, KEYS_ID, MANIFEST, &[], out.as_mut_slice());
+        out
     }
 
     /// The key that signs this workspace's policies. Never part of `OpenKeys`.
@@ -346,9 +361,9 @@ mod tests {
     use crate::crypto::kem::{DecapKey, ciphertext_of, combine, encapsulate};
     use crate::crypto::sign::Signature;
     use crate::crypto::vectors::{
-        KAT_HARDWARE_EK_FIRST, KAT_HARDWARE_EK_LAST, KAT_HARDWARE_P256, KAT_HARDWARE_WRAP, KAT_KEY_ITEM_NAMES, KAT_KEY_LOGS, KAT_KEY_SECRETS, KAT_KEY_SESSIONS, KAT_KEY_STORE,
-        KAT_PASSPHRASE_RECORD, KAT_POLICY_SCALAR, KAT_POLICY_VERIFY, KAT_RECOVERY_COMBINED, KAT_RECOVERY_P256_EPH, KAT_RECOVERY_SS_M, KAT_RECOVERY_SS_P, KAT_RECOVERY_WRAP_BODY,
-        PASSPHRASE, hardware_rand, hardware_seed, hex, inner_bytes, recovery_rand, recovery_seed, ws_bytes,
+        KAT_HARDWARE_EK_FIRST, KAT_HARDWARE_EK_LAST, KAT_HARDWARE_P256, KAT_HARDWARE_WRAP, KAT_KEY_ITEM_NAMES, KAT_KEY_LOGS, KAT_KEY_MANIFEST, KAT_KEY_SECRETS, KAT_KEY_SESSIONS,
+        KAT_KEY_STORE, KAT_PASSPHRASE_RECORD, KAT_POLICY_SCALAR, KAT_POLICY_VERIFY, KAT_RECOVERY_COMBINED, KAT_RECOVERY_P256_EPH, KAT_RECOVERY_SS_M, KAT_RECOVERY_SS_P,
+        KAT_RECOVERY_WRAP_BODY, PASSPHRASE, hardware_rand, hardware_seed, hex, inner_bytes, recovery_rand, recovery_seed, ws_bytes,
     };
     use crate::holder::{KeyRef, Released};
     use crate::passphrase::{Passphrase, PassphraseRecord};
@@ -423,6 +438,21 @@ mod tests {
         assert_eq!(keys.item_names().as_slice(), hex(KAT_KEY_ITEM_NAMES));
         assert_eq!(derive_scalar(KEYS_ID, &inner_bytes()).as_slice(), hex(KAT_POLICY_SCALAR));
         assert_eq!(keys.policy_verify().to_bytes().as_slice(), hex(KAT_POLICY_VERIFY));
+    }
+
+    #[test]
+    fn the_manifest_key_is_unchanged_and_none_of_the_working_keys() {
+        let key = inner().manifest_key();
+        assert_eq!(key.as_slice(), hex(KAT_KEY_MANIFEST));
+        // Derived beside the working keys from the same root, and none of them: no part an open workspace holds is it.
+        let keys = inner().open_keys();
+        for working in held(&keys).0 {
+            assert_ne!(working, &*key);
+        }
+        assert_ne!(derive_scalar(KEYS_ID, &inner_bytes()), key, "nor the policy signing scalar");
+        // Another inner key, as a planted wrap holds, gives another.
+        assert_ne!(InnerKey::from_bytes(Zeroizing::new([0x21; 32])).manifest_key(), key);
+        assert_eq!(inner().manifest_key(), key, "the same each time");
     }
 
     #[test]

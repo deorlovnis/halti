@@ -6,6 +6,7 @@ use std::fmt;
 
 use crate::ids::WsName;
 use crate::passphrase::Passphrase;
+use crate::platform::{Build, Grade, Lacks, Property};
 
 /// Why core said no.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -29,6 +30,15 @@ pub enum Refusal {
     Tampered,
     /// A new passphrase is too short. It is never echoed.
     ShortPassphrase,
+    /// A workspace already has the name. It holds only what was typed.
+    Taken(WsName),
+    /// A release build does not run a workspace on this adapter on this system.
+    NotAdmitted { adapter: &'static str, grade: Grade },
+    /// This machine lacks protections the workspace was made with: these, which it did not lack
+    /// then.
+    Downgraded(Lacks),
+    /// The workspace was made by a build of the other kind.
+    OtherBuild(Build),
 }
 
 impl fmt::Display for Refusal {
@@ -43,6 +53,13 @@ impl fmt::Display for Refusal {
             Refusal::Declined => write!(f, "that was not approved"),
             Refusal::Tampered => write!(f, "this workspace's files were changed by something other than halti"),
             Refusal::ShortPassphrase => write!(f, "a passphrase has at least {} characters", Passphrase::MIN_CHARS),
+            Refusal::Taken(name) => write!(f, "there is already a workspace named {name}"),
+            Refusal::NotAdmitted { adapter, grade } => write!(f, "a release build does not run workspaces on {adapter} ({})", grade.name()),
+            Refusal::Downgraded(lacks) => {
+                let names: Vec<&str> = lacks.iter().map(Property::name).collect();
+                write!(f, "this machine lacks what this workspace was made with: {}", names.join(", "))
+            }
+            Refusal::OtherBuild(build) => write!(f, "this workspace was made by a {} build", build.name()),
         }
     }
 }

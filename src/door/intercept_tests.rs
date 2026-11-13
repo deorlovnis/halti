@@ -201,7 +201,7 @@ fn the_door_ends_tls_for_a_guest_that_trusts_only_the_box_ca() {
             allow: vec!["*".into()],
             model: None,
             sites: vec![],
-            net: inspect::Net { writes: Mode::Allow, allow_writes: vec![] },
+            net: inspect::Net { writes: Mode::Allow, ..Default::default() },
             log_key: [9; 32],
             log: log.clone(),
             ca: Some(box_ca.clone()),

@@ -1,5 +1,6 @@
-//! The fixed sequences that make a workspace's key and open it. Every check that needs no answer
-//! from the key holder comes before it is asked, and it is asked once: core never asks again.
+//! The fixed sequences that make a workspace's key and unlock it for one change. Every check that
+//! needs no answer from the key holder comes before it is asked, and it is asked once: core never
+//! asks again.
 //!
 //! Refusals tell three things apart. A check that fails before the holder answers is
 //! `Refusal::Unreadable`, whichever it is. The holder's "no" is `Refusal::Declined`. A check that
@@ -48,13 +49,14 @@ impl fmt::Debug for Opened {
     }
 }
 
-/// Makes a workspace's key, wrap and first pin: one approval, no decapsulation. The pin is written
-/// last, so a failure part way leaves files and no pin, which `open` refuses and a second
-/// `create_key` does too.
+/// Makes a workspace's key, wrap and first pin: one approval, no decapsulation. `then` is handed
+/// the inner key once the key ref and the wrap are written, and writes the rest of what the first
+/// pin covers. The pin is written last, so a failure part way leaves files and no pin, which
+/// `unlock` refuses and a second `create_key` does too.
 ///
 /// It does not check that the holder kept the commitment: a holder that did not makes a workspace
 /// whose first open is `Refusal::Tampered`.
-pub fn create_key(host: &Host<'_>, ws: WsId, name: &WsName, build: Build, draws: Draws) -> Result<()> {
+pub(crate) fn create_key(host: &Host<'_>, ws: WsId, name: &WsName, build: Build, draws: Draws, then: impl FnOnce(&InnerKey) -> Result<()>) -> Result<()> {
     let _held = host.files.lock(ws)?;
     if host.anchor.read(ws)?.is_some() || host.files.read(&FileKey::KeyRef(ws))?.is_some() || host.files.read(&FileKey::Wrap(ws))?.is_some() {
         bail!("workspace {ws} already has a key");
@@ -67,14 +69,16 @@ pub fn create_key(host: &Host<'_>, ws: WsId, name: &WsName, build: Build, draws:
     let wrap = inner.wrap_to(&public, ws, WrapKind::Hardware, &draws.wrap)?;
     host.files.write_atomic(&FileKey::KeyRef(ws), &key_ref.0)?;
     host.files.write_atomic(&FileKey::Wrap(ws), &wrap)?;
+    then(&inner)?;
     let pin = Pin { version: 1, key_ref: key_ref_hash(ws, host.holder.kind(), &key_ref), public_key: public_key_hash(ws, &public), state: state(host.files, ws, name, &wrap)? };
     host.anchor.advance(ws, &pin)
 }
 
-/// Opens a workspace: every check before the one decapsulation, and the commitment right after
-/// it. No inner key, `OpenKeys` or signing key leaves the call; the inner key is wiped before it
-/// returns.
-pub fn open(host: &Host<'_>, ws: WsId, name: &WsName, build: Build) -> Result<Opened> {
+/// Unlocks a workspace for one change: every check before the one decapsulation and the
+/// commitment right after it, then `then`, still under the lock, with the inner key, the key ref
+/// the pin named and the manifest file the pin covers. No inner key leaves the call; it is wiped
+/// before it returns.
+pub(crate) fn unlock<T>(host: &Host<'_>, ws: WsId, name: &WsName, build: Build, change: Change, then: impl FnOnce(&InnerKey, &KeyRef, &[u8]) -> Result<T>) -> Result<T> {
     let _held = host.files.lock(ws)?;
     let Some(pin) = host.anchor.read(ws)?.filter(|pin| pin.version > 0) else { return Err(Refusal::Unreadable.into()) };
     let (Some(key_ref), Some(wrap)) = (host.files.read(&FileKey::KeyRef(ws))?, host.files.read(&FileKey::Wrap(ws))?) else { return Err(Refusal::Unreadable.into()) };
@@ -82,21 +86,29 @@ pub fn open(host: &Host<'_>, ws: WsId, name: &WsName, build: Build) -> Result<Op
     check(key_ref_hash(ws, host.holder.kind(), &key_ref) == pin.key_ref)?;
     let public = host.holder.public(&key_ref)?;
     check(public_key_hash(ws, &public) == pin.public_key)?;
-    check(state(host.files, ws, name, &wrap)? == pin.state)?;
+    // Read once: what `then` is handed is what the pin was checked over.
+    let manifest = host.files.read(&FileKey::Manifest(ws))?.unwrap_or_default();
+    let policy = host.files.read(&FileKey::Policy(ws))?.unwrap_or_default();
+    check(state_hash(ws, name, &wrap, &manifest, &policy) == pin.state)?;
     // Before anything is asked: a wrap of another length, format or suite would otherwise be found
     // only by its tag, after the holder had answered.
     check(wrap.len() == WRAP_LEN)?;
     let ct = ciphertext_of(&wrap)?;
     check(ct.suite == public.suite)?;
 
-    let released = host.holder.decapsulate(&key_ref, &Prompt::new(ws, name, Change::Open, build), &ct)?;
+    let released = host.holder.decapsulate(&key_ref, &Prompt::new(ws, name, change, build), &ct)?;
     // The holder has answered, so a wrap that does not open under its answer was changed: no typo gives this.
     let inner = InnerKey::unwrap_with(&wrap, &public, ws, WrapKind::Hardware, &released.shares).map_err(|_| Refusal::Tampered)?;
     if inner.commitment() != released.commitment {
         return Err(Refusal::Tampered.into());
     }
+    then(&inner, &key_ref, manifest.as_slice())
+}
+
+/// The working keys of an unwrapped inner key, split for each place.
+pub(crate) fn opened(inner: &InnerKey) -> Opened {
     let (door, store, names) = inner.open_keys().split();
-    Ok(Opened { door, store, names })
+    Opened { door, store, names }
 }
 
 /// The pin's state hash of what is on disk now. A manifest or policy that is not there counts as
@@ -136,6 +148,11 @@ mod tests {
         WsName::parse(text).unwrap()
     }
 
+    /// Opening as the verbs do, without the manifest: every check, one decapsulation, the keys split.
+    fn open(host: &Host<'_>, ws: WsId, name: &WsName, build: Build) -> Result<Opened> {
+        unlock(host, ws, name, build, Change::Open, |inner, _, _| Ok(opened(inner)))
+    }
+
     /// The known answers' inner key and wrap randomness, as the caller would have drawn them.
     fn draws() -> Draws {
         Draws { inner: Zeroizing::new(inner_bytes()), wrap: Zeroizing::new(hardware_rand()) }
@@ -163,7 +180,7 @@ mod tests {
         }
 
         fn create_acme(&self) -> Result<()> {
-            create_key(&self.host(), acme(), &ws_name("acme"), Build::Release, draws())
+            create_key(&self.host(), acme(), &ws_name("acme"), Build::Release, draws(), |_| Ok(()))
         }
 
         /// Opens acme's workspace under `name`.
@@ -533,7 +550,7 @@ mod tests {
         let kept = || (world.files.read(&FileKey::KeyRef(acme())).unwrap(), world.files.read(&FileKey::Wrap(acme())).unwrap(), world.anchor.read(acme()).unwrap());
         let before = kept();
         assert!(world.create_acme().unwrap_err().to_string().contains("already has a key"));
-        assert!(create_key(&world.host(), acme(), &ws_name("globex"), Build::Release, draws()).is_err(), "nor under another name");
+        assert!(create_key(&world.host(), acme(), &ws_name("globex"), Build::Release, draws(), |_| Ok(())).is_err(), "nor under another name");
         assert_eq!(world.holder.creates(), 1, "the holder was not asked again");
         assert_eq!(kept(), before);
         // Nor where only the pin is left, only the key ref, or only the wrap: and the holder is not asked, nor a file written.

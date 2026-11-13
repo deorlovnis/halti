@@ -43,6 +43,8 @@ pub(crate) const LOGS: &[u8] = b"logs";
 pub(crate) const SESSIONS: &[u8] = b"sessions";
 pub(crate) const STORE: &[u8] = b"store";
 pub(crate) const ITEM_NAMES: &[u8] = b"item_names";
+// Also under `KEYS_ID`, and never one of the working keys: the key the manifest is sealed under.
+pub(crate) const MANIFEST: &[u8] = b"manifest";
 
 // Under `PIN_ID`: what each of a pin's hashes covers. They are SHA-384s, not derivations (`anchor`).
 pub(crate) const PIN_KEY_REF: &[u8] = b"key_ref";
@@ -171,7 +173,7 @@ mod tests {
         for (label, text) in pinned {
             assert_eq!(label, text.as_bytes());
         }
-        assert_eq!((SESSIONS, STORE, ITEM_NAMES), (b"sessions".as_slice(), b"store".as_slice(), b"item_names".as_slice()));
+        assert_eq!((SESSIONS, STORE, ITEM_NAMES, MANIFEST), (b"sessions".as_slice(), b"store".as_slice(), b"item_names".as_slice(), b"manifest".as_slice()));
         // A pin's hashes: its id ends in the pin's format, 0x01.
         assert_eq!((PIN_ID, PIN_KEY_REF, PIN_PUBLIC_KEY, PIN_STATE), (b"PIN\x01".as_slice(), b"key_ref".as_slice(), b"public_key".as_slice(), b"state".as_slice()));
         assert_eq!(PIN_ID.last(), Some(&0x01));
@@ -188,11 +190,11 @@ mod tests {
         let used: [(&[u8], &[&[u8]]); 4] = [
             (KEM_ID, &[DKP_PRK, CANDIDATE, EAE_PRK, SHARED_SECRET]),
             (SEAL_ID, &[PSK_ID_HASH, INFO_HASH, SECRET, KEY, BASE_NONCE]),
-            (KEYS_ID, &[DKP_PRK, CANDIDATE, INNER, SECRETS, LOGS, SESSIONS, STORE, ITEM_NAMES]),
+            (KEYS_ID, &[DKP_PRK, CANDIDATE, INNER, SECRETS, LOGS, SESSIONS, STORE, ITEM_NAMES, MANIFEST]),
             (PIN_ID, &[PIN_KEY_REF, PIN_PUBLIC_KEY, PIN_STATE]),
         ];
         let joined: Vec<Vec<u8>> = used.iter().flat_map(|(id, labels)| labels.iter().map(move |label| [*id, *label].concat())).collect();
-        assert_eq!(joined.len(), 20);
+        assert_eq!(joined.len(), 21);
         for (i, one) in joined.iter().enumerate() {
             for (j, other) in joined.iter().enumerate() {
                 assert!(i == j || !other.starts_with(one), "{one:?} starts {other:?}");

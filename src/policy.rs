@@ -1,10 +1,10 @@
 //! Per-resource policies: what halti may do with a resource's secrets.
 //!
 //! A policy is a TOML file, policy/<resource>.toml in the config folder. It counts only once the
-//! user approves it with Touch ID: the approval pins the file's sha256, and the sha256 of every
-//! refresh script it names, in a Keychain item that halti reads without UI. A policy or script
-//! changed afterwards, or an approval halti can't read silently (e.g. one planted by another
-//! program), blocks the resource until it is approved again.
+//! user approves it with Touch ID (a box's, as `[box.approval] policy` says): the approval pins
+//! the file's sha256, and the sha256 of every refresh script it names, in a Keychain item that
+//! halti reads without UI. A policy or script changed afterwards, or an approval halti can't read
+//! silently (e.g. one planted by another program), blocks the resource until it is approved again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal};
@@ -19,8 +19,11 @@ use serde_json::{Map, Value};
 use similar::TextDiff;
 use url::{Host, Url};
 
+use crate::approval::{self, Action, Means, World};
+use crate::config::{self, Settings};
 use crate::util::{config_dir, expand_home, sha256_hex};
-use crate::{approve, ask, boxes, browser, interactive, keychain, names, parse_env, parse_field, parse_resource};
+use crate::ws::OS;
+use crate::{ask, boxes, browser, interactive, keychain, names, parse_env, parse_field, parse_resource};
 
 /// Keychain field of a resource's approval record. Field names can't start with "_".
 const APPROVAL: &str = "_policy";
@@ -629,6 +632,17 @@ fn record(res: &str) -> Option<Approval> {
     serde_json::from_str(&keychain::get_silently(res, APPROVAL)?).ok()
 }
 
+/// The text an approval record under this Keychain name keeps, if its sha256 is the one approved.
+pub fn pinned_text(key: &str) -> Option<String> {
+    let record = record(key)?;
+    record.text.filter(|text| sha256_hex(text.as_bytes()) == record.policy)
+}
+
+/// Keep `approval` under this Keychain name, in a new item only the running halti reads silently.
+pub fn pin(key: &str, approval: &Approval) -> Result<()> {
+    keychain::replace(key, APPROVAL, &serde_json::to_string(approval)?)
+}
+
 pub fn status(res: &str) -> Status {
     status_of(res, &path(res))
 }
@@ -690,6 +704,11 @@ pub fn revoke(key: &str) {
     keychain::delete(key, APPROVAL);
 }
 
+/// Whether an approval's Keychain name is a box's.
+fn is_box(key: &str) -> bool {
+    key.starts_with(boxes::KEY_PREFIX)
+}
+
 /// How an approval reads in messages: a resource's name, or "box NAME".
 fn label(key: &str) -> String {
     key.strip_prefix(boxes::KEY_PREFIX).map_or_else(|| key.to_string(), |name| format!("box {name}"))
@@ -736,19 +755,45 @@ pub fn approve(resources: &[String]) -> Result<()> {
     if prepared.is_empty() {
         bail!("there are no policies (write one with: halti policy edit RESOURCE)");
     }
-    approve_prepared(prepared)
+    // Only a box's approval reads the settings, so approving resources alone doesn't.
+    let settings = if prepared.iter().any(|(key, _)| is_box(key)) { config::settings() } else { Settings::builtin(OS) };
+    approve_prepared(prepared, &settings)
 }
 
-/// Pin prepared approvals (Keychain name, record) after one confirmation.
-pub fn approve_prepared(prepared: Vec<(String, Approval)>) -> Result<()> {
-    let list: Vec<String> = prepared.iter().map(|(key, a)| format!("{} (sha256 {})", label(key), a.short())).collect();
-    let what = if list.len() == 1 { "policy" } else { "policies" };
-    approve::confirm(&format!("approve the halti {what} for {}", list.join(", ")))?;
+/// Pin prepared approvals (Keychain name, record) once approved: see `ask_to_approve`.
+pub fn approve_prepared(prepared: Vec<(String, Approval)>, settings: &Settings) -> Result<()> {
+    ask_to_approve(&approval::Real, settings, &prepared)?;
     for (key, approval) in prepared {
         keychain::replace(&key, APPROVAL, &serde_json::to_string(&approval)?)?;
         println!("approved the policy for {}", label(&key));
     }
     Ok(())
+}
+
+/// Asks once to approve `prepared`: a resource's policy with Touch ID, a box's as `[box.approval]
+/// policy` in `settings` says. While that is Touch ID too, one Touch ID approves them all; otherwise
+/// the resources are asked for with Touch ID, then the boxes their own way. Where nothing can
+/// approve a box's policy, nothing is asked.
+fn ask_to_approve(world: &dyn World, settings: &Settings, prepared: &[(String, Approval)]) -> Result<()> {
+    // The approvals named: all, or only the boxes' or only the resources'.
+    let reason = |boxes: Option<bool>| {
+        let list: Vec<String> =
+            prepared.iter().filter(|(key, _)| boxes.is_none_or(|boxes| is_box(key) == boxes)).map(|(key, a)| format!("{} (sha256 {})", label(key), a.short())).collect();
+        let what = if list.len() == 1 { "policy" } else { "policies" };
+        format!("approve the halti {what} for {}", list.join(", "))
+    };
+    let boxes = prepared.iter().filter(|(key, _)| is_box(key)).count();
+    if boxes == 0 {
+        return world.touch_id(&reason(None));
+    }
+    let means = settings.means(Action::BoxPolicy);
+    if boxes == prepared.len() || means == Some(Means::TouchId) {
+        return approval::ask_by(world, means, Action::BoxPolicy, &reason(None)).map(drop);
+    }
+    if means.is_some() {
+        world.touch_id(&reason(Some(false)))?;
+    }
+    approval::ask_by(world, means, Action::BoxPolicy, &reason(Some(true))).map(drop)
 }
 
 pub fn show(res: &str) -> Result<()> {
@@ -764,9 +809,14 @@ pub fn show(res: &str) -> Result<()> {
 /// What changed from the approved text to the current one, as a unified diff. Colored
 /// (ANSI) for a terminal.
 fn diff(old: &str, new: &str, color: bool) -> String {
+    diff_from("approved", old, new, color)
+}
+
+/// What changed from `old`, which `label` names, to `new`, as a unified diff. Colored (ANSI) for a terminal.
+pub fn diff_from(label: &str, old: &str, new: &str, color: bool) -> String {
     let body = TextDiff::from_lines(old, new).unified_diff().context_radius(3).to_string();
     let paint = |code: &str, line: &str| if color { format!("\x1b[{code}m{line}\x1b[0m\n") } else { format!("{line}\n") };
-    let mut out = paint("1", "--- approved") + &paint("1", "+++ now");
+    let mut out = paint("1", &format!("--- {label}")) + &paint("1", "+++ now");
     for line in body.lines() {
         out += &paint(
             match line.as_bytes().first() {
@@ -796,11 +846,7 @@ pub fn edit(res: &str) -> Result<()> {
 /// Open an approvable file in $EDITOR and check what was saved. A file approved before shows
 /// what the edit changed (false if nothing); a new one is shown whole when approved.
 pub fn edit_file(key: &str, p: &Path, check: impl FnOnce(&str) -> Result<()>) -> Result<bool> {
-    let editor = env::var("VISUAL").or_else(|_| env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
-    let status = Command::new("sh").args(["-c", &format!("{editor} \"$1\""), "sh"]).arg(p).status()?;
-    if !status.success() {
-        bail!("{editor} exited with {status}");
-    }
+    run_editor(p)?;
     let text = fs::read_to_string(p)?;
     check(&text).with_context(|| p.display().to_string())?;
     if let Some(old) = approved_text(key) {
@@ -811,6 +857,16 @@ pub fn edit_file(key: &str, p: &Path, check: impl FnOnce(&str) -> Result<()>) ->
         println!("{}", diff(&old, &text, io::stdout().is_terminal()));
     }
     Ok(true)
+}
+
+/// Opens the file in $VISUAL, else $EDITOR, else vi, and waits for it to end.
+pub fn run_editor(p: &Path) -> Result<()> {
+    let editor = env::var("VISUAL").or_else(|_| env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
+    let status = Command::new("sh").args(["-c", &format!("{editor} \"$1\""), "sh"]).arg(p).status()?;
+    if !status.success() {
+        bail!("{editor} exited with {status}");
+    }
+    Ok(())
 }
 
 /// Say that an edited file takes effect once approved, and offer to approve it now.
@@ -855,7 +911,48 @@ consent_minutes = 240  # a session consent lapses after this long (0: only when 
 
 #[cfg(test)]
 mod tests {
+    use halti_core::platform::Os;
+
     use super::*;
+    use crate::approval::fake_tests::Fake;
+
+    #[test]
+    fn a_box_s_policy_is_approved_as_its_settings_say() {
+        let prepared = |keys: &[&str]| -> Vec<(String, Approval)> { keys.iter().map(|key| (key.to_string(), Approval::of(key))).collect() };
+        let named = |key: &str| format!("{} (sha256 {})", label(key), Approval::of(key).short());
+        let (app, research, docs) = (named("app"), named("box.research"), named("box.docs"));
+        let mac = Settings::builtin(Os::Macos);
+        let fake = Fake::answering(true, true);
+        // Resources only: Touch ID, as ever. Boxes too, while the settings say Touch ID: one for all.
+        ask_to_approve(&fake, &mac, &prepared(&["app"])).unwrap();
+        ask_to_approve(&fake, &mac, &prepared(&["box.research"])).unwrap();
+        ask_to_approve(&fake, &mac, &prepared(&["app", "box.research", "box.docs"])).unwrap();
+        let all = format!("touch id: approve the halti policies for {app}, {research}, {docs}");
+        let one = |name: &str| format!("touch id: approve the halti policy for {name}");
+        assert_eq!(fake.calls(), [one(&app), one(&research), all]);
+
+        // Another way for boxes: the resources with Touch ID, then the boxes as the settings say.
+        let sudo = config::parse("[box.approval]\npolicy = \"sudo\"\n", Os::Macos).unwrap();
+        ask_to_approve(&fake, &sudo, &prepared(&["app", "box.research", "box.docs"])).unwrap();
+        let boxes = format!("sudo: approve the halti policies for {research}, {docs}");
+        assert_eq!(fake.calls(), [one(&app), boxes]);
+        let none = config::parse("[box.approval]\npolicy = \"none\"\n", Os::Macos).unwrap();
+        ask_to_approve(&fake, &none, &prepared(&["box.research"])).unwrap();
+        assert!(fake.calls().is_empty(), "none asks nothing");
+
+        // A no, either one, approves nothing.
+        let no = Fake::answering(false, true);
+        assert!(ask_to_approve(&no, &sudo, &prepared(&["app", "box.research"])).is_err());
+        assert_eq!(no.calls().len(), 2);
+        let no = Fake::answering(true, false);
+        assert!(ask_to_approve(&no, &sudo, &prepared(&["app", "box.research"])).is_err());
+        assert_eq!(no.calls().len(), 1, "a refused Touch ID asks nothing more");
+
+        // No box runs on Linux, so nothing there approves a box's policy, and halti says so.
+        let error = ask_to_approve(&fake, &Settings::builtin(Os::Linux), &prepared(&["app", "box.research"])).unwrap_err();
+        assert_eq!(error.to_string(), "approving a changed box policy needs an approval this system can't give");
+        assert!(fake.calls().is_empty(), "not even the resources are asked for");
+    }
 
     const GOOD: &str = r#"
         [run]
@@ -972,6 +1069,7 @@ mod tests {
         assert_eq!(plain, "--- approved\n+++ now\n@@ -1,2 +1,2 @@\n [run]\n-mode = \"ask\"\n+mode = \"allow\"\n");
         let colored = diff(old, new, true);
         assert!(colored.contains("\x1b[31m-mode = \"ask\"\x1b[0m\n") && colored.contains("\x1b[32m+mode = \"allow\"\x1b[0m\n"));
+        assert!(diff_from("template", old, new, false).starts_with("--- template\n+++ now\n@@ -1,2 +1,2 @@\n"));
     }
 
     #[test]

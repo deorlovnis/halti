@@ -7,8 +7,8 @@
 //!   ask for objects). Everything else is a write, and so is anything that asks for an
 //!   `Upgrade` (WebSocket). Reads pass. A write follows the site's `[fetch] writes` on the
 //!   hosts of one of the box's sites, and `[net] writes` and `allow_writes` everywhere else;
-//!   `ask` is a Touch ID per write. A refused request gets a 403 with the reason, and the
-//!   connection stays usable.
+//!   `ask` is a Touch ID per write (for `[net]`, as `[box.approval] write` says). A refused
+//!   request gets a 403 with the reason, and the connection stays usable.
 //! - **Credentials for any tool.** On the hosts of one of the box's sites (read fresh from its
 //!   approved policy, like the model gateway does), the site's auth header and fixed headers
 //!   replace whatever the guest sent, whatever tool sent it.
@@ -37,6 +37,7 @@ use super::addr::split_target;
 use super::gateway::HOP_BY_HOP;
 use super::http::{self, Body, Framing, Head};
 use super::{Entry, Shared, page};
+use crate::approval::{self, Action, Means};
 use crate::audit::mask_url;
 use crate::index::Index;
 use crate::mask::{Masker, Stream};
@@ -48,13 +49,24 @@ use crate::{approve, keychain};
 const MAX_DISCARD: u64 = 64 * 1024 * 1024;
 
 /// `[net]`: what the box's own requests may do on hosts no site covers.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Net {
-    /// Requests other than reads: `deny`, `ask` (Touch ID each) or `allow`.
+    /// Requests other than reads: `deny`, `ask` (each approved as `ask` says) or `allow`.
     pub writes: Mode,
     /// URL prefixes (`https://host/path`) that may receive writes whatever `writes` says. A
     /// prefix ends at a `/` of the path: `https://a.com/api` covers `/api` and `/api/x`, not `/apix`.
     pub allow_writes: Vec<String>,
+    /// What approves a write `writes = "ask"` asks about (`[box.approval] write`): Touch ID, or
+    /// none, which lets it through unasked. None: this system has nothing that can. A means asked
+    /// on the terminal is never used: the agent holds it.
+    pub ask: Option<Means>,
+}
+
+impl Default for Net {
+    /// Writes denied, and asked about with Touch ID where they are asked about, as the template says.
+    fn default() -> Net {
+        Net { writes: Mode::default(), allow_writes: Vec::new(), ask: Some(Means::TouchId) }
+    }
 }
 
 /// Whose connection it is.
@@ -272,7 +284,8 @@ enum Rules<'a> {
     Page(&'a page::Rules),
 }
 
-/// What the request does at this host: `allowed`, or `asked:yes` after Touch ID, or why not.
+/// What the request does at this host: `allowed`, or `asked:yes` after Touch ID, or why not. A write
+/// `[net]` asks about is `allowed` when `[box.approval] write` says none.
 fn decide(sh: &Shared, kind: Kind, rules: &Rules, method: &str, host: &str, target: &str, url: &str) -> Result<&'static str, Refusal> {
     if kind == Kind::Read {
         return Ok("allowed");
@@ -292,10 +305,22 @@ fn decide(sh: &Shared, kind: Kind, rules: &Rules, method: &str, host: &str, targ
     match (mode, kind) {
         (Mode::Deny, _) => Err(refusal(403, "blocked:writes", format!("{who} doesn't allow {method} requests here{hint}"))),
         (_, Kind::Upgrade) => Err(refusal(501, "blocked:upgrade", "the door can't carry an upgraded connection (WebSocket) yet")),
-        (Mode::Ask, _) => match approve::confirm(&format!("let box {} send {method} {url}", sh.cfg.name)) {
-            Ok(()) => Ok("asked:yes"),
-            Err(_) => Err(refusal(403, "asked:no", format!("{method} {url} wasn't approved"))),
-        },
+        (Mode::Ask, _) => {
+            let reason = format!("let box {} send {method} {url}", sh.cfg.name);
+            // The agent holds the terminal, so what is asked there never approves its writes.
+            let means = sh.cfg.net.ask.filter(|means| !means.asks_on_terminal());
+            let asked = match rules {
+                Rules::Net if means == Some(Means::None) => return Ok("allowed"),
+                Rules::Net => approval::ask_by(&approval::Real, means, Action::BoxWrite, &reason).map(drop),
+                Rules::Fetch(_) | Rules::Page(_) => approve::confirm(&reason),
+            };
+            match asked {
+                Ok(()) => Ok("asked:yes"),
+                // Nothing here can approve it: the answer says so.
+                Err(e) if means.is_none() && matches!(rules, Rules::Net) => Err(refusal(403, "asked:no", format!("{method} {url} wasn't approved: {e}"))),
+                Err(_) => Err(refusal(403, "asked:no", format!("{method} {url} wasn't approved"))),
+            }
+        }
         (Mode::Allow, _) => Ok("allowed"),
     }
 }

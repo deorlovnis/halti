@@ -166,6 +166,20 @@ impl PassphraseRecord {
         Ok(record)
     }
 
+    /// `seal` of the key a seed gives, for a key holder that draws the seed and never holds the key
+    /// itself. `seed` is 96 fresh random bytes, as `DecapKey::from_seed` takes them.
+    pub fn seal_seed(
+        prompt: &Prompt,
+        passphrase: &Passphrase,
+        seed: Zeroizing<[u8; 96]>,
+        commitment: &Commitment,
+        params: KdfParams,
+        salt: &[u8; 16],
+        nonce: &[u8; 12],
+    ) -> Result<PassphraseRecord, Refusal> {
+        PassphraseRecord::seal(prompt, passphrase, &DecapKey::from_seed(seed), commitment, params, salt, nonce)
+    }
+
     /// Refuses any other length, format, kind, suite or derivation, and parameters outside the
     /// bounds. Derives nothing.
     pub fn from_key_ref(key: &KeyRef) -> Result<PassphraseRecord, Refusal> {
@@ -364,7 +378,8 @@ mod tests {
     #[test]
     fn a_passphrase_record_is_unchanged() {
         let create = prompt(acme(), "acme", Change::Create);
-        let sealed = PassphraseRecord::seal(&create, &passphrase(), &hardware(), &commitment(), KdfParams::DEFAULT, &passphrase_salt(), &passphrase_nonce()).unwrap();
+        let seed = Zeroizing::new(hardware_seed());
+        let sealed = PassphraseRecord::seal_seed(&create, &passphrase(), seed, &commitment(), KdfParams::DEFAULT, &passphrase_salt(), &passphrase_nonce()).unwrap();
         let bytes = sealed.to_key_ref().0;
         assert_eq!((bytes.len(), PassphraseRecord::LEN), (1855, 1855));
         // Piece by piece first, so that a difference says where it is.

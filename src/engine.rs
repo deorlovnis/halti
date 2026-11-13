@@ -127,6 +127,61 @@ pub struct VmSpec {
     pub rosetta: bool,
 }
 
+/// What a box asks of the engine that runs its VMs. `[box] engine` picks one (`boxes::vms`):
+/// Apple's container is `Container`, and another engine is one more implementation.
+pub trait Vms: Sync {
+    /// The engine is installed and ready.
+    fn available(&self) -> Result<()>;
+    fn running(&self, name: &str) -> bool;
+    /// Start a VM, detached; it is removed when it stops.
+    fn run(&self, spec: &VmSpec) -> Result<()>;
+    /// Stop a VM; fine if it is gone already.
+    fn stop(&self, name: &str) -> Result<()>;
+    /// Run a command in the VM as the agent. The environment holds no secrets (see `agent_env`).
+    fn exec(&self, name: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus>;
+    fn install_ca(&self, name: &str, pem: &str) -> Result<()>;
+    fn start_docker(&self, name: &str) -> Result<()>;
+    /// The pinned reference of a local image.
+    fn image_digest(&self, reference: &str) -> Result<String>;
+}
+
+/// Apple's `container`: the functions of this module.
+pub struct Container;
+
+impl Vms for Container {
+    fn available(&self) -> Result<()> {
+        available()
+    }
+
+    fn running(&self, name: &str) -> bool {
+        running(name)
+    }
+
+    fn run(&self, spec: &VmSpec) -> Result<()> {
+        run(spec)
+    }
+
+    fn stop(&self, name: &str) -> Result<()> {
+        stop(name)
+    }
+
+    fn exec(&self, name: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus> {
+        exec(name, env, cmd, tty)
+    }
+
+    fn install_ca(&self, name: &str, pem: &str) -> Result<()> {
+        install_ca(name, pem)
+    }
+
+    fn start_docker(&self, name: &str) -> Result<()> {
+        start_docker(name)
+    }
+
+    fn image_digest(&self, reference: &str) -> Result<String> {
+        image_digest(reference)
+    }
+}
+
 fn container() -> Command {
     Command::new("container")
 }

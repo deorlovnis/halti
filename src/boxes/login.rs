@@ -15,9 +15,10 @@ use std::thread;
 use anyhow::{Result, bail};
 
 use super::sessions::Sessions;
-use super::{BoxPolicy, load, run, with_store};
+use super::{BoxPolicy, KeyStore, load, run, with_store};
 use crate::browse::{self, Stop};
 use crate::policy::{self, Policy};
+use crate::{approve, config};
 
 /// What a sign-in needs from outside: a runner to start, how the person ends it, and where words go.
 pub struct Window<'a> {
@@ -97,8 +98,10 @@ pub fn login(name: &str, only: Option<&str>, all: bool) -> Result<()> {
         Some(site) => format!("sign in to {site} for box {name} and keep its session in the box"),
         None => format!("sign in to the sites of box {name} and keep their sessions in the box"),
     };
-    with_store(name, &reason, false, |mnt| {
-        let sessions = Sessions::new(mnt, &super::box_key(name)?, true);
+    let keys = KeyStore::of(&config::settings());
+    let ask = || approve::confirm(&reason);
+    with_store(name, keys, ask, false, |mnt| {
+        let sessions = Sessions::new(mnt, &keys.open_key(name)?, true);
         let sites = match named {
             Some(sites) => sites,
             None => pick(name, &box_policy, None, all, &sessions.sites())?,

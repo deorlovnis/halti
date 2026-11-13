@@ -1,11 +1,15 @@
 //! Boxes: isolated, encrypted places where an agent works (`halti box`).
 //!
-//! A box has a policy, box/<name>.toml in the config folder, that counts only once approved with
-//! Touch ID, exactly like a resource's policy (the same approval records, kept under the
-//! Keychain name `box.<name>`: resource names can't contain a dot, so the two never collide).
-//! Its data lives in an encrypted store (see `store`) whose key is one Keychain item,
-//! `box.<name>/_key`, read only to open the store. `run` (see `run`) opens the store, starts
-//! the VM and the door, and tears it all down again.
+//! A box has a policy, box/<name>.toml in the config folder, that counts only once approved, like
+//! a resource's policy (the same approval records, kept under the Keychain name `box.<name>`:
+//! resource names can't contain a dot, so the two never collide). Its data lives in an encrypted
+//! store (see `store`) whose key is kept where `[box] keys` says (`KeyStore`): in the Keychain, as
+//! the item `box.<name>/_key`, read only to open the store. `run` (see `run`) opens the store,
+//! starts the VM on the engine `[box] engine` names (`vms`) and the door, and tears it all down again.
+//!
+//! What asks the person first is in `[box.approval]`: opening a box, approving its policy, a write
+//! its policy says to ask about, copying files out, and deleting it. Each is Touch ID unless the
+//! settings say otherwise. Reading its log, importing and signing in ask for Touch ID.
 //!
 //! The door sees every request (see `door::inspect`): `[net] allow` says which hosts the box may
 //! reach, `writes` and `allow_writes` what it may send them besides reads, and `standins` which
@@ -31,11 +35,14 @@ use jiff::tz::TimeZone;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::approval::{self, Action};
 use crate::chain::{self, Chain};
+use crate::config::{Engine, Keys, Settings};
 use crate::door::inspect::parse_prefix;
+use crate::engine::Vms;
 use crate::policy::{self, Approval, Mode, Site, Status};
 use crate::util::{config_dir, expand_home, home, store_root};
-use crate::{approve, engine, keychain, legacy, names, parse_env, parse_resource};
+use crate::{approve, config, engine, keychain, legacy, names, parse_env, parse_resource};
 pub use login::login;
 use store::Layout;
 
@@ -211,12 +218,20 @@ impl MountPolicy {
     }
 }
 
-/// Why a folder can't be handed to a box: it holds halti's own files, or everything.
+/// Why a folder can't be handed to a box: it holds halti's own files (its config, its store, the
+/// workspaces folder in effect), or everything.
 pub fn mount_problem(path: &Path) -> Option<String> {
+    mount_problem_among(path, &[config_dir(), store_root(), config::workspaces_in_effect()])
+}
+
+/// The same, with `own` as halti's folders. Each is compared as written and as its real path, since
+/// a mount is checked both ways too.
+fn mount_problem_among(path: &Path, own: &[PathBuf]) -> Option<String> {
     if path == Path::new("/") || path == home() {
         return Some("is too broad".into());
     }
-    [config_dir(), store_root()].iter().any(|own| path.starts_with(own) || own.starts_with(path)).then(|| "holds halti's own files".into())
+    let mut all = own.iter().cloned().chain(own.iter().filter_map(|dir| fs::canonicalize(dir).ok()));
+    all.any(|dir| path.starts_with(&dir) || dir.starts_with(path)).then(|| "holds halti's own files".into())
 }
 
 impl BoxPolicy {
@@ -377,20 +392,89 @@ pub fn prepare(name: &str) -> Result<(String, Approval)> {
 }
 
 pub fn approve(names_given: &[String]) -> Result<()> {
+    approve_with(&config::settings(), names_given)
+}
+
+/// Approves the boxes' policies as `[box.approval] policy` says.
+fn approve_with(settings: &Settings, names_given: &[String]) -> Result<()> {
     let given = if names_given.is_empty() { names() } else { names_given.to_vec() };
     if given.is_empty() {
         bail!("there are no boxes (create one with: halti box new NAME)");
     }
     let prepared = given.iter().map(|n| prepare(n)).collect::<Result<_>>()?;
-    policy::approve_prepared(prepared)
+    policy::approve_prepared(prepared, settings)
+}
+
+/// Asks for a box's `action` as `[box.approval]` says. No box action takes a passphrase, so what is
+/// granted is a yes.
+fn ask_for(world: &dyn approval::World, settings: &Settings, action: Action, reason: &str) -> Result<()> {
+    approval::approve_with(world, settings, action, reason).map(drop)
+}
+
+// --- what the settings pick ---
+
+/// The engine `[box] engine` names: the one place a box's engine is picked. Another engine is one
+/// more variant of `config::Engine` and one more arm here.
+fn vms(settings: &Settings) -> Result<&'static dyn Vms> {
+    match settings.engine {
+        Some(Engine::Container) => Ok(&engine::Container),
+        None => bail!("boxes can't run on this system: halti has no box engine for it"),
+    }
+}
+
+/// Where box keys are kept, as `[box] keys` says: the one place a box's store key is read, written
+/// and deleted. Another place is one more variant of `config::Keys` and one more arm in each.
+#[derive(Clone, Copy)]
+struct KeyStore(Option<Keys>);
+
+impl KeyStore {
+    fn of(settings: &Settings) -> KeyStore {
+        KeyStore(settings.keys)
+    }
+
+    fn get(self, name: &str) -> Option<String> {
+        match self.0? {
+            Keys::Keychain => keychain::get(&key(name), KEY_FIELD),
+        }
+    }
+
+    /// Whether there is one, without reading it.
+    fn exists(self, name: &str) -> bool {
+        match self.0 {
+            Some(Keys::Keychain) => keychain::exists(&key(name), KEY_FIELD),
+            None => false,
+        }
+    }
+
+    fn set(self, name: &str, value: &str) -> Result<()> {
+        match self.0 {
+            Some(Keys::Keychain) => keychain::set(&key(name), KEY_FIELD, value),
+            None => bail!("a box's key can't be kept on this system"),
+        }
+    }
+
+    fn delete(self, name: &str) -> bool {
+        match self.0 {
+            Some(Keys::Keychain) => keychain::delete(&key(name), KEY_FIELD),
+            None => false,
+        }
+    }
+
+    /// Where a key is, as halti says it.
+    fn place(self) -> &'static str {
+        match self.0 {
+            Some(Keys::Keychain) => "in the Keychain",
+            None => "anywhere on this system",
+        }
+    }
+
+    /// The box's store key, or why its store can't be opened.
+    fn open_key(self, name: &str) -> Result<String> {
+        self.get(name).ok_or_else(|| anyhow!("the key of box {name} isn't {}, so its store can't be opened (halti box rm {name})", self.place()))
+    }
 }
 
 // --- commands ---
-
-/// The box's store key, from the Keychain.
-fn box_key(name: &str) -> Result<String> {
-    keychain::get(&key(name), KEY_FIELD).ok_or_else(|| anyhow!("the key of box {name} isn't in the Keychain, so its store can't be opened (halti box rm {name})"))
-}
 
 // STUB: replaced at merge by seal::derive (one key per purpose, derived from the box key)
 fn derive(box_key: &[u8], purpose: &str) -> [u8; 32] {
@@ -422,15 +506,13 @@ fn session_names(name: &str) -> Vec<String> {
     keychain::get_silently(&key(name), SESSIONS_FIELD).map(|s| s.split(',').filter(|n| !n.is_empty()).map(str::to_string).collect()).unwrap_or_default()
 }
 
-fn has_key(name: &str) -> bool {
-    keychain::exists(&key(name), KEY_FIELD)
-}
-
-/// Make a box: its policy (edited from a template), a key in the Keychain and an empty store.
+/// Make a box: its policy (edited from a template), a key where `[box] keys` says and an empty store.
 pub fn new(name: &str) -> Result<()> {
+    let settings = config::settings();
+    let keys = KeyStore::of(&settings);
     let layout = Layout::real()?;
     let (p, bundle, k) = (path(name), layout.bundle(name), key(name));
-    match (has_key(name), bundle.exists()) {
+    match (keys.exists(name), bundle.exists()) {
         (true, true) => bail!("box {name} exists (halti box edit {name} changes its policy)"),
         (false, true) => bail!("box {name} has a store but no key, so it can't be opened: remove it with halti box rm {name}"),
         _ => {}
@@ -438,28 +520,28 @@ pub fn new(name: &str) -> Result<()> {
     if !p.exists() {
         fs::create_dir_all(dir())?;
         // The pinned image of the engine's agent system, if there is one yet.
-        let image = engine::image_digest(engine::AGENT_IMAGE).ok();
+        let image = vms(&settings).ok().and_then(|vms| vms.image_digest(engine::AGENT_IMAGE).ok());
         fs::write(&p, template(name, image.as_deref()))?;
     }
     let edited = policy::edit_file(&k, &p, |text| BoxPolicy::parse(text).map(drop))?;
     if BoxPolicy::parse(&fs::read_to_string(&p)?)?.keep {
-        let created = !has_key(name);
+        let created = !keys.exists(name);
         if created {
-            keychain::set(&k, KEY_FIELD, &store::new_key()?)?;
+            keys.set(name, &store::new_key()?)?;
         }
-        let made = keychain::get(&k, KEY_FIELD).ok_or_else(|| anyhow!("the key of box {name} can't be read"));
+        let made = keys.get(name).ok_or_else(|| anyhow!("the key of box {name} can't be read"));
         if let Err(e) = made.and_then(|key| store::create(&layout, &bundle, &key)) {
             if created {
-                keychain::delete(&k, KEY_FIELD);
+                keys.delete(name);
             }
             return Err(e);
         }
-        println!("created box {name}: an empty encrypted store, its key in the Keychain");
+        println!("created box {name}: an empty encrypted store, its key {}", keys.place());
     } else {
         println!("created box {name}: keep = false, so every run gets a new store that is shredded when it stops");
     }
     if edited || !matches!(policy::status_of(&k, &p), Status::Approved) {
-        policy::offer_approval(&p, &format!("halti box approve {name}"), || approve(&[name.to_string()]))?;
+        policy::offer_approval(&p, &format!("halti box approve {name}"), || approve_with(&settings, &[name.to_string()]))?;
     }
     Ok(())
 }
@@ -478,6 +560,8 @@ pub fn edit(name: &str) -> Result<()> {
 /// `halti box run`: open the box (or join it if it runs), and work in it until it ends.
 pub fn run(name: &str, temp: bool, command: Vec<String>) -> Result<u8> {
     let (policy, text) = load(name)?;
+    let settings = config::settings();
+    let vms = vms(&settings)?;
     let layout = Layout::real()?;
     let persistent = policy.keep && !temp;
     if persistent && !layout.bundle(name).exists() {
@@ -498,15 +582,17 @@ pub fn run(name: &str, temp: bool, command: Vec<String>) -> Result<u8> {
         command: (!command.is_empty()).then_some(command),
         tty: crate::interactive(),
         stop: run::signalled(),
+        write: settings.means(Action::BoxWrite),
     };
-    run::run(&layout, &run::Real, &request)
+    run::run(&layout, &run::Real { vms, keys: KeyStore::of(&settings), settings: &settings }, &request)
 }
 
 pub fn stop(name: &str) -> Result<()> {
+    let vms = vms(&config::settings())?;
     let layout = Layout::real()?;
-    let running: Vec<String> = [run::vm_name(name)].into_iter().filter(|vm| engine::running(vm)).collect();
+    let running: Vec<String> = [run::vm_name(name)].into_iter().filter(|vm| vms.running(vm)).collect();
     for vm in &running {
-        engine::stop(vm)?;
+        vms.stop(vm)?;
     }
     let was_running = !running.is_empty();
     let lock = layout.lock(name);
@@ -529,9 +615,10 @@ pub fn stop(name: &str) -> Result<()> {
     }
 }
 
-/// Run `f` on the open store. A store that is closed is opened (and closed again) after Touch ID
-/// and the key from the Keychain. One that a run has open can be read, not changed: `readonly`.
-fn with_store<T>(name: &str, reason: &str, readonly: bool, f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
+/// Run `f` on the open store. A store that is closed is opened (and closed again) once `ask` says
+/// yes, with its key from where `keys` are kept. One that a run has open can be read, not changed:
+/// `readonly`.
+fn with_store<T>(name: &str, keys: KeyStore, ask: impl FnOnce() -> Result<()>, readonly: bool, f: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
     let layout = Layout::real()?;
     layout.prepare()?;
     let bundle = layout.bundle(name);
@@ -548,8 +635,8 @@ fn with_store<T>(name: &str, reason: &str, readonly: bool, f: impl FnOnce(&Path)
         }
         return f(&mnt);
     };
-    approve::confirm(reason)?;
-    let key = box_key(name)?;
+    ask()?;
+    let key = keys.open_key(name)?;
     let open = store::open(&bundle, &mnt, &key, readonly)?;
     f(open.path())
 }
@@ -557,9 +644,11 @@ fn with_store<T>(name: &str, reason: &str, readonly: bool, f: impl FnOnce(&Path)
 /// What the door and halti did for a box, latest last. With `verify`, checks the whole log
 /// against its chain instead, and fails naming the first line that was changed or removed.
 pub fn log(name: &str, last: usize, verify: bool) -> Result<()> {
-    with_store(name, &format!("read the log of box {name}"), true, |mnt| {
+    let keys = KeyStore::of(&config::settings());
+    let ask = || approve::confirm(&format!("read the log of box {name}"));
+    with_store(name, keys, ask, true, |mnt| {
         if verify {
-            let chain = Chain::new(&store::door_log(mnt), log_key(&box_key(name)?));
+            let chain = Chain::new(&store::door_log(mnt), log_key(&keys.open_key(name)?));
             let found = chain.verify().with_context(|| format!("the log of box {name}"))?;
             let head = keychain::get_silently(&key(name), LOG_HEAD_FIELD).and_then(|h| serde_json::from_str::<chain::Head>(&h).ok());
             if let Some(head) = &head {
@@ -637,9 +726,12 @@ fn export_from(mnt: &Path, rel: &str, to: &Path) -> Result<(Vec<Exported>, usize
 
 pub fn export(name: &str, rel: &str, to: &Path) -> Result<()> {
     box_path(rel)?;
+    let settings = config::settings();
+    let keys = KeyStore::of(&settings);
     let reason = format!("export {rel} from box {name} to {}", to.display());
-    with_store(name, &reason, false, |mnt| {
-        let log_key = log_key(&box_key(name)?);
+    let ask = || ask_for(&approval::Real, &settings, Action::BoxExport, &reason);
+    with_store(name, keys, ask, false, |mnt| {
+        let log_key = log_key(&keys.open_key(name)?);
         let (files, skipped) = export_from(mnt, rel, to)?;
         let mut total = 0;
         for f in &files {
@@ -656,8 +748,10 @@ pub fn export(name: &str, rel: &str, to: &Path) -> Result<()> {
 pub fn import(name: &str, from: &str) -> Result<()> {
     let src = expand_home(from);
     let file_name = src.file_name().map(|n| n.to_os_string()).ok_or_else(|| anyhow!("{from} isn't a file or folder"))?;
-    with_store(name, &format!("import {} into box {name}", src.display()), false, |mnt| {
-        let log_key = log_key(&box_key(name)?);
+    let keys = KeyStore::of(&config::settings());
+    let ask = || approve::confirm(&format!("import {} into box {name}", src.display()));
+    with_store(name, keys, ask, false, |mnt| {
+        let log_key = log_key(&keys.open_key(name)?);
         let dst = mnt.join("work").join(&file_name);
         let copied = store::copy_tree(&src, &dst)?;
         let rel = Path::new("work").join(&file_name);
@@ -668,9 +762,11 @@ pub fn import(name: &str, from: &str) -> Result<()> {
 }
 
 pub fn rm(name: &str) -> Result<()> {
+    let settings = config::settings();
+    let keys = KeyStore::of(&settings);
     let layout = Layout::real()?;
     let (p, bundle, k) = (path(name), layout.bundle(name), key(name));
-    if !p.exists() && !bundle.exists() && !has_key(name) {
+    if !p.exists() && !bundle.exists() && !keys.exists(name) {
         bail!("there is no box {name}");
     }
     let lock = layout.lock(name);
@@ -678,9 +774,9 @@ pub fn rm(name: &str) -> Result<()> {
     let Some(_held) = store::lock(&lock)? else {
         bail!("box {name} is running: stop it first (halti box stop {name})");
     };
-    approve::confirm(&format!("delete box {name}: its data can never be read again"))?;
+    ask_for(&approval::Real, &settings, Action::BoxDelete, &format!("delete box {name}: its data can never be read again"))?;
     // The key goes first: without it the store is noise, whatever happens to the files.
-    keychain::delete(&k, KEY_FIELD);
+    keys.delete(name);
     keychain::delete(&k, LOG_HEAD_FIELD);
     keychain::delete(&k, SESSIONS_FIELD);
     policy::revoke(&k);
@@ -753,7 +849,10 @@ pub fn ls() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use halti_core::platform::Os;
+
     use super::*;
+    use crate::approval::fake_tests::Fake;
     use crate::parse_field;
     use crate::util::TempDir;
 
@@ -880,6 +979,17 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_workspaces_folder_in_effect_out_of_boxes() {
+        let ws = home().join("work/ws");
+        let own = [config_dir(), store_root(), ws.clone()];
+        for path in [ws.clone(), ws.join("acme"), home().join("work")] {
+            assert_eq!(mount_problem_among(&path, &own).as_deref(), Some("holds halti's own files"), "{}", path.display());
+        }
+        assert_eq!(mount_problem_among(&home().join("work/project"), &own), None);
+        assert!(mount_problem(&config::workspaces_in_effect()).is_some(), "wherever it is");
+    }
+
+    #[test]
     fn the_templates_are_valid_policies() {
         assert!(BoxPolicy::parse(&template("research", None)).is_ok());
         let open = BoxPolicy::parse(&template("research", None)).unwrap();
@@ -905,6 +1015,49 @@ mod tests {
         assert!(say(Status::Missing).contains("halti box new research"));
         assert!(say(Status::Unapproved).contains("isn't approved") && say(Status::Unapproved).contains("halti box approve research"));
         assert!(say(Status::Changed).contains("changed since"));
+    }
+
+    #[test]
+    fn a_box_s_actions_ask_as_the_settings_say() {
+        let mac = config::Settings::builtin(Os::Macos);
+        let fake = Fake::answering(true, true);
+        for action in [Action::BoxRun, Action::BoxPolicy, Action::BoxWrite, Action::BoxExport, Action::BoxDelete] {
+            ask_for(&fake, &mac, action, "do it").unwrap();
+        }
+        assert_eq!(fake.calls(), ["touch id: do it"; 5], "Touch ID, as before the settings had lines");
+        let mine = config::parse("[box.approval]\nrun = \"sudo\"\nexport = \"none\"\ndelete = \"sudo\"\n", Os::Macos).unwrap();
+        ask_for(&fake, &mine, Action::BoxRun, "open box research").unwrap();
+        ask_for(&fake, &mine, Action::BoxExport, "export it").unwrap();
+        ask_for(&fake, &mine, Action::BoxDelete, "delete box research").unwrap();
+        assert_eq!(fake.calls(), ["sudo: open box research", "sudo: delete box research"], "none asks nothing");
+
+        // A no stops the action, whatever asked it.
+        let no = Fake::answering(false, false);
+        assert!(ask_for(&no, &mac, Action::BoxExport, "export it").is_err());
+        assert!(ask_for(&no, &mine, Action::BoxDelete, "delete box research").unwrap_err().is::<approval::Declined>());
+        assert!(ask_for(&no, &mine, Action::BoxExport, "export it").is_ok());
+        assert_eq!(no.calls(), ["touch id: export it", "sudo: delete box research"]);
+
+        // No box runs on Linux: halti says so, and asks nothing.
+        let linux = config::Settings::builtin(Os::Linux);
+        let error = ask_for(&fake, &linux, Action::BoxDelete, "delete box research").unwrap_err();
+        assert_eq!(error.to_string(), "deleting a box needs an approval this system can't give");
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn the_settings_pick_the_engine_and_where_keys_are_kept() {
+        let mac = config::Settings::builtin(Os::Macos);
+        assert!(vms(&mac).is_ok());
+        assert_eq!(KeyStore::of(&mac).place(), "in the Keychain");
+        // Nothing here touches the Keychain: there is no place for keys on Linux.
+        let linux = config::Settings::builtin(Os::Linux);
+        assert_eq!(vms(&linux).err().map(|e| e.to_string()).as_deref(), Some("boxes can't run on this system: halti has no box engine for it"));
+        let nowhere = KeyStore::of(&linux);
+        assert!(!nowhere.exists("research") && nowhere.get("research").is_none() && !nowhere.delete("research"));
+        assert_eq!(nowhere.set("research", "k").unwrap_err().to_string(), "a box's key can't be kept on this system");
+        let error = nowhere.open_key("research").unwrap_err().to_string();
+        assert_eq!(error, "the key of box research isn't anywhere on this system, so its store can't be opened (halti box rm research)");
     }
 
     #[test]
