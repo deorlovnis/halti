@@ -4,8 +4,9 @@
 //!
 //! A box is the approval of its policy (`policy::Kind::Box`) and, for one that keeps a store, its
 //! store key: a sealed item in a namespace of its own (`boxkey`), listed in the manifest's box
-//! section. Both are written in one change, so a box is never approved without its key or kept
-//! without its approval. Removing a resource never touches a box of the same name, nor the reverse.
+//! section. A box with a key gets its key and its approval in one change, and removing a box drops
+//! both in one change, so a listed key is never kept without its approval; a box without a key is
+//! only an approval. Removing a resource never touches a box of the same name, nor the reverse.
 
 use anyhow::Result;
 
@@ -349,6 +350,7 @@ mod tests {
     fn a_declined_or_refused_make_never_calls_made() {
         let world = World::new();
         world.make("acme", "dev", Some(&key(0x41))).unwrap();
+        world.make("acme", "scratch", None).unwrap();
         let kept = world.kept(acme());
         let called = Cell::new(false);
         let made = || {
@@ -374,9 +376,12 @@ mod tests {
         assert_eq!(new("test", BOX_TEXT, Kind::Box), Refusal::Declined);
         assert_eq!(world.asks(), asks + 1);
         world.acme.decline(false);
+        // Approved without a key, and shown as new: the base doesn't hold, refused after the ask, and nothing made.
+        assert_eq!(new("scratch", BOX_TEXT, Kind::Box), Refusal::NotTheBase { name: "scratch".to_string() });
+        assert_eq!(world.asks(), asks + 2);
         // A workspace that is not there: refused before anything is asked.
         assert_eq!(refused(world.make("initech", "dev", None)), Refusal::Unknown(ws_name("initech")));
-        assert_eq!(world.asks(), asks + 1);
+        assert_eq!(world.asks(), asks + 2);
         assert!(!called.get());
         assert!(world.kept(acme()) == kept);
     }
@@ -388,6 +393,12 @@ mod tests {
         world.make("acme", "test", Some(&key(0x42))).unwrap();
         world.make("acme", "scratch", None).unwrap();
         let version = world.pin(acme()).version;
+        // Cut short before the list is replaced: dev stays listed and approved, and its blob is kept.
+        let (manifest, _, pin, blobs) = world.kept(acme());
+        world.anchor.fail_next_advance();
+        assert!(world.rm("acme", "dev").unwrap_err().to_string().contains("could not be written"));
+        let (after, _, pin_after, blobs_after) = world.kept(acme());
+        assert!((after, pin_after, blobs_after) == (manifest, pin, blobs), "only a manifest beside the old may be left");
         assert_eq!(world.rm("acme", "dev").unwrap(), BoxGone { key: true, approval: true });
         assert_eq!(world.acme.asked().last().unwrap().3, "[DEV, not protected] remove a box from workspace acme");
         assert_eq!(world.pin(acme()).version, version + 1, "one change");

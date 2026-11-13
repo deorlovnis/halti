@@ -107,8 +107,9 @@ impl Reader {
     /// Reads the pin and, if it moved, the manifest it covers, with the same checks as the open:
     /// the manifest opens for this workspace under `name`, agrees with the record, was made by
     /// this kind of build, lacks nothing more now, and every item and box is named as its text
-    /// says. Writes nothing, and takes no lock: a change cut short between moving the pin and
-    /// putting its manifest in place is read from beside it. True if anything changed.
+    /// says. Writes nothing, and takes no lock: the manifest beside is read before the one in
+    /// place, so a change cut short between moving the pin and putting its manifest in place, or
+    /// one that finishes while it reads, is read as the pin covers it. True if anything changed.
     ///
     /// A pin lower than the one seen, or another pin at the same version, is `Refusal::Tampered`,
     /// and so is a pin whose files don't match it once read twice over. Nothing it holds changes
@@ -126,9 +127,12 @@ impl Reader {
             let wrap = files.read(&FileKey::Wrap(self.ws))?.unwrap_or_default();
             let policy = files.read(&FileKey::Policy(self.ws))?.unwrap_or_default();
             let covered = |manifest: &Vec<u8>| state_hash(self.ws, name, &wrap, manifest, &policy) == pin.state;
-            let sealed = match files.read(&FileKey::Manifest(self.ws))?.filter(covered) {
+            // Beside it first: a change puts its manifest in place before it removes the one beside
+            // it, so with that one gone or not covered, the one in place is covered, unless the pin
+            // moved again.
+            let sealed = match files.read(&FileKey::NextManifest(self.ws))?.filter(covered) {
                 Some(sealed) => Some(sealed),
-                None => files.read(&FileKey::NextManifest(self.ws))?.filter(covered),
+                None => files.read(&FileKey::Manifest(self.ws))?.filter(covered),
             };
             let Some(sealed) = sealed else {
                 if anchor.read(self.ws)? == Some(pin) {
@@ -1159,6 +1163,99 @@ mod tests {
         // The next unlock finishes the change, as ever.
         assert_eq!(ws_items(&world.machine(&world.acme, Build::Dev), &ws_name("acme")).unwrap().len(), 1);
         assert_eq!((world.file(&FileKey::Manifest(acme())), world.file(&FileKey::NextManifest(acme()))), (Some(second), None));
+    }
+
+    /// Files in memory where a change finishes as soon as either manifest file is first read: `next` is put in place of the
+    /// manifest and the one beside it removed, as the last two steps of a replacement do.
+    struct Finishing<'a> {
+        files: &'a MemFiles,
+        next: std::cell::RefCell<Option<Vec<u8>>>,
+    }
+
+    impl Adapter for Finishing<'_> {
+        fn label(&self) -> Label {
+            self.files.label()
+        }
+    }
+
+    impl Files for Finishing<'_> {
+        fn read(&self, k: &FileKey) -> Result<Option<Vec<u8>>> {
+            let read = self.files.read(k)?;
+            if matches!(k, FileKey::Manifest(_) | FileKey::NextManifest(_))
+                && let Some(next) = self.next.take()
+            {
+                self.files.write_atomic(&FileKey::Manifest(acme()), &next)?;
+                self.files.remove(&FileKey::NextManifest(acme()))?;
+            }
+            Ok(read)
+        }
+
+        fn write_atomic(&self, k: &FileKey, bytes: &[u8]) -> Result<()> {
+            self.files.write_atomic(k, bytes)
+        }
+
+        fn create_new(&self, k: &FileKey, bytes: &[u8]) -> Result<bool> {
+            self.files.create_new(k, bytes)
+        }
+
+        fn append(&self, k: &FileKey, line: &[u8]) -> Result<()> {
+            self.files.append(k, line)
+        }
+
+        fn remove(&self, k: &FileKey) -> Result<()> {
+            self.files.remove(k)
+        }
+
+        fn names(&self) -> Result<Vec<WsName>> {
+            self.files.names()
+        }
+
+        fn lock(&self, ws: WsId) -> Result<Box<dyn crate::store::Held>> {
+            self.files.lock(ws)
+        }
+    }
+
+    #[test]
+    fn a_reread_while_a_change_finishes_sees_it() {
+        let world = World::new().made();
+        let mut reader = world.open(&world.acme, "acme").unwrap();
+        world.set(&world.acme, "acme", &key("github", "token"), "one", 1);
+        let first = world.file(&FileKey::Manifest(acme())).unwrap();
+        world.set(&world.acme, "acme", &key("github", "token"), "two", 2);
+        // The pin moved and the new manifest beside the old, which is still in place; the change finishes between the
+        // reader's two reads of the manifest files.
+        let second = world.file(&FileKey::Manifest(acme())).unwrap();
+        world.files.write_atomic(&FileKey::NextManifest(acme()), &second).unwrap();
+        world.files.write_atomic(&FileKey::Manifest(acme()), &first).unwrap();
+        let finishing = Finishing { files: &world.files, next: std::cell::RefCell::new(Some(second.clone())) };
+        assert!(reader.reread(&finishing, &world.anchor, &ws_name("acme")).unwrap());
+        assert!(finishing.next.borrow().is_none(), "it finished while read");
+        assert_eq!((world.file(&FileKey::Manifest(acme())), world.file(&FileKey::NextManifest(acme()))), (Some(second), None));
+        assert_eq!(reader.seen(), 3);
+        assert_eq!(read(&reader, &world, &key("github", "token")), Ok(Some("two".to_string())));
+    }
+
+    #[test]
+    fn a_reread_makes_the_checks_of_the_open() {
+        let world = World::new().made();
+        let mut reader = world.open(&world.acme, "acme").unwrap();
+        let (seen, first) = (reader.seen(), reader.manifest().clone());
+        // Each sealed under the inner key and pinned at a higher version, as a program holding that key could.
+        let lacking_nothing = first.adapters.iter().map(|recorded| Recorded { lacks: Lacks::NONE, ..recorded.clone() }).collect();
+        let cases = [
+            (Manifest { keystore: KeystoreKind::Files, ..first.clone() }, Refusal::Tampered),
+            (Manifest { key: KeyKind::Passphrase, ..first.clone() }, Refusal::Tampered),
+            (Manifest { built_by: Build::Release, ..first.clone() }, Refusal::OtherBuild(Build::Release)),
+            (Manifest { adapters: lacking_nothing, ..first.clone() }, Refusal::Downgraded(Lacks::of(&Property::ALL))),
+        ];
+        for (manifest, refusal) in cases {
+            world.plant(&manifest, acme(), "acme");
+            assert_eq!(refused(reader.reread(&world.files, &world.anchor, &ws_name("acme"))), refusal, "{manifest:?}");
+            assert_eq!((reader.seen(), reader.manifest()), (seen, &first), "it kept what it had read");
+        }
+        // The same manifest planted again is read.
+        world.plant(&first, acme(), "acme");
+        assert!(reader.reread(&world.files, &world.anchor, &ws_name("acme")).unwrap());
     }
 
     #[test]
