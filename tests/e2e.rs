@@ -28,6 +28,9 @@ use sha2::{Digest, Sha256};
 #[path = "../src/legacy.rs"]
 #[allow(dead_code)] // the tests use a few
 mod legacy;
+#[path = "../src/names.rs"]
+#[allow(dead_code)] // the tests use a few
+mod names;
 
 const HALTI: &str = env!("CARGO_BIN_EXE_halti");
 const TOKEN: &str = "s3cret-token-value";
@@ -780,7 +783,7 @@ impl Env {
 
     /// The store of a box; the test's HOME holds it, so nothing lands in the real Library.
     fn box_store(&self, name: &str) -> PathBuf {
-        self.dir.join("home").join(DEV_STORE_ROOT).join("box").join(format!("{name}.sparsebundle"))
+        self.dir.join("home").join(DEV_STORE_ROOT).join("box").join(format!("{name}{}", names::STORE))
     }
 
     /// An "editor" that replaces the policy with `toml`.
@@ -1483,7 +1486,7 @@ fn a_killed_keeper_is_cleaned_up_by_the_next_open() {
     fs::create_dir_all(boxes.join("policies")).unwrap();
     fs::write(boxes.join("policies/dev.toml"), box_text(false)).unwrap();
     fs::write(boxes.join("open/dev.lock"), "").unwrap();
-    fs::create_dir_all(boxes.join("temp/dev.sparsebundle")).unwrap();
+    fs::create_dir_all(boxes.join(format!("temp/dev{}", names::STORE))).unwrap();
     // Not open: a ping nobody answers lists it closed, and close puts away what was left, where
     // there is an engine to stop its VMs.
     let listed = stdout(&ws(&env, PASSPHRASE, &["ws", "ls"]));
@@ -1492,9 +1495,9 @@ fn a_killed_keeper_is_cleaned_up_by_the_next_open() {
     let closed = env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["close", "acme"]).output().unwrap();
     let left = if cfg!(target_os = "macos") { "acme isn't open. put away what its last open left: dev\n" } else { "acme isn't open\n" };
     assert!(closed.status.success() && stdout(&closed) == left, "{}{}", stdout(&closed), stderr(&closed));
-    assert_eq!(boxes.join("temp/dev.sparsebundle").exists(), cfg!(not(target_os = "macos")));
+    assert_eq!(boxes.join(format!("temp/dev{}", names::STORE)).exists(), cfg!(not(target_os = "macos")));
     // The next open takes the socket's place, and says what it put away.
-    fs::create_dir_all(boxes.join("temp/dev.sparsebundle")).unwrap();
+    fs::create_dir_all(boxes.join(format!("temp/dev{}", names::STORE))).unwrap();
     let opened = open_then_close(&env, env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["open", "acme"]), "acme");
     let put_away = if cfg!(target_os = "macos") { "put away what the last open of acme left: dev\n" } else { "" };
     assert!(opened.status.success() && stdout(&opened) == format!("{put_away}{}closed acme\n", is_open("acme")), "{}{}", stdout(&opened), stderr(&opened));
@@ -3369,13 +3372,13 @@ fn deleting_a_workspace_with_a_store_is_refused_before_asking() {
     let env = Env::new();
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
     let boxes = wsdir(&env, "acme").join("boxes");
-    fs::create_dir_all(boxes.join("dev.sparsebundle")).unwrap();
-    fs::create_dir_all(boxes.join("temp/scratch.sparsebundle")).unwrap();
+    fs::create_dir_all(boxes.join(format!("dev{}", names::STORE))).unwrap();
+    fs::create_dir_all(boxes.join(format!("temp/scratch{}", names::STORE))).unwrap();
     let out = env.ws_box(PASSPHRASE, "true", &["ws", "delete", "acme"]);
     assert_eq!(stderr(&out), "halti: acme has boxes with stores: dev, scratch. remove them first: halti ws box rm acme/dev\n");
     assert!(!out.status.success() && asked(&out) == 0 && ws_dir(&env).join("dir/acme").exists());
     // A box whose lock is held runs: refused too, before anything is asked.
-    fs::remove_dir_all(boxes.join("dev.sparsebundle")).unwrap();
+    fs::remove_dir_all(boxes.join(format!("dev{}", names::STORE))).unwrap();
     fs::remove_dir_all(boxes.join("temp")).unwrap();
     fs::create_dir_all(boxes.join("open")).unwrap();
     let lock = fs::File::create(boxes.join("open/dev.lock")).unwrap();
@@ -3455,7 +3458,7 @@ fn a_workspace_box_is_made_approved_listed_and_removed() {
     assert_eq!(stdout(&out), made);
     assert_eq!(pin_version(&env, "acme"), pin + 1);
     assert_eq!(items(&env, "acme").len(), 1, "the box's key");
-    let store = wsdir(&env, "acme").join("boxes/dev.sparsebundle");
+    let store = wsdir(&env, "acme").join(format!("boxes/dev{}", names::STORE));
     assert!(store.join("bands").is_dir() && fs::read(path.parent().unwrap().join("approved/dev.toml")).unwrap() == text.as_bytes());
     assert!(!env.dir.join("keychain").read_dir().unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with("box.")), "nothing in the Keychain");
     // Again: refused, before anything is asked.
@@ -3538,7 +3541,7 @@ fn ws_run_refuses_before_asking() {
     refused(&env.ws_box(PASSPHRASE, "true", &["ws", "stop", "acme/dev"]), "box acme/dev isn't running");
     refused(&env.ws_box(PASSPHRASE, "true", &["ws", "run", "globex/dev"]), "there is no workspace named globex");
     // That hint works: the box approved before it was made gets its key and store.
-    let store = wsdir(&env, "acme").join("boxes/dev.sparsebundle");
+    let store = wsdir(&env, "acme").join(format!("boxes/dev{}", names::STORE));
     let out = env.ws_box(PASSPHRASE, "true", &["ws", "box", "new", "acme/dev"]);
     assert!(out.status.success() && stdout(&out).ends_with("made box acme/dev. run it with: halti ws run acme/dev\n") && asked(&out) == 1, "{}", stderr(&out));
     assert!(store.join("bands").is_dir() && items(&env, "acme").len() == 1);
@@ -3615,7 +3618,7 @@ fn a_declined_make_leaves_no_store() {
     let out = env.ws_box("not the passphrase", &env.editor_writing(&box_text(true)), &["ws", "box", "new", "acme/dev"]);
     assert!(!out.status.success() && asked(&out) == 1, "{}", stderr(&out));
     let boxes = wsdir(&env, "acme").join("boxes");
-    assert!(!boxes.join("dev.sparsebundle").exists() && !boxes.join("policies/approved").exists() && items(&env, "acme").is_empty());
+    assert!(!boxes.join(format!("dev{}", names::STORE)).exists() && !boxes.join("policies/approved").exists() && items(&env, "acme").is_empty());
     // Only the policy file was written, as the editor left it.
     let after: Vec<PathBuf> = ws_files(&env).into_iter().map(|(path, _)| path).filter(|path| !before.iter().any(|(was, _)| was == path)).collect();
     assert_eq!(after, [boxes.join("policies/dev.toml")]);

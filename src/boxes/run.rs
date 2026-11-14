@@ -755,7 +755,7 @@ pub fn sweep(layout: &Layout, id: &str) -> Result<()> {
 fn sweep_temp(layout: &Layout) -> Result<()> {
     for entry in fs::read_dir(layout.root.join("temp")).into_iter().flatten().flatten() {
         let file = entry.file_name().to_string_lossy().into_owned();
-        let Some(id) = file.strip_suffix(".sparsebundle") else { continue };
+        let Some(id) = file.strip_suffix(names::STORE) else { continue };
         let lock = layout.lock(id);
         if let Some(_held) = store::lock(&lock)? {
             sweep(layout, id)?;
@@ -1920,8 +1920,32 @@ mod tests {
             let error = run(&layout, &fake, &Request { confirm, ..in_workspace(&s, &p) }).unwrap_err().to_string();
             assert!(error.contains("is too long"), "{error}");
             assert_eq!(fake.calls(), ["available", "bearer: anthropic", "site: anthropic", "site: github"], "nothing asked or opened");
-            assert!(!layout.bearer("dev").exists() && !layout.root.join("temp/dev.sparsebundle").exists());
+            assert!(!layout.bearer("dev").exists() && !layout.ephemeral_bundle("dev").exists());
         }
+    }
+
+    /// What runs that kept nothing left in temp/ when they ended without cleaning up: on Linux each
+    /// a disk and halti's folder beside it. A start's sweep removes both, and keeps the store of a
+    /// run whose halti still holds its lock.
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "a Linux store")]
+    fn a_temp_image_and_its_folder_are_swept() {
+        let s = setup();
+        s.layout.prepare().unwrap();
+        let temp = s.layout.root.join("temp");
+        for id in ["old-tmp-1", "busy"] {
+            fs::write(s.layout.ephemeral_bundle(id), b"a disk").unwrap();
+            fs::create_dir_all(temp.join(format!("{id}.d/log"))).unwrap();
+            fs::write(temp.join(format!("{id}.d/log/door.log")), b"logged\n").unwrap();
+        }
+        let busy = store::lock(&s.layout.lock("busy")).unwrap().unwrap();
+        sweep_temp(&s.layout).unwrap();
+        assert!(!s.layout.ephemeral_bundle("old-tmp-1").exists() && !temp.join("old-tmp-1.d").exists());
+        assert!(!s.layout.lock("old-tmp-1").exists(), "a temporary box's lock goes with it");
+        assert!(s.layout.ephemeral_bundle("busy").exists() && temp.join("busy.d/log/door.log").exists(), "a run that holds its lock keeps its store");
+        drop(busy);
+        sweep_temp(&s.layout).unwrap();
+        assert_eq!(fs::read_dir(&temp).unwrap().count(), 0);
     }
 
     #[test]

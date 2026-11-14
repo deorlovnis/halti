@@ -1,4 +1,5 @@
-//! A box's store: an AES-256 encrypted APFS sparse bundle, mounted only while the box runs.
+//! A box's store: an AES-256 encrypted APFS sparse bundle, mounted only while the box runs. On
+//! Linux it is the box's disk and a folder beside it instead (`disk`), behind the same functions.
 //!
 //! The key (256 random bits, hex) reaches `hdiutil` on stdin, NUL-terminated, and is never put in
 //! an argument list or a file. The bundle sits in a 0700 folder; the volume is attached with
@@ -9,6 +10,8 @@
 //! `diskutil image attach` (which gives space back) mounts `noowners`, so files would show the
 //! wrong owner. TODO: `halti box compact` (copy into a new store) if this matters in practice.
 
+mod disk;
+
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -16,7 +19,9 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
+#[cfg(not(target_os = "linux"))]
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
 use halti_core::ids::WsId;
@@ -28,6 +33,7 @@ use crate::util::store_root;
 use crate::{engine, names};
 
 /// The most a store can hold; the bundle grows as needed and starts small.
+#[cfg(not(target_os = "linux"))]
 const SIZE: &str = "100g";
 /// Folders of a store. `log`, `door` (the box CA, sealed) and `browser` (sealed sessions) are
 /// halti's; no VM mounts them.
@@ -126,13 +132,14 @@ impl Layout {
         }
     }
 
+    /// The box's store: `NAME.sparsebundle`, or on Linux its disk, `NAME.img`.
     pub fn bundle(&self, name: &str) -> PathBuf {
-        self.root.join(format!("{name}.sparsebundle"))
+        self.root.join(format!("{name}{}", names::STORE))
     }
 
     /// The store of a box that is shredded when it stops, or of `--temp`; its key is never kept.
     pub fn ephemeral_bundle(&self, id: &str) -> PathBuf {
-        self.root.join("temp").join(format!("{id}.sparsebundle"))
+        self.root.join("temp").join(format!("{id}{}", names::STORE))
     }
 
     pub fn open_dir(&self) -> PathBuf {
@@ -293,7 +300,11 @@ fn hdiutil(args: &[&std::ffi::OsStr], key: Option<&str>) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+#[cfg(target_os = "linux")]
+pub use disk::{Open, create, open, shred, usage};
+
 /// Create an empty encrypted store.
+#[cfg(not(target_os = "linux"))]
 pub fn create(layout: &Layout, bundle: &Path, key: &str) -> Result<()> {
     layout.prepare()?;
     if bundle.exists() {
@@ -328,6 +339,7 @@ pub fn create(layout: &Layout, bundle: &Path, key: &str) -> Result<()> {
 }
 
 /// Delete a store. Its key goes first (the caller's job); this only removes the ciphertext.
+#[cfg(not(target_os = "linux"))]
 pub fn shred(bundle: &Path) -> Result<()> {
     match fs::remove_dir_all(bundle) {
         Ok(()) => Ok(()),
@@ -360,15 +372,23 @@ pub fn detach(mnt: &Path) -> Result<()> {
 }
 
 /// An attached store. Dropping it detaches the volume, and deletes the store if it is to be shredded.
+#[cfg(not(target_os = "linux"))]
 pub struct Open {
     mnt: PathBuf,
     bundle: PathBuf,
     shred: bool,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Open {
     pub fn path(&self) -> &Path {
         &self.mnt
+    }
+
+    /// A disk for the box's VM: none, the VM mounts the store's folders.
+    #[allow(dead_code)] // for the engine that takes a disk
+    pub fn disk(&self) -> Option<&Path> {
+        None
     }
 
     /// Delete the store when this is closed (after detaching it).
@@ -377,6 +397,7 @@ impl Open {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Drop for Open {
     fn drop(&mut self) {
         match detach(&self.mnt) {
@@ -392,6 +413,7 @@ impl Drop for Open {
 /// Attach a store at `mnt`, whose parent must be a private folder. A volume still mounted there is
 /// left over from a crash (the caller holds the box's lock, so nobody else uses it) and is
 /// detached first. Writable attaches make sure the folders exist.
+#[cfg(not(target_os = "linux"))]
 pub fn open(bundle: &Path, mnt: &Path, key: &str, readonly: bool) -> Result<Open> {
     if !bundle.exists() {
         bail!("{} doesn't exist", bundle.display());
@@ -461,6 +483,7 @@ pub fn is_held(path: &Path) -> bool {
 }
 
 /// Space the store takes on disk, and when it last changed.
+#[cfg(not(target_os = "linux"))]
 pub fn usage(bundle: &Path) -> (u64, Option<SystemTime>) {
     let mut bytes = 0;
     let mut newest = None;
@@ -652,7 +675,7 @@ mod tests {
         assert_eq!((today.vm("dev"), today.browser_vm("dev")), ("halti-box-dev".to_string(), "halti-browser-dev".to_string()));
         assert_eq!((today.vm("dev"), today.browser_vm("dev")), (super::super::run::vm_name("dev"), engine::browser_vm_name("dev")));
         assert_eq!((today.socket("dev"), today.browser_socket("dev")), (dir.0.join("sock/dev.sock"), dir.0.join("sock/dev-browser.sock")));
-        assert_eq!((today.downloads("dev"), today.bundle("dev")), (dir.0.join("downloads/dev"), dir.0.join("box/dev.sparsebundle")));
+        assert_eq!((today.downloads("dev"), today.bundle("dev")), (dir.0.join("downloads/dev"), dir.0.join(format!("box/dev{}", names::STORE))));
         assert_eq!((today.lock("dev"), today.opened_with("dev")), (dir.0.join("box/open/dev.lock"), dir.0.join("box/open/dev.policy")));
         let real = Layout::real().unwrap();
         assert_eq!((real.root.clone(), real.downloads("dev")), (store_root().join("box"), store_root().join("downloads/dev")));
@@ -666,7 +689,7 @@ mod tests {
         assert_eq!((acme.vm("dev"), acme.browser_vm("dev")), ("halti-wsbox-abcdef012345-dev".to_string(), "halti-wsbrowser-abcdef012345-dev".to_string()));
         assert_eq!((acme.socket("dev"), acme.browser_socket("dev")), (dir.0.join("sock/ws/abcdef012345-dev.sock"), dir.0.join("sock/ws/abcdef012345-dev.browser.sock")));
         let boxes = dir.0.join("boxes");
-        assert_eq!((acme.bundle("dev"), acme.ephemeral_bundle("dev")), (boxes.join("dev.sparsebundle"), boxes.join("temp/dev.sparsebundle")));
+        assert_eq!((acme.bundle("dev"), acme.ephemeral_bundle("dev")), (boxes.join(format!("dev{}", names::STORE)), boxes.join(format!("temp/dev{}", names::STORE))));
         assert_eq!((acme.mount_point("dev"), acme.lock("dev"), acme.opened_with("dev")), (boxes.join("open/dev"), boxes.join("open/dev.lock"), boxes.join("open/dev.policy")));
         assert_eq!((acme.bearer("dev"), acme.downloads("dev")), (boxes.join("open/dev.bearer"), boxes.join("downloads/dev")));
         // Box x's browser socket is never box x-browser's agent socket, as today's are.
