@@ -2,7 +2,7 @@
 //! it runs on a Mac too), `id`, `sudo` and `cargo`. The stand-in sudo writes down what it was
 //! asked to install and runs nothing; the stand-in cargo makes a halti that only says its
 //! build-info. Nothing is installed, and no real sudo or cargo is run. And what check.sh writes for
-//! it: what it could not run here, with a stand-in `unshare` that fails as AppArmor makes it.
+//! it: what it could not run here, with stand-ins for `unshare`, `sysctl` and the debug halti.
 
 #![cfg(unix)]
 
@@ -185,49 +185,116 @@ fn what_check_sh_could_not_run_is_named_in_one_line() {
     assert!(repo.sudo_log().contains("/usr/local/bin/halti"), "installed all the same: {}", repo.sudo_log());
 }
 
+/// Runs `./check.sh userns ARGS` with the stand-ins in `fakes` first on the PATH, and the target
+/// folder in the test repo; what it says.
+fn check_userns(repo: &Repo, args: &[&str]) -> String {
+    let path = format!("{}:{}", repo.path("fakes").display(), env::var("PATH").unwrap());
+    let check = Path::new(env!("CARGO_MANIFEST_DIR")).join("check.sh");
+    let out = Command::new(check).arg("userns").args(args).env("PATH", path).env("CARGO_TARGET_DIR", repo.path("target")).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    text(&out.stdout)
+}
+
+fn write_script(path: &Path, script: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, script).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A script that says each line on stderr and fails.
+fn failing(lines: &[&str]) -> String {
+    let mut script = "#!/bin/sh\n".to_string();
+    for line in lines {
+        script.push_str(&format!("echo \"{line}\" >&2\n"));
+    }
+    script + "exit 1\n"
+}
+
+const APPARMOR_ON: &str = "#!/bin/sh\necho 1\n";
+const APPARMOR_OFF: &str = "#!/bin/sh\necho 0\n";
+const SUCCEEDS: &str = "#!/bin/sh\nexit 0\n";
+
 #[test]
 fn check_sh_says_why_no_user_namespace_can_be_made() {
     let repo = Repo::new();
-    let fake = repo.path("fakes/unshare");
-    let check = |args: &[&str]| {
-        let path = format!("{}:{}", repo.path("fakes").display(), env::var("PATH").unwrap());
-        let out = Command::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("check.sh")).arg("userns").args(args).env("PATH", path).output().unwrap();
-        assert!(out.status.success(), "{}", text(&out.stderr));
-        text(&out.stdout)
-    };
+    let (unshare, sysctl) = (repo.path("fakes/unshare"), repo.path("fakes/sysctl"));
 
     // As unshare fails where AppArmor restricts user namespaces.
-    fs::write(&fake, "#!/bin/sh\necho 'unshare: write failed /proc/self/uid_map: Operation not permitted' >&2\nexit 1\n").unwrap();
-    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
-    let apparmor = fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").is_ok_and(|v| v.trim() == "1");
-    let why = |args: &str| {
-        if apparmor {
-            "AppArmor restricts unprivileged user namespaces here\n".to_string()
-        } else {
-            format!("unshare {args} fails here: unshare: write failed /proc/self/uid_map: Operation not permitted\n")
-        }
-    };
-    assert_eq!(check(&[]), why("-Urm"));
-    assert_eq!(check(&["-Urnm", "--pid", "--fork"]), why("-Urnm --pid --fork"));
+    let uid_map = "unshare: write failed /proc/self/uid_map: Operation not permitted";
+    write_script(&unshare, &failing(&[uid_map]));
+    write_script(&sysctl, APPARMOR_ON);
+    assert_eq!(check_userns(&repo, &[]), "AppArmor restricts unprivileged user namespaces here\n");
+    write_script(&sysctl, APPARMOR_OFF);
+    assert_eq!(check_userns(&repo, &[]), format!("{uid_map}\n"));
 
-    fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
-    assert_eq!(check(&[]), "", "nothing where a user namespace can be made");
+    // Where AppArmor's limit is on but something else stops unshare: a container's seccomp filter,
+    // or no user namespaces allowed at all. AppArmor isn't named, and unshare's own words are kept.
+    write_script(&sysctl, APPARMOR_ON);
+    for said in ["unshare: unshare failed: Operation not permitted", "unshare: unshare failed: No space left on device"] {
+        write_script(&unshare, &failing(&[said]));
+        assert_eq!(check_userns(&repo, &[]), format!("{said}\n"));
+    }
+
+    write_script(&unshare, SUCCEEDS);
+    assert_eq!(check_userns(&repo, &[]), "", "nothing where a user namespace can be made");
+}
+
+#[test]
+fn check_sh_asks_the_debug_halti_whether_it_can_make_a_box() {
+    // AppArmor's limit is per program: here unshare(1) may make user namespaces, halti may not.
+    let repo = Repo::new();
+    let halti = repo.path("target/debug/halti");
+    write_script(&repo.path("fakes/unshare"), SUCCEEDS);
+    write_script(&repo.path("fakes/sysctl"), APPARMOR_ON);
+    let dev = "halti: [DEV, not protected] a debug build";
+
+    // As halti fails where AppArmor restricts user namespaces.
+    let setgroups = "halti: writing /proc/self/setgroups: Permission denied (os error 13)";
+    write_script(&halti, &failing(&[dev, dev, setgroups]));
+    assert_eq!(check_userns(&repo, &["box"]), "AppArmor restricts unprivileged user namespaces here\n");
+    write_script(&repo.path("fakes/sysctl"), APPARMOR_OFF);
+    assert_eq!(check_userns(&repo, &["box"]), format!("{setgroups}\n"));
+    let unshare = "halti: making the box's namespaces (does this kernel allow user namespaces?): Operation not permitted";
+    write_script(&halti, &failing(&[dev, dev, unshare]));
+    assert_eq!(check_userns(&repo, &["box"]), format!("{unshare}\n"));
+
+    // Any other failure is the sandbox's own: the escape tests run and say what it is.
+    write_script(&halti, &failing(&[dev, dev, "halti: sandbox: bringing up lo: Operation not permitted"]));
+    assert_eq!(check_userns(&repo, &["box"]), "");
+    write_script(&halti, SUCCEEDS);
+    assert_eq!(check_userns(&repo, &["box"]), "", "nothing where a box can be made");
+}
+
+/// The names in one of check.sh's lists, in their order there.
+fn check_sh_list(name: &str) -> Vec<String> {
+    let check = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("check.sh")).unwrap();
+    check.split(&format!("\n{name}=(\n")).nth(1).unwrap().split(')').next().unwrap().split_whitespace().map(String::from).collect()
+}
+
+/// Each test of a file of tests/ with its name, in their order there.
+fn tests_in(file: &str) -> Vec<(String, String)> {
+    let code = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join(file)).unwrap();
+    code.split("#[test]\n").skip(1).map(|test| (test.lines().find_map(|l| l.strip_prefix("fn ")).unwrap().split('(').next().unwrap().to_string(), test.to_string())).collect()
 }
 
 #[test]
 fn check_sh_names_the_release_tests_that_need_a_user_namespace() {
     // check.sh leaves these out where no user namespace can be made: each test of release.rs that
     // makes a Dirs, which runs halti in one, in their order there.
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let check = fs::read_to_string(root.join("check.sh")).unwrap();
-    let listed: Vec<&str> = check.split("\nrelease_userns_tests=(\n").nth(1).unwrap().split(')').next().unwrap().split_whitespace().collect();
-    let release = fs::read_to_string(root.join("tests/release.rs")).unwrap();
-    let needing: Vec<&str> = release
-        .split("#[test]\n")
-        .skip(1)
-        .filter(|test| test.contains("Dirs::new()"))
-        .map(|test| test.lines().find_map(|l| l.strip_prefix("fn ")).unwrap().split('(').next().unwrap())
-        .collect();
+    let needing: Vec<String> = tests_in("release.rs").into_iter().filter(|(_, test)| test.contains("Dirs::new()")).map(|(name, _)| name).collect();
     assert_eq!(needing.len(), 6, "{needing:?}");
-    assert_eq!(listed, needing);
+    assert_eq!(check_sh_list("release_userns_tests"), needing);
+}
+
+#[test]
+fn check_sh_names_the_escape_tests_and_cargo_test_runs_them() {
+    // check.sh leaves these out of `cargo test` where no box can be made. Elsewhere a plain
+    // `cargo test` runs them: none is ignored.
+    let tests = tests_in("sandbox.rs");
+    for (name, test) in &tests {
+        assert!(!test.trim_start().starts_with("#[ignore"), "{name} is ignored");
+    }
+    let names: Vec<String> = tests.into_iter().map(|(name, _)| name).collect();
+    assert_eq!(names.len(), 11, "{names:?}");
+    assert_eq!(check_sh_list("escape_tests"), names);
 }

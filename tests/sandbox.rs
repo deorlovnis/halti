@@ -2,9 +2,8 @@
 //! `halti box sh --engine sandbox` (the debug binary) and checks, from both sides, what the box
 //! can't see or reach, and that nothing of it is left after.
 //!
-//! Linux only, and only where the kernel lets a user make namespaces. They are `#[ignore]`d:
-//! check.sh runs them where it can and shows which ran, and elsewhere lists them as not run. Run
-//! where a box can't be made, each fails saying so, so none counts as passed.
+//! Linux only. Where halti can't make a box's namespaces, each fails saying it cannot run here, so
+//! none counts as passed; check.sh leaves them out there and lists them as not run.
 
 #![cfg(target_os = "linux")]
 
@@ -16,14 +15,16 @@ use std::{fs, process};
 
 const HALTI: &str = env!("CARGO_BIN_EXE_halti");
 
-/// Fails the test, saying why, where a box can't be made here.
+/// Fails the test, saying why, where halti can't make a box's namespaces here. It asks halti, not
+/// unshare(1), as AppArmor's limit on user namespaces is per program. Any other failure is left
+/// to the test.
 fn can_sandbox() {
-    let why = match Command::new("unshare").args(["-Urnm", "--pid", "--fork", "true"]).stdin(Stdio::null()).output() {
-        Ok(out) if out.status.success() => return,
-        Ok(out) => text(&out.stderr).trim().to_string(),
-        Err(e) => e.to_string(),
-    };
-    panic!("cannot run here: unshare -Urnm --pid --fork fails ({why})");
+    let out = in_box(&["true"]).output().unwrap();
+    let said = text(&out.stderr);
+    let why = said.lines().last().unwrap_or_default();
+    if !out.status.success() && (why.contains("making the box's namespaces") || why.contains("writing /proc/self/")) {
+        panic!("cannot run here: {why}");
+    }
 }
 
 fn ran(test: &str) {
@@ -79,7 +80,6 @@ fn mounts(mountinfo: &str) -> Vec<[String; 4]> {
 }
 
 #[test]
-#[ignore = "needs user namespaces: check.sh runs these where they can be made"]
 fn bash_and_claude_run_inside() {
     can_sandbox();
     let out = in_box(&["bash", "-c", "true"]).output().unwrap();
@@ -96,7 +96,6 @@ fn bash_and_claude_run_inside() {
 }
 
 #[test]
-#[ignore = "needs user namespaces: check.sh runs these where they can be made"]
 fn the_network_is_only_lo() {
     can_sandbox();
     let said = bash("readlink /proc/self/ns/net; echo ---; sed 1,2d /proc/net/dev | cut -d: -f1 | tr -d ' '; echo ---; ls /sys/class/net 2>/dev/null; true");
@@ -114,7 +113,6 @@ fn the_network_is_only_lo() {
 }
 
 #[test]
-#[ignore = "needs user namespaces: check.sh runs these where they can be made"]
 fn tcp_to_the_host_fails() {
     can_sandbox();
     // A listener of the host's own, which the host reaches, so the test can't pass by reaching nothing.
@@ -128,7 +126,6 @@ fn tcp_to_the_host_fails() {
 }
 
 #[test]
-#[ignore = "needs user namespaces: check.sh runs these where they can be made"]
 fn a_file_outside_the_bind_set_is_missing() {
     can_sandbox();
     let fixture = Fixture::new("fixture");
@@ -139,7 +136,6 @@ fn a_file_outside_the_bind_set_is_missing() {
 }
 
 #[test]
-#[ignore = "needs user namespaces: check.sh runs these where they can be made"]
 fn the_callers_folder_is_out_of_reach() {
     can_sandbox();
     // Started from a folder outside the bind set, no process the box can see has it as its folder.
@@ -152,7 +148,6 @@ fn the_callers_folder_is_out_of_reach() {
 }
 
 #[test]
-#[ignore = "needs user namespaces: check.sh runs these where they can be made"]
 fn the_callers_environment_stays_out() {
     can_sandbox();
     let marker = format!("planted-{}", process::id());
@@ -163,7 +158,6 @@ fn the_callers_environment_stays_out() {
 }
 
 #[test]
-#[ignore = "needs user namespaces: check.sh runs these where they can be made"]
 fn the_callers_fds_stay_out() {
     can_sandbox();
     // bash opens fd 7 on a folder outside the bind set and runs the box with it.
@@ -182,7 +176,6 @@ fn the_callers_fds_stay_out() {
 }
 
 #[test]
-#[ignore = "needs user namespaces: check.sh runs these where they can be made"]
 fn no_host_root_in_mountinfo() {
     can_sandbox();
     let host = mounts(&fs::read_to_string("/proc/self/mountinfo").unwrap());
@@ -197,7 +190,6 @@ fn no_host_root_in_mountinfo() {
 }
 
 #[test]
-#[ignore = "needs user namespaces: check.sh runs these where they can be made"]
 fn every_proc_mount_is_read_only() {
     can_sandbox();
     let out = in_box(&["cat", "/proc/self/mountinfo"]).output().unwrap();
@@ -211,7 +203,6 @@ fn every_proc_mount_is_read_only() {
 }
 
 #[test]
-#[ignore = "needs user namespaces: check.sh runs these where they can be made"]
 fn nothing_is_left_after_exit() {
     can_sandbox();
     let marker = format!("600.{}", process::id());
@@ -235,7 +226,6 @@ fn nothing_is_left_after_exit() {
 }
 
 #[test]
-#[ignore = "needs user namespaces: check.sh runs these where they can be made"]
 fn a_missing_or_unrunnable_command_says_so() {
     can_sandbox();
     let out = in_box(&["no-such-command"]).output().unwrap();
