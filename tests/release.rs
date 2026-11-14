@@ -116,7 +116,9 @@ fn build_info_says_the_release_has_no_hooks() {
     let out = Command::new(release()).arg("build-info").output().unwrap();
     let said = text(&out.stdout);
     assert!(out.status.success() && said.lines().any(|l| l == "debug_assertions=false halti_dev=false"), "{said}");
-    assert!(said.lines().any(|l| l == "verified: linux-aarch64") && said.contains(&format!("target={}-unknown-linux-", env::consts::ARCH)), "{said}");
+    // This machine's own target: x86_64 and aarch64 Linux each say theirs.
+    let verified = format!("verified: linux-{}", env::consts::ARCH);
+    assert!(said.lines().any(|l| l == verified) && said.contains(&format!("target={}-unknown-linux-", env::consts::ARCH)), "{said}");
     let debug = text(&Command::new(DEBUG).arg("build-info").output().unwrap().stdout);
     assert!(debug.lines().any(|l| l == "debug_assertions=true halti_dev=true"), "{debug}");
 }

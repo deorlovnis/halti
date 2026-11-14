@@ -59,9 +59,17 @@ use refresh::{auto_resources, refresh_due};
 
 const MASK: &[u8] = b"********";
 
-/// The target check.sh builds and tests this source on. x86_64 Linux and macOS aren't, until
-/// there is a machine to run them on.
-const VERIFIED: &str = "linux-aarch64";
+/// The Linux target check.sh builds and tests this source for, on this build's processor. It
+/// doesn't say check.sh has passed anywhere: install-linux.sh asks for the record check.sh writes
+/// when it passes on that machine. Other processors have none, and macOS isn't one, until there is
+/// a machine to run it on.
+const VERIFIED: &str = if cfg!(target_arch = "x86_64") {
+    "linux-x86_64"
+} else if cfg!(target_arch = "aarch64") {
+    "linux-aarch64"
+} else {
+    "none"
+};
 
 #[derive(Parser)]
 #[command(name = "halti", version, about = "Keychain-backed secrets for humans and agents")]
@@ -1043,5 +1051,15 @@ fn main() -> ExitCode {
             eprintln!("halti: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_verified_target_is_linux_on_this_build_s_processor() {
+        assert_eq!(VERIFIED, format!("linux-{}", std::env::consts::ARCH));
     }
 }
