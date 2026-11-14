@@ -551,7 +551,6 @@ fn mcp(guest: &Guest, upstream: &Upstream, dir: &Path) {
     assert!(names.contains(&"fetch") && names.contains(&"sites"), "{names:?}");
 
     // Only the box's sites are offered, and using one needs no prompt: the run already asked.
-    approve::take_answers();
     let sites = call(3, "tools/call", json!({ "name": "sites", "arguments": {} }));
     let text = sites["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("notes:") && !text.contains("other:") && !text.contains("anthropic:"), "{text}");
@@ -564,12 +563,13 @@ fn mcp(guest: &Guest, upstream: &Upstream, dir: &Path) {
     assert_eq!(outside["isError"], true);
     assert!(outside["content"][0]["text"].as_str().unwrap().contains("unknown site"), "{outside}");
     assert_eq!(upstream.seen.lock().unwrap().len(), calls + 1);
-    assert!(approve::take_answers().is_empty(), "a box's sites need no prompt of their own");
 
-    // Audit entries are written, tagged with the box.
+    // Audit entries are written, tagged with the box. Each says what its call asked, read on the
+    // door's thread that ran it: a box's sites need no prompt of their own.
     let audit = fs::read_to_string(dir.join("audit.log")).unwrap();
     let entries: Vec<Value> = audit.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert!(entries.len() >= 3 && entries.iter().all(|e| e["box"] == "testbox"), "{audit}");
+    assert!(entries.iter().all(|e| !e["decision"].as_str().unwrap().starts_with("asked")), "{audit}");
     assert!(entries.iter().any(|e| e["tool"] == "fetch" && e["site"] == "notes" && e["decision"] == "allowed"));
     conn.stream.shutdown(Shutdown::Both).unwrap();
 }
