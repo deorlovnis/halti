@@ -99,6 +99,27 @@ pub fn write(root: &Path, rel: &Path, bytes: &[u8]) -> Result<Vec<PathBuf>> {
     Ok(replaced)
 }
 
+/// Fails if a part of `rel` in the folder `root` is a link. A part that isn't there, or isn't a
+/// folder, ends the check: nothing is below it.
+pub fn no_link(root: &Path, rel: &Path) -> Result<()> {
+    let (folders, name) = split(rel)?;
+    let mut dir = open_root(root)?;
+    let mut at = PathBuf::new();
+    for part in folders {
+        at.push(part);
+        match kind(&dir, part, &at)? {
+            Kind::Folder => dir = open_folder(&dir, part, &at)?,
+            Kind::Link => bail!("{} is a link; links aren't followed", at.display()),
+            _ => return Ok(()),
+        }
+    }
+    at.push(name);
+    if kind(&dir, name, &at)? == Kind::Link {
+        bail!("{} is a link; links aren't followed", at.display());
+    }
+    Ok(())
+}
+
 /// The folders of `rel` and the name at its end. Only plain names: no `..`, `.` or leading `/`.
 fn split(rel: &Path) -> Result<(Vec<&OsStr>, &OsStr)> {
     let mut parts = rel
@@ -211,7 +232,10 @@ mod tests {
 
         for rel in ["home/file", "home/folder/x", "home/gone/x"] {
             assert_eq!(read(&mnt, Path::new(rel)).unwrap(), None, "{rel} is read as if it weren't there");
+            let error = no_link(&mnt, Path::new(rel)).unwrap_err().to_string();
+            assert!(error.starts_with("home/") && error.ends_with(" is a link; links aren't followed"), "{error}");
         }
+        no_link(&mnt, Path::new("home/missing/x")).unwrap();
         assert_eq!(write(&mnt, Path::new("home/file"), b"halti's").unwrap(), [PathBuf::from("home/file")]);
         assert_eq!(write(&mnt, Path::new("home/folder/x"), b"halti's").unwrap(), [PathBuf::from("home/folder")]);
         assert_eq!(write(&mnt, Path::new("home/gone/x"), b"halti's").unwrap(), [PathBuf::from("home/gone")]);

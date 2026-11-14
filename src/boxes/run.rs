@@ -518,10 +518,11 @@ fn resolve_mounts<'a>(mounts: &'a [MountPolicy], rule: &MountRule) -> Result<Vec
         .collect()
 }
 
-/// Copy a folder into work/<name> the first time. Later runs keep the agent's own copy.
+/// Copy a folder into work/<name> the first time. Later runs keep the agent's own copy, even a link
+/// in its place, which isn't followed.
 fn clone_into(work: &Path, name: &str, host: &Path) -> Result<()> {
     let dst = work.join(name);
-    if dst.exists() {
+    if fs::symlink_metadata(&dst).is_ok() {
         return Ok(());
     }
     match store::copy_tree(host, &dst) {
@@ -1544,5 +1545,27 @@ mod tests {
         }
         assert!(fs::read_to_string(home.join(".claude.json")).unwrap().contains(names::SHIM));
         assert!(prepare_home(&dir.0, true).unwrap().is_empty(), "the next start finds nothing to replace");
+    }
+
+    #[test]
+    fn a_link_in_place_of_a_copy_is_kept_and_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new("halti-clone-links").unwrap();
+        let (work, outside, host) = (dir.0.join("work"), dir.0.join("outside"), dir.0.join("proj"));
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("README"), "original").unwrap();
+        symlink(&outside, work.join("proj")).unwrap();
+        symlink(dir.0.join("gone"), work.join("other")).unwrap();
+
+        clone_into(&work, "proj", &host).unwrap();
+        clone_into(&work, "other", &host).unwrap();
+        assert!(fs::read_dir(&outside).unwrap().next().is_none() && !dir.0.join("gone").exists(), "nothing was copied through a link");
+        assert!(fs::symlink_metadata(work.join("other")).unwrap().file_type().is_symlink(), "the agent's link stays");
+
+        clone_into(&work, "new", &host).unwrap();
+        assert_eq!(fs::read_to_string(work.join("new/README")).unwrap(), "original");
     }
 }
