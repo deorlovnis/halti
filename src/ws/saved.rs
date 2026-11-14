@@ -1,7 +1,7 @@
 //! A workspace's passphrase saved by a password manager (`[passwords] manager`): the Keychain, on a
-//! Mac. `ws new` saves it once the workspace is made, and `open` and `ws delete` take it from there
-//! after the approval the settings name for them (`[workspace.approval]`), instead of having it
-//! typed.
+//! Mac. `ws new` saves it once the workspace is made, and `open`, `ws ls WS`, `ws set`, `ws rm`
+//! and `ws delete` take it from there after the approval the settings name for them
+//! (`[workspace.approval]`; listing follows `open`), instead of having it typed.
 //!
 //! A workspace records which way it was made. One made with the saved copy records this module's
 //! label, which lacks more than a typed one's: a program running as you has more ways to get a
@@ -12,7 +12,7 @@
 //! (`names::WS_KEYCHAIN_PREFIX`). It is read only after the approval, and only while macOS may show
 //! no window, so an item the running halti didn't write reads as missing. One that is missing or
 //! can't be used sends the person to typing, and is saved again once the typed passphrase has
-//! opened the workspace.
+//! opened the workspace with `open`; the other commands leave it as it is.
 
 use std::cell::Cell;
 use std::fmt;

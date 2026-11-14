@@ -178,7 +178,7 @@ enum Cmd {
         #[arg(long)]
         default: bool,
     },
-    /// Workspaces, each opened with its own passphrase: create, list and delete them
+    /// Workspaces, each opened with its own passphrase: create, list and delete them, and store secrets in them
     Ws {
         #[command(subcommand)]
         action: WsCmd,
@@ -336,9 +336,34 @@ enum WsCmd {
         #[arg(long)]
         generate: bool,
     },
-    /// List workspaces (asks for nothing)
+    /// Store a secret in a workspace, typed unseen or piped in (asks as halti config says)
+    Set {
+        #[arg(value_name = "WS/RESOURCE", value_parser = parse_ws_resource)]
+        target: String,
+        #[arg(value_parser = parse_field)]
+        field: String,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
+    },
+    /// List workspaces (asks for nothing), or the secrets in one (asks as halti config says for open)
     #[command(visible_alias = "list")]
-    Ls,
+    Ls {
+        name: Option<String>,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type", requires = "name")]
+        type_it: bool,
+    },
+    /// Remove one field of a resource, or the whole resource, from a workspace (asks as halti config says)
+    Rm {
+        #[arg(value_name = "WS/RESOURCE", value_parser = parse_ws_resource)]
+        target: String,
+        #[arg(value_parser = parse_field)]
+        field: Option<String>,
+        /// Type the passphrase, whatever halti config says
+        #[arg(long = "type")]
+        type_it: bool,
+    },
     /// Delete a workspace and everything in it; it can't be undone (asks as halti config says)
     Delete {
         name: String,
@@ -367,6 +392,14 @@ fn parse_field(s: &str) -> Result<String, String> {
     let mut chars = s.chars();
     let ok = chars.next().is_some_and(|c| c.is_ascii_lowercase()) && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     if ok { Ok(s.to_string()) } else { Err("use lowercase letters, digits and _, e.g. token".into()) }
+}
+
+/// `acme/github`: a workspace, one `/`, then a resource.
+fn parse_ws_resource(s: &str) -> Result<String, String> {
+    match ws::target(s) {
+        Ok(_) => Ok(s.to_string()),
+        Err(_) => Err("use a workspace and a resource, e.g. acme/github".into()),
+    }
 }
 
 fn parse_env(s: &str) -> Result<String, String> {
@@ -810,7 +843,9 @@ fn main() -> ExitCode {
         Cmd::Config { show, default } => ok(config::command(show, default)),
         Cmd::Ws { action } => ok(match action {
             WsCmd::New { name, own, generate } => ws::new(&name, passphrase_choice(own, generate)),
-            WsCmd::Ls => ws::ls(),
+            WsCmd::Set { target, field, type_it } => ws::set(&target, &field, type_it),
+            WsCmd::Ls { name, type_it } => ws::ls(name.as_deref(), type_it),
+            WsCmd::Rm { target, field, type_it } => ws::rm(&target, field.as_deref(), type_it),
             WsCmd::Delete { name, type_it } => ws::delete(&name, type_it),
         }),
         Cmd::Open { name, type_it } => ok(ws::open(name.as_deref(), type_it)),

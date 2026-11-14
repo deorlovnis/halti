@@ -6,6 +6,8 @@
 //! A workspace's lines take passphrase, or another means where a password manager keeps its
 //! passphrase (`[passwords] manager`): then the person approves that way, or not at all, and halti
 //! takes the passphrase from the manager. Where this system has no manager, they take passphrase only.
+//! Storing a secret is never approved by nothing: a value of someone else's choosing could then be
+//! stored with no one asked.
 //!
 //! An action raised while an agent holds the terminal accepts only a means that shows its own
 //! window: the agent could answer what is asked on the terminal, or eat the keystrokes.
@@ -31,12 +33,17 @@ use crate::config::approved::{self, Found, Place};
 use crate::config::{Engine, Manager, Settings, Word};
 use crate::{approve, policy, util};
 
-/// What can ask for an approval. Later: storing a secret.
+/// What can ask for an approval.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Action {
     /// A change to halti's settings.
     Config,
+    /// Opening a workspace, and listing its secrets.
     WsOpen,
+    /// Storing a secret in a workspace.
+    WsSet,
+    /// Removing secrets from a workspace.
+    WsRm,
     WsDelete,
     BoxRun,
     /// Approving a box's policy, new or changed.
@@ -120,17 +127,32 @@ const BOX_WRITE_MEANS: &[Means] = &[Means::TouchId, Means::None];
 /// What a change to the settings accepts: what a program running as the person can't answer.
 const CONFIG_MEANS: &[Means] = &[Means::Sudo, Means::TouchId];
 
-/// What opening or deleting a workspace accepts: its passphrase typed, as it always was; or, where a
-/// password manager keeps it, the person's password, Touch ID, or nothing before it is taken from there.
+/// What opening, removing secrets from or deleting a workspace accepts: its passphrase typed, as it
+/// always was; or, where a password manager keeps it, the person's password, Touch ID, or nothing
+/// before it is taken from there.
 const WS_MEANS: &[Means] = &[Means::Passphrase, Means::Sudo, Means::TouchId, Means::None];
+
+/// What storing a secret accepts: as a workspace's other actions, but never nothing.
+const WS_SET_MEANS: &[Means] = &[Means::Passphrase, Means::Sudo, Means::TouchId];
 
 /// Config takes only what a program running as the person can't answer: the sudo password, or the
 /// Touch ID window. A workspace unlocks with its passphrase, which core demands anyway, or with the
-/// passphrase a password manager keeps, released by the means its line names. A box's write is
+/// passphrase a password manager keeps, released by the means its line names; storing a secret
+/// takes some approval, never none. A box's write is
 /// asked while the agent has the terminal, so only Touch ID's window, or nothing, answers it.
 pub const RULES: &[Rule] = &[
     Rule { action: Action::Config, table: "approval", key: "config", about: "a change to this file", accepts: CONFIG_MEANS, agent_at_terminal: false, manager: false },
     Rule { action: Action::WsOpen, table: "workspace.approval", key: "open", about: "opening a workspace", accepts: WS_MEANS, agent_at_terminal: false, manager: true },
+    Rule {
+        action: Action::WsSet,
+        table: "workspace.approval",
+        key: "set",
+        about: "storing a secret in a workspace",
+        accepts: WS_SET_MEANS,
+        agent_at_terminal: false,
+        manager: true,
+    },
+    Rule { action: Action::WsRm, table: "workspace.approval", key: "rm", about: "removing secrets from a workspace", accepts: WS_MEANS, agent_at_terminal: false, manager: true },
     Rule { action: Action::WsDelete, table: "workspace.approval", key: "delete", about: "deleting a workspace", accepts: WS_MEANS, agent_at_terminal: false, manager: true },
     Rule { action: Action::BoxRun, table: BOX, key: "run", about: "opening a box", accepts: BOX_MEANS, agent_at_terminal: false, manager: false },
     Rule { action: Action::BoxPolicy, table: BOX, key: "policy", about: "approving a changed box policy", accepts: BOX_MEANS, agent_at_terminal: false, manager: false },
@@ -369,12 +391,17 @@ mod tests {
 
     #[test]
     fn a_workspace_takes_any_means_where_a_password_manager_is_and_its_passphrase_elsewhere() {
-        for action in [Action::WsOpen, Action::WsDelete] {
+        for action in [Action::WsOpen, Action::WsSet, Action::WsRm, Action::WsDelete] {
             assert!(action.rule().manager && action.rule().table == "workspace.approval");
-            assert_eq!(action.accepts(Os::Macos), [Means::Passphrase, Means::Sudo, Means::TouchId, Means::None], "{action:?}");
+            let any = [Means::Passphrase, Means::Sudo, Means::TouchId, Means::None];
+            // Storing a secret is never approved by nothing.
+            let expected = if action == Action::WsSet { &any[..3] } else { &any[..] };
+            assert_eq!(action.accepts(Os::Macos), expected, "{action:?}");
             assert_eq!(action.accepts(Os::Linux), [Means::Passphrase], "{action:?}");
         }
-        assert_eq!(RULES.iter().filter(|rule| rule.manager).count(), 2, "only a workspace's passphrase is kept by a manager");
+        assert_eq!(RULES.iter().filter(|rule| rule.manager).count(), 4, "only a workspace's passphrase is kept by a manager");
+        let keys: Vec<&str> = RULES.iter().filter(|rule| rule.table == "workspace.approval").map(|rule| rule.key).collect();
+        assert_eq!(keys, ["open", "set", "rm", "delete"]);
     }
 
     #[test]
@@ -421,7 +448,7 @@ mod tests {
     fn a_passphrase_asks_nothing_here_and_the_others_ask_their_way() {
         let yes = Fake::answering(true, true);
         let builtin = config::Settings::builtin(Os::Macos);
-        for action in [Action::WsOpen, Action::WsDelete] {
+        for action in [Action::WsOpen, Action::WsSet, Action::WsRm, Action::WsDelete] {
             assert_eq!(approve_with(&yes, &builtin, action, "open workspace acme").unwrap(), Granted::ByPassphrase);
         }
         assert!(yes.calls().is_empty(), "core asks for the passphrase");

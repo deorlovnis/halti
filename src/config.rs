@@ -850,26 +850,33 @@ mod tests {
 
     /// The template a debug build has, as the person sees it.
     fn expected(os: Os) -> String {
-        let (default, config, managers, ws, boxes) = match os {
-            Os::Macos => ("sudo | touchid | passphrase", "sudo | touchid", "none | keychain", "passphrase | sudo | touchid | none", BOX_SECTIONS),
-            Os::Linux => ("sudo | passphrase", "sudo", "none", "passphrase", ""),
+        let (default, config, managers, ws, set, boxes) = match os {
+            Os::Macos => ("sudo | touchid | passphrase", "sudo | touchid", "none | keychain", "passphrase | sudo | touchid | none", "passphrase | sudo | touchid", BOX_SECTIONS),
+            Os::Linux => ("sudo | passphrase", "sudo", "none", "passphrase", "passphrase", ""),
         };
         format!(
             "# halti config. edit with: halti config\n\n[approval]\ndefault = \"sudo\"              # {default}\n\
              config  = \"sudo\"              # a change to this file: {config}\n\n[paths]\nworkspaces = \"~/{}/ws\"\n\n\
              [passwords]\nmanager = \"none\"              # {managers}\n\n[secrets]\nstore = \"files\"               # files\n\n\
              [workspace]\npassphrase = \"own\"            # own | generate\n\n[workspace.approval]\n\
-             open   = \"passphrase\"         # opening a workspace: {ws}\ndelete = \"passphrase\"         # deleting a workspace: {ws}\n{boxes}",
+             open   = \"passphrase\"         # opening a workspace: {ws}\nset    = \"passphrase\"         # storing a secret in a workspace: {set}\n\
+             rm     = \"passphrase\"         # removing secrets from a workspace: {ws}\ndelete = \"passphrase\"         # deleting a workspace: {ws}\n{boxes}",
             util::DEV_STORE_ROOT
         )
     }
 
-    /// The template the build before a password manager could be named had: no manager, and a
-    /// workspace's lines taking its passphrase alone.
+    /// The template the build before a password manager could be named had: no manager, a
+    /// workspace's lines taking its passphrase alone, and no line for its secrets.
     fn before_managers(os: Os) -> String {
         let ws = if os == Os::Macos { "passphrase | sudo | touchid | none" } else { "passphrase" };
-        let text = template(os).replace("# none | keychain", "# none");
+        let text = without_secret_lines(&template(os)).replace("# none | keychain", "# none");
         text.replace(&format!("opening a workspace: {ws}"), "opening a workspace: passphrase").replace(&format!("deleting a workspace: {ws}"), "deleting a workspace: passphrase")
+    }
+
+    /// `text` without the lines of storing and removing a workspace's secrets, as a copy approved
+    /// before they could be stored has it.
+    fn without_secret_lines(text: &str) -> String {
+        text.lines().filter(|line| !line.starts_with("set ") && !line.starts_with("rm ")).map(|line| format!("{line}\n")).collect()
     }
 
     /// The template with `config` and `workspaces` changed.
@@ -895,14 +902,14 @@ mod tests {
             assert_eq!(parse(&template(os), os), Ok(Settings::builtin(os)), "{os:?}");
         }
         let builtin = Settings::builtin(Os::Macos);
-        let means = [Action::Config, Action::WsOpen, Action::WsDelete].map(|action| builtin.means(action));
-        assert_eq!(means, [Some(Means::Sudo), Some(Means::Passphrase), Some(Means::Passphrase)]);
+        let means = [Action::Config, Action::WsOpen, Action::WsSet, Action::WsRm, Action::WsDelete].map(|action| builtin.means(action));
+        assert_eq!(means, [Some(Means::Sudo), Some(Means::Passphrase), Some(Means::Passphrase), Some(Means::Passphrase), Some(Means::Passphrase)]);
         assert_eq!(BOX_ACTIONS.map(|action| builtin.means(action)), [Some(Means::TouchId); 5], "a box asks for Touch ID, as it always did");
         assert_eq!((builtin.engine, builtin.keys), (Some(Engine::Container), Some(Keys::Keychain)));
         assert_eq!(builtin.workspaces.path, util::store_root().join(names::WS_DIR), "where workspaces always were");
         let shown = format!(
             "\n[approval]\ndefault = \"sudo\"\nconfig  = \"sudo\"\n\n[paths]\nworkspaces = \"~/{}/ws\"\n\n[passwords]\nmanager = \"none\"\n\n[secrets]\nstore = \"files\"\n\n\
-             [workspace]\npassphrase = \"own\"\n\n[workspace.approval]\nopen   = \"passphrase\"\ndelete = \"passphrase\"\n\n\
+             [workspace]\npassphrase = \"own\"\n\n[workspace.approval]\nopen   = \"passphrase\"\nset    = \"passphrase\"\nrm     = \"passphrase\"\ndelete = \"passphrase\"\n\n\
              [box]\nengine = \"container\"\nkeys   = \"keychain\"\n\n[box.approval]\nrun    = \"touchid\"\npolicy = \"touchid\"\nwrite  = \"touchid\"\n\
              export = \"touchid\"\ndelete = \"touchid\"\n",
             util::DEV_STORE_ROOT
@@ -931,6 +938,10 @@ mod tests {
             ("[workspace.approval]\ndelete = \"none\"\n", Os::Linux, 2, "delete can't be none. it can only be passphrase"),
             ("[workspace.approval]\nopen = \"touchid\"\n", Os::Linux, 2, "touchid is only on a mac"),
             ("[workspace.approval]\nopen = \"always\"\n", Os::Macos, 2, "open can be passphrase, sudo, touchid or none"),
+            // Storing a secret is never approved by nothing, whatever keeps the passphrase.
+            ("[passwords]\nmanager = \"keychain\"\n[workspace.approval]\nset = \"none\"\n", Os::Macos, 4, "set can't be none. it can be passphrase, sudo or touchid"),
+            ("[workspace.approval]\nset = \"none\"\n", Os::Linux, 2, "set can't be none. it can only be passphrase"),
+            ("[workspace.approval]\nrm = \"sudo\"\n", Os::Macos, 2, "rm can't be sudo while [passwords] manager is none"),
             // A workspace's line that takes the passphrase from a password manager, where the file names none.
             ("[workspace.approval]\nopen = \"sudo\"\n", Os::Macos, 2, "open can't be sudo while [passwords] manager is none"),
             ("[workspace.approval]\ndelete = \"none\"\n", Os::Macos, 2, "delete can't be none while [passwords] manager is none"),
@@ -1072,6 +1083,12 @@ mod tests {
             let settings = parse(&format!("[approval]\ndefault = \"{default}\"\n\n[passwords]\nmanager = \"keychain\"\n"), Os::Macos).unwrap();
             assert_eq!(ws(&settings), (Manager::Keychain, Some(Means::Passphrase), Some(Means::Passphrase)), "{default}");
         }
+        // Storing and removing secrets have their own lines; left out, the passphrase is typed for them.
+        let secrets = |settings: &Settings| (settings.means(Action::WsSet), settings.means(Action::WsRm));
+        let lines = parse(&format!("{}set = \"touchid\"\nrm = \"none\"\n", managed("sudo", "sudo")), Os::Macos).unwrap();
+        assert_eq!(secrets(&lines), (Some(Means::TouchId), Some(Means::None)));
+        assert_eq!(parse(&lines.render(Os::Macos), Os::Macos), Ok(lines));
+        assert_eq!(secrets(&parse(&managed("touchid", "touchid"), Os::Macos).unwrap()), (Some(Means::Passphrase), Some(Means::Passphrase)));
         // The line that says the manager is the one that counts, wherever it is in the file.
         let after = "[workspace.approval]\nopen = \"touchid\"\n\n[passwords]\nmanager = \"keychain\"\n";
         assert_eq!(parse(after, Os::Macos).unwrap().means(Action::WsOpen), Some(Means::TouchId));
@@ -1091,7 +1108,8 @@ mod tests {
             // With any `default` it took, a workspace still opens and is deleted with its passphrase typed.
             for default in default_choices(os) {
                 let settings = parse(&before.replace("default = \"sudo\"", &format!("default = \"{}\"", default.name())), os).unwrap();
-                assert_eq!((settings.means(Action::WsOpen), settings.means(Action::WsDelete)), (Some(Means::Passphrase), Some(Means::Passphrase)), "{os:?} {default:?}");
+                let ws = [Action::WsOpen, Action::WsSet, Action::WsRm, Action::WsDelete].map(|action| settings.means(action));
+                assert_eq!(ws, [Some(Means::Passphrase); 4], "{os:?} {default:?}");
                 assert_eq!(settings.manager, Manager::None);
             }
         }

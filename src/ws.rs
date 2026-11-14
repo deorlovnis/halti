@@ -1,12 +1,19 @@
-//! Workspaces on this machine: where their files are, how a passphrase is read, and what `ws new`,
-//! `ws ls`, `ws delete`, `open` and `close` print. What a workspace is, and every check on it, is
-//! core's (`halti_core::verbs`); nothing here decides whether one opens.
+//! Workspaces on this machine: where their files are, how a passphrase and a secret's value are
+//! read, and what `ws new`, `ws ls`, `ws set`, `ws rm`, `ws delete`, `open` and `close` print. What
+//! a workspace is, every check on it, and how its secrets are sealed are core's
+//! (`halti_core::verbs`); nothing here decides whether one opens, and no key of a workspace's
+//! reaches this side.
 //!
 //! The settings in effect (`config`) say where the workspaces folder is, whose passphrase a new
 //! workspace gets unless `ws new` says, whether a password manager keeps it (`saved`), and what
-//! approves opening and deleting one: the passphrase typed, which core asks for, or, where a manager
-//! keeps it, the means their line names before halti takes it from there. With `--type` it is typed
-//! whatever they say. A workspace opens with what it was made with, which its own records hold.
+//! approves opening one or listing its secrets, storing a secret, removing secrets, and deleting
+//! one: the passphrase typed, which core asks for, or, where a manager keeps it, the means their
+//! line names before halti takes it from there. With `--type` it is typed whatever they say. Each
+//! command asks for one approval; a saved copy that can't be used is typed instead, once. A
+//! workspace opens with what it was made with, which its own records hold.
+//!
+//! A secret's value is read only after the approval and the checks (`tty::read_value`), once, and
+//! is never printed. Only `open` saves a typed passphrase again.
 //!
 //! Workspaces can't stay open yet: `open` checks the passphrase and the files and wipes the keys as
 //! it ends, and `close` has nothing to do and says so.
@@ -16,6 +23,7 @@ mod memory;
 mod saved;
 mod tty;
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -25,11 +33,14 @@ use halti_core::anchor::Anchor;
 use halti_core::directory::DirRecord;
 use halti_core::holder::{KeyHolder, KeyKind};
 use halti_core::ids::{WsId, WsName};
+use halti_core::item::{ItemKey, Secret};
 use halti_core::manifest::Manifest;
 use halti_core::platform::{Build, Os, Role};
 use halti_core::refusal::Refusal;
 use halti_core::store::{FileKey, Files};
-use halti_core::verbs::{Deleted, Draws, Fresh, Host, Machine, Workspace, resolve_name, ws_delete, ws_list, ws_new, ws_open};
+use halti_core::verbs::{
+    Deleted, Draws, Fresh, Host, Machine, Nonces, Put, State, Stored, Which, Workspace, resolve_name, ws_delete, ws_items, ws_list, ws_new, ws_open, ws_remove, ws_set,
+};
 use zeroize::Zeroizing;
 
 use crate::approval::{Action, Declined, Means, Real, World};
@@ -88,8 +99,8 @@ impl Said {
     }
 }
 
-/// How `open` and `ws delete` have the passphrase: from the saved copy through the approval engine
-/// (`World`) after `means`, or typed when there is no means.
+/// How a command on one workspace has its passphrase: from the saved copy through the approval
+/// engine (`World`) after `means`, or typed when there is no means.
 struct Way<'a> {
     world: &'a dyn World,
     copies: &'a dyn Copies,
@@ -214,37 +225,65 @@ pub fn open(typed: Option<&str>, type_it: bool) -> Result<()> {
     Ok(())
 }
 
-/// Opens `name` the way `way` says, with `typing` making the holder that has it typed.
+/// Runs `verb` on `name` with the key holder `way` says, approved as `action` asks. With no means,
+/// the passphrase is typed (`typing`). Through the saved copy: if there is one, the approval, then
+/// the copy. Declined, nothing more happens, and the error is `declined`. A copy that can't be used,
+/// or a workspace made to be typed, goes on to typing, after a line that says so; with no copy, the
+/// usual question is asked. Any other failure is said as it is. So the passphrase is asked for at
+/// most once, and `verb` runs at most twice, the second time only if the first failed before core
+/// went past its checks.
 ///
-/// Through the saved copy: if there is one, the approval, then the copy. Declined, nothing more
-/// happens. A copy that can't be used, or a workspace made to be typed, goes on to typing, after a
-/// line that says so; with no copy, the usual question is asked. Any other failure is said as it
-/// is. Typed after that, a workspace made with a saved copy has it saved again, and one made to be
-/// typed loses any copy found for it.
-fn open_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
-    let closed = format!("workspaces can't stay open yet, so {name} was closed again");
+/// The holder that typed it after a means was tried comes back with what `verb` gave, for `open`.
+fn approved<T>(
+    here: &Here,
+    name: &WsName,
+    way: &Way<'_>,
+    action: Action,
+    declined: &str,
+    typing: &dyn Fn() -> TtyPassphrase,
+    verb: &dyn Fn(&Machine<'_>) -> Result<T>,
+) -> Result<(T, Option<TtyPassphrase>)> {
     let Some(means) = way.means else {
-        let Workspace { keys, .. } = ws_open(&here.machine(&typing()), name)?;
-        drop(keys);
-        return Ok(Said { out: vec!["passphrase correct".to_string(), closed], notes: Vec::new() });
+        return Ok((verb(&here.machine(&typing()))?, None));
     };
     let found = here.id_of(name).is_some_and(|id| way.copies.exists(id));
     if found {
-        let holder = KeychainPassphrase::new(way.copies, way.world, means, Action::WsOpen);
-        match ws_open(&here.machine(&holder), name) {
-            Ok(Workspace { keys, .. }) => {
-                drop(keys);
-                return Ok(Said { out: vec!["passphrase correct".to_string(), closed], notes: Vec::new() });
-            }
-            Err(error) if error.is::<Declined>() => bail!("{name} was not opened. to type the passphrase instead: halti open {name} --type"),
+        let holder = KeychainPassphrase::new(way.copies, way.world, means, action);
+        match verb(&here.machine(&holder)) {
+            Ok(done) => return Ok((done, None)),
+            Err(error) if error.is::<Declined>() => bail!("{declined}"),
             Err(error) if !saved::falls_to_typing(&error) => return Err(error),
             Err(_) => {}
         }
     }
-    let holder = if found { typing().keeping().telling(type_it_once(name)) } else { typing().keeping() };
-    let Workspace { id, keys, manifest } = ws_open(&here.machine(&holder), name)?;
+    let holder = if found { typing().telling(type_it_once(name)) } else { typing() };
+    let done = verb(&here.machine(&holder))?;
+    Ok((done, Some(holder)))
+}
+
+/// What a declined approval says: what didn't happen, and the command that types the passphrase
+/// instead.
+fn declined(what: &str, command: &str) -> String {
+    format!("{what}. to type the passphrase instead: halti {command} --type")
+}
+
+/// Opens `name` the way `way` says (`approved`), with `typing` making the holder that has it typed.
+/// Typed after a means was tried, a workspace made with a saved copy has it saved again, and one
+/// made to be typed loses any copy found for it.
+fn open_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
+    let closed = format!("workspaces can't stay open yet, so {name} was closed again");
+    // Kept only where it may be saved again.
+    let keeping = || typing().keeping();
+    let typing: &dyn Fn() -> TtyPassphrase = if way.means.is_some() { &keeping } else { typing };
+    let declined = declined(&format!("{name} was not opened"), &format!("open {name}"));
+    let open = |machine: &Machine<'_>| ws_open(machine, name);
+    let (Workspace { id, keys, manifest }, typed) = approved(here, name, way, Action::WsOpen, &declined, typing, &open)?;
     drop(keys);
     let mut said = Said { out: vec!["passphrase correct".to_string()], notes: Vec::new() };
+    let Some(holder) = typed else {
+        said.out.push(closed);
+        return Ok(said);
+    };
     if made_saved(&manifest) {
         if let Some(passphrase) = holder.take() {
             match way.copies.add(id, &passphrase) {
@@ -270,10 +309,20 @@ pub fn close(typed: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `halti ws ls`: every workspace, from the directory records and the pins. Reads no secret and
-/// asks nothing.
-pub fn ls() -> Result<()> {
-    let here = Here::at(&config::settings().workspaces.path);
+/// `halti ws ls [WS] [--type]`: with a name, the secrets of that workspace, approved as opening it
+/// is (`items_with`). Without one, every workspace, from the directory records and the pins, which
+/// reads no secret and asks nothing.
+pub fn ls(typed: Option<&str>, type_it: bool) -> Result<()> {
+    let settings = config::settings();
+    if let Some(typed) = typed {
+        let name = WsName::parse(typed)?;
+        memory::harden();
+        let here = Here::at(&settings.workspaces.path);
+        let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsOpen, type_it) };
+        items_with(&here, &name, &way, &|| TtyPassphrase::new(false))?.print();
+        return Ok(());
+    }
+    let here = Here::at(&settings.workspaces.path);
     let listed = ws_list(&here.files, &here.anchor)?;
     if listed.is_empty() {
         println!("no workspaces yet. create one with: halti ws new NAME");
@@ -320,8 +369,8 @@ pub fn delete(name: &str, type_it: bool) -> Result<()> {
     Ok(())
 }
 
-/// Deletes `name` the way `way` says, as `open_with` opens one, then removes its saved passphrase
-/// by the id its record named, whichever way it went.
+/// Deletes `name` the way `way` says (`approved`), then removes its saved passphrase by the id its
+/// record named, whichever way it went.
 fn delete_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
     // Core refuses to delete what fails its checks, and removes nothing of it.
     let refused = |error: anyhow::Error| {
@@ -331,24 +380,9 @@ fn delete_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> T
         error
     };
     let id = here.id_of(name);
-    let found = way.means.is_some() && id.is_some_and(|id| way.copies.exists(id));
-    let mut deleted = None;
-    if let Some(means) = way.means
-        && found
-    {
-        let holder = KeychainPassphrase::new(way.copies, way.world, means, Action::WsDelete);
-        match ws_delete(&here.machine(&holder), name) {
-            Ok(done) => deleted = Some(done),
-            Err(error) if error.is::<Declined>() => bail!("{name} was not deleted. to type the passphrase instead: halti ws delete {name} --type"),
-            Err(error) if !saved::falls_to_typing(&error) => return Err(refused(error)),
-            Err(_) => {}
-        }
-    }
-    let deleted = match deleted {
-        Some(done) => done,
-        None if found => ws_delete(&here.machine(&typing().telling(type_it_once(name))), name).map_err(refused)?,
-        None => ws_delete(&here.machine(&typing()), name).map_err(refused)?,
-    };
+    let declined = declined(&format!("{name} was not deleted"), &format!("ws delete {name}"));
+    let delete = |machine: &Machine<'_>| ws_delete(machine, name);
+    let (deleted, _) = approved(here, name, way, Action::WsDelete, &declined, typing, &delete).map_err(refused)?;
     let mut said = Said::default();
     said.out.push(match deleted {
         Deleted::Whole => format!("deleted workspace {name}"),
@@ -361,6 +395,107 @@ fn delete_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> T
         said.notes.push(format!("the saved passphrase of {name} is still in the keychain. remove the item named {}{id} in keychain access", names::WS_KEYCHAIN_PREFIX));
     }
     Ok(said)
+}
+
+/// `acme/github`: a workspace's name, then after the first `/` a resource, each as core checks it.
+pub fn target(text: &str) -> Result<(WsName, &str)> {
+    let Some((name, resource)) = text.split_once('/') else { bail!("use a workspace and a resource, e.g. acme/github") };
+    let name = WsName::parse(name)?;
+    ItemKey::check_resource(resource)?;
+    Ok((name, resource))
+}
+
+/// `halti ws set WS/RESOURCE FIELD [--type]`: stores a secret, approved as `[workspace.approval]
+/// set` says, then its value: piped in, or typed unseen.
+pub fn set(target_text: &str, field: &str, type_it: bool) -> Result<()> {
+    let (name, resource) = target(target_text)?;
+    let key = ItemKey::parse(resource, field)?;
+    let settings = config::settings();
+    memory::harden();
+    let here = Here::at(&settings.workspaces.path);
+    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsSet, type_it) };
+    set_with(&here, &name, &key, &way, &|| TtyPassphrase::new(false), &|| tty::read_value(&key))?.print();
+    Ok(())
+}
+
+/// Stores `key` in `name` the way `way` says (`approved`), with the value `value` reads: once, and
+/// only once the approval is given and the workspace has passed its checks.
+fn set_with(here: &Here, name: &WsName, key: &ItemKey, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase, value: &dyn Fn() -> Result<Secret>) -> Result<Said> {
+    let read = Cell::new(false);
+    let once = || {
+        if read.replace(true) {
+            bail!("the value was read already, so nothing was stored");
+        }
+        value()
+    };
+    let store = |machine: &Machine<'_>| {
+        let nonces = Nonces { value: *random::<12>()?, manifest: *random::<12>()? };
+        ws_set(machine, name, key, once, nonces)
+    };
+    let declined = declined(&format!("{key} was not stored"), &format!("ws set {name}/{} {}", key.resource(), key.field()));
+    let (put, _) = approved(here, name, way, Action::WsSet, &declined, typing, &store)?;
+    let done = match put {
+        Put::Added => "stored",
+        Put::Replaced => "replaced",
+    };
+    Ok(Said { out: vec![format!("{done} {key} in {name}")], notes: Vec::new() })
+}
+
+/// `halti ws rm WS/RESOURCE [FIELD] [--type]`: removes one field, or every field of the resource,
+/// approved as `[workspace.approval] rm` says.
+pub fn rm(target_text: &str, field: Option<&str>, type_it: bool) -> Result<()> {
+    let (name, resource) = target(target_text)?;
+    let which = match field {
+        Some(field) => Which::Field(ItemKey::parse(resource, field)?),
+        None => Which::Resource(resource.to_string()),
+    };
+    let settings = config::settings();
+    memory::harden();
+    let here = Here::at(&settings.workspaces.path);
+    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsRm, type_it) };
+    rm_with(&here, &name, &which, &way, &|| TtyPassphrase::new(false))?.print();
+    Ok(())
+}
+
+/// Removes what `which` names from `name` the way `way` says (`approved`).
+fn rm_with(here: &Here, name: &WsName, which: &Which, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
+    let (what, command) = match which {
+        Which::Field(key) => (key.to_string(), format!("ws rm {name}/{} {}", key.resource(), key.field())),
+        Which::Resource(resource) => (resource.clone(), format!("ws rm {name}/{resource}")),
+    };
+    let remove = |machine: &Machine<'_>| ws_remove(machine, name, which, *random::<12>()?);
+    approved(here, name, way, Action::WsRm, &declined(&format!("{what} was not removed"), &command), typing, &remove)?;
+    Ok(Said { out: vec![format!("removed {what} from {name}")], notes: Vec::new() })
+}
+
+/// The secrets of `name`, approved as opening it is: what a listing gets from core.
+fn items_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
+    let declined = declined(&format!("the secrets of {name} were not listed"), &format!("ws ls {name}"));
+    let list = |machine: &Machine<'_>| ws_items(machine, name);
+    let (stored, _) = approved(here, name, way, Action::WsOpen, &declined, typing, &list)?;
+    Ok(listing(name, &stored))
+}
+
+/// A workspace's secrets as `ws ls WS` prints them: one line per resource with its fields, in the
+/// order of their text, then a line for each that can't be read, saying how to set it again.
+fn listing(name: &WsName, stored: &[Stored]) -> Said {
+    if stored.is_empty() {
+        return Said { out: vec![format!("{name} has no secrets yet. add one with: halti ws set {name}/RESOURCE FIELD")], notes: Vec::new() };
+    }
+    // Sorted by text, so a resource's fields are next to each other.
+    let mut rows: Vec<(&str, Vec<&str>)> = Vec::new();
+    for item in stored {
+        match rows.last_mut() {
+            Some((resource, fields)) if *resource == item.key.resource() => fields.push(item.key.field()),
+            _ => rows.push((item.key.resource(), vec![item.key.field()])),
+        }
+    }
+    let mut out = vec![format!("{:<16} FIELDS", "RESOURCE")];
+    out.extend(rows.iter().map(|(resource, fields)| format!("{resource:<16} {}", fields.join(", "))));
+    for item in stored.iter().filter(|item| item.state == State::Unreadable) {
+        out.push(format!("{} can't be read. set it again with: halti ws set {name}/{} {}", item.key, item.key.resource(), item.key.field()));
+    }
+    Said { out, notes: Vec::new() }
 }
 
 #[cfg(all(test, halti_dev))]
@@ -408,11 +543,56 @@ mod tests {
     }
 
     #[test]
+    fn a_target_is_a_workspace_then_a_resource() {
+        let (name, resource) = target("acme/github").unwrap();
+        assert_eq!((name.as_str(), resource), ("acme", "github"));
+        assert_eq!(target("9lives/github-ee").unwrap().1, "github-ee");
+        for refused in ["acme", "acme/", "/github", "Acme/github", "acme/github/token", "acme/Git", "acme/-x", "", "acme\x1b[2J/github"] {
+            assert!(target(refused).is_err(), "{refused:?}");
+        }
+        // Nothing of what was typed is said back.
+        assert!(!format!("{:#}", target("acme\x1b[2J/github").unwrap_err()).contains('\x1b'));
+    }
+
+    #[test]
+    fn a_listing_groups_fields_by_resource_and_names_what_cant_be_read() {
+        let name = WsName::parse("acme").unwrap();
+        let stored = |text: &str, state: State| {
+            let (resource, field) = text.split_once('/').unwrap();
+            Stored { key: ItemKey::parse(resource, field).unwrap(), state }
+        };
+        let listed = [
+            stored("github-ee/token", State::Readable),
+            stored("github/token", State::Readable),
+            stored("github/user", State::Unreadable),
+            stored("linear/token", State::Unreadable),
+        ];
+        let said = listing(&name, &listed);
+        assert_eq!(
+            said.out,
+            [
+                "RESOURCE         FIELDS",
+                "github-ee        token",
+                "github           token, user",
+                "linear           token",
+                "github/user can't be read. set it again with: halti ws set acme/github user",
+                "linear/token can't be read. set it again with: halti ws set acme/linear token",
+            ]
+        );
+        assert!(said.notes.is_empty());
+        assert_eq!(listing(&name, &[]).out, ["acme has no secrets yet. add one with: halti ws set acme/RESOURCE FIELD"]);
+    }
+
+    #[test]
     fn the_saved_copy_is_used_only_with_a_manager_and_a_line_that_is_not_the_passphrase() {
         let settings = |text: &str| config::parse(text, Os::Macos).unwrap();
-        let managed = settings("[passwords]\nmanager = \"keychain\"\n\n[workspace.approval]\nopen = \"touchid\"\ndelete = \"none\"\n");
+        let managed = settings("[passwords]\nmanager = \"keychain\"\n\n[workspace.approval]\nopen = \"touchid\"\nset = \"sudo\"\ndelete = \"none\"\n");
         assert_eq!(saved_means(&managed, Action::WsOpen, false), Some(Means::TouchId));
         assert_eq!(saved_means(&managed, Action::WsDelete, false), Some(Means::None));
+        assert_eq!(saved_means(&managed, Action::WsSet, false), Some(Means::Sudo));
+        // A line left out types it.
+        assert_eq!(saved_means(&managed, Action::WsRm, false), None);
+        assert_eq!(saved_means(&managed, Action::WsSet, true), None);
         // `--type` types it, whatever the settings say.
         assert_eq!((saved_means(&managed, Action::WsOpen, true), saved_means(&managed, Action::WsDelete, true)), (None, None));
         // A line that says passphrase types it, and so does the template, with or without a manager.

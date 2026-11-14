@@ -16,15 +16,22 @@
 //! Where a password manager keeps the passphrase (`saved`), the holder that makes a workspace is
 //! this one, recorded as made with the saved copy, and it keeps what was typed until `ws new` has
 //! saved it. A typed open of such a workspace keeps it too, to save it again.
+//!
+//! A secret's value (`read_value`) is read here too, once the workspace is approved and checked:
+//! piped in on standard input, or typed unseen at the terminal when standard input is one. Unlike
+//! the passphrase it can be piped, so a script can store a value but never approve the store. It is
+//! never echoed, and never answered by the test variable, which is for passphrases only. Typed, it
+//! is one line: a paste of more is refused and thrown away, so the shell never reads the rest.
 
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 
 use anyhow::{Result, anyhow, bail};
 use halti_core::holder::{Change, Commitment, KeyHolder, KeyKind, KeyRef, Prompt, Released};
 use halti_core::ids::WsName;
+use halti_core::item::{ItemKey, Secret};
 use halti_core::key::{KemCiphertext, PublicKey};
 use halti_core::passphrase::{self, KdfParams, Passphrase, PassphraseRecord};
 use halti_core::platform::{Adapter, Build, Label};
@@ -278,6 +285,96 @@ impl KeyHolder for TtyPassphrase {
     }
 }
 
+/// What is said when no value came: nothing piped in, or nothing typed.
+const NO_VALUE: &str = "no value was given, so nothing was stored";
+
+/// A secret's value: piped in on standard input when that isn't a terminal, else typed at the
+/// terminal unseen after "value for KEY: ". Typed, a value is one line, and the tab and escape keys
+/// type nothing, so a value with a line break or a tab is piped in. Nothing piped or typed, Ctrl-C
+/// or Ctrl-D, stores nothing. A value a secret can't hold is `Refusal::BadSecret`, which says
+/// nothing of it.
+pub fn read_value(key: &ItemKey) -> Result<Secret> {
+    let stdin = io::stdin();
+    let bytes = if stdin.is_terminal() { typed_value(key)? } else { piped(stdin.lock())? };
+    if bytes.is_empty() {
+        bail!(NO_VALUE);
+    }
+    Ok(Secret::new(bytes)?)
+}
+
+/// What is typed at the terminal after the value's question, unseen, with typeahead thrown away
+/// first. rpassword ends the answer at the first line break and drops the tab and escape keys, so a
+/// typed value is one line without them. A paste of more lines is refused, and its other lines are
+/// thrown away: left there, the shell would read them, shown and run, once halti ends.
+fn typed_value(key: &ItemKey) -> Result<Zeroizing<Vec<u8>>> {
+    let tty = OpenOptions::new().read(true).write(true).open("/dev/tty").map_err(|_| anyhow!("there is no terminal to type the value in. pipe it in instead"))?;
+    unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) };
+    let read = crate::util::sigint_ignored(|| rpassword::prompt_password(format!("value for {key}: ")));
+    let more = flushed(&tty);
+    let typed = match read {
+        Ok(typed) => Zeroizing::new(typed),
+        Err(e) if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::Interrupted) => bail!(NO_VALUE),
+        Err(e) => return Err(anyhow::Error::from(e).context("reading the value")),
+    };
+    if more {
+        bail!("a value of more than one line can't be typed, so nothing was stored. pipe it in instead");
+    }
+    typed_text(typed)
+}
+
+/// Throws away whatever is waiting to be read at the terminal, and says whether anything was. It
+/// looks with the terminal not waiting for a whole line, so a last line with no line break counts
+/// too, then puts the terminal back.
+fn flushed(tty: &File) -> bool {
+    let fd = tty.as_raw_fd();
+    let mut was: libc::termios = unsafe { std::mem::zeroed() };
+    let got = unsafe { libc::tcgetattr(fd, &mut was) } == 0;
+    if got {
+        let mut raw = was;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) };
+    }
+    let mut waiting: libc::c_int = 0;
+    let looked = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut waiting) } == 0;
+    unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
+    if got {
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &was) };
+    }
+    looked && waiting > 0
+}
+
+/// What was typed, if it can be a value. rpassword reads each byte that isn't UTF-8 as U+FFFD, so
+/// an answer with one is refused rather than stored as other text than was typed.
+fn typed_text(mut typed: Zeroizing<String>) -> Result<Zeroizing<Vec<u8>>> {
+    if typed.contains('\u{FFFD}') {
+        bail!("what was typed isn't UTF-8 text, so it wasn't stored (set the terminal to UTF-8)");
+    }
+    Ok(Zeroizing::new(std::mem::take(&mut *typed).into_bytes()))
+}
+
+/// What `source` gives until it ends, less one trailing "\n" or "\r\n". It is read into a buffer
+/// made at its full size first, one byte longer than the longest value and its line break, so
+/// nothing is copied as it grows. More than the longest value is `Refusal::BadSecret`.
+fn piped(mut source: impl Read) -> Result<Zeroizing<Vec<u8>>> {
+    let mut bytes = Zeroizing::new(vec![0; Secret::MAX + 3]);
+    let mut len = 0;
+    while len < bytes.len() {
+        match source.read(&mut bytes[len..]) {
+            Ok(0) => break,
+            Ok(read) => len += read,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(anyhow::Error::from(e).context("reading the value")),
+        }
+    }
+    let ending = if bytes[..len].ends_with(b"\r\n") { 2 } else { usize::from(bytes[..len].ends_with(b"\n")) };
+    // A buffer filled to the end holds more than the longest value, whatever its last bytes are.
+    if len - ending > Secret::MAX {
+        return Err(Refusal::BadSecret.into());
+    }
+    bytes.truncate(len - ending);
+    Ok(bytes)
+}
+
 /// Makes the passphrase and shows it once, then has it typed again, so it is known to be written down right.
 fn made(terminal: &mut Terminal, name: &WsName) -> Result<Zeroizing<String>> {
     #[cfg(halti_dev)]
@@ -371,5 +468,43 @@ mod tests {
         let error = usable(Zeroizing::new("acme passphrase \u{FFFD}ne".to_string())).unwrap_err();
         assert!(error.to_string().contains("isn't UTF-8 text") && error.downcast_ref::<Refusal>().is_none(), "{error:#}");
         assert_eq!(usable(Zeroizing::new("acme passphrase \u{f6}ne".to_string())).unwrap().as_str(), "acme passphrase \u{f6}ne");
+    }
+
+    #[test]
+    fn a_typed_value_is_refused_when_the_terminal_sent_no_utf8() {
+        let error = typed_text(Zeroizing::new("acme github \u{FFFD}oken".to_string())).unwrap_err();
+        assert!(error.to_string().contains("isn't UTF-8 text") && error.downcast_ref::<Refusal>().is_none(), "{error:#}");
+        assert!(!format!("{error:#}").contains("acme github"), "nothing of the value is said");
+        assert_eq!(typed_text(Zeroizing::new("acme github t\u{f6}ken".to_string())).unwrap().as_slice(), "acme github t\u{f6}ken".as_bytes());
+    }
+
+    #[test]
+    fn a_piped_value_loses_one_line_break_and_no_more() {
+        let read = |bytes: &[u8]| piped(bytes).map(|value| value.to_vec());
+        for (given, kept) in [(&b"x\n"[..], &b"x"[..]), (b"x\r\n", b"x"), (b"x\n\n", b"x\n"), (b"x", b"x"), (b"a\tb\nc\n", b"a\tb\nc"), (b"\n", b""), (b"", b"")] {
+            assert_eq!(read(given).unwrap(), kept, "{given:?}");
+        }
+        // The longest value, with or without its line break; one byte more, or anything after the line break, is refused.
+        let longest = vec![b'a'; Secret::MAX];
+        assert_eq!(read(&longest).unwrap().len(), Secret::MAX);
+        assert_eq!(read(&[&longest[..], b"\r\n"].concat()).unwrap().len(), Secret::MAX);
+        for longer in [vec![b'a'; Secret::MAX + 1], [&longest[..], b"\r\nx"].concat(), vec![b'a'; Secret::MAX + 3], vec![b'a'; 1 << 20]] {
+            assert_eq!(piped(&longer[..]).unwrap_err().downcast_ref::<Refusal>(), Some(&Refusal::BadSecret), "{}", longer.len());
+        }
+    }
+
+    #[test]
+    fn a_piped_value_is_read_in_pieces_until_it_ends() {
+        // A pipe gives what was written so far: one byte at a time here.
+        struct Trickle<'a>(&'a [u8]);
+        impl Read for Trickle<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let Some((first, rest)) = self.0.split_first() else { return Ok(0) };
+                buf[0] = *first;
+                self.0 = rest;
+                Ok(1)
+            }
+        }
+        assert_eq!(piped(Trickle(b"acme github token\r\n")).unwrap().as_slice(), b"acme github token");
     }
 }

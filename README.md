@@ -1,6 +1,6 @@
 # halti
 
-Keychain-backed secrets for humans and agents on macOS. Values live only in the login Keychain. Agents never get them: they work through `halti mcp`, where halti makes the requests and adds the credentials itself.
+Keychain-backed secrets for humans and agents on macOS. Values live in the login Keychain, or sealed in a workspace's files (see Workspaces). Agents never get them: they work through `halti mcp`, where halti makes the requests and adds the credentials itself.
 
 Secrets are grouped by **resource**, one thing you sign in to (`github`, `aws`, `app`). A resource has a link, a description and **fields** (`token`, `user`, `password`, `session`, …), each its own Keychain item. What may happen to them is decided by the resource's **policy**, which has no effect until you approve it with Touch ID.
 
@@ -70,6 +70,26 @@ halti audit                                  # what agents did through halti mcp
 
 `halti copy RES FIELD` asks for Touch ID. `halti describe RES` edits the link and description, and `halti rm RES [FIELD]` deletes. `halti --help` lists everything.
 
+## Workspaces
+
+A **workspace** keeps one client's secrets apart from another's, sealed in files under its own passphrase. Nothing uses them yet.
+
+```sh
+halti ws new acme                          # asks for a new passphrase (or makes one: --generate)
+halti ws set acme/github token             # asks as [workspace.approval] says, then the value, typed unseen
+pbpaste | halti ws set acme/github token   # or the value piped in; the approval is still asked
+halti ws ls acme                           # the resources and fields stored in acme (asks as for open)
+halti ws rm acme/github token              # one field; `halti ws rm acme/github` removes every field of github
+halti ws ls                                # the workspaces (asks nothing)
+halti open acme                            # checks the passphrase and the files
+halti ws delete acme                       # the workspace and everything in it
+```
+
+- Each command asks for one approval, as `[workspace.approval]` says (see Settings), and if a saved passphrase can't be read, has you type it once more; `--type` has you type the passphrase whatever it says. The value is read only after that, and never shown, logged or taken from an argument.
+- A value is text of 1 to 65536 bytes with no control characters but tab and line feed; binary goes in as base64. From a pipe, one trailing line break is dropped and nothing else. Typed, a value is one line, and the tab and escape keys type nothing; pipe in a value that has a line break or a tab.
+- Values are kept as `[secrets] store` says: files, one per secret, sealed and named by 64 hex characters, beside a sealed list of what is stored. `halti ws ls acme` says if a secret's file is missing or isn't the one the list names, and how to set it again.
+- **Limit:** older copies of a workspace's files, put back together with its pin file, read as they were, older secrets included.
+
 ## Settings
 
 halti needs no settings file. `halti config` makes `~/.config/halti/config.toml` from its template the first time and opens it in `$EDITOR`:
@@ -95,6 +115,8 @@ passphrase = "own"            # own | generate
 
 [workspace.approval]
 open   = "passphrase"         # opening a workspace: passphrase | sudo | touchid | none
+set    = "passphrase"         # storing a secret in a workspace: passphrase | sudo | touchid
+rm     = "passphrase"         # removing secrets from a workspace: passphrase | sudo | touchid | none
 delete = "passphrase"         # deleting a workspace: passphrase | sudo | touchid | none
 
 [box]
@@ -114,7 +136,7 @@ delete = "touchid"            # deleting a box: touchid | sudo | none
 - `halti config` shows what your edit changed, on the terminal where sudo asks, then approves it. `halti config --show` prints the settings in effect, `halti config --default` the template. Until a change is approved, every workspace command says so.
 - With no approved copy, or one someone other than root could change, the template is in effect.
 - `[approval] default` is for any action without its own line, except a box's and a workspace's. `[paths] workspaces` is where new workspaces go: a folder that isn't there yet, an empty one only you can open, or one halti made. Ones already made stay where they are, and aren't listed until you move them there. `[workspace] passphrase` says whether `halti ws new` asks for a passphrase of your own or makes one (`--own` and `--generate` say otherwise).
-- `[passwords] manager = "keychain"` (on a Mac) saves each new workspace's passphrase in your login Keychain once `halti ws new` has made it. `[workspace.approval]` says how you approve opening and deleting a workspace: `passphrase`, the default, has you type it, and the saved copy isn't used; `sudo`, `touchid` or `none` has you approve that way, or not at all, and halti takes the passphrase from the Keychain. Those three need a manager. `halti open NAME --type` and `halti ws delete NAME --type` always have you type it. The copy is kept in your login Keychain only, whatever your default keychain is. If the saved copy can't be read (after a halti update, say, or while your login Keychain is locked), halti asks you to type it once and saves it again. A workspace made before its passphrase could be saved stays typed each time; to have one saved, make the workspace again. halti never shows a Keychain window for a saved passphrase: if one asks to use an item named `halti-ws:...`, choose Deny.
+- `[passwords] manager = "keychain"` (on a Mac) saves each new workspace's passphrase in your login Keychain once `halti ws new` has made it. `[workspace.approval]` says how you approve opening a workspace (and listing its secrets, `halti ws ls NAME`), storing a secret in it, removing secrets from it, and deleting it: `passphrase`, the default, has you type it, and the saved copy isn't used; `sudo`, `touchid` or `none` has you approve that way, or not at all, and halti takes the passphrase from the Keychain. Those three need a manager, and `set` can't be `none`. `--type` on `halti open`, `halti ws ls NAME`, `halti ws set`, `halti ws rm` and `halti ws delete` always has you type it. The copy is kept in your login Keychain only, whatever your default keychain is. If the saved copy can't be read (after a halti update, say, or while your login Keychain is locked), halti asks you to type it once, and `halti open` saves it again. A workspace made before its passphrase could be saved stays typed each time; to have one saved, make the workspace again. halti never shows a Keychain window for a saved passphrase: if one asks to use an item named `halti-ws:...`, choose Deny.
 - `[box]` names what runs a box (Apple's `container`) and where its key is kept (the Keychain). `[box.approval]` says what you answer before a box opens, before its changed policy counts, before a write its policy says to ask about, before files are copied out of it, and before it is deleted: Touch ID, your password through sudo, or nothing (`none`). A write is asked while the agent has the terminal, so only Touch ID or `none` can approve it. A box line you leave out is Touch ID, whatever `default` says. A running box keeps the write approval it opened with. On Linux no box runs, so the template has no `[box]` section.
 
 ## Policies
