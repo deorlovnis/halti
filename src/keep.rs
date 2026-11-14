@@ -47,6 +47,10 @@ const CONNECT_WAIT: Duration = Duration::from_secs(2);
 /// is put away.
 pub const PING_WAIT: Duration = Duration::from_secs(1);
 pub const CLOSE_WAIT: Duration = Duration::from_secs(300);
+/// How long a client waits for the answer to a `start`, which comes once the box runs, and to a
+/// `stop`, which comes once it is put away.
+pub const START_WAIT: Duration = Duration::from_secs(180);
+pub const STOP_WAIT: Duration = Duration::from_secs(90);
 
 /// The kind of a refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,9 +356,16 @@ pub fn connect(path: &Path) -> Option<UnixStream> {
 /// Sends `request` to the open workspace at `path`, and reads the line that answers it within
 /// `wait`. None if nothing answered in time, or not with one of the words.
 pub fn ask(path: &Path, request: &Request, wait: Duration) -> Option<Reply> {
+    ask_held(path, request, wait).map(|(reply, _)| reply)
+}
+
+/// As `ask`, and the connection with it, nothing read past the answer: after `started` or
+/// `running` it is the session.
+pub fn ask_held(path: &Path, request: &Request, wait: Duration) -> Option<(Reply, UnixStream)> {
     let mut stream = connect(path)?;
     write_line(&mut stream, &request.line()).ok()?;
-    Reply::parse(&read_line(&mut stream, wait)?)
+    let reply = Reply::parse(&read_line(&mut stream, wait)?)?;
+    Some((reply, stream))
 }
 
 #[cfg(test)]

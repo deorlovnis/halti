@@ -1491,6 +1491,12 @@ fn a_start_through_the_socket_says_why_it_was_refused() {
     assert_eq!(start("halti-keep/1 start globex dev\n"), "halti-keep/1 other\n");
     assert_eq!(start("halti-keep/2 start acme dev\n"), "halti-keep/1 unsupported\n");
     assert_eq!(start("halti-keep/1 ping acme\n"), "halti-keep/1 open 0\n");
+    // `ws run` asks it, asks nothing itself, and says the kind in its own words.
+    if cfg!(target_os = "macos") {
+        let out = env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["ws", "run", "acme/dev"]).output().unwrap();
+        let said = "halti: box acme/dev was not started: anthropic isn't ready in acme. the terminal where acme is open says why\n";
+        assert!(!out.status.success() && stderr(&out) == said && asked(&out) == 0, "{}", stderr(&out));
+    }
     let closed = env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["close", "acme"]).output().unwrap();
     assert!(closed.status.success(), "{}", stderr(&closed));
     let opened = open.wait();
@@ -1502,10 +1508,10 @@ fn a_start_through_the_socket_says_why_it_was_refused() {
     };
     assert!(stderr(&opened).contains(why), "{}", stderr(&opened));
     assert_eq!(asked(&opened), 1);
-    // Nothing was started: the engine was asked if it is ready and if the box's VMs run.
+    // Nothing was started: at each start the engine was asked if it is ready and if the box's VMs run.
     if cfg!(target_os = "macos") {
         let tag = &ws_id(&env, "acme")[..12];
-        assert_eq!(fs::read_to_string(calls).unwrap(), format!("inspect halti-wsbox-{tag}-dev\ninspect halti-wsbrowser-{tag}-dev\nsystem status\n"));
+        assert_eq!(fs::read_to_string(calls).unwrap(), format!("inspect halti-wsbox-{tag}-dev\ninspect halti-wsbrowser-{tag}-dev\nsystem status\n").repeat(2));
     }
 }
 
@@ -1526,6 +1532,14 @@ fn a_held_lock_nobody_answers_at_is_being_opened_and_listed_closed() {
     let closed = env.ws_box(PASSPHRASE, "true", &["close", "acme"]);
     assert!(!closed.status.success() && asked(&closed) == 0, "{}", stderr(&closed));
     assert_eq!(stderr(&closed), "halti: acme is being opened or closed: try again in a moment\n");
+    // A run and a stop never fall back to asking. Where there is no engine, they stop before that.
+    for args in [["ws", "run", "acme/dev"], ["ws", "stop", "acme/dev"]] {
+        let out = env.ws_box(PASSPHRASE, "true", &args);
+        assert!(!out.status.success() && asked(&out) == 0, "{args:?}: {}", stderr(&out));
+        if cfg!(target_os = "macos") {
+            assert_eq!(stderr(&out), "halti: acme is being opened or closed: try again in a moment\n", "{args:?}");
+        }
+    }
     let listed = stdout(&ws(&env, PASSPHRASE, &["ws", "ls"]));
     assert!(listed.lines().any(|line| line.starts_with("acme ") && line.contains(" closed ")), "{listed}");
     let again = env.ws_box(PASSPHRASE, "true", &["open", "acme"]);
@@ -1656,6 +1670,157 @@ fn files_that_went_back_while_open_are_said_once_where_it_is_open() {
     let closed = env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["close", "acme"]).output().unwrap();
     assert!(closed.status.success(), "{}", stderr(&closed));
     assert_eq!(stderr(&open.wait()).matches(said).count(), 1);
+}
+
+/// A program at an open workspace's `socket` that takes one connection, reads its line and answers
+/// `answer`: the line, and the connection, still open.
+fn answer_once(socket: &Path, answer: &str) -> thread::JoinHandle<(String, UnixStream)> {
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _ = fs::remove_file(socket);
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    let answer = format!("halti-keep/1 {answer}\n");
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        (&stream).write_all(answer.as_bytes()).unwrap();
+        (line, stream)
+    })
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "only a Mac has a box engine")]
+fn a_run_and_a_stop_of_an_open_workspace_say_each_answer_in_their_own_words() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let _lock = hold_keeper_lock(&env, "acme");
+    let socket = keeper_socket(&env, "acme");
+    let ask = |args: &[&str], answer: &str, line: &str| {
+        let keeper = answer_once(&socket, answer);
+        let out = env.ws_box(PASSPHRASE, "true", args);
+        assert_eq!(keeper.join().unwrap().0, line);
+        assert_eq!(asked(&out), 0, "{answer}");
+        out
+    };
+    let not = "box acme/dev was not started";
+    let says = "the terminal where acme is open says why";
+    let run = [
+        ("busy", "box acme/dev is being opened or closed: try again in a moment".to_string()),
+        ("full", "acme has too many sessions: end one first".to_string()),
+        ("no box", format!("{not}: there is no box acme/dev. make one with: halti ws box new acme/dev")),
+        ("no unapproved", format!("{not}: its policy isn't approved. approve it with: halti ws box approve acme/dev")),
+        ("no changed", format!("{not}: its policy changed since it was approved. approve it with: halti ws box approve acme/dev")),
+        ("no store", format!("{not}: it has no store. make one with: halti ws box new acme/dev")),
+        ("no key", format!("{not}: it has a store but no key. remove it with: halti ws box rm acme/dev")),
+        ("no site github", format!("{not}: github isn't ready in acme. {says}")),
+        ("no engine", format!("{not}: the box engine isn't ready. {says}")),
+        ("no failed", format!("{not}. {says}")),
+        ("other", "acme's record names another workspace, which is open. nothing was done".to_string()),
+        // Another version, a word that doesn't answer a start, and a name that isn't one: no answer.
+        ("unsupported", "acme is being opened or closed: try again in a moment".to_string()),
+        ("closed 0", "acme is being opened or closed: try again in a moment".to_string()),
+        ("no site ../x", "acme is being opened or closed: try again in a moment".to_string()),
+    ];
+    for (answer, error) in run {
+        let out = ask(&["ws", "run", "acme/dev"], answer, "halti-keep/1 start acme dev\n");
+        assert!(!out.status.success() && stdout(&out).is_empty(), "{answer}: {}", stdout(&out));
+        assert_eq!(stderr(&out), format!("halti: {error}\n"), "{answer}");
+    }
+    let stop = [
+        ("busy", "box acme/dev is being opened or closed: try again in a moment"),
+        ("other", "acme's record names another workspace, which is open. nothing was done"),
+        ("started", "acme is being opened or closed: try again in a moment"),
+        // It doesn't run the box: stopped here, as when it isn't open, and nothing runs.
+        ("idle", "box acme/dev isn't running"),
+    ];
+    for (answer, error) in stop {
+        let out = ask(&["ws", "stop", "acme/dev"], answer, "halti-keep/1 stop acme dev\n");
+        assert!(!out.status.success() && stderr(&out) == format!("halti: {error}\n"), "{answer}: {}", stderr(&out));
+    }
+    let out = ask(&["ws", "stop", "acme/dev"], "stopped", "halti-keep/1 stop acme dev\n");
+    assert!(out.status.success() && stdout(&out) == "stopped box acme/dev\n", "{}", stderr(&out));
+    // Told it stopped, while something still holds the box: the word alone isn't believed.
+    let open = wsdir(&env, "acme").join("boxes/open");
+    fs::create_dir_all(&open).unwrap();
+    let held = fs::File::create(open.join("dev.lock")).unwrap();
+    held.lock().unwrap();
+    let out = ask(&["ws", "stop", "acme/dev"], "stopped", "halti-keep/1 stop acme dev\n");
+    assert!(!out.status.success() && stdout(&out).is_empty(), "{}", stdout(&out));
+    assert_eq!(stderr(&out), "halti: box acme/dev is being opened or closed: try again in a moment\n");
+    let _ = fs::remove_file(&socket);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "only a Mac has a box engine")]
+fn a_run_of_an_open_workspace_holds_its_session_and_stops_its_box_once_it_is_gone() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let (path, vms) = env.engine_of_files();
+    // What a start of dev leaves for whoever joins it: its policy as it opened with it, how its
+    // model is reached, and its VM up.
+    let boxes = wsdir(&env, "acme").join("boxes");
+    fs::create_dir_all(boxes.join("policies")).unwrap();
+    fs::create_dir_all(boxes.join("open")).unwrap();
+    let text = box_text(false);
+    fs::write(boxes.join("policies/dev.toml"), &text).unwrap();
+    fs::write(boxes.join("open/dev.policy"), sha256(text.as_bytes())).unwrap();
+    fs::write(boxes.join("open/dev.bearer"), "0").unwrap();
+    let vm = vms.join(format!("halti-wsbox-{}-dev", &ws_id(&env, "acme")[..12]));
+    let _lock = hold_keeper_lock(&env, "acme");
+    let socket = keeper_socket(&env, "acme");
+    let run = || {
+        let mut command = env.ws_box_command(PASSPHRASE, "true");
+        command.env("PATH", &path).args(["ws", "run", "acme/dev", "--", "true"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
+    };
+    let started = |answer: &str| {
+        fs::write(&vm, "").unwrap();
+        let keeper = answer_once(&socket, answer);
+        let agent = run();
+        let (line, session) = keeper.join().unwrap();
+        assert_eq!(line, "halti-keep/1 start acme dev\n");
+        // Joined: the agent's command works in the box.
+        let working = PathBuf::from(format!("{}-working", vm.display()));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while fs::remove_file(&working).is_err() {
+            assert!(Instant::now() < deadline, "the agent never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+        (agent, session)
+    };
+
+    // The box is put away by the open workspace: the agent's command ends with it, and nothing more
+    // is said.
+    let (agent, mut session) = started("started");
+    session.write_all(b"halti-keep/1 stopped\n").unwrap();
+    fs::remove_file(&vm).unwrap();
+    drop(session);
+    let out = agent.wait_with_output().unwrap();
+    assert!(out.status.code() == Some(7) && stderr(&out).is_empty(), "{}", stderr(&out));
+
+    // The agent's command ends: the open workspace sees the session leave.
+    let (agent, mut session) = started("running");
+    fs::write(&vm, "done").unwrap();
+    session.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    assert_eq!(session.read(&mut [0u8; 64]).unwrap(), 0);
+    let out = agent.wait_with_output().unwrap();
+    assert!(out.status.code() == Some(7) && stderr(&out).is_empty(), "{}", stderr(&out));
+    assert!(vm.exists(), "its box is left to the open workspace");
+
+    // The open workspace is gone, as a killed one is: the run stops the box itself, and says so.
+    let (agent, session) = started("started");
+    drop(session);
+    let out = agent.wait_with_output().unwrap();
+    assert!(!out.status.success() && asked(&out) == 0, "{}", stderr(&out));
+    assert_eq!(stderr(&out), "halti: acme is no longer open, so box acme/dev was stopped\n");
+    assert!(!vm.exists(), "its VM is stopped");
+
+    // Another halti runs the box: joined as without an open workspace, with no session.
+    fs::write(&vm, "done").unwrap();
+    let keeper = answer_once(&socket, "elsewhere");
+    let out = env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["ws", "run", "acme/dev", "--", "true"]).output().unwrap();
+    assert_eq!(keeper.join().unwrap().0, "halti-keep/1 start acme dev\n");
+    assert!(out.status.code() == Some(7) && asked(&out) == 0, "{}", stderr(&out));
+    let _ = fs::remove_file(&socket);
 }
 
 // --- a workspace's secrets ---
@@ -3070,15 +3235,19 @@ impl Env {
     }
 
     /// A stand-in for the engine, first on PATH, whose VMs are files: one whose file is in the
-    /// folder runs, and a stop removes it. It says it is ready, and does nothing else. Returns PATH
-    /// with it, and the folder.
+    /// folder runs, and a stop removes it. The agent's command in one leaves `VM-working` beside it
+    /// and runs until its file is gone or says `done`, then ends with 7. It says it is ready, and
+    /// does nothing else. Returns PATH with it, and the folder.
     fn engine_of_files(&self) -> (String, PathBuf) {
         let (bin, vms) = (self.dir.join("files-engine"), self.dir.join("files-engine-vms"));
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&vms).unwrap();
         let vm = format!("'{}'/\"$2\"", vms.display());
+        let agent = format!("'{}'/\"$name\"", vms.display());
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\nsystem) [ \"$2\" = status ] ;;\ninspect) [ -e {vm} ] && echo '[{{\"status\":{{\"state\":\"running\"}}}}]' ;;\nstop) rm -f {vm} ;;\n*) exit 1 ;;\nesac\n"
+            "#!/bin/sh\ncase \"$1\" in\nsystem) [ \"$2\" = status ] ;;\ninspect) [ -e {vm} ] && echo '[{{\"status\":{{\"state\":\"running\"}}}}]' ;;\nstop) rm -f {vm} ;;\n\
+             exec) for arg; do case \"$arg\" in halti-*) name=\"$arg\"; break ;; esac; done\n  : > {agent}-working\n  \
+             while [ -e {agent} ] && [ \"$(cat {agent})\" != done ]; do sleep 0.05; done; exit 7 ;;\n*) exit 1 ;;\nesac\n"
         );
         fs::write(bin.join("container"), script).unwrap();
         fs::set_permissions(bin.join("container"), fs::Permissions::from_mode(0o755)).unwrap();
