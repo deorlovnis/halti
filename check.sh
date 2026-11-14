@@ -5,6 +5,11 @@
 # this). When every step passes with no changes to the files, it writes the commit it passed at to
 # check-passed in the target folder: install-linux.sh installs only that commit.
 #
+# The release build's run with every test hook set and the escape tests need user namespaces. Where
+# the system restricts them (Ubuntu 24.04 does, through AppArmor), they are not run: check.sh ends
+# by listing what it could not run here and why, and writes those lines into check-passed after the
+# commit, for install-linux.sh to name.
+#
 # CARGO_BUILD_JOBS defaults to 3. A set CARGO_TARGET_DIR is used for halti; the shim builds in
 # SHIM_TARGET_DIR if that is set, else in its own target/.
 #
@@ -12,6 +17,8 @@
 # (issue tracker IDs, milestone and plan codes, local design notes, decision records), and with a
 # RANGE (`A..B`, or `B --not --remotes`) no commit message in it does either. The repo is public;
 # those stay in the tracker. `./check.sh install-hook` makes git run it before every push.
+# `./check.sh userns [ARGS]` says why `unshare ARGS true` (`-Urm` by default) fails here, or nothing
+# when it works.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -44,9 +51,26 @@ refs() {
   fi
 }
 
+# Why `unshare ARGS true` fails here, or nothing when it works.
+userns_blocked() {
+  local said
+  if said="$(unshare "$@" true 2>&1)"; then return 0; fi
+  if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = 1 ]; then
+    echo "AppArmor restricts unprivileged user namespaces here"
+  else
+    echo "unshare $* fails here${said:+: ${said%%$'\n'*}}"
+  fi
+}
+
 case "${1:-}" in
   refs)
     refs "${2:-}"
+    exit
+    ;;
+  userns)
+    shift
+    if [ $# = 0 ]; then set -- -Urm; fi
+    userns_blocked "$@"
     exit
     ;;
   install-hook)
@@ -70,7 +94,7 @@ HOOK
     ;;
   "") ;;
   *)
-    echo "usage: ./check.sh [refs [RANGE] | install-hook]" >&2
+    echo "usage: ./check.sh [refs [RANGE] | install-hook | userns [ARGS]]" >&2
     exit 2
     ;;
 esac
@@ -80,6 +104,18 @@ target="${CARGO_TARGET_DIR:-target}"
 case "$target" in /*) ;; *) target="$PWD/$target" ;; esac
 stamp="$target/check-passed"
 rm -f "$stamp"
+# What could not run here, with why: one line each.
+not_run=()
+# The tests of tests/release.rs that run the release build in a user namespace, in their order
+# there; tests/install_linux.rs keeps this list true.
+release_userns_tests=(
+  the_home_folder_is_the_passwd_one
+  no_variable_answers_an_approval
+  no_variable_moves_the_index_the_policies_the_boxes_or_the_keychain
+  without_a_passwd_home_nothing_runs
+  no_variable_answers_a_passphrase
+  no_variable_answers_sudo
+)
 
 # The commit checked out, if the files have no changes since it; else nothing.
 clean_head() {
@@ -102,9 +138,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 step tests
 cargo test --workspace
 
-# Again with their output, to show which escape tests ran here and which were skipped.
+# They are #[ignore]d, so they run only here, with their output, to show which ran and which parts
+# were skipped. Linux only, and only where a box can be made.
 step "escape tests"
-cargo test --test sandbox -- --nocapture --test-threads=1 2>&1 | grep -oE 'escape test (ran|skipped): .*|test result: .*'
+why=""
+if [ "$(uname -s)" = Linux ]; then why="$(userns_blocked -Urnm --pid --fork)"; fi
+if [ -n "$why" ]; then
+  echo "not run: $why"
+  not_run+=("the escape tests of the sandbox engine, which only debug builds have ($why)")
+else
+  if ! said="$(cargo test --test sandbox -- --ignored --nocapture --test-threads=1 2>&1)"; then
+    printf '%s\n' "$said"
+    exit 1
+  fi
+  grep -oE 'escape test (ran|skipped): .*|test result: .*' <<<"$said"
+  while IFS= read -r line; do
+    not_run+=("escape test ${line#escape test skipped: }")
+  done < <(grep -oE 'escape test skipped: .*' <<<"$said" || true)
+fi
 
 step "release check"
 cargo check --release
@@ -119,9 +170,18 @@ if ! grep -qx 'debug_assertions=false halti_dev=false' <<<"$info"; then
   echo "check.sh: the ci-release build has the test hooks" >&2
   exit 1
 fi
-# Runs it with every test hook set (in a user namespace, so Linux only).
+# Runs it with every test hook set, in a user namespace, so Linux only. Where none can be made,
+# only the release tests that need none run.
 if [ "$(uname -s)" = Linux ]; then
-  HALTI_RELEASE_BIN="$bin" cargo test --test release -- --ignored
+  why="$(userns_blocked -Urm)"
+  if [ -z "$why" ]; then
+    HALTI_RELEASE_BIN="$bin" cargo test --test release -- --ignored
+  else
+    skip=()
+    for name in "${release_userns_tests[@]}"; do skip+=(--skip "$name"); done
+    HALTI_RELEASE_BIN="$bin" cargo test --test release -- --ignored --exact "${skip[@]}"
+    not_run+=("the ${#release_userns_tests[@]} release tests that run the release build with every test hook set ($why)")
+  fi
 fi
 
 step shim
@@ -144,6 +204,11 @@ bash -n install-linux.sh
 bash -n macos-check.sh
 
 if [ -n "$head" ] && [ "$(clean_head)" = "$head" ]; then
-  echo "$head" >"$stamp"
+  { echo "$head"; for line in ${not_run[@]+"${not_run[@]}"}; do echo "$line"; done; } >"$stamp"
 fi
-step "all checks passed"
+if [ ${#not_run[@]} = 0 ]; then
+  step "all checks passed"
+else
+  step "all checks that ran passed; not run here:"
+  printf '%s\n' "${not_run[@]}"
+fi

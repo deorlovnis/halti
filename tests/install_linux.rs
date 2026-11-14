@@ -1,7 +1,8 @@
 //! install-linux.sh, run on a copy of itself in a test git repo, with stand-ins for `uname` (so
 //! it runs on a Mac too), `id`, `sudo` and `cargo`. The stand-in sudo writes down what it was
 //! asked to install and runs nothing; the stand-in cargo makes a halti that only says its
-//! build-info. Nothing is installed, and no real sudo or cargo is run.
+//! build-info. Nothing is installed, and no real sudo or cargo is run. And what check.sh writes for
+//! it: what it could not run here, with a stand-in `unshare` that fails as AppArmor makes it.
 
 #![cfg(unix)]
 
@@ -162,4 +163,71 @@ fn check_sh_writes_the_stamp_install_linux_sh_reads() {
         let code = fs::read_to_string(root.join(script)).unwrap();
         assert!(code.lines().any(|l| l == "stamp=\"$target/check-passed\""), "{script} names the stamp");
     }
+}
+
+#[test]
+fn what_check_sh_could_not_run_is_named_in_one_line() {
+    let repo = Repo::new();
+    let head = repo.git(&["rev-parse", "HEAD"]);
+    repo.stamp(&repo.path("repo/target"), &head);
+    let out = repo.install(&[], false);
+    assert!(out.status.success() && !text(&out.stderr).contains("not checked"), "{}", text(&out.stderr));
+
+    let lines = "the 6 release tests that run the release build with every test hook set (AppArmor restricts unprivileged user namespaces here)\n\
+                 the escape tests of the sandbox engine, which only debug builds have (AppArmor restricts unprivileged user namespaces here)\n";
+    fs::write(repo.path("repo/target/check-passed"), format!("{head}\n{lines}")).unwrap();
+    let out = repo.install(&[], false);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let note = "note: not checked on this machine: the 6 release tests that run the release build with every test hook set (AppArmor restricts unprivileged user \
+                namespaces here); the escape tests of the sandbox engine, which only debug builds have (AppArmor restricts unprivileged user namespaces here)";
+    assert!(text(&out.stderr).lines().any(|l| l == note), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stderr).matches("not checked").count(), 1, "{}", text(&out.stderr));
+    assert!(repo.sudo_log().contains("/usr/local/bin/halti"), "installed all the same: {}", repo.sudo_log());
+}
+
+#[test]
+fn check_sh_says_why_no_user_namespace_can_be_made() {
+    let repo = Repo::new();
+    let fake = repo.path("fakes/unshare");
+    let check = |args: &[&str]| {
+        let path = format!("{}:{}", repo.path("fakes").display(), env::var("PATH").unwrap());
+        let out = Command::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("check.sh")).arg("userns").args(args).env("PATH", path).output().unwrap();
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        text(&out.stdout)
+    };
+
+    // As unshare fails where AppArmor restricts user namespaces.
+    fs::write(&fake, "#!/bin/sh\necho 'unshare: write failed /proc/self/uid_map: Operation not permitted' >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let apparmor = fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").is_ok_and(|v| v.trim() == "1");
+    let why = |args: &str| {
+        if apparmor {
+            "AppArmor restricts unprivileged user namespaces here\n".to_string()
+        } else {
+            format!("unshare {args} fails here: unshare: write failed /proc/self/uid_map: Operation not permitted\n")
+        }
+    };
+    assert_eq!(check(&[]), why("-Urm"));
+    assert_eq!(check(&["-Urnm", "--pid", "--fork"]), why("-Urnm --pid --fork"));
+
+    fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    assert_eq!(check(&[]), "", "nothing where a user namespace can be made");
+}
+
+#[test]
+fn check_sh_names_the_release_tests_that_need_a_user_namespace() {
+    // check.sh leaves these out where no user namespace can be made: each test of release.rs that
+    // makes a Dirs, which runs halti in one, in their order there.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let check = fs::read_to_string(root.join("check.sh")).unwrap();
+    let listed: Vec<&str> = check.split("\nrelease_userns_tests=(\n").nth(1).unwrap().split(')').next().unwrap().split_whitespace().collect();
+    let release = fs::read_to_string(root.join("tests/release.rs")).unwrap();
+    let needing: Vec<&str> = release
+        .split("#[test]\n")
+        .skip(1)
+        .filter(|test| test.contains("Dirs::new()"))
+        .map(|test| test.lines().find_map(|l| l.strip_prefix("fn ")).unwrap().split('(').next().unwrap())
+        .collect();
+    assert_eq!(needing.len(), 6, "{needing:?}");
+    assert_eq!(listed, needing);
 }

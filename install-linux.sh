@@ -1,7 +1,8 @@
 #!/bin/sh
 # Build halti and install it as /usr/local/bin/halti on Linux, owned by root so nothing running as
 # you can replace it. It installs only a commit ./check.sh has passed at on this machine, with no
-# changes to the files. `./install-linux.sh --dry-run` only says what it would do.
+# changes to the files, and names what check.sh could not run here (where the system restricts user
+# namespaces, some tests can't run). `./install-linux.sh --dry-run` only says what it would do.
 #
 # It ends with a warning for each of two things that undo what root ownership gives: sudo that
 # asks no password, and swap that isn't encrypted. Neither stops the install. See README "On a
@@ -16,7 +17,8 @@ approved=/etc/halti/approved
 dest=/usr/local/bin/halti
 
 # Where cargo builds, as check.sh has it. check.sh writes the stamp last, naming the commit it
-# passed at, and only when the files had no changes.
+# passed at on its first line, and only when the files had no changes; each line after it names
+# something check.sh could not run here, and why.
 target="${CARGO_TARGET_DIR:-target}"
 bin="$target/release/halti"
 stamp="$target/check-passed"
@@ -26,6 +28,7 @@ case "${1:-}" in
     cat <<DRY
 would build $bin and install it only if ./check.sh passed at this commit on this machine
   (with no changes to the files) and the build has no test hooks
+would name what ./check.sh could not run on this machine, if anything
 would write, owned by root:
   $dest
 would build no box image: boxes don't run on Linux yet
@@ -95,10 +98,11 @@ if [ -n "$(git status --porcelain)" ]; then
   echo "install-linux.sh: the files have changes since the last commit; commit or undo them, then run ./check.sh" >&2
   exit 1
 fi
-if [ "$(cat "$stamp" 2>/dev/null)" != "$head" ]; then
+if [ "$(head -n 1 "$stamp" 2>/dev/null)" != "$head" ]; then
   echo "install-linux.sh: ./check.sh hasn't passed at this commit on this machine; run it, then install" >&2
   exit 1
 fi
+not_run=$(awk 'NR > 1 { printf "%s%s", sep, $0; sep = "; " }' "$stamp")
 
 cargo build --release
 info=$("$bin" build-info)
@@ -115,6 +119,9 @@ sudo install -d -o root -g root -m 755 "$(dirname "$dest")"
 sudo install -o root -g root -m 755 "$bin" "$dest"
 echo "installed $dest"
 echo "note: boxes don't run on Linux yet; workspaces do" >&2
+if [ -n "$not_run" ]; then
+  echo "note: not checked on this machine: $not_run" >&2
+fi
 
 if [ "$sudo_asks" = no ]; then
   echo "warning: $user can use sudo without a password, so any program running as $user is root here; see README \"On a Linux server\"" >&2
