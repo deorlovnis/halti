@@ -28,6 +28,13 @@ pub fn harden() {
     }
 }
 
+/// Unlocks the process's memory again, for a process that lives on once the keys it read are
+/// wiped: one that runs a box, whose allocations over hours could pass the locked-memory limit and
+/// fail. Core dumps stay off. Nothing happens where nothing was locked.
+pub fn release() {
+    unsafe { libc::munlockall() };
+}
+
 /// Whether a locked-memory limit leaves room for what a passphrase command allocates.
 fn room_for_argon2(limit: libc::rlim_t) -> bool {
     limit == libc::RLIM_INFINITY || limit >= ROOM

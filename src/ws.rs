@@ -1,6 +1,6 @@
 //! Workspaces on this machine: where their files are, how a passphrase and a secret's value are
 //! read, and what `ws new`, `ws ls`, `ws set`, `ws rm`, `ws delete`, `ws policy` (`policies`),
-//! `open` and `close` print. What
+//! `ws box`, `ws run` and `ws stop` (`boxes`), `open` and `close` print. What
 //! a workspace is, every check on it, and how its secrets are sealed are core's
 //! (`halti_core::verbs`); nothing here decides whether one opens, and no key of a workspace's
 //! reaches this side.
@@ -20,6 +20,7 @@
 //! Workspaces can't stay open yet: `open` checks the passphrase and the files and wipes the keys as
 //! it ends, and `close` has nothing to do and says so.
 
+pub mod boxes;
 mod files;
 mod memory;
 pub mod policies;
@@ -288,6 +289,8 @@ fn open_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> Tty
     let typing: &dyn Fn() -> TtyPassphrase = if way.means.is_some() { &keeping } else { typing };
     let declined = declined(&format!("{name} was not opened"), &format!("open {name}"));
     let open = |machine: &Machine<'_>| ws_open(machine, name);
+    // Opening it names nothing but the workspace.
+    let way = &Way { world: way.world, copies: way.copies, means: way.means, detail: None };
     let (reader, typed) = approved(here, name, way, Action::WsOpen, &declined, typing, &open)?;
     let (id, made_with_a_copy) = (reader.id(), made_saved(reader.manifest()));
     drop(reader);
@@ -367,23 +370,28 @@ pub fn names_in(root: &Path) -> Vec<String> {
 }
 
 /// `halti ws delete NAME [--type]`: one approval, then the workspace's items, pin, key and files,
-/// its record, its saved passphrase, and its policies. One with no pin (never fully created, a delete cut short,
-/// or its pin removed) goes with no approval: its record and its files go, its key file among them
-/// (the passphrase key is nowhere else), and any stored items are left, which with the key gone
-/// nothing can open.
+/// its record, its saved passphrase, its policies and its boxes folder. One with no pin (never
+/// fully created, a delete cut short, or its pin removed) goes with no approval: its record and its
+/// files go, its key file among them (the passphrase key is nowhere else), and any stored items are
+/// left, which with the key gone nothing can open. A workspace with a box's store, or a box that
+/// runs, is refused before anything is asked; VMs its boxes left running are stopped once it is gone.
 pub fn delete(name: &str, type_it: bool) -> Result<()> {
     let name = WsName::parse(name)?;
     let settings = config::settings();
     memory::harden();
     let here = Here::at(&settings.workspaces.path);
     let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsDelete, type_it), detail: None };
-    delete_with(&here, &name, &way, &|| TtyPassphrase::new(false))?.print();
+    let leftovers = boxes::Leftovers::of(&here, &name, &settings);
+    let said = delete_with(&here, &name, &way, &|| TtyPassphrase::new(false))?;
+    leftovers.stop();
+    said.print();
     Ok(())
 }
 
-/// Deletes `name` the way `way` says (`approved`), then removes its saved passphrase and its
-/// policies by the id its record named, whichever way it went; and then the policies any earlier
-/// delete left behind (`orphan_policies`).
+/// Deletes `name` the way `way` says (`approved`), then removes its saved passphrase, its policies
+/// and its boxes folder by the id its record named, whichever way it went; and then the policies
+/// and boxes folders any earlier delete left behind (`orphan_policies`). A box's store, or a box's
+/// lock held, refuses it before anything is asked (`boxes::refuse_delete`).
 fn delete_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
     // Core refuses to delete what fails its checks, and removes nothing of it.
     let refused = |error: anyhow::Error| {
@@ -393,6 +401,9 @@ fn delete_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> T
         error
     };
     let id = here.id_of(name);
+    if let Some(id) = id {
+        boxes::refuse_delete(here, name, id)?;
+    }
     let declined = declined(&format!("{name} was not deleted"), &format!("ws delete {name}"));
     let delete = |machine: &Machine<'_>| ws_delete(machine, name);
     let (deleted, _) = approved(here, name, way, Action::WsDelete, &declined, typing, &delete).map_err(refused)?;
@@ -408,12 +419,18 @@ fn delete_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> T
         said.notes.push(format!("the saved passphrase of {name} is still in the keychain. remove the item named {}{id} in keychain access", names::WS_KEYCHAIN_PREFIX));
     }
     if let Some(id) = id {
+        if boxes::clear(here, id).is_err() {
+            said.notes.push(format!("the boxes folder of {name} is still in {}. remove that folder", files::boxes_dir(&here.root, id).display()));
+        }
         let policies = here.policies(id);
         if policies.remove_all().is_err() {
             said.notes.push(format!("the policies of {name} are still in {}. remove that folder", policies.dir().display()));
         }
     }
     for orphan in orphan_policies(&here.root).unwrap_or_default() {
+        if boxes::clear(here, orphan).is_err() {
+            said.notes.push(format!("the boxes folder of a deleted workspace is still in {}. remove that folder", files::boxes_dir(&here.root, orphan).display()));
+        }
         let policies = here.policies(orphan);
         if policies.remove_all().is_err() {
             said.notes.push(format!("the policies of a deleted workspace are still in {}. remove that folder", policies.dir().display()));

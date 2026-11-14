@@ -243,7 +243,11 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     world.available()?;
     let image =
         policy.image.as_deref().ok_or_else(|| anyhow!("the policy of box {} names no image (set image = \"{}@sha256:...\" and approve it)", req.shown, names::AGENT_IMAGE))?;
-    let uses_bearer = bearer()?;
+    // A workspace's box names itself in what its model's lookup says; today's keep their words.
+    let uses_bearer = match &policy.model {
+        Some(model) if layout.in_workspace() => bearer().with_context(|| format!("box {} uses {model}", req.shown))?,
+        _ => bearer()?,
+    };
     let env = agent_env(policy, uses_bearer);
     for site in policy.model.iter().chain(&policy.sites) {
         world.site_ready(site).with_context(|| format!("box {} uses {site}", req.shown))?;
@@ -409,7 +413,7 @@ fn record_head(world: &dyn World, name: &str, shown: &str, mnt: &Path, log_key: 
 /// Join a workspace's box that another halti has open, from a second terminal: the engine only.
 /// Nothing is asked and nothing is looked up: the policy file must be the one the box opened with
 /// (`policy` is its bytes, read once), and how the model is reached is what the opener noted.
-#[allow(dead_code, clippy::too_many_arguments)] // for a workspace's boxes
+#[allow(clippy::too_many_arguments)]
 pub fn join(layout: &Layout, vms: &dyn Vms, box_name: &str, shown: &str, mounts: &MountRule, policy: &[u8], command: Option<&[String]>, tty: bool) -> Result<u8> {
     let vm = layout.vm(box_name);
     let busy = || anyhow!("box {shown} is being opened or closed by another halti: try again in a moment");

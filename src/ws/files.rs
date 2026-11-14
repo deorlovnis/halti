@@ -19,6 +19,8 @@
 //!   ID/policies/approved/RES.toml 0600   the text last approved, written once it was
 //!   ID/boxes/                     0700   the workspace's boxes: their stores and runs, and what
 //!                                        a run notes in plain files (`Reading`)
+//!   ID/boxes/policies/BOX.toml    0600   a box's policy, made by `ws box new`, with its
+//!                                        approved copy in policies/approved/ as for a resource
 //! ```
 //!
 //! A policy's file is read as halti's own are, and at most 64 KiB of it. Whether a policy is
@@ -539,7 +541,6 @@ pub struct Reading {
 
 impl Reading {
     /// Over the workspaces folder `root`.
-    #[allow(dead_code)] // for running a workspace's box
     pub fn at(root: &Path) -> Reading {
         Reading { files: DirFiles::at(root), anchor: FileAnchor::at(root), keystore: FileKeystore::at(root), root: root.to_path_buf() }
     }
@@ -600,17 +601,73 @@ pub fn boxes_dir(root: &Path, ws: WsId) -> PathBuf {
     root.join(ws.to_string()).join("boxes")
 }
 
+/// The stores in a boxes folder: `BOX.sparsebundle` in it, and in its temp/ folder those of runs
+/// that keep nothing, by their boxes' names, sorted and each once. A folder that isn't there holds
+/// none.
+pub fn stores_in(boxes: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for dir in [boxes.to_path_buf(), boxes.join("temp")] {
+        let found = match fs::read_dir(&dir) {
+            Ok(found) => found,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        };
+        for entry in found {
+            let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(stem) = name.strip_suffix(".sparsebundle").filter(|_| !name.starts_with('.')) {
+                names.push(stem.to_string());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// Removes a workspace's boxes folder and all in it, then the workspace's folder if nothing else
+/// is left in it. One that holds a store is left as it is and refused: a store goes only with its
+/// box. A link or a file in the folder's place is removed itself, and what it points at is left.
+pub fn remove_boxes(root: &Path, ws: WsId) -> Result<()> {
+    let (folder, boxes) = (root.join(ws.to_string()), boxes_dir(root, ws));
+    match fs::symlink_metadata(&folder) {
+        Ok(meta) if meta.is_dir() && meta.uid() == unsafe { libc::getuid() } => {}
+        Ok(_) => bail!("{} isn't a folder of yours", folder.display()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", folder.display())),
+    }
+    match fs::symlink_metadata(&boxes) {
+        Ok(meta) if meta.is_dir() => {
+            if !stores_in(&boxes)?.is_empty() {
+                bail!("{} holds a box's store", boxes.display());
+            }
+            fs::remove_dir_all(&boxes).with_context(|| format!("removing {}", boxes.display()))?
+        }
+        Ok(_) => fs::remove_file(&boxes).with_context(|| format!("removing {}", boxes.display()))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", boxes.display())),
+    }
+    tidy(&boxes)
+}
+
 /// One kind's policies in a workspace: DIR/RES.toml, and the copies last approved in
 /// DIR/approved/. A policy is named as a resource is (`ItemKey::check_resource`).
 pub struct PolicyFiles {
     dir: PathBuf,
+    /// The workspace's folder, which holds this one.
+    ws: PathBuf,
     root: PathBuf,
 }
 
 impl PolicyFiles {
     /// The policies of a workspace's resources: WSDIR/policies, in the workspaces folder `root`.
     pub fn resources(root: &Path, ws: WsId) -> PolicyFiles {
-        PolicyFiles { dir: root.join(ws.to_string()).join("policies"), root: root.to_path_buf() }
+        PolicyFiles { dir: root.join(ws.to_string()).join("policies"), ws: root.join(ws.to_string()), root: root.to_path_buf() }
+    }
+
+    /// The policies of a workspace's boxes: WSDIR/boxes/policies, in the workspaces folder `root`.
+    pub fn boxes(root: &Path, ws: WsId) -> PolicyFiles {
+        PolicyFiles { dir: boxes_dir(root, ws).join("policies"), ws: root.join(ws.to_string()), root: root.to_path_buf() }
     }
 
     /// The folder they are in.
@@ -629,7 +686,7 @@ impl PolicyFiles {
 
     /// The workspace's folder, which holds this one.
     fn ws_dir(&self) -> &Path {
-        self.dir.parent().expect("a workspace's policies are in its folder")
+        &self.ws
     }
 
     /// The names of the `*.toml` files, sorted. A name starting with a dot, and any other name, is
@@ -694,14 +751,17 @@ impl PolicyFiles {
     /// written in it.
     fn ready(&self, dir: &Path) -> Result<()> {
         ready_root(&self.root)?;
-        for folder in [self.ws_dir(), self.dir.as_path(), dir] {
+        let mut folders: Vec<&Path> = dir.ancestors().take_while(|folder| *folder != self.ws_dir()).collect();
+        folders.push(self.ws_dir());
+        for folder in folders.iter().rev() {
             private_dir(folder)?;
         }
         Ok(())
     }
 
-    /// Removes the folder and all in it, then the workspace's folder if nothing else is left in it.
-    /// A link or a file in the folder's place is removed itself, and what it points at is left.
+    /// Removes the folder and all in it, then the folder that holds it if nothing else is left in
+    /// it: the workspace's folder, or for boxes their folder. A link or a file in the folder's place
+    /// is removed itself, and what it points at is left.
     pub fn remove_all(&self) -> Result<()> {
         let ws = self.ws_dir();
         match fs::symlink_metadata(ws) {
@@ -733,10 +793,10 @@ fn read_policy(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(bytes)
 }
 
-/// The workspaces in the folder `root` that are gone but for their policies: id folders that no
-/// directory record names and that hold nothing but `policies/` (and Finder's `.DS_Store`). A
-/// crash between a workspace's delete and the removal of its policies leaves one. While any record
-/// can't be read, none is.
+/// The workspaces in the folder `root` that are gone but for their policies and boxes folder: id
+/// folders that no directory record names and that hold nothing but `policies/`, a `boxes/` with no
+/// store (`stores_in`), and Finder's `.DS_Store`. A crash between a workspace's delete and the
+/// removal of those leaves one. While any record can't be read, none is.
 pub fn orphan_policies(root: &Path) -> Result<Vec<WsId>> {
     let files = DirFiles::at(root);
     let mut named = Vec::new();
@@ -761,7 +821,8 @@ pub fn orphan_policies(root: &Path) -> Result<Vec<WsId>> {
             .map(|inner| inner.map(|inner| inner.file_name().to_string_lossy().into_owned()))
             .collect::<io::Result<_>>()
             .with_context(|| format!("reading {}", entry.path().display()))?;
-        if inside.iter().any(|name| name == "policies") && inside.iter().all(|name| name == "policies" || name == ".DS_Store") {
+        let left = |name: &String| name == "policies" || name == "boxes";
+        if inside.iter().any(left) && inside.iter().all(|name| left(name) || name == ".DS_Store") && stores_in(&entry.path().join("boxes"))?.is_empty() {
             orphans.push(id);
         }
     }
@@ -1101,6 +1162,39 @@ mod tests {
         assert_eq!(orphan_policies(&root).unwrap(), [globex], "acme has a record");
         // While a record can't be read, it could name any: none is an orphan.
         fs::write(root.join("dir/umbrella"), b"not a record").unwrap();
+        assert_eq!(orphan_policies(&root).unwrap(), []);
+    }
+
+    #[test]
+    fn orphaned_boxes_folders_go_only_without_a_store() {
+        let dir = TempDir::new("halti-ws-box-orphans").unwrap();
+        let root = dir.0.join("ws");
+        let (acme, globex, initech) = (WsId::from_bytes([0x10; 16]), WsId::from_bytes([0x02; 16]), WsId::from_bytes([0x03; 16]));
+        // acme: policies and a boxes folder with a box's policy, a run's leftovers and Finder's litter.
+        PolicyFiles::resources(&root, acme).create("github", "[fetch]\n").unwrap();
+        let boxes = PolicyFiles::boxes(&root, acme);
+        assert!(boxes.create("dev", "run = [\"claude\"]\n").unwrap());
+        let mode = |p: &Path| fs::symlink_metadata(p).unwrap().mode() & 0o777;
+        let acme_boxes = boxes_dir(&root, acme);
+        assert_eq!((mode(&root.join(acme.to_string())), mode(&acme_boxes), mode(&acme_boxes.join("policies"))), (0o700, 0o700, 0o700));
+        assert_eq!(boxes.path("dev"), acme_boxes.join("policies/dev.toml"));
+        fs::create_dir_all(acme_boxes.join("open")).unwrap();
+        fs::write(acme_boxes.join("open/dev.lock"), b"").unwrap();
+        fs::write(root.join(acme.to_string()).join(".DS_Store"), b"finder's").unwrap();
+        // globex: only a boxes folder, with a store in it. initech: a store of a run that keeps nothing.
+        fs::create_dir_all(boxes_dir(&root, globex).join("dev.sparsebundle")).unwrap();
+        fs::create_dir_all(boxes_dir(&root, initech).join("temp/scratch.sparsebundle")).unwrap();
+        assert_eq!(stores_in(&boxes_dir(&root, initech)).unwrap(), ["scratch"]);
+        assert_eq!(stores_in(&boxes_dir(&root, globex)).unwrap(), ["dev"]);
+        assert_eq!(orphan_policies(&root).unwrap(), [acme], "a folder with a store is never an orphan");
+        // Removed, the boxes folder takes the workspace's folder with it once nothing else is left.
+        remove_boxes(&root, acme).unwrap();
+        assert!(!acme_boxes.exists() && root.join(acme.to_string()).join("policies").exists());
+        PolicyFiles::resources(&root, acme).remove_all().unwrap();
+        assert!(!root.join(acme.to_string()).exists());
+        // One with a store is refused, and left as it is.
+        assert!(remove_boxes(&root, globex).unwrap_err().to_string().ends_with("holds a box's store"));
+        assert!(boxes_dir(&root, globex).join("dev.sparsebundle").exists());
         assert_eq!(orphan_policies(&root).unwrap(), []);
     }
 

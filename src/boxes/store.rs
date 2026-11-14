@@ -74,7 +74,6 @@ impl Layout {
     /// The boxes of the workspace `ws`, whose boxes folder is `boxes` (WSDIR/boxes): stores, locks,
     /// mount points and downloads in it, sockets in the ws/ folder of the sockets folder, and VMs
     /// named with the first 12 hex characters of its id.
-    #[allow(dead_code)] // for running a workspace's boxes
     pub fn workspace(boxes: &Path, ws: WsId) -> Result<Self> {
         let uid = uid()?;
         Ok(Self::of_workspace(boxes, sockets(uid).join(names::WS_SOCKETS), uid, ws))

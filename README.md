@@ -72,7 +72,7 @@ halti audit                                  # what agents did through halti mcp
 
 ## Workspaces
 
-A **workspace** keeps one client's secrets apart from another's, sealed in files under its own passphrase. Nothing uses them yet.
+A **workspace** keeps one client's secrets apart from another's, sealed in files under its own passphrase. Its boxes use them (see Boxes in a workspace), and nothing else does yet.
 
 ```sh
 halti ws new acme                          # asks for a new passphrase (or makes one: --generate)
@@ -85,7 +85,7 @@ halti ws policy approve acme               # every policy in acme, shown against
 halti ws policy show acme                  # which are approved (asks as for open); acme/github prints one
 halti ws ls                                # the workspaces (asks nothing)
 halti open acme                            # checks the passphrase and the files
-halti ws delete acme                       # the workspace and everything in it
+halti ws delete acme                       # the workspace and everything in it (not while one of its boxes has a store)
 ```
 
 - Each command asks for one approval, as `[workspace.approval]` says (see Settings), and if a saved passphrase can't be read, has you type it once more; `--type` has you type the passphrase whatever it says. The value is read only after that, and never shown, logged or taken from an argument.
@@ -95,13 +95,37 @@ halti ws delete acme                       # the workspace and everything in it
 
 ### Policies in a workspace
 
-A workspace's policies are its own: `halti ws policy edit acme/github` writes github's in acme's folder, apart from the Keychain's `~/.config/halti/policy/github.toml`, and an approval in one never counts in the other. A policy in a workspace takes effect for boxes once boxes run in workspaces; until then nothing reads it.
+A workspace's policies are its own: `halti ws policy edit acme/github` writes github's in acme's folder, apart from the Keychain's `~/.config/halti/policy/github.toml`, and an approval in one never counts in the other. A policy in a workspace is what acme's boxes use; nothing else reads it.
 
 - Approving asks as `[workspace.approval] policy` says, never `none`, and seals the sha256 of each policy's text in the workspace, with its secrets' list. What is shown before you approve is what is sealed. `halti ws policy approve acme` shows each policy against the copy kept when it was last approved: `new` with its whole text, `changed` with a diff, or `unchanged`. If a copy isn't what was approved, nothing is approved, and `halti ws policy approve acme/github` shows that one whole. With a password manager, the Touch ID window or sudo names the policies being approved, the first three with the start of their sha256, then how many more.
 - `halti ws policy show` says `approved`, `not approved`, `changed since approval`, or `approved, no file`: the file's bytes now, against the sealed sha256.
 - A policy in a workspace is 1 byte to 64 KiB of plain ASCII (a host with other letters is written in its `xn--` form; a line that is only a comment may have other letters, but no control or invisible character), can't use `[refresh]` yet, and keeps `[run]` and `[agent]` as they are when left out. A policy copied from the Keychain's folder passes once its `[run]`, `[agent]` and `[refresh]` are removed or left as the template has them.
 - Deleting or narrowing a policy's file revokes nothing: the text approved, written back, is approved again. `halti ws rm acme/github` removes github's secrets and its approval, and keeps the file; approving another text replaces it. `halti ws delete acme` removes the policies with the workspace.
 - **Limit:** any earlier state of a workspace's files can be put back, with approvals and revocations as they were then.
+
+### Boxes in a workspace
+
+A workspace's boxes are boxes (see Boxes) whose agent reaches only that workspace's sites and model, with its secrets: never the Keychain's, never another workspace's. Starting one opens the workspace, and that is the only question.
+
+```sh
+halti ws box new acme/dev           # its policy in $EDITOR, then one approval: its key, its policy, an empty encrypted store
+halti ws box edit acme/dev          # shows what changed from the approved policy; asks nothing
+halti ws box approve acme/dev       # until then a changed policy can't start the box
+halti ws run acme/dev               # asks as for opening acme; you're in Claude Code, inside the box
+halti ws run acme/dev -- bash       # another terminal joins the box that runs, and is asked nothing
+halti ws box ls acme                # open or locked, size, last used, sites (asks nothing)
+halti ws box log acme/dev           # what went through its door (asks as for opening acme, unless it runs)
+halti ws stop acme/dev              # stop and lock; also happens when `run` ends or on Ctrl-C
+halti ws box rm acme/dev            # its key, then its store; its policy file stays
+```
+
+- `ws box new` and `ws box approve` ask as `[workspace.approval] policy` says, `ws run` and `ws box log` as `open`, and `ws box rm` as `rm`; each takes `--type`. A wrong passphrase, a no, and every check before them change nothing. `[box] engine` and `[box.approval] write` apply as to any box; `[box] keys` and the other `[box.approval]` lines don't: a box's key is sealed in its workspace, and the workspace's lines approve the rest.
+- `WSDIR` is the workspace's folder: `[paths] workspaces` (see Settings), then the workspace's id, 32 hex characters. The box's policy is `WSDIR/boxes/policies/NAME.toml`, the file `halti ws box new` and `ws box edit` open in `$EDITOR`, and its store `WSDIR/boxes/NAME.sparsebundle`. Its policy is approved like a workspace's policies: what is shown is what is sealed, and plain ASCII. A box that runs keeps the policy it started with; its sites' secrets and approvals are read again as they change, so `halti ws set acme/github token` or approving github's policy counts at the next request.
+- `model` names the workspace's own resource: store a long-lived token for it (`claude setup-token`, then `halti ws set acme/anthropic token`). Refresh doesn't run in a workspace yet.
+- A workspace's box mounts only folders in your home that aren't hidden (no `~/.ssh`, `~/.claude`, `~/.config`) and aren't in `~/Library`, nor the home folder itself, as written and as their real path: copy anything else into such a folder first. A folder of another client's in your home is yours to approve or not: halti can't tell whose it is.
+- A write a site's `[fetch]` or `[browse]` policy says to ask about is asked with Touch ID, whatever the settings, and the question names the box (`box acme/dev: ...`).
+- Its VMs are `halti-wsbox-TAG-NAME` and `halti-wsbrowser-TAG-NAME`, TAG the first 12 characters of the workspace's id, so they never meet halti's other boxes, cred's, or another workspace's. `halti ws delete acme` refuses while a box of acme's has a store or runs, and otherwise removes the boxes folder with the workspace.
+- There is no `ws box login`, `export` or `import` yet. To move a client's box here by hand: export its work into a plain folder in your home, run `halti ws box new acme/NAME`, and in the editor put its box policy in place of the template, with a `[[mount]]` of that folder (mode `clone`, which copies it in at the first run). Remove the folder after.
 
 ## Settings
 
@@ -150,7 +174,7 @@ delete = "touchid"            # deleting a box: touchid | sudo | none
 - `halti config` shows what your edit changed, on the terminal where sudo asks, then approves it. `halti config --show` prints the settings in effect, `halti config --default` the template. Until a change is approved, every workspace command says so.
 - With no approved copy, or one someone other than root could change, the template is in effect.
 - `[approval] default` is for any action without its own line, except a box's and a workspace's. `[paths] workspaces` is where new workspaces go: a folder that isn't there yet, an empty one only you can open, or one halti made. Ones already made stay where they are, and aren't listed until you move them there. `[workspace] passphrase` says whether `halti ws new` asks for a passphrase of your own or makes one (`--own` and `--generate` say otherwise).
-- `[passwords] manager = "keychain"` (on a Mac) saves each new workspace's passphrase in your login Keychain once `halti ws new` has made it. `[workspace.approval]` says how you approve opening a workspace (and listing its secrets, `halti ws ls NAME`, and its policies, `halti ws policy show`), storing a secret in it, removing secrets from it, approving its policies, and deleting it: `passphrase`, the default, has you type it, and the saved copy isn't used; `sudo`, `touchid` or `none` has you approve that way, or not at all, and halti takes the passphrase from the Keychain. Those three need a manager, and `set` and `policy` can't be `none`. `--type` on `halti open`, `halti ws ls NAME`, `halti ws set`, `halti ws rm`, `halti ws policy approve`, `halti ws policy show` and `halti ws delete` always has you type it. The copy is kept in your login Keychain only, whatever your default keychain is. If the saved copy can't be read (after a halti update, say, or while your login Keychain is locked), halti asks you to type it once, and `halti open` saves it again. A workspace made before its passphrase could be saved stays typed each time; to have one saved, make the workspace again. halti never shows a Keychain window for a saved passphrase: if one asks to use an item named `halti-ws:...`, choose Deny.
+- `[passwords] manager = "keychain"` (on a Mac) saves each new workspace's passphrase in your login Keychain once `halti ws new` has made it. `[workspace.approval]` says how you approve opening a workspace (and listing its secrets, `halti ws ls NAME`, and its policies, `halti ws policy show`), storing a secret in it, removing secrets from it, approving its policies, and deleting it: `passphrase`, the default, has you type it, and the saved copy isn't used; `sudo`, `touchid` or `none` has you approve that way, or not at all, and halti takes the passphrase from the Keychain. Those three need a manager, and `set` and `policy` can't be `none`. `--type` on `halti open`, `halti ws ls NAME`, `halti ws set`, `halti ws rm`, `halti ws policy approve`, `halti ws policy show`, `halti ws delete`, `halti ws run` and `halti ws box new`, `approve`, `rm` and `log` always has you type it. The copy is kept in your login Keychain only, whatever your default keychain is. If the saved copy can't be read (after a halti update, say, or while your login Keychain is locked), halti asks you to type it once, and `halti open` saves it again. A workspace made before its passphrase could be saved stays typed each time; to have one saved, make the workspace again. halti never shows a Keychain window for a saved passphrase: if one asks to use an item named `halti-ws:...`, choose Deny.
 - `[box]` names what runs a box (Apple's `container`) and where its key is kept (the Keychain). `[box.approval]` says what you answer before a box opens, before its changed policy counts, before a write its policy says to ask about, before files are copied out of it, and before it is deleted: Touch ID, your password through sudo, or nothing (`none`). A write is asked while the agent has the terminal, so only Touch ID or `none` can approve it. A box line you leave out is Touch ID, whatever `default` says. A running box keeps the write approval it opened with. On Linux no box runs, so the template has no `[box]` section.
 
 ## Policies

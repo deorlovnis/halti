@@ -397,3 +397,280 @@ fn test_ca_pem() -> String {
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params.self_signed(&key).unwrap().pem()
 }
+
+// --- a workspace's boxes, through the halti binary ---
+//
+// These drive the debug binary in a throwaway home, with its test hooks answering passphrases and
+// Touch ID, and real VMs. Each box is named for this test run alone, so no box of an installed
+// halti or of cred is ever named, stopped or swept.
+
+const HALTI: &str = env!("CARGO_BIN_EXE_halti");
+const ACME: &str = "acme passphrase one";
+const GLOBEX: &str = "globex passphrase one";
+
+/// A home for the debug binary, one per test, removed when dropped, after its boxes are stopped.
+struct Home {
+    dir: PathBuf,
+    /// Workspace boxes to stop when the test ends, however it ends: `acme/NAME`.
+    boxes: Mutex<Vec<String>>,
+}
+
+impl Home {
+    /// The home of the test `what`, as `box_name` names its box: tests run side by side.
+    fn new(what: &str) -> Home {
+        let dir = env::temp_dir().join(format!("halti-e2e-wsbox-{what}-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for sub in ["keychain", "policy", "box", "home"] {
+            fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        Home { dir, boxes: Mutex::default() }
+    }
+
+    /// `halti` with every path in this home and Touch ID answering yes; nothing answers a passphrase.
+    fn halti(&self) -> Command {
+        let mut command = Command::new(HALTI);
+        command
+            .env("HOME", self.dir.join("home"))
+            .env("HALTI_INDEX", self.dir.join("index.json"))
+            .env("HALTI_POLICY_DIR", self.dir.join("policy"))
+            .env("HALTI_BOX_DIR", self.dir.join("box"))
+            .env("HALTI_TEST_KEYCHAIN", self.dir.join("keychain"))
+            .env("HALTI_TEST_APPROVE", "yes")
+            .env_remove("HALTI_TEST_PASSPHRASE")
+            .env_remove("VISUAL")
+            .stdin(Stdio::null());
+        command
+    }
+
+    /// `halti ARGS` with `passphrase` answering, and `editor` as $EDITOR.
+    fn ws(&self, passphrase: &str, editor: &str, args: &[&str]) -> std::process::Output {
+        let out = self.halti().env("HALTI_TEST_PASSPHRASE", passphrase).env("EDITOR", editor).args(args).output().unwrap();
+        println!("halti {args:?}:\n{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        out
+    }
+
+    /// An "editor" that writes `text` over the file.
+    fn editor(&self, text: &str) -> String {
+        static COUNT: Mutex<usize> = Mutex::new(0);
+        let mut count = COUNT.lock().unwrap();
+        *count += 1;
+        let file = self.dir.join(format!("edited-{count}.toml"));
+        fs::write(&file, text).unwrap();
+        format!("cp {}", file.display())
+    }
+
+    /// Stores `value` as RES/FIELD in workspace `ws`, piped in.
+    fn set(&self, ws: &str, passphrase: &str, res: &str, field: &str, value: &str) {
+        let target = format!("{ws}/{res}");
+        let mut child = self
+            .halti()
+            .env("HALTI_TEST_PASSPHRASE", passphrase)
+            .args(["ws", "set", &target, field])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(value.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Writes and approves `text` as RES's policy in workspace `ws`.
+    fn policy(&self, ws: &str, passphrase: &str, res: &str, text: &str) {
+        let target = format!("{ws}/{res}");
+        assert!(self.ws(passphrase, &self.editor(text), &["ws", "policy", "edit", &target]).status.success());
+        assert!(self.ws(passphrase, "true", &["ws", "policy", "approve", &target]).status.success());
+    }
+
+    /// Workspace `ws` with a model and github, its token `token` (`basic`'s, for httpbin's
+    /// /basic-auth), and a box `name` that may use github.
+    fn workspace_with_box(&self, ws: &str, passphrase: &str, name: &str, token: &str, image: &str) {
+        assert!(self.ws(passphrase, "true", &["ws", "new", ws]).status.success());
+        self.set(ws, passphrase, "anthropic", "token", "model-token-not-used");
+        self.policy(ws, passphrase, "anthropic", "[fetch]\nhosts = [\"https://api.anthropic.com\"]\nauth = \"Bearer {token}\"\n");
+        self.set(ws, passphrase, "github", "token", token);
+        self.policy(ws, passphrase, "github", GITHUB);
+        let text = format!("run = [\"claude\"]\nimage = \"{image}\"\nmodel = \"anthropic\"\nsites = [\"github\"]\nkeep = true\ncpus = 2\nmemory = \"2G\"\n\n[net]\nallow = []\n");
+        let target = format!("{ws}/{name}");
+        assert!(self.ws(passphrase, &self.editor(&text), &["ws", "box", "new", &target]).status.success());
+        self.boxes.lock().unwrap().push(target);
+    }
+
+    /// `halti ws run TARGET -- CMD`, started and left running.
+    fn start(&self, passphrase: &str, target: &str, cmd: &[&str]) -> std::process::Child {
+        let mut command = self.halti();
+        command.env("HALTI_TEST_PASSPHRASE", passphrase).args(["ws", "run", target, "--"]).args(cmd).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.spawn().unwrap()
+    }
+}
+
+impl Drop for Home {
+    fn drop(&mut self) {
+        for target in self.boxes.lock().unwrap().iter() {
+            let _ = self.halti().args(["ws", "stop", target]).output();
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The agent image to pin, once the engine is there: HALTI_E2E_AGENT_IMAGE's, or the one built.
+fn agent_image() -> Option<String> {
+    if env::var_os("HALTI_E2E_BOX").is_none() {
+        eprintln!("HALTI_E2E_BOX isn't set: skipping");
+        return None;
+    }
+    engine::available().unwrap();
+    Some(engine::image_digest(&env::var("HALTI_E2E_AGENT_IMAGE").unwrap_or_else(|_| engine::AGENT_IMAGE.to_string())).unwrap())
+}
+
+/// github's policy: httpbin, with the token sent as Basic credentials.
+const GITHUB: &str = "[fetch]\nhosts = [\"https://httpbin.org\"]\nauth = \"Basic {token}\"\n";
+
+/// A token for `Basic {token}` that httpbin's /basic-auth/USER/PASSWORD answers 200 to only for
+/// this user and password: what the door sent shows in the answer's status, which isn't masked.
+fn basic(user: &str, password: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+}
+
+/// A box name of this test run alone.
+fn box_name(what: &str) -> String {
+    format!("e2e-{what}-{}", process::id())
+}
+
+/// Waits until the VM of box `name` (`VM_PREFIX…-NAME`) runs, or a minute passes: this test's,
+/// never another's that runs beside it.
+fn until_running(vm_prefix: &str, name: &str) -> String {
+    let suffix = format!("-{name}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        let listed = Command::new("container").args(["ls"]).output().unwrap();
+        if let Some(vm) = String::from_utf8_lossy(&listed.stdout).split_whitespace().find(|word| word.starts_with(vm_prefix) && word.ends_with(&suffix)) {
+            return vm.to_string();
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    panic!("no VM {vm_prefix}…{suffix} runs");
+}
+
+/// A shell command for the agent: the status httpbin's /basic-auth answers for each user and
+/// password, then its echo of a request, with the Authorization the door put on it.
+fn statuses_then_headers(pairs: &[(&str, &str)]) -> String {
+    let mut script = String::new();
+    for (user, password) in pairs {
+        script += &format!("curl -sS -m 20 -o /dev/null -w '%{{http_code}} ' https://httpbin.org/basic-auth/{user}/{password}; ");
+    }
+    script + "curl -sS -m 20 https://httpbin.org/headers"
+}
+
+/// The Authorization header as httpbin echoes it, the whole header masked.
+const MASKED: &str = "\"Authorization\": \"********\"";
+
+#[test]
+#[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
+fn a_workspace_box_reaches_only_its_sites() {
+    let Some(image) = agent_image() else { return };
+    let home = Home::new("sites");
+    let name = box_name("sites");
+    // The Keychain's github, approved, and globex's: a box of acme's must reach neither.
+    let (acme, globex, keychain) = (basic("acme", "acme-token-0001"), basic("globex", "globex-token-0001"), basic("keychain", "keychain-token-0001"));
+    fs::write(home.dir.join("keychain/github.token"), &keychain).unwrap();
+    fs::write(home.dir.join("index.json"), "{\"github\":{\"fields\":{\"token\":{}}}}").unwrap();
+    fs::write(home.dir.join("policy/github.toml"), GITHUB).unwrap();
+    assert!(home.halti().args(["policy", "approve", "github"]).output().unwrap().status.success());
+    home.workspace_with_box("globex", GLOBEX, &name, &globex, &image);
+    home.workspace_with_box("acme", ACME, &name, &acme, &image);
+    // Only acme's credentials are accepted: the door sent acme's token, and no other.
+    let script = statuses_then_headers(&[("acme", "acme-token-0001"), ("globex", "globex-token-0001"), ("keychain", "keychain-token-0001")]);
+    let out = home.ws(ACME, "true", &["ws", "run", &format!("acme/{name}"), "--", "sh", "-c", &script]);
+    let seen = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && seen.starts_with("200 401 401 "), "acme's alone: {seen}");
+    assert!(seen.contains(MASKED), "acme's token, masked: {seen}");
+    assert!(![&acme, &globex, &keychain].iter().any(|token| seen.contains(token.as_str())), "{seen}");
+}
+
+#[test]
+#[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
+fn a_token_set_while_running_is_used_at_once() {
+    let Some(image) = agent_image() else { return };
+    let home = Home::new("rotate");
+    let name = box_name("rotate");
+    home.workspace_with_box("acme", ACME, &name, &basic("acme", "acme-token-0001"), &image);
+    let target = format!("acme/{name}");
+    let mut opener = home.start(ACME, &target, &["sleep", "120"]);
+    until_running("halti-wsbox-", &name);
+    let new = basic("acme", "acme-token-0002");
+    home.set("acme", ACME, "github", "token", &new);
+    // A second terminal, in the same VM through the opener's door, which reads acme again: only
+    // the new token is accepted.
+    let script = statuses_then_headers(&[("acme", "acme-token-0002"), ("acme", "acme-token-0001")]);
+    let out = home.halti().args(["ws", "run", &target, "--", "sh", "-c", &script]).output().unwrap();
+    let seen = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success() && seen.starts_with("200 401 ") && seen.contains(MASKED) && !seen.contains(&new), "{seen}");
+    assert!(home.halti().args(["ws", "stop", &target]).output().unwrap().status.success());
+    opener.wait().unwrap();
+}
+
+#[test]
+#[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
+fn a_second_terminal_joins_without_a_question() {
+    let Some(image) = agent_image() else { return };
+    let home = Home::new("join");
+    let name = box_name("join");
+    home.workspace_with_box("acme", ACME, &name, &basic("acme", "acme-token-0001"), &image);
+    let target = format!("acme/{name}");
+    let mut opener = home.start(ACME, &target, &["sleep", "120"]);
+    until_running("halti-wsbox-", &name);
+    // Nothing answers a passphrase here: the join asks none.
+    let out = home.halti().args(["ws", "run", &target, "--", "sh", "-c", "exit 7"]).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.code() == Some(7) && !said.contains("[test] asked"), "{said}");
+    assert!(home.halti().args(["ws", "stop", &target]).output().unwrap().status.success());
+    opener.wait().unwrap();
+}
+
+#[test]
+#[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
+fn ws_stop_seals_sessions_then_stops_both_vms() {
+    let Some(image) = agent_image() else { return };
+    let home = Home::new("stop");
+    let name = box_name("stop");
+    home.workspace_with_box("acme", ACME, &name, &basic("acme", "acme-token-0001"), &image);
+    let target = format!("acme/{name}");
+    let mut opener = home.start(ACME, &target, &["sleep", "120"]);
+    let vm = until_running("halti-wsbox-", &name);
+    let out = home.halti().args(["ws", "stop", &target]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("stopped box {target}\n"));
+    opener.wait().unwrap();
+    assert!(!engine::running(&vm) && !engine::running(&vm.replacen("halti-wsbox-", "halti-wsbrowser-", 1)));
+    // The opener put the box away: its lock is free, and its store closed.
+    let listed = home.ws(ACME, "true", &["ws", "box", "ls", "acme"]);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains(" locked "), "{}", String::from_utf8_lossy(&listed.stdout));
+    let again = home.halti().args(["ws", "stop", &target]).output().unwrap();
+    assert!(String::from_utf8_lossy(&again.stderr).ends_with(&format!("halti: box {target} isn't running\n")));
+}
+
+#[test]
+#[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
+fn a_keychain_box_of_the_same_name_keeps_running() {
+    let Some(image) = agent_image() else { return };
+    let home = Home::new("apart");
+    let name = box_name("apart");
+    // A Keychain box of this name, running.
+    let text = format!("run = [\"claude\"]\nimage = \"{image}\"\nkeep = false\ncpus = 2\nmemory = \"2G\"\n");
+    assert!(home.halti().env("EDITOR", home.editor(&text)).args(["box", "new", &name]).output().unwrap().status.success());
+    assert!(home.halti().args(["box", "approve", &name]).output().unwrap().status.success());
+    let mut keychain_box = home.halti().args(["box", "run", &name, "--", "sleep", "120"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let keychain_vm = format!("{}{name}", names::BOX_VM_PREFIX);
+    until_running(names::BOX_VM_PREFIX, &name);
+    // acme's box of the same name starts, ends and is stopped beside it.
+    home.workspace_with_box("acme", ACME, &name, &basic("acme", "acme-token-0001"), &image);
+    let target = format!("acme/{name}");
+    assert!(home.ws(ACME, "true", &["ws", "run", &target, "--", "true"]).status.success());
+    let out = home.halti().args(["ws", "stop", &target]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).ends_with(&format!("halti: box {target} isn't running\n")));
+    assert!(engine::running(&keychain_vm), "the Keychain box runs on");
+    assert!(home.halti().args(["box", "stop", &name]).output().unwrap().status.success());
+    keychain_box.wait().unwrap();
+}

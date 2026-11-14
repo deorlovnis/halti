@@ -702,3 +702,83 @@ fn ws_names_only_source_free_policy_items() {
     assert!(named >= WS_POLICY_ITEMS.len(), "the workspace commands use the policy module: {named}");
     assert!(found.is_empty(), "src/ws reaches no source through the policy module; name only {WS_POLICY_ITEMS:?}:\n{}", found.join("\n"));
 }
+
+/// What the workspace's box commands (src/ws/boxes.rs) may name of the binary's boxes module: the
+/// items that reach no source. Its lookups go through `source::current()`, which a workspace's
+/// command never has: it opens the workspace and hands it to `main`, which chooses it.
+const WS_BOX_ITEMS: &[&str] = &[
+    "vms(",
+    "workspace_template(",
+    "human(",
+    "Join",
+    "Start",
+    "store::create",
+    "store::shred(",
+    "store::lock(",
+    "store::is_held(",
+    "store::usage(",
+    "store::open(",
+    "store::door_log(",
+    "store::is_mounted(",
+    "store::detach(",
+    "run::sweep(",
+];
+
+/// The box items the workspace's box commands name by type: the parse under a rule, the rule, and
+/// a workspace's layout.
+const WS_BOX_TYPE_ITEMS: &[(&str, &[&str])] = &[("BoxPolicy::", &["parse_in("]), ("MountRule::", &["workspace(", "Workspace("]), ("Layout::", &["workspace("])];
+
+/// The workspace's box commands name only the boxes items that reach no source, through the
+/// module's path or one of the three types they import; no other workspace command names the
+/// module at all.
+#[test]
+fn ws_names_only_source_free_box_items() {
+    const FILE: &str = "src/ws/boxes.rs";
+    let mut found = Vec::new();
+    let mut named = 0;
+    for (path, text) in sources(&["src"]) {
+        if path != "src/ws.rs" && !path.starts_with("src/ws/") {
+            continue;
+        }
+        let Some(code) = release_code(&path, &text) else { continue };
+        if path != FILE {
+            if code.contains("crate::boxes") {
+                found.push(format!("{path}: crate::boxes"));
+            }
+            continue;
+        }
+        for statement in uses(&code) {
+            let flat: String = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+            if flat.contains("crate::boxes") && !["use crate::boxes::store::Layout", "use crate::boxes::{self, BoxPolicy, MountRule}"].contains(&flat.as_str()) {
+                found.push(format!("{path}: {flat}"));
+            }
+        }
+        for (n, line) in code.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("use ") {
+                continue;
+            }
+            for (at, _) in line.match_indices("boxes::") {
+                if line[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                match WS_BOX_ITEMS.iter().find(|item| line[at + "boxes::".len()..].starts_with(*item)) {
+                    Some(_) => named += 1,
+                    None => found.push(format!("{path}:{}: {}", n + 1, line.trim())),
+                }
+            }
+            for (ty, items) in WS_BOX_TYPE_ITEMS {
+                for (at, _) in line.match_indices(ty) {
+                    if line[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+                        continue;
+                    }
+                    if !items.iter().any(|item| line[at + ty.len()..].starts_with(item)) {
+                        found.push(format!("{path}:{}: {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(named >= WS_BOX_ITEMS.len(), "the workspace's box commands use the boxes module: {named}");
+    assert!(found.is_empty(), "src/ws reaches no source through the boxes module; name only {WS_BOX_ITEMS:?}:\n{}", found.join("\n"));
+}
