@@ -23,6 +23,7 @@ mod door;
 mod engine;
 mod fetch;
 mod index;
+mod keep;
 mod keychain;
 // Mostly read by nothing until the migration of an install made under the old name exists.
 #[allow(dead_code)]

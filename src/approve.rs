@@ -2,23 +2,32 @@
 //! An agent can't answer this prompt, so it gates everything that loosens a policy or
 //! releases a value outside halti.
 
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 use anyhow::{Result, bail};
 
-/// How each prompt was answered since the last `take_answers` (true: approved).
-static ANSWERS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+thread_local! {
+    /// How each prompt this thread asked was answered since its last `take_answers` (true:
+    /// approved). Kept per thread: where several boxes run in one process, a call reads back only
+    /// what it asked itself.
+    static ANSWERS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+}
 
-/// The answers to the prompts so far, and forget them. The audit log reads what a call asked.
+/// The answers to the prompts this thread asked so far, and forget them. The audit log reads what a
+/// call asked.
 pub fn take_answers() -> Vec<bool> {
-    std::mem::take(&mut *ANSWERS.lock().unwrap_or_else(|e| e.into_inner()))
+    ANSWERS.with_borrow_mut(std::mem::take)
 }
 
 /// Ask for confirmation; macOS shows it as "halti is trying to <reason>."
 pub fn confirm(reason: &str) -> Result<()> {
     let result = prompt(reason);
-    ANSWERS.lock().unwrap_or_else(|e| e.into_inner()).push(result.is_ok());
+    note(result.is_ok());
     result
+}
+
+fn note(approved: bool) {
+    ANSWERS.with_borrow_mut(|answers| answers.push(approved));
 }
 
 fn prompt(reason: &str) -> Result<()> {
@@ -68,4 +77,24 @@ fn ask_person(reason: &str) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn ask_person(reason: &str) -> Result<()> {
     bail!("not approved (Touch ID needs macOS): {reason}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn answers_are_kept_per_thread() {
+        take_answers();
+        note(true);
+        let other = thread::spawn(|| {
+            note(false);
+            take_answers()
+        });
+        assert_eq!(other.join().unwrap(), [false], "another thread reads only its own");
+        assert_eq!(take_answers(), [true]);
+        assert!(take_answers().is_empty());
+    }
 }

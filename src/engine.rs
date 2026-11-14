@@ -14,6 +14,7 @@
 use std::fs::DirBuilder;
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -182,7 +183,23 @@ impl Vms for Container {
     }
 }
 
+/// A `container` command that needs no terminal: none of its streams is the terminal, and it
+/// starts in a process group of its own, so Ctrl-C and a closed terminal reach halti alone, which
+/// then puts the box away in order: a VM's stop or a browser runner isn't cut off half way.
 fn container() -> Command {
+    apart("container")
+}
+
+/// `program`, to be started in a process group of its own.
+fn apart(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.process_group(0);
+    command
+}
+
+/// A `container` command on the terminal: the agent's own `exec`, and image builds, which print
+/// their progress there. Ctrl-C reaches it as it reaches halti.
+fn container_on_terminal() -> Command {
     Command::new("container")
 }
 
@@ -284,7 +301,7 @@ pub fn exec(name: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> 
 
 /// The `container exec` command behind `exec`, for callers that want to pipe its streams.
 pub fn exec_command(name: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Command {
-    let mut c = container();
+    let mut c = container_on_terminal();
     // --uid needs --gid, or the process stays in group root
     c.args(["exec", "--uid", AGENT_ID, "--gid", AGENT_ID, "-i"]);
     if tty {
@@ -516,7 +533,7 @@ pub fn build_agent_image(repo_box_dir: &Path) -> Result<String> {
     if !containerfile.is_file() {
         bail!("no agent.Containerfile in {}", repo_box_dir.display());
     }
-    let status = container().arg("build").arg("-f").arg(&containerfile).args(["-t", AGENT_IMAGE]).arg(repo_box_dir).status().context("running container build")?;
+    let status = container_on_terminal().arg("build").arg("-f").arg(&containerfile).args(["-t", AGENT_IMAGE]).arg(repo_box_dir).status().context("running container build")?;
     if !status.success() {
         bail!("building the agent image failed ({status})");
     }
@@ -531,7 +548,7 @@ pub fn build_browser_image(repo_box_dir: &Path) -> Result<String> {
         bail!("no browser.Containerfile in {}", repo_box_dir.display());
     }
     let context = repo_box_dir.parent().context("the box folder has no parent")?;
-    let status = container().arg("build").arg("-f").arg(&containerfile).args(["-t", BROWSER_IMAGE]).arg(context).status().context("running container build")?;
+    let status = container_on_terminal().arg("build").arg("-f").arg(&containerfile).args(["-t", BROWSER_IMAGE]).arg(context).status().context("running container build")?;
     if !status.success() {
         bail!("building the browser image failed ({status})");
     }
@@ -635,6 +652,17 @@ mod tests {
     fn mount_paths_with_commas_are_refused() {
         let m = Mount { host: "/a,b".into(), guest: "/x".into(), readonly: false };
         assert!(mount_arg(&m).is_err());
+    }
+
+    #[test]
+    fn a_child_that_needs_no_terminal_has_a_process_group_of_its_own() {
+        let mut child = apart("sleep").arg("10").stdin(Stdio::null()).spawn().unwrap();
+        let pid = child.id() as i32;
+        let group = unsafe { libc::getpgid(pid) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(group, pid, "it leads a group of its own");
+        assert_ne!(group, unsafe { libc::getpgrp() }, "Ctrl-C at the terminal doesn't reach it");
     }
 
     #[test]
