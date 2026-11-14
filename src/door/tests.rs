@@ -696,10 +696,12 @@ fn a_dial_that_gets_no_ok_is_dropped() {
     let _door = dialing_door(&dir.0, socket, 7000);
     for n in 0..3 {
         let (_, mut stream) = dialed.recv_timeout(WAIT).unwrap();
-        // a socket the door has already closed may refuse a timeout (macOS)
-        let _ = stream.set_read_timeout(Some(WAIT));
+        // A socket the door has already closed may refuse a timeout (macOS), and then a read ends
+        // at once. A connection the door kept would time out, which is a failure.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let mut rest = Vec::new();
-        assert!(matches!(stream.read_to_end(&mut rest), Ok(0) | Err(_)), "answer {n}: the door hung up");
+        let read = stream.read_to_end(&mut rest);
+        assert!(matches!(read, Ok(0)), "answer {n}: the door kept the connection: {read:?}");
     }
     let (line, stream) = dialed.recv_timeout(WAIT).unwrap();
     assert_eq!(line, "CONNECT 7000\n");
@@ -711,8 +713,17 @@ fn a_dial_that_gets_no_ok_is_dropped() {
 #[test]
 fn an_endless_answer_line_is_dropped() {
     use super::connect_port;
-    let answers: [(&[u8], bool); 6] =
-        [(b"OK 1073741824\n", true), (b"OK 7\nhalti\n", true), (b"", false), (b"OK 1073741824", false), (b"OK OK OK OK OK OK OK OK OK OK OK OK\n", false), (&[b'O'; 4096], false)];
+    let answers: [(&[u8], bool); 9] = [
+        (b"OK 1073741824\n", true),
+        (b"OK 7\nhalti\n", true),
+        (b"", false),
+        (b"OK 1073741824", false),
+        (b"NO\n", false),
+        (b"OK\n", false),
+        (b"OK 12x\n", false),
+        (b"OK OK OK OK OK OK OK OK OK OK OK OK\n", false),
+        (&[b'O'; 4096], false),
+    ];
     for (answer, ok) in answers {
         let (mut door, mut vm) = UnixStream::pair().unwrap();
         let sent = answer.to_vec();

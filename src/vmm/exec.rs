@@ -8,17 +8,18 @@
 //!
 //! Every frame comes from inside the box, where an agent with Docker is root and can replace the
 //! shim, and is read in the process that holds the workspace's keys. So a frame is never longer
-//! than `MAX_FRAME`, which is checked before anything is allocated; a frame of a kind halti does
-//! not know ends the command; what the box says about a failure is shown cut short and without
-//! control characters; and nothing read here can panic.
+//! than `MAX_FRAME`, which is checked before anything is allocated; what is kept of its output and
+//! its errors together has a cap; a frame of a kind halti does not know ends the command; what the
+//! box says about a failure is shown cut short and without control characters; a time limit ends a
+//! box that stops answering; and nothing read here can panic.
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
@@ -161,37 +162,55 @@ pub enum Input<'a> {
 pub struct Sink<'a> {
     pub out: &'a mut dyn Write,
     pub err: &'a mut dyn Write,
-    /// The most standard output kept; more ends the command with an error. `None`: no limit (it
-    /// is passed on as it comes).
+    /// The most of standard output and standard error, together, that is taken; more ends the
+    /// command with an error. `None`: no limit (both are passed on as they come).
     pub most: Option<usize>,
 }
 
 /// Run `request` over `stream` (a connection to the exec service) and return how the command
-/// ended. An error is a command that did not start, a box that broke the protocol, or a connection
-/// that ended with no last frame.
-pub fn run(stream: UnixStream, request: &Request, input: Input, sink: Sink) -> Result<ExitStatus> {
+/// ended. An error is a command that did not start, a box that broke the protocol, a connection
+/// that ended with no last frame, or, with a `limit`, a command that had not ended by then: the
+/// connection is then shut, which ends every read and write on it.
+///
+/// The input goes from a thread of its own, so a command that writes before it has read all its
+/// input never holds both ends up.
+pub fn run(stream: UnixStream, request: &Request, input: Input, sink: Sink, limit: Option<Duration>) -> Result<ExitStatus> {
     let payload = request.encode()?;
     let mut writer = stream.try_clone()?;
-    write_frame(&mut writer, REQUEST, &payload)?;
-    let done = Arc::new(AtomicBool::new(false));
-    let feeding = match input {
-        Input::Bytes(bytes) => {
-            send_bytes(&mut writer, bytes);
-            None
+    let done = AtomicBool::new(false);
+    let late = AtomicBool::new(false);
+    let (finished, waiting) = mpsc::channel::<()>();
+    let tty = request.tty.is_some();
+    let ended = thread::scope(|scope| {
+        if let Some(limit) = limit {
+            let (stream, late) = (&stream, &late);
+            scope.spawn(move || {
+                if waiting.recv_timeout(limit) == Err(RecvTimeoutError::Timeout) {
+                    late.store(true, Ordering::SeqCst);
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            });
         }
-        Input::Stdin => {
-            let done = done.clone();
-            let tty = request.tty.is_some();
-            Some(thread::spawn(move || feed_stdin(writer, tty, &done)))
-        }
-    };
-    let ended = read_answers(&stream, sink);
-    done.store(true, Ordering::SeqCst);
-    let _ = stream.shutdown(Shutdown::Both);
-    if let Some(feeding) = feeding {
-        let _ = feeding.join();
+        let done = &done;
+        scope.spawn(move || {
+            if write_frame(&mut writer, REQUEST, &payload).is_err() {
+                return;
+            }
+            match input {
+                Input::Bytes(bytes) => send_bytes(&mut writer, bytes),
+                Input::Stdin => feed_stdin(writer, tty, done),
+            }
+        });
+        let ended = read_answers(&stream, sink);
+        done.store(true, Ordering::SeqCst);
+        drop(finished);
+        let _ = stream.shutdown(Shutdown::Both);
+        ended
+    });
+    match ended {
+        Err(_) if late.load(Ordering::SeqCst) => bail!("the command did not end in {} seconds", limit.unwrap_or_default().as_secs_f32()),
+        ended => ended,
     }
-    ended
 }
 
 /// Send `bytes` as input frames, then the end of the input. A box that stops reading ends it.
@@ -214,13 +233,15 @@ fn read_answers(stream: &UnixStream, sink: Sink) -> Result<ExitStatus> {
             Ok(None) => bail!("the box ended the command's connection before it said how the command ended"),
             Err(e) => bail!("reading from the box: {e}"),
         };
+        if matches!(frame.0, OUTPUT | ERROR) {
+            kept += frame.1.len();
+            if sink.most.is_some_and(|most| kept > most) {
+                bail!("the command's output is over the limit of {} bytes", sink.most.unwrap_or(0));
+            }
+        }
         match frame {
+            // a reader that went away (halti's own output closed) doesn't stop the command
             (OUTPUT, bytes) => {
-                kept += bytes.len();
-                if sink.most.is_some_and(|most| kept > most) {
-                    bail!("the command's output is over the limit of {} bytes", sink.most.unwrap_or(0));
-                }
-                // a reader that went away (halti's own output closed) doesn't stop the command
                 let _ = sink.out.write_all(&bytes).and_then(|()| sink.out.flush());
             }
             (ERROR, bytes) => {
@@ -397,7 +418,7 @@ mod tests {
         let argv = strings(&["cat"]);
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let input = vec![7u8; MAX_FRAME + 10];
-        let status = run(host, &Request { root: false, tty: None, argv: &argv, env: &[] }, Input::Bytes(&input), Sink { out: &mut out, err: &mut err, most: None }).unwrap();
+        let status = run(host, &Request { root: false, tty: None, argv: &argv, env: &[] }, Input::Bytes(&input), Sink { out: &mut out, err: &mut err, most: None }, None).unwrap();
         assert_eq!(status.code(), Some(3));
         assert_eq!((out.as_slice(), err.as_slice()), (&b"hello box"[..], &b"oops"[..]));
         let (_, frames) = the_box.join().unwrap();
@@ -412,21 +433,36 @@ mod tests {
 
         // a command that did not start says why, made safe to print
         let (host, _the_box) = fake_box(frame(FAILED, b"running nope: \x1b[31mnot found"));
-        let err =
-            run(host, &Request { root: false, tty: None, argv: &strings(&["nope"]), env: &[] }, Input::Bytes(b""), Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: None })
-                .unwrap_err();
+        let err = run(
+            host,
+            &Request { root: false, tty: None, argv: &strings(&["nope"]), env: &[] },
+            Input::Bytes(b""),
+            Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: None },
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "running nope: ?[31mnot found");
 
         // output over the caller's limit ends it
         let (host, _the_box) = fake_box(frame(OUTPUT, &[1; 100]));
-        let err = run(host, &Request { root: false, tty: None, argv: &argv, env: &[] }, Input::Bytes(b""), Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: Some(99) })
-            .unwrap_err();
+        let err =
+            run(host, &Request { root: false, tty: None, argv: &argv, env: &[] }, Input::Bytes(b""), Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: Some(99) }, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("over the limit"), "{err}");
+        // and so does error output, which counts against the same limit
+        let mut answer = frame(OUTPUT, &[1; 50]);
+        answer.extend(frame(ERROR, &[2; 50]));
+        answer.extend(frame(EXIT, &0i32.to_be_bytes()));
+        let (host, _the_box) = fake_box(answer);
+        let err =
+            run(host, &Request { root: false, tty: None, argv: &argv, env: &[] }, Input::Bytes(b""), Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: Some(99) }, None)
+                .unwrap_err();
         assert!(err.to_string().contains("over the limit"), "{err}");
 
         // a connection that ends with no last frame, as when the command stopped the box
         let (host, _the_box) = fake_box(frame(OUTPUT, b"bye"));
-        let err =
-            run(host, &Request { root: true, tty: None, argv: &argv, env: &[] }, Input::Bytes(b""), Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: None }).unwrap_err();
+        let err = run(host, &Request { root: true, tty: None, argv: &argv, env: &[] }, Input::Bytes(b""), Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: None }, None)
+            .unwrap_err();
         assert!(err.to_string().contains("before it said how the command ended"), "{err}");
     }
 
@@ -443,9 +479,14 @@ mod tests {
         assert_eq!(read_frame(&mut &header[..]).unwrap_err().kind(), io::ErrorKind::InvalidData);
         // and the client ends the command on it
         let (host, _the_box) = fake_box(header);
-        let err =
-            run(host, &Request { root: false, tty: None, argv: &strings(&["x"]), env: &[] }, Input::Bytes(b""), Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: None })
-                .unwrap_err();
+        let err = run(
+            host,
+            &Request { root: false, tty: None, argv: &strings(&["x"]), env: &[] },
+            Input::Bytes(b""),
+            Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: None },
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("over the limit"), "{err}");
         // an exit status of the wrong size, and a kind nobody sends, end it too
         for bad in [frame(EXIT, &[0; 5]), frame(b'Z', b"")] {
@@ -455,7 +496,8 @@ mod tests {
                     host,
                     &Request { root: false, tty: None, argv: &strings(&["x"]), env: &[] },
                     Input::Bytes(b""),
-                    Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: None }
+                    Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: None },
+                    None
                 )
                 .is_err()
             );
@@ -513,12 +555,68 @@ mod tests {
         let argv = strings(&["sh", "-c", "echo \"$TOKEN_STANDIN\""]);
         let env = vec![("TOKEN_STANDIN".to_string(), "halti-managed".to_string())];
         let (host, the_box) = fake_box(frame(EXIT, &0i32.to_be_bytes()));
-        run(host, &Request { root: false, tty: None, argv: &argv, env: &env }, Input::Bytes(b""), Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: None }).unwrap();
+        run(host, &Request { root: false, tty: None, argv: &argv, env: &env }, Input::Bytes(b""), Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: None }, None).unwrap();
         let (request, _) = the_box.join().unwrap();
-        assert!(argv.iter().all(|a| !a.contains("halti-managed")), "not in an argument");
+        assert_eq!(request.windows(13).filter(|w| *w == b"halti-managed").count(), 1, "not in an argument");
         let at = request.windows(13).rposition(|w| w == b"TOKEN_STANDIN").expect("the name is in the request");
         assert_eq!(&request[at + 13..at + 17], &13u32.to_be_bytes(), "its value follows, by its length");
         assert_eq!(&request[at + 17..], b"halti-managed");
+    }
+
+    /// A command that echoes its input as it reads it, as `cat` does, with more input than the
+    /// sockets hold: the input goes on while the output is read, so neither side waits for the
+    /// other.
+    #[test]
+    fn a_command_that_answers_before_it_has_read_all_its_input_gets_all_of_it() {
+        let (host, mut shim) = UnixStream::pair().unwrap();
+        thread::spawn(move || {
+            read_frame(&mut shim).unwrap().unwrap();
+            while let Ok(Some((INPUT, bytes))) = read_frame(&mut shim) {
+                if bytes.is_empty() {
+                    let _ = write_frame(&mut shim, EXIT, &0i32.to_be_bytes());
+                    return;
+                }
+                if write_frame(&mut shim, OUTPUT, &bytes).is_err() {
+                    return;
+                }
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let input: Vec<u8> = (0..4 << 20).map(|i: u32| i as u8).collect();
+            let mut out = Vec::new();
+            let argv = strings(&["cat"]);
+            let status =
+                run(host, &Request { root: false, tty: None, argv: &argv, env: &[] }, Input::Bytes(&input), Sink { out: &mut out, err: &mut Vec::new(), most: None }, None);
+            let _ = tx.send((status.map(|s| s.success()).ok(), out == input));
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(30)).expect("the input and the output each waited for the other"), (Some(true), true));
+    }
+
+    /// A box that takes the connection and then neither reads nor answers is given up on at the
+    /// limit, whether halti is reading its answer or still writing its input.
+    #[test]
+    fn a_box_that_stops_answering_is_given_up_on() {
+        for input in [Vec::new(), vec![0u8; 4 << 20]] {
+            let (host, shim) = UnixStream::pair().unwrap();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let argv = strings(&["true"]);
+                let got = run(
+                    host,
+                    &Request { root: true, tty: None, argv: &argv, env: &[] },
+                    Input::Bytes(&input),
+                    Sink { out: &mut Vec::new(), err: &mut Vec::new(), most: None },
+                    Some(Duration::from_millis(300)),
+                );
+                let _ = tx.send((got.map_err(|e| e.to_string()), started.elapsed()));
+            });
+            let (got, took) = rx.recv_timeout(Duration::from_secs(10)).expect("the limit ended it");
+            assert_eq!(got.unwrap_err(), "the command did not end in 0.3 seconds");
+            assert!(took < Duration::from_secs(3), "{took:?}");
+            drop(shim);
+        }
     }
 
     #[test]

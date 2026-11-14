@@ -41,6 +41,19 @@ for cid in (1, 2, 3):
         print(\"id %d: connected; then %s\" % (cid, e))
 ";
 
+/// Dials the server's ports 9 and 10 from inside the box. Prints what each did.
+const SERVER_DIAL: &str = "
+import socket
+for port in (9, 10):
+    c = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    c.settimeout(3)
+    try:
+        c.connect((2, port))
+        print(\"port %d: connected\" % port)
+    except Exception as e:
+        print(\"port %d: not connected: %s\" % (port, e))
+";
+
 /// Stops the VM when the test ends, however it ends.
 struct Running<'a>(&'a CloudHypervisor, String);
 
@@ -51,7 +64,7 @@ impl Drop for Running<'_> {
 }
 
 fn sh(engine: &CloudHypervisor, name: &str, root: bool, script: &str) -> String {
-    let out = engine.run_in(name, root, &["sh".into(), "-c".into(), script.into()], &[], b"").unwrap_or_else(|e| panic!("{script}: {e:#}"));
+    let out = engine.run_in(name, root, &["sh".into(), "-c".into(), script.into()], &[], b"", RUN_LIMIT).unwrap_or_else(|e| panic!("{script}: {e:#}"));
     String::from_utf8_lossy(&out).into_owned()
 }
 
@@ -68,13 +81,12 @@ fn new_disk(path: &Path) {
 fn a_box_boots_runs_as_the_agent_and_as_root_and_keeps_its_disk_across_a_stop() {
     let var = |name: &str| env::var_os(name).map(PathBuf::from);
     let (Some(program), Some(kernel), Some(images)) = (var("HALTI_KVM_PROGRAM"), var("HALTI_KVM_KERNEL"), var("HALTI_KVM_IMAGES")) else {
-        eprintln!("HALTI_KVM_PROGRAM, HALTI_KVM_KERNEL or HALTI_KVM_IMAGES isn't set: skipping");
-        return;
+        panic!("HALTI_KVM_PROGRAM, HALTI_KVM_KERNEL and HALTI_KVM_IMAGES must be set: see the top of this file");
     };
     let dir = PathBuf::from(format!("/tmp/hk-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("open")).unwrap();
-    let engine = CloudHypervisor { program, kernel, images, kvm: "/dev/kvm".into(), sockets: dir.join("ws") };
+    let engine = CloudHypervisor { program, kernel, images, kvm: "/dev/kvm".into(), sockets: dir.join("ws"), waits: Waits::REAL };
     engine.available().unwrap();
     let image = engine.image_digest(names::AGENT_IMAGE).unwrap();
     println!("image: {image}");
@@ -134,8 +146,10 @@ fn a_box_boots_runs_as_the_agent_and_as_root_and_keeps_its_disk_across_a_stop() 
     // an agent's command through exec gives its exit code, with its variables
     let status = engine.exec(&name, &[("A".into(), "b".into())], &["sh".into(), "-c".into(), "[ \"$A\" = b ] && exit 3".into()], false).unwrap();
     assert_eq!(status.code(), Some(3));
-    // bytes in and bytes out
+    // bytes in and bytes out, also more than the sockets hold, which cat echoes as it reads
     assert_eq!(engine.pipe(&name, &["cat".into()], b"through the box").unwrap(), b"through the box");
+    let large: Vec<u8> = (0..4 << 20).map(|i: u32| (i % 251) as u8).collect();
+    assert!(engine.pipe(&name, &["cat".into()], &large).unwrap() == large, "4 MiB through cat");
 
     // What the shim set up: the box's folders from its disk, the agent's, and no network but lo.
     let mounts = sh(&engine, &name, false, "for d in /home/agent /work /downloads; do stat -c '%n %u' $d; done; ls /sys/class/net");
@@ -154,9 +168,11 @@ fn a_box_boots_runs_as_the_agent_and_as_root_and_keeps_its_disk_across_a_stop() 
     assert!(logged.contains("nowhere.example.com"), "{logged}");
 
     // A program in the box that dials the exec service itself, at every id it could reach it by,
-    // asking to run a command as root: the shim serves only the server, so nothing runs.
+    // asking to run a command as root. On this kernel none of these dials connects, so the shim's
+    // own check of its peer is not reached here (box/shim tests it with a made-up peer).
     let dials = sh(&engine, &name, false, &format!("python3 -c '{INSIDE_DIAL}'; test -e /tmp/inside-ran && echo ran || echo nothing ran"));
     println!("dials from inside the box to the exec port: {}", dials.trim().replace('\n', " | "));
+    assert!(!dials.contains(": connected"), "{dials}");
     assert!(dials.ends_with("nothing ran\n"), "{dials}");
 
     // A write to the box's disk, with no sync of its own: the stop must keep it.
@@ -167,9 +183,12 @@ fn a_box_boots_runs_as_the_agent_and_as_root_and_keeps_its_disk_across_a_stop() 
     println!("stopped in {} ms", took.as_millis());
     assert!(!engine.running(&name));
     let printed = String::from_utf8_lossy(&fs::read(&console).unwrap_or_default()).into_owned();
-    assert!(took < STOP_WAIT, "the box powered off when asked from inside, with no need for the VM program's stop or a kill: {}", console_tail(&console));
+    assert!(took < engine.waits.stop, "the box powered off when asked from inside, with no need for the VM program's stop or a kill: {}", console_tail(&console));
     assert!(printed.contains("reboot: Power down"), "the shim powered the VM off: {}", console_tail(&console));
     assert_eq!(fs::read_dir(&paths.dir).unwrap().count(), 0, "no socket is left");
+
+    // A program's listener beside the VM's socket, for the box to dial the server's port 9.
+    let left = std::os::unix::net::UnixListener::bind(paths.dir.join("vsock.sock_9")).unwrap();
 
     // Boot again on the same disk: the write is there.
     engine.run(&spec).unwrap_or_else(|e| panic!("{e:#}\nconsole: {}", console_tail(&console)));
@@ -178,6 +197,33 @@ fn a_box_boots_runs_as_the_agent_and_as_root_and_keeps_its_disk_across_a_stop() 
     assert_eq!(kept, "kept\nkept\n");
     // and the door, which went on dialing, reaches the new VM
     assert_eq!(sh(&engine, &name, false, refused), "403");
+
+    // The start removed the listener's file, so the box's dial to port 9 finds nothing; a file
+    // made after the start, for port 10, shows that such a dial would connect.
+    assert!(!paths.dir.join("vsock.sock_9").exists(), "the start removed the listener's file");
+    let made = std::os::unix::net::UnixListener::bind(paths.dir.join("vsock.sock_10")).unwrap();
+    let dials = sh(&engine, &name, false, &format!("python3 -c '{SERVER_DIAL}'"));
+    println!("dials from inside the box to the server: {}", dials.trim().replace('\n', " | "));
+    let lines: Vec<&str> = dials.lines().collect();
+    assert!(lines[0].starts_with("port 9: not connected"), "{dials}");
+    assert_eq!(lines[1], "port 10: connected", "{dials}");
+    drop((left, made));
+    fs::remove_file(paths.dir.join("vsock.sock_10")).unwrap();
+
+    // As if another halti had started the VM and been killed: it is found by its command line,
+    // and stopped from inside.
+    let child = CHILDREN.lock().unwrap().remove(&name).expect("this halti's child");
+    let pid = child.id() as i32;
+    assert!(engine.running(&name), "found without this halti's child");
+    assert_eq!(engine.pid(&name, &paths), Some(pid));
+    let stopping = Instant::now();
+    engine.stop(&name).unwrap();
+    let took = stopping.elapsed();
+    println!("another halti's VM stopped in {} ms", took.as_millis());
+    assert!(took < engine.waits.stop, "it powered off when asked from inside: {}", console_tail(&console));
+    let mut child = child;
+    println!("the VM program ended: {}", child.wait().unwrap());
+    assert!(!engine.running(&name));
 
     drop(running);
     assert!(!engine.running(&name));
