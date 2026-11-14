@@ -17,9 +17,6 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-/// The most bytes a file is read with: far more than any file halti changes in a box holds.
-const MOST: u64 = 64 << 20;
-
 /// What a name in a folder is, a link not followed.
 #[derive(PartialEq, Eq, Debug)]
 enum Kind {
@@ -52,11 +49,9 @@ pub fn read(root: &Path, rel: &Path) -> Result<Option<Vec<u8>>> {
     if !file.metadata().with_context(|| format!("reading {}", at.display()))?.is_file() {
         return Ok(None);
     }
+    // Read whole, however large: Claude Code keeps its history of projects in ~/.claude.json.
     let mut bytes = Vec::new();
-    file.take(MOST + 1).read_to_end(&mut bytes).with_context(|| format!("reading {}", at.display()))?;
-    if bytes.len() as u64 > MOST {
-        bail!("{} is larger than 64 MiB", at.display());
-    }
+    (&file).read_to_end(&mut bytes).with_context(|| format!("reading {}", at.display()))?;
     Ok(Some(bytes))
 }
 

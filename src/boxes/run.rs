@@ -566,11 +566,12 @@ fn prepare_home(mnt: &Path, docker: bool) -> Result<Vec<PathBuf>> {
     Ok(replaced)
 }
 
-/// Changes the JSON object in the file `rel` of the store `mnt`; one that isn't there or can't be
-/// read is made anew.
+/// Changes the JSON object in the file `rel` of the store `mnt`; one that isn't there, isn't a plain
+/// file or holds no JSON object is made anew. One that can't be read is left alone, and the start
+/// fails.
 fn merge_json(mnt: &Path, rel: &str, change: impl FnOnce(&mut Map<String, Value>)) -> Result<Vec<PathBuf>> {
     let rel = Path::new(rel);
-    let found = nofollow::read(mnt, rel).ok().flatten();
+    let found = nofollow::read(mnt, rel)?;
     let mut value = found.and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}));
     change(value.as_object_mut().expect("an object"));
     nofollow::write(mnt, rel, (serde_json::to_string_pretty(&value)? + "\n").as_bytes())
@@ -1514,6 +1515,32 @@ mod tests {
         assert!(prepare_home(&dir.0, true).unwrap().is_empty());
         let docker: Value = serde_json::from_str(&fs::read_to_string(home.join(".docker/config.json")).unwrap()).unwrap();
         assert_eq!((docker["auths"]["x"].clone(), docker["proxies"]["default"]["noProxy"].clone()), (json!({}), json!("localhost,127.0.0.1")));
+
+        // However large: Claude Code keeps its history of projects in this file.
+        let projects = "x".repeat(65 << 20);
+        fs::write(home.join(".claude.json"), format!(r#"{{"projects":"{projects}"}}"#)).unwrap();
+        assert!(prepare_home(&dir.0, false).unwrap().is_empty());
+        let claude: Value = serde_json::from_slice(&fs::read(home.join(".claude.json")).unwrap()).unwrap();
+        assert!(claude["projects"] == json!(projects), "a large file is kept");
+        assert_eq!(claude["mcpServers"][names::MCP_SERVER_KEY]["command"], json!(names::SHIM));
+    }
+
+    #[test]
+    fn a_settings_file_that_cant_be_read_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads it anyway
+        }
+        let dir = TempDir::new("halti-home").unwrap();
+        let file = dir.0.join("home/.claude.json");
+        fs::create_dir_all(dir.0.join("home")).unwrap();
+        fs::write(&file, r#"{"mine":1}"#).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o200)).unwrap();
+        let error = format!("{:#}", prepare_home(&dir.0, false).unwrap_err());
+        assert!(error.contains("reading home/.claude.json"), "{error}");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), r#"{"mine":1}"#);
     }
 
     #[test]
