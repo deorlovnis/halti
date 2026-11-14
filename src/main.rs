@@ -185,7 +185,8 @@ enum Cmd {
         #[command(subcommand)]
         action: WsCmd,
     },
-    /// Check a workspace's passphrase and files (workspaces can't stay open yet)
+    /// Open a workspace and keep it open in this terminal: its boxes start without a question until it is closed (asks as halti config says for open)
+    #[command(after_help = "Close it with Ctrl-C, by closing the terminal, or from another terminal with: halti close NAME")]
     Open {
         /// The workspace; may be left out when there is only one
         name: Option<String>,
@@ -193,7 +194,7 @@ enum Cmd {
         #[arg(long = "type")]
         type_it: bool,
     },
-    /// Close a workspace (workspaces can't stay open yet, so there is nothing to close)
+    /// Close a workspace that is open in another terminal: its boxes are stopped and its keys wiped (asks nothing)
     Close {
         /// The workspace; may be left out when there is only one
         name: Option<String>,
@@ -903,8 +904,8 @@ fn cmd_run(resources: Vec<String>, command: Vec<String>) -> Result<u8> {
 /// Where a command finds and keeps secrets. Workspaces, the settings and how halti was built reach
 /// only the machine's own items, so they choose no place here: a lookup there fails instead of
 /// reading the Keychain. `ws run` chooses its workspace itself, once it is opened, when it starts a
-/// box; no other workspace command chooses one. Every other command keeps its secrets in the
-/// Keychain.
+/// box, and `open` once it is opened, to keep it open; no other workspace command chooses one.
+/// Every other command keeps its secrets in the Keychain.
 fn source_for(cmd: &Cmd) -> Option<source::Source> {
     match cmd {
         Cmd::Ws { .. } | Cmd::Open { .. } | Cmd::Close { .. } | Cmd::Config { .. } | Cmd::BuildInfo => None,
@@ -1018,8 +1019,14 @@ fn main() -> ExitCode {
             WsCmd::Stop { target } => ws::boxes::stop(&target),
             WsCmd::Run { .. } => unreachable!("ws run returns its command's exit code, above"),
         }),
-        Cmd::Open { name, type_it } => ok(ws::open(name.as_deref(), type_it)),
-        Cmd::Close { name } => ok(ws::close(name.as_deref())),
+        Cmd::Open { name, type_it } => match ws::keep::open(name.as_deref(), type_it) {
+            Ok(opened) => {
+                source::choose(*opened.source).expect("open chose where secrets are kept once");
+                boxes::keep::serve(*opened.keep)
+            }
+            Err(e) => Err(e),
+        },
+        Cmd::Close { name } => ok(ws::keep::close(name.as_deref())),
         Cmd::BuildInfo => {
             cmd_build_info();
             Ok(0)

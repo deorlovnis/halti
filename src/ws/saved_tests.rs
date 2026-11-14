@@ -14,7 +14,8 @@ use crate::util::{TempDir, sha256_hex};
 
 const ACME: &str = "acme passphrase one";
 const GLOBEX: &str = "globex passphrase one";
-const OPENED: [&str; 2] = ["passphrase correct", "workspaces can't stay open yet, so acme was closed again"];
+/// What an open says once the passphrase opened it, where nothing is said of the saved copy.
+const OPENED: [&str; 0] = [];
 const DEBUG: &str = "debug build: this workspace opens only with a debug build";
 
 /// Saved passphrases in memory, with how often one was read. `broken`: none can be added or removed,
@@ -93,6 +94,11 @@ fn way<'a>(world: &'a Fake, copies: &'a Memory, means: Option<Means>) -> Way<'a>
     Way { world, copies, means, detail: None }
 }
 
+/// What `open_with` says, its reader dropped.
+fn opened(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
+    open_with(here, name, way, typing).map(|(_, said)| said)
+}
+
 fn out(said: &Said) -> Vec<&str> {
     said.out.iter().map(String::as_str).collect()
 }
@@ -132,7 +138,7 @@ fn the_saved_copy_is_released_after_the_approval_each_means_asks_for() {
     for (means, calls) in [(Means::Sudo, asked("sudo")), (Means::TouchId, asked("touch id")), (Means::None, Vec::new())] {
         let world = Fake::answering(true, true);
         // Any question would be answered wrong: it opens only from the copy.
-        let said = open_with(&f.here, &name("acme"), &way(&world, &copies, Some(means)), &typing("not the passphrase")).unwrap();
+        let said = opened(&f.here, &name("acme"), &way(&world, &copies, Some(means)), &typing("not the passphrase")).unwrap();
         assert_eq!((out(&said), said.notes.len()), (OPENED.to_vec(), 0), "{means:?}");
         assert_eq!(world.calls(), calls, "{means:?}");
     }
@@ -146,7 +152,7 @@ fn a_declined_approval_releases_nothing_and_says_how_to_type_it() {
     let (acme, _) = make(&f.here, "acme", ACME, true, &copies);
     for means in [Means::Sudo, Means::TouchId] {
         let world = Fake::answering(false, false);
-        let error = open_with(&f.here, &name("acme"), &way(&world, &copies, Some(means)), &typing(ACME)).unwrap_err();
+        let error = opened(&f.here, &name("acme"), &way(&world, &copies, Some(means)), &typing(ACME)).unwrap_err();
         assert_eq!(error.to_string(), "acme was not opened. to type the passphrase instead: halti open acme --type", "{means:?}");
         let error = delete_with(&f.here, &name("acme"), &way(&world, &copies, Some(means)), &typing(ACME)).unwrap_err();
         assert_eq!(error.to_string(), "acme was not deleted. to type the passphrase instead: halti ws delete acme --type", "{means:?}");
@@ -155,7 +161,7 @@ fn a_declined_approval_releases_nothing_and_says_how_to_type_it() {
     assert_eq!(copies.reads.get(), 0, "the copy was never read");
     // The workspace and its copy are as they were.
     assert_eq!(copies.copy(acme).as_deref(), Some(ACME));
-    let said = open_with(&f.here, &name("acme"), &way(&Fake::answering(true, true), &copies, None), &typing(ACME)).unwrap();
+    let said = opened(&f.here, &name("acme"), &way(&Fake::answering(true, true), &copies, None), &typing(ACME)).unwrap();
     assert_eq!(out(&said), OPENED);
 }
 
@@ -167,10 +173,10 @@ fn a_typed_passphrase_never_reads_the_copy_or_asks_for_an_approval() {
     let (acme, _) = make(&f.here, "acme", ACME, true, &copies);
     copies.put(acme, "a copy never read");
     let world = Fake::answering(true, true);
-    let said = open_with(&f.here, &name("acme"), &way(&world, &copies, None), &typing(ACME)).unwrap();
+    let said = opened(&f.here, &name("acme"), &way(&world, &copies, None), &typing(ACME)).unwrap();
     assert_eq!(out(&said), OPENED);
     // A wrong one typed is refused as ever.
-    let error = open_with(&f.here, &name("acme"), &way(&world, &copies, None), &typing("acme passphrase two")).unwrap_err();
+    let error = opened(&f.here, &name("acme"), &way(&world, &copies, None), &typing("acme passphrase two")).unwrap_err();
     assert_eq!(error.downcast_ref::<Refusal>(), Some(&Refusal::Unreadable));
     assert!(world.calls().is_empty() && copies.reads.get() == 0);
     assert_eq!(copies.copy(acme).as_deref(), Some("a copy never read"), "left as it is");
@@ -183,7 +189,7 @@ fn a_missing_stale_or_swapped_copy_is_typed_once_and_saved_again() {
     let (acme, _) = make(&f.here, "acme", ACME, true, &copies);
     let (globex, _) = make(&f.here, "globex", GLOBEX, true, &copies);
     let swapped = copies.copy(globex).unwrap();
-    let again = ["passphrase correct", "saved the passphrase of acme in the keychain again", "workspaces can't stay open yet, so acme was closed again"];
+    let again = ["saved the passphrase of acme in the keychain again"];
     // Another passphrase, one too short to be any, globex's own, and none.
     for copy in [Some("acme passphrase two"), Some("short"), Some(swapped.as_str()), None] {
         match copy {
@@ -191,7 +197,7 @@ fn a_missing_stale_or_swapped_copy_is_typed_once_and_saved_again() {
             None => assert!(copies.remove(acme)),
         }
         let world = Fake::answering(true, true);
-        let said = open_with(&f.here, &name("acme"), &way(&world, &copies, Some(Means::TouchId)), &typing(ACME)).unwrap();
+        let said = opened(&f.here, &name("acme"), &way(&world, &copies, Some(Means::TouchId)), &typing(ACME)).unwrap();
         assert_eq!(out(&said), again, "{copy:?}");
         assert_eq!(copies.copy(acme).as_deref(), Some(ACME), "{copy:?}");
         // The approval is asked only where there was a copy to release.
@@ -199,12 +205,12 @@ fn a_missing_stale_or_swapped_copy_is_typed_once_and_saved_again() {
     }
     assert_eq!(copies.copy(globex).as_deref(), Some(GLOBEX), "globex's own copy is untouched");
     // The copy saved again opens it, with nothing typed.
-    let said = open_with(&f.here, &name("acme"), &way(&Fake::answering(true, true), &copies, Some(Means::TouchId)), &typing("not the passphrase")).unwrap();
+    let said = opened(&f.here, &name("acme"), &way(&Fake::answering(true, true), &copies, Some(Means::TouchId)), &typing("not the passphrase")).unwrap();
     assert_eq!(out(&said), OPENED);
     // One that can't be saved again: typed now, and said so.
     assert!(copies.remove(acme));
     copies.broken.set(true);
-    let said = open_with(&f.here, &name("acme"), &way(&Fake::answering(true, true), &copies, Some(Means::TouchId)), &typing(ACME)).unwrap();
+    let said = opened(&f.here, &name("acme"), &way(&Fake::answering(true, true), &copies, Some(Means::TouchId)), &typing(ACME)).unwrap();
     assert_eq!(out(&said), OPENED);
     assert_eq!(said.notes, ["the passphrase of acme was not saved in the keychain. it is typed the next time acme is opened"]);
 }
@@ -214,21 +220,21 @@ fn a_workspace_made_to_be_typed_never_opens_from_a_copy() {
     let f = folder("halti-saved-made-typed");
     let copies = Memory::default();
     let (acme, _) = make(&f.here, "acme", ACME, false, &copies);
-    let each_time = ["passphrase correct", "acme was made without a saved passphrase, so it is typed each time", "workspaces can't stay open yet, so acme was closed again"];
+    let each_time = ["acme was made without a saved passphrase, so it is typed each time"];
     // No copy: typed, and none is saved for it.
     let world = Fake::answering(true, true);
-    let said = open_with(&f.here, &name("acme"), &way(&world, &copies, Some(Means::TouchId)), &typing(ACME)).unwrap();
+    let said = opened(&f.here, &name("acme"), &way(&world, &copies, Some(Means::TouchId)), &typing(ACME)).unwrap();
     assert_eq!(out(&said), each_time);
     assert!(!copies.exists(acme) && world.calls().is_empty());
     // The right passphrase planted as its copy: core refuses to open it from there, it is typed instead, and the copy goes.
     copies.put(acme, ACME);
-    let said = open_with(&f.here, &name("acme"), &way(&world, &copies, Some(Means::TouchId)), &typing(ACME)).unwrap();
+    let said = opened(&f.here, &name("acme"), &way(&world, &copies, Some(Means::TouchId)), &typing(ACME)).unwrap();
     assert_eq!(out(&said), each_time);
     assert!(!copies.exists(acme));
     assert_eq!(world.calls().len(), 1);
     // And typed wrong after it, nothing opens.
     copies.put(acme, ACME);
-    let error = open_with(&f.here, &name("acme"), &way(&world, &copies, Some(Means::TouchId)), &typing("acme passphrase two")).unwrap_err();
+    let error = opened(&f.here, &name("acme"), &way(&world, &copies, Some(Means::TouchId)), &typing("acme passphrase two")).unwrap_err();
     assert_eq!(error.downcast_ref::<Refusal>(), Some(&Refusal::Unreadable));
 }
 
@@ -243,7 +249,7 @@ fn a_changed_workspace_is_refused_as_it_is_and_nothing_is_asked_or_typed() {
     fs::write(wrap, bytes).unwrap();
     let world = Fake::answering(true, true);
     let never = || -> TtyPassphrase { panic!("nothing is typed") };
-    let error = open_with(&f.here, &name("acme"), &way(&world, &copies, Some(Means::TouchId)), &never).unwrap_err();
+    let error = opened(&f.here, &name("acme"), &way(&world, &copies, Some(Means::TouchId)), &never).unwrap_err();
     assert_eq!(error.downcast_ref::<Refusal>(), Some(&Refusal::Unreadable));
     let error = delete_with(&f.here, &name("acme"), &way(&world, &copies, Some(Means::TouchId)), &never).unwrap_err();
     assert!(error.to_string().starts_with("nothing was deleted") && error.downcast_ref::<Refusal>() == Some(&Refusal::Unreadable), "{error:#}");
@@ -387,7 +393,7 @@ fn the_approve_window_names_the_policies() {
     assert_eq!(world.calls(), [format!("sudo: [DEV, not protected] approve policies zoom {zoom} in workspace acme")]);
     // Any other change says only core's words, whatever detail the way was given.
     let named = Way { world: &world, copies: &copies, means: Some(Means::TouchId), detail: Some(format!("github {github}")) };
-    assert_eq!(out(&open_with(&f.here, &name("acme"), &named, &typing("not the passphrase")).unwrap()), OPENED);
+    assert_eq!(out(&opened(&f.here, &name("acme"), &named, &typing("not the passphrase")).unwrap()), OPENED);
     assert_eq!(world.calls(), ["touch id: [DEV, not protected] open workspace acme"]);
     // Typed, nothing but the passphrase is asked.
     let said = policies::approve_with(&f.here, &name("acme"), None, &way(&world, &copies, None), &typing(ACME)).unwrap();

@@ -84,14 +84,25 @@ halti ws policy edit acme/github           # github's policy in acme, in $EDITOR
 halti ws policy approve acme               # every policy in acme, shown against what was approved (or acme/github)
 halti ws policy show acme                  # which are approved (asks as for open); acme/github prints one
 halti ws ls                                # the workspaces (asks nothing)
-halti open acme                            # checks the passphrase and the files
-halti ws delete acme                       # the workspace and everything in it (not while one of its boxes has a store)
+halti open acme                            # asks once, then keeps acme open in this terminal until Ctrl-C
+halti close acme                           # from another terminal: stops acme's boxes and wipes its keys (asks nothing)
+halti ws delete acme                       # the workspace and everything in it (not while it is open, or one of its boxes has a store)
 ```
 
 - Each command asks for one approval, as `[workspace.approval]` says (see Settings), and if a saved passphrase can't be read, has you type it once more; `--type` has you type the passphrase whatever it says. The value is read only after that, and never shown, logged or taken from an argument.
 - A value is text of 1 to 65536 bytes with no control characters but tab and line feed; binary goes in as base64. From a pipe, one trailing line break is dropped and nothing else. Typed, a value is one line, and the tab and escape keys type nothing; pipe in a value that has a line break or a tab.
 - Values are kept as `[secrets] store` says: files, one per secret, sealed and named by 64 hex characters, beside a sealed list of what is stored. `halti ws ls acme` says if a secret's file is missing or isn't the one the list names, and how to set it again.
 - **Limit:** older copies of a workspace's files, put back together with its pin file, read as they were, older secrets included.
+
+### An open workspace
+
+`halti open acme` asks as `[workspace.approval] open` says, says `acme is open in this terminal`, and stays: that process holds acme's keys until Ctrl-C, a closed terminal or `halti close acme` from another terminal closes it. The terminal says each time a box starts or stops, and why one wasn't started.
+
+- One terminal keeps a workspace open: a second `halti open acme`, and `halti ws delete acme`, are refused before anything is asked. `halti ws ls` shows `open` for a workspace that answers its socket within a second.
+- It listens on a socket only you can reach, `/tmp/halti-<uid>/ws/TAG.keep.sock`, which no box sees. Each line on it is a request or an answer of names only (a workspace, a box, a site, a count): no passphrase, key, value, policy or path crosses it. A box started through it asks nothing, after the same checks as `halti ws run`, and stops when the last connection that started or joined it ends. `halti ws run` still opens the workspace in its own terminal and asks, and joins a box that runs.
+- Closing stops every box in order, waits for one that is still starting, stops acme's boxes that other terminals run with `halti ws run` (they hold acme's keys too), wipes the keys, and only then says `closed acme`; `halti close` waits until the open workspace has let go before it says so. If a box another terminal runs doesn't let go, it says that box still runs instead, and exits 1. A box start that arrives while it closes is refused.
+- What a `halti open` or a run that was killed left behind (a VM, a mounted store) is put away by the next `halti open acme` or `halti close acme`, which say so.
+- Its settings are the ones read when it opened. Secrets set and policies approved in another terminal count at its next lookup, and if its files go back to an older state it refuses every secret and says so once. Core dumps are off, and the pages that hold its keys are locked out of swap.
 
 ### Policies in a workspace
 
@@ -124,7 +135,7 @@ halti ws box rm acme/dev            # its key, then its store; its policy file s
 - `model` names the workspace's own resource: store a long-lived token for it (`claude setup-token`, then `halti ws set acme/anthropic token`). Refresh doesn't run in a workspace yet.
 - A workspace's box mounts only folders in your home that aren't hidden (no `~/.ssh`, `~/.claude`, `~/.config`) and aren't in `~/Library`, nor the home folder itself, as written and as their real path: copy anything else into such a folder first. A folder of another client's in your home is yours to approve or not: halti can't tell whose it is.
 - A write a site's `[fetch]` or `[browse]` policy says to ask about is asked with Touch ID, whatever the settings, and the question names the box (`box acme/dev: ...`).
-- Its VMs are `halti-wsbox-TAG-NAME` and `halti-wsbrowser-TAG-NAME`, TAG the first 12 characters of the workspace's id, so they never meet halti's other boxes, cred's, or another workspace's. `halti ws delete acme` refuses while a box of acme's has a store or runs, and otherwise removes the boxes folder with the workspace.
+- Its VMs are `halti-wsbox-TAG-NAME` and `halti-wsbrowser-TAG-NAME`, TAG the first 12 characters of the workspace's id, so they never meet halti's other boxes, cred's, or another workspace's. `halti ws delete acme` refuses while acme is open or a box of acme's has a store or runs, and otherwise removes the boxes folder with the workspace.
 - There is no `ws box login`, `export` or `import` yet. To move a client's box here by hand: export its work into a plain folder in your home, run `halti ws box new acme/NAME`, and in the editor put its box policy in place of the template, with a `[[mount]]` of that folder (mode `clone`, which copies it in at the first run). Remove the folder after.
 
 ## Settings

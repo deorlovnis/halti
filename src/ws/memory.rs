@@ -35,6 +35,19 @@ pub fn release() {
     unsafe { libc::munlockall() };
 }
 
+/// Locks the pages that hold `len` bytes at `at` in memory, so they never reach swap: the keys of a
+/// workspace that stays open. On a Mac `mlockall` doesn't exist, and this is what keeps them out;
+/// a page or two, well within any limit. False if the system refused.
+pub fn lock_pages(at: *const u8, len: usize) -> bool {
+    let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+        size if size > 0 => size as usize,
+        _ => return false,
+    };
+    let start = at as usize / page * page;
+    let end = (at as usize + len).div_ceil(page) * page;
+    unsafe { libc::mlock(start as *const libc::c_void, end - start) == 0 }
+}
+
 /// Whether a locked-memory limit leaves room for what a passphrase command allocates.
 fn room_for_argon2(limit: libc::rlim_t) -> bool {
     limit == libc::RLIM_INFINITY || limit >= ROOM
@@ -46,6 +59,13 @@ mod tests {
 
     // `harden` itself runs only in the commands' own processes (tests/e2e.rs): in this one it
     // would lock the memory of every test.
+
+    #[test]
+    fn the_pages_of_a_value_can_be_locked() {
+        let keys = Box::new([7u8; 96]);
+        assert!(lock_pages(keys.as_ptr(), keys.len()));
+        assert!(lock_pages(keys.as_ptr(), 1), "one byte locks its page");
+    }
 
     #[test]
     fn memory_is_locked_only_where_the_limit_leaves_room_for_argon2() {

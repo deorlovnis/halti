@@ -14,10 +14,12 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
 use serde_json::{Value, json};
@@ -1194,9 +1196,9 @@ fn a_workspace_is_made_listed_opened_closed_and_deleted_with_one_passphrase_each
     let labels = ws(&env, PASSPHRASE, &["ws", "ls", "--labels"]);
     assert!(!labels.status.success() && stdout(&labels).is_empty(), "{}", stderr(&labels));
     for args in [&["open", "acme"][..], &["open"]] {
-        let opened = ws(&env, PASSPHRASE, args);
+        let opened = open_then_close(&env, env.command().env("HALTI_TEST_PASSPHRASE", PASSPHRASE).args(args), "acme");
         let said = stdout(&opened);
-        assert!(opened.status.success() && said == "passphrase correct\nworkspaces can't stay open yet, so acme was closed again\n", "{said}{}", stderr(&opened));
+        assert!(opened.status.success() && said == format!("{}closed acme\n", is_open("acme")), "{said}{}", stderr(&opened));
         assert_eq!((prompted(&opened), asked(&opened)), (1, 1), "{args:?}");
         assert!(stderr(&opened).contains("halti: [test] asked: passphrase for workspace acme: \n"), "{}", stderr(&opened));
     }
@@ -1284,6 +1286,376 @@ fn names_are_checked_never_swapped_and_an_unfinished_workspace_is_cleared() {
     let said = stdout(&cleared);
     assert!(said == "removed workspace globex. it was never fully created, so no passphrase was asked\n" && prompted(&cleared) == 0, "{said}");
     assert!(!dir.join("dir/globex").exists() && !dir.join(&id).exists());
+}
+
+// --- an open workspace ---
+
+/// The line `halti open NAME` says once NAME is open, and stays.
+fn is_open(name: &str) -> String {
+    format!("{name} is open in this terminal. close it with Ctrl-C, or from another terminal: halti close {name}\n")
+}
+
+/// A `halti open` that stays: what it says as it says it, until it ends.
+struct Open {
+    child: Option<Child>,
+    out: Arc<Mutex<String>>,
+    err: Arc<Mutex<String>>,
+    readers: Vec<thread::JoinHandle<()>>,
+}
+
+/// Copies `from` into `to` until it ends.
+fn pipe(mut from: impl Read + Send + 'static, to: Arc<Mutex<String>>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = from.read(&mut buf) {
+            to.lock().unwrap().push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    })
+}
+
+impl Open {
+    /// Starts `command`, a `halti open`, and waits until it says the workspace is open, or ends.
+    fn start(command: &mut Command) -> Open {
+        let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let (out, err) = (Arc::<Mutex<String>>::default(), Arc::<Mutex<String>>::default());
+        let readers = vec![pipe(child.stdout.take().unwrap(), out.clone()), pipe(child.stderr.take().unwrap(), err.clone())];
+        let mut open = Open { child: Some(child), out, err, readers };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !open.is_open() && open.child.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "halti open never said it was open: {}", open.err.lock().unwrap());
+            thread::sleep(Duration::from_millis(20));
+        }
+        open
+    }
+
+    fn is_open(&self) -> bool {
+        self.out.lock().unwrap().contains(" is open in this terminal.")
+    }
+
+    fn pid(&self) -> i32 {
+        self.child.as_ref().unwrap().id() as i32
+    }
+
+    /// Waits until it ends: what it said.
+    fn wait(mut self) -> Output {
+        let status = self.child.take().unwrap().wait().unwrap();
+        for reader in self.readers.drain(..) {
+            reader.join().unwrap();
+        }
+        Output { status, stdout: self.out.lock().unwrap().clone().into_bytes(), stderr: self.err.lock().unwrap().clone().into_bytes() }
+    }
+}
+
+impl Drop for Open {
+    /// A test that fails leaves nothing running.
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// `command`, a `halti open`, kept open until it says so and closed from another terminal with
+/// `halti close NAME`: what it said. One that never opens ends by itself.
+fn open_then_close(env: &Env, command: &mut Command, name: &str) -> Output {
+    let open = Open::start(command);
+    if open.is_open() {
+        let closed = env.halti(&["close", name]);
+        assert!(closed.status.success() && stdout(&closed).starts_with(&format!("closed {name}")), "{}", stderr(&closed));
+    }
+    open.wait()
+}
+
+/// Where the open workspace `name` listens: in the debug build's sockets folder, by its tag.
+fn keeper_socket(env: &Env, name: &str) -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/halti-dev-{uid}/ws/{}.keep.sock", &ws_id(env, name)[..12]))
+}
+
+/// One line to an open workspace's socket, and the line it answers.
+fn talk(socket: &Path, line: &str) -> Option<String> {
+    let mut stream = UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(60))).ok()?;
+    stream.write_all(line.as_bytes()).ok()?;
+    let mut answer = String::new();
+    BufReader::new(stream).read_line(&mut answer).ok()?;
+    Some(answer)
+}
+
+/// Sends `signal` to a process.
+fn signal(pid: i32, signal: i32) {
+    assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+}
+
+#[test]
+fn open_stays_until_close_and_a_second_open_is_refused_before_asking() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    // A workspace that never had a box has no boxes folder: one is made for the lock.
+    assert!(!wsdir(&env, "acme").join("boxes").exists());
+    let open = Open::start(env.ws_box_command(PASSPHRASE, "true").args(["open", "acme"]));
+    assert!(open.is_open(), "{}", open.err.lock().unwrap());
+    // A second open, and a delete, are refused before anything is asked.
+    let again = env.ws_box(PASSPHRASE, "true", &["open", "acme"]);
+    assert!(!again.status.success() && asked(&again) == 0, "{}", stderr(&again));
+    assert_eq!(stderr(&again), "halti: acme is open already, in another terminal. close it with: halti close acme\n");
+    let delete = env.ws_box(PASSPHRASE, "true", &["ws", "delete", "acme"]);
+    assert!(!delete.status.success() && asked(&delete) == 0, "{}", stderr(&delete));
+    assert_eq!(stderr(&delete), "halti: acme is open: close it first (halti close acme)\n");
+    // Listed as open, asking nothing.
+    let listed = stdout(&ws(&env, PASSPHRASE, &["ws", "ls"]));
+    assert!(listed.lines().any(|line| line.starts_with("acme ") && line.contains(" open ")), "{listed}");
+    // Closed from another terminal, which asks nothing.
+    let closed = env.ws_box(PASSPHRASE, "true", &["close", "acme"]);
+    assert!(closed.status.success() && stdout(&closed) == "closed acme\n" && prompted(&closed) == 0, "{}", stderr(&closed));
+    let opened = open.wait();
+    assert!(opened.status.success() && stdout(&opened) == format!("{}closed acme\n", is_open("acme")), "{}", stderr(&opened));
+    assert_eq!(asked(&opened), 1);
+    assert!(!keeper_socket(&env, "acme").exists(), "its socket is gone");
+    let listed = stdout(&ws(&env, PASSPHRASE, &["ws", "ls"]));
+    assert!(listed.lines().any(|line| line.starts_with("acme ") && line.contains(" closed ")), "{listed}");
+    assert_eq!(stdout(&env.ws_box(PASSPHRASE, "true", &["close", "acme"])), "acme isn't open\n");
+}
+
+#[test]
+fn sigint_and_sighup_close_it() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    for sig in [libc::SIGINT, libc::SIGHUP, libc::SIGTERM] {
+        let open = Open::start(env.ws_box_command(PASSPHRASE, "true").args(["open", "acme"]));
+        assert!(open.is_open(), "{sig}: {}", open.err.lock().unwrap());
+        signal(open.pid(), sig);
+        let opened = open.wait();
+        assert!(opened.status.success() && stdout(&opened) == format!("{}closed acme\n", is_open("acme")), "{sig}: {}", stderr(&opened));
+        assert!(!keeper_socket(&env, "acme").exists(), "{sig}: its socket is gone");
+    }
+    // Nothing is left: it opens again.
+    let opened = open_then_close(&env, env.ws_box_command(PASSPHRASE, "true").args(["open", "acme"]), "acme");
+    assert!(opened.status.success(), "{}", stderr(&opened));
+}
+
+#[test]
+fn a_killed_keeper_is_cleaned_up_by_the_next_open() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let open = Open::start(env.ws_box_command(PASSPHRASE, "true").args(["open", "acme"]));
+    assert!(open.is_open());
+    // Killed, as by kill -9: it left its socket, and what a box of it left behind.
+    signal(open.pid(), libc::SIGKILL);
+    assert!(!open.wait().status.success());
+    let socket = keeper_socket(&env, "acme");
+    assert!(socket.exists());
+    let boxes = wsdir(&env, "acme").join("boxes");
+    fs::create_dir_all(boxes.join("policies")).unwrap();
+    fs::write(boxes.join("policies/dev.toml"), box_text(false)).unwrap();
+    fs::write(boxes.join("open/dev.lock"), "").unwrap();
+    fs::create_dir_all(boxes.join("temp/dev.sparsebundle")).unwrap();
+    // Not open: a ping nobody answers lists it closed, and close puts away what was left, where
+    // there is an engine to stop its VMs.
+    let listed = stdout(&ws(&env, PASSPHRASE, &["ws", "ls"]));
+    assert!(listed.lines().any(|line| line.starts_with("acme ") && line.contains(" closed ")), "{listed}");
+    let (path, _calls) = env.fake_engine();
+    let closed = env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["close", "acme"]).output().unwrap();
+    let left = if cfg!(target_os = "macos") { "acme isn't open. put away what its last open left: dev\n" } else { "acme isn't open\n" };
+    assert!(closed.status.success() && stdout(&closed) == left, "{}{}", stdout(&closed), stderr(&closed));
+    assert_eq!(boxes.join("temp/dev.sparsebundle").exists(), cfg!(not(target_os = "macos")));
+    // The next open takes the socket's place, and says what it put away.
+    fs::create_dir_all(boxes.join("temp/dev.sparsebundle")).unwrap();
+    let opened = open_then_close(&env, env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["open", "acme"]), "acme");
+    let put_away = if cfg!(target_os = "macos") { "put away what the last open of acme left: dev\n" } else { "" };
+    assert!(opened.status.success() && stdout(&opened) == format!("{put_away}{}closed acme\n", is_open("acme")), "{}{}", stdout(&opened), stderr(&opened));
+}
+
+#[test]
+fn a_start_through_the_socket_says_why_it_was_refused() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    if cfg!(target_os = "macos") {
+        let out = env.ws_box(PASSPHRASE, &env.editor_writing(&box_text(false)), &["ws", "box", "new", "acme/dev"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    let (path, calls) = env.fake_engine();
+    let open = Open::start(env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["open", "acme"]));
+    assert!(open.is_open(), "{}", open.err.lock().unwrap());
+    let socket = keeper_socket(&env, "acme");
+    let start = |line: &str| talk(&socket, line).unwrap_or_default();
+    // Asked nothing, it starts the box as `ws run` would, and says only the kind of refusal: here
+    // the model, which acme has no policy for. Where there is no engine, it says that.
+    let refused = if cfg!(target_os = "macos") { "halti-keep/1 no site anthropic\n" } else { "halti-keep/1 no engine\n" };
+    assert_eq!(start("halti-keep/1 start acme dev\n"), refused);
+    // A box it hasn't, another workspace's name and another version say so, and do nothing.
+    if cfg!(target_os = "macos") {
+        assert_eq!(start("halti-keep/1 start acme web\n"), "halti-keep/1 no box\n");
+    }
+    assert_eq!(start("halti-keep/1 start globex dev\n"), "halti-keep/1 other\n");
+    assert_eq!(start("halti-keep/2 start acme dev\n"), "halti-keep/1 unsupported\n");
+    assert_eq!(start("halti-keep/1 ping acme\n"), "halti-keep/1 open 0\n");
+    let closed = env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["close", "acme"]).output().unwrap();
+    assert!(closed.status.success(), "{}", stderr(&closed));
+    let opened = open.wait();
+    // The reason in full is in the terminal where acme is open.
+    let why = if cfg!(target_os = "macos") {
+        "halti: box acme/dev was not started: box acme/dev uses anthropic: anthropic has no policy in acme. write one with: halti ws policy edit acme/anthropic\n"
+    } else {
+        "halti: box acme/dev was not started: boxes can't run on this system: halti has no box engine for it\n"
+    };
+    assert!(stderr(&opened).contains(why), "{}", stderr(&opened));
+    assert_eq!(asked(&opened), 1);
+    // Nothing was started: the engine was asked if it is ready and if the box's VMs run.
+    if cfg!(target_os = "macos") {
+        let tag = &ws_id(&env, "acme")[..12];
+        assert_eq!(fs::read_to_string(calls).unwrap(), format!("inspect halti-wsbox-{tag}-dev\ninspect halti-wsbrowser-{tag}-dev\nsystem status\n"));
+    }
+}
+
+/// Holds the open workspace `name`'s lock, as a program running as you can.
+fn hold_keeper_lock(env: &Env, name: &str) -> fs::File {
+    let boxes = wsdir(env, name).join("boxes");
+    fs::create_dir_all(&boxes).unwrap();
+    let lock = fs::File::create(boxes.join("keeper.lock")).unwrap();
+    lock.lock().unwrap();
+    lock
+}
+
+#[test]
+fn a_held_lock_nobody_answers_at_is_being_opened_and_listed_closed() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let lock = hold_keeper_lock(&env, "acme");
+    let closed = env.ws_box(PASSPHRASE, "true", &["close", "acme"]);
+    assert!(!closed.status.success() && asked(&closed) == 0, "{}", stderr(&closed));
+    assert_eq!(stderr(&closed), "halti: acme is being opened or closed: try again in a moment\n");
+    let listed = stdout(&ws(&env, PASSPHRASE, &["ws", "ls"]));
+    assert!(listed.lines().any(|line| line.starts_with("acme ") && line.contains(" closed ")), "{listed}");
+    let again = env.ws_box(PASSPHRASE, "true", &["open", "acme"]);
+    assert!(!again.status.success() && asked(&again) == 0 && stderr(&again).contains(" is open already"), "{}", stderr(&again));
+    drop(lock);
+}
+
+#[test]
+fn close_says_still_open_when_the_lock_stays_held() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let _lock = hold_keeper_lock(&env, "acme");
+    // A program at acme's socket that answers what it likes, and never lets go of the lock.
+    let socket = keeper_socket(&env, "acme");
+    fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let said = [
+        ("closed 0", "halti: acme is still open. close it in its own terminal with Ctrl-C\n"),
+        ("other", "halti: acme's record names another workspace, which is open. nothing was done\n"),
+    ];
+    for (answer, error) in said {
+        let _ = fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let liar = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            (&stream).write_all(format!("halti-keep/1 {answer}\n").as_bytes()).unwrap();
+            line
+        });
+        let closed = env.ws_box(PASSPHRASE, "true", &["close", "acme"]);
+        assert_eq!(liar.join().unwrap(), "halti-keep/1 close acme\n");
+        assert!(!closed.status.success() && stdout(&closed).is_empty(), "{answer}: {}", stdout(&closed));
+        assert_eq!(stderr(&closed), error);
+    }
+    let _ = fs::remove_file(&socket);
+}
+
+/// Holds box `box_name` of workspace `name` as the halti that runs it in another terminal does,
+/// with its VM up in `vms` (`engine_of_files`), and lets go once its VM is stopped.
+fn run_elsewhere(env: &Env, name: &str, box_name: &str, vms: &Path) -> thread::JoinHandle<()> {
+    let open = wsdir(env, name).join("boxes/open");
+    fs::create_dir_all(&open).unwrap();
+    let lock = fs::File::create(open.join(format!("{box_name}.lock"))).unwrap();
+    lock.lock().unwrap();
+    let vm = vms.join(format!("halti-wsbox-{}-{box_name}", &ws_id(env, name)[..12]));
+    fs::write(&vm, "").unwrap();
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while vm.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        drop(lock);
+    })
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "only a Mac has a box engine")]
+fn close_stops_the_boxes_other_terminals_run_and_counts_them() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let (path, vms) = env.engine_of_files();
+    let close = || env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["close", "acme"]).output().unwrap();
+    // Not open: a box another terminal runs is stopped, and named.
+    let elsewhere = run_elsewhere(&env, "acme", "dev", &vms);
+    let closed = close();
+    elsewhere.join().unwrap();
+    assert!(closed.status.success() && asked(&closed) == 0, "{}", stderr(&closed));
+    assert_eq!(stdout(&closed), "acme isn't open. stopped 1 box that another terminal ran: dev\n");
+    // Open: it is stopped as acme closes, and counted.
+    let open = Open::start(env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["open", "acme"]));
+    assert!(open.is_open(), "{}", open.err.lock().unwrap());
+    let elsewhere = run_elsewhere(&env, "acme", "dev", &vms);
+    let closed = close();
+    elsewhere.join().unwrap();
+    assert!(closed.status.success() && stdout(&closed) == "closed acme and stopped 1 box\n", "{}{}", stdout(&closed), stderr(&closed));
+    let opened = open.wait();
+    assert!(opened.status.success() && stdout(&opened) == format!("{}stopped box acme/dev\nclosed acme\n", is_open("acme")), "{}", stderr(&opened));
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "only a Mac has a box engine")]
+fn a_box_another_terminal_runs_that_holds_on_leaves_the_workspace_not_closed() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let (path, _vms) = env.engine_of_files();
+    let open = Open::start(env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["open", "acme"]));
+    assert!(open.is_open(), "{}", open.err.lock().unwrap());
+    // Another terminal holds dev, and never lets go: it holds acme's keys, so acme isn't closed.
+    let boxes = wsdir(&env, "acme").join("boxes/open");
+    let held = fs::File::create(boxes.join("dev.lock")).unwrap();
+    held.lock().unwrap();
+    let closed = env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["close", "acme"]).output().unwrap();
+    let still = "halti: box acme/dev still runs in another terminal. stop it with: halti ws stop acme/dev\n";
+    assert!(!closed.status.success() && stdout(&closed).is_empty(), "{}", stdout(&closed));
+    assert_eq!(stderr(&closed), still);
+    let opened = open.wait();
+    assert!(!opened.status.success() && stdout(&opened) == is_open("acme"), "{}", stdout(&opened));
+    assert!(stderr(&opened).ends_with(still), "{}", stderr(&opened));
+    drop(held);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "only a Mac has a box engine")]
+fn files_that_went_back_while_open_are_said_once_where_it_is_open() {
+    let env = Env::new();
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let pin = ws_dir(&env).join("pins").join(ws_id(&env, "acme"));
+    let before = fs::read(&pin).unwrap();
+    // Making a box seals its approval in acme: its files move on.
+    let made = env.ws_box(PASSPHRASE, &env.editor_writing(&box_text(false)), &["ws", "box", "new", "acme/dev"]);
+    assert!(made.status.success() && fs::read(&pin).unwrap() != before, "{}", stderr(&made));
+    let (path, _calls) = env.fake_engine();
+    let open = Open::start(env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["open", "acme"]));
+    assert!(open.is_open(), "{}", open.err.lock().unwrap());
+    // Put back as they were: the lookups of a start are refused, and that is said once.
+    fs::write(&pin, &before).unwrap();
+    let socket = keeper_socket(&env, "acme");
+    let said = "halti: acme's files went back to an older state. its boxes are refused every secret. close acme and check its files\n";
+    for _ in 0..2 {
+        assert!(talk(&socket, "halti-keep/1 start acme dev\n").is_some_and(|line| line.starts_with("halti-keep/1 no ")));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !open.err.lock().unwrap().contains(said) {
+            assert!(Instant::now() < deadline, "never said: {}", open.err.lock().unwrap());
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    thread::sleep(Duration::from_millis(500));
+    let closed = env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["close", "acme"]).output().unwrap();
+    assert!(closed.status.success(), "{}", stderr(&closed));
+    assert_eq!(stderr(&open.wait()).matches(said).count(), 1);
 }
 
 // --- a workspace's secrets ---
@@ -1645,7 +2017,7 @@ fn a_saved_passphrase_stores_lists_and_removes_with_nothing_typed() {
     assert!(out.status.success() && stdout(&out) == "stored linear/token in acme\n" && asked(&out) == 1, "{}", stderr(&out));
     assert!(stderr(&out).contains("\nthe saved passphrase of acme can't be read. type it once.\n"), "{}", stderr(&out));
     assert_eq!(fs::read_to_string(&copy).unwrap(), "acme passphrase two");
-    assert!(ws(&env, PASSPHRASE, &["open", "acme"]).status.success());
+    assert!(open_then_close(&env, env.command().env("HALTI_TEST_PASSPHRASE", PASSPHRASE).args(["open", "acme"]), "acme").status.success());
     assert_eq!(fs::read_to_string(&copy).unwrap(), PASSPHRASE);
 
     // Removed after sudo, nothing typed.
@@ -2451,10 +2823,10 @@ fn a_saved_passphrase_is_taken_from_the_keychain_after_the_approval_in_effect() 
     assert_eq!(stdout(&made), said);
     let copy = saved_copy(&env, "acme");
     assert_eq!(fs::read_to_string(&copy).unwrap(), PASSPHRASE);
-    let opened = "passphrase correct\nworkspaces can't stay open yet, so acme was closed again\n";
+    let opened = format!("{}closed acme\n", is_open("acme"));
 
     // Touch ID, then the copy: no passphrase is given, and none is asked for.
-    let open = |approve: &str| env.command().args(["open", "acme"]).env("HALTI_TEST_APPROVE", approve).output().unwrap();
+    let open = |approve: &str| open_then_close(&env, env.command().args(["open", "acme"]).env("HALTI_TEST_APPROVE", approve), "acme");
     let out = open("yes");
     assert!(out.status.success() && stdout(&out) == opened && keeps_quiet(&out, PASSPHRASE), "{}{}", stdout(&out), stderr(&out));
     assert_eq!(stderr(&out), "halti: [test] [DEV, not protected] open workspace acme: yes\n");
@@ -2463,7 +2835,7 @@ fn a_saved_passphrase_is_taken_from_the_keychain_after_the_approval_in_effect() 
     assert!(!out.status.success() && stdout(&out).is_empty(), "{}", stdout(&out));
     assert!(stderr(&out).ends_with("halti: acme was not opened. to type the passphrase instead: halti open acme --type\n"), "{}", stderr(&out));
     // With --type it is typed, and Touch ID isn't asked.
-    let out = env.command().args(["open", "acme", "--type"]).env("HALTI_TEST_APPROVE", "no").env("HALTI_TEST_PASSPHRASE", PASSPHRASE).output().unwrap();
+    let out = open_then_close(&env, env.command().args(["open", "acme", "--type"]).env("HALTI_TEST_APPROVE", "no").env("HALTI_TEST_PASSPHRASE", PASSPHRASE), "acme");
     assert!(out.status.success() && stdout(&out) == opened && asked(&out) == 1, "{}", stderr(&out));
     assert!(!stderr(&out).contains("open workspace acme: ") && keeps_quiet(&out, PASSPHRASE), "{}", stderr(&out));
 
@@ -2474,12 +2846,12 @@ fn a_saved_passphrase_is_taken_from_the_keychain_after_the_approval_in_effect() 
             Some(other) => fs::write(&copy, other).unwrap(),
             None => fs::remove_file(&copy).unwrap(),
         }
-        let out = ws(&env, PASSPHRASE, &["open", "acme"]);
+        let out = open_then_close(&env, env.command().env("HALTI_TEST_PASSPHRASE", PASSPHRASE).args(["open", "acme"]), "acme");
         assert!(out.status.success() && asked(&out) == 1 && keeps_quiet(&out, PASSPHRASE), "{change:?}: {}", stderr(&out));
         let once = stderr(&out).contains("\nthe saved passphrase of acme can't be read. type it once.\n");
         assert_eq!(once, change.is_some(), "{change:?}: {}", stderr(&out));
         assert_eq!(stderr(&out).contains("open workspace acme: yes"), change.is_some(), "{change:?}: {}", stderr(&out));
-        let again = "passphrase correct\nsaved the passphrase of acme in the keychain again\nworkspaces can't stay open yet, so acme was closed again\n";
+        let again = format!("saved the passphrase of acme in the keychain again\n{}closed acme\n", is_open("acme"));
         assert_eq!(stdout(&out), again, "{change:?}");
         assert_eq!(fs::read_to_string(&copy).unwrap(), PASSPHRASE, "{change:?}");
     }
@@ -2508,10 +2880,10 @@ fn a_workspace_made_before_the_manager_is_typed_and_a_passphrase_line_types_it()
     // Made while nothing kept a passphrase, as every workspace before the manager was.
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
     assert!(config(&env, &with_keychain("touchid", "touchid"), "yes").status.success());
-    let out = ws(&env, PASSPHRASE, &["open", "acme"]);
+    let out = open_then_close(&env, env.command().env("HALTI_TEST_PASSPHRASE", PASSPHRASE).args(["open", "acme"]), "acme");
     assert!(out.status.success() && asked(&out) == 1 && !stderr(&out).contains("open workspace acme: "), "{}", stderr(&out));
     assert!(!stderr(&out).contains("saved passphrase"), "no copy, so the usual question: {}", stderr(&out));
-    let each_time = "passphrase correct\nacme was made without a saved passphrase, so it is typed each time\nworkspaces can't stay open yet, so acme was closed again\n";
+    let each_time = format!("acme was made without a saved passphrase, so it is typed each time\n{}closed acme\n", is_open("acme"));
     assert_eq!(stdout(&out), each_time);
     assert!(!saved_copy(&env, "acme").exists(), "nothing is saved for it");
 
@@ -2522,7 +2894,7 @@ fn a_workspace_made_before_the_manager_is_typed_and_a_passphrase_line_types_it()
     assert!(made.status.success() && stdout(&made).contains("\nits passphrase is saved in the keychain\n"), "{}", stdout(&made));
     let copy = saved_copy(&env, "globex");
     let typed = |args: &[&str]| env.command().args(args).env("HALTI_TEST_APPROVE", "no").env("HALTI_TEST_PASSPHRASE", globex).output().unwrap();
-    let out = typed(&["open", "globex"]);
+    let out = open_then_close(&env, env.command().args(["open", "globex"]).env("HALTI_TEST_APPROVE", "no").env("HALTI_TEST_PASSPHRASE", globex), "globex");
     assert!(out.status.success() && asked(&out) == 1 && !stderr(&out).contains("open workspace globex: "), "{}", stderr(&out));
     assert!(!stderr(&out).contains("saved passphrase") && copy.exists());
     let out = typed(&["ws", "delete", "globex"]);
@@ -2544,8 +2916,8 @@ fn a_workspace_line_that_needs_a_password_manager_is_refused_without_one() {
     assert!(!approved_copy(&env).exists());
     // Nothing changed: a workspace is made, opened and deleted with its passphrase, as before.
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
-    let out = ws(&env, PASSPHRASE, &["open", "acme"]);
-    assert!(out.status.success() && asked(&out) == 1 && stdout(&out).starts_with("passphrase correct\n"), "{}", stderr(&out));
+    let out = open_then_close(&env, env.command().env("HALTI_TEST_PASSPHRASE", PASSPHRASE).args(["open", "acme"]), "acme");
+    assert!(out.status.success() && asked(&out) == 1 && stdout(&out).starts_with(&is_open("acme")), "{}", stderr(&out));
 }
 
 #[test]
@@ -2695,6 +3067,22 @@ impl Env {
         fs::write(&script, format!("#!/bin/sh\necho \"$*\" >> '{}'\n[ \"$1 $2\" = \"system status\" ]\n", calls.display())).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         (format!("{}:{}", bin.display(), no_engine()), calls)
+    }
+
+    /// A stand-in for the engine, first on PATH, whose VMs are files: one whose file is in the
+    /// folder runs, and a stop removes it. It says it is ready, and does nothing else. Returns PATH
+    /// with it, and the folder.
+    fn engine_of_files(&self) -> (String, PathBuf) {
+        let (bin, vms) = (self.dir.join("files-engine"), self.dir.join("files-engine-vms"));
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&vms).unwrap();
+        let vm = format!("'{}'/\"$2\"", vms.display());
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\nsystem) [ \"$2\" = status ] ;;\ninspect) [ -e {vm} ] && echo '[{{\"status\":{{\"state\":\"running\"}}}}]' ;;\nstop) rm -f {vm} ;;\n*) exit 1 ;;\nesac\n"
+        );
+        fs::write(bin.join("container"), script).unwrap();
+        fs::set_permissions(bin.join("container"), fs::Permissions::from_mode(0o755)).unwrap();
+        (format!("{}:{}", bin.display(), no_engine()), vms)
     }
 }
 

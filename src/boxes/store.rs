@@ -180,6 +180,20 @@ impl Layout {
         self.downloads.join(name)
     }
 
+    /// The lock `halti open` holds while it keeps the workspace open, in its boxes folder.
+    pub fn keeper_lock(&self) -> PathBuf {
+        self.root.join(names::KEEPER_LOCK)
+    }
+
+    /// The socket of the `halti open` that keeps the workspace open: `TAG.keep.sock`, beside its
+    /// boxes' sockets. Today's boxes have none.
+    pub fn keeper_socket(&self) -> Option<PathBuf> {
+        match &self.names {
+            Names::Keychain => None,
+            Names::Workspace { tag } => Some(self.sockets.join(format!("{tag}{}", names::KEEP_SOCKET))),
+        }
+    }
+
     /// Fails unless both of the box's sockets fit the system's limit: checked before anything opens.
     pub fn sockets_fit(&self, id: &str) -> Result<()> {
         for socket in [self.socket(id), self.browser_socket(id)] {
@@ -362,7 +376,7 @@ impl Drop for Open {
                 let _ = shred(&self.bundle);
             }
             Ok(()) => {}
-            Err(e) => eprintln!("halti: {e:#} (detach it with: hdiutil detach -force '{}')", self.mnt.display()),
+            Err(e) => crate::util::warn(&format!("{e:#} (detach it with: hdiutil detach -force '{}')", self.mnt.display())),
         }
     }
 }
@@ -407,9 +421,20 @@ pub struct Lock(#[allow(dead_code)] File);
 
 /// Take the lock; `None` if another process holds it. A busy lock is tried again for a moment:
 /// a child that one of our threads has forked but not yet exec'd still shares the lock of a
-/// file we just let go of.
+/// file we just let go of. Opening never waits and follows no link: a pipe or a link planted in
+/// the lock file's place is refused at once.
 pub fn lock(path: &Path) -> Result<Option<Lock>> {
-    let file = OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    if !file.metadata().with_context(|| format!("reading {}", path.display()))?.is_file() {
+        bail!("{} isn't a plain file", path.display());
+    }
     for attempt in 0..20 {
         match file.try_lock() {
             Ok(()) => return Ok(Some(Lock(file))),
@@ -421,7 +446,8 @@ pub fn lock(path: &Path) -> Result<Option<Lock>> {
     Ok(None)
 }
 
-/// Whether some process holds the lock right now (a missing lock file is nobody's).
+/// Whether some process holds the lock right now (a missing lock file is nobody's, and so is one
+/// that can't be opened).
 pub fn is_held(path: &Path) -> bool {
     path.exists() && matches!(lock(path), Ok(None))
 }
@@ -573,6 +599,25 @@ mod tests {
     }
 
     #[test]
+    fn a_pipe_or_a_link_in_a_lock_s_place_is_refused_at_once() {
+        let dir = TempDir::new("halti-lock-planted").unwrap();
+        // A pipe with no one at the other end: an open that waited would wait for good.
+        let fifo = dir.0.join("pipe.lock");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let link = dir.0.join("link.lock");
+        symlink(dir.0.join("elsewhere"), &link).unwrap();
+        let (sent, got) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = sent.send((lock(&fifo).map(|_| ()), is_held(&fifo), lock(&link).map(|_| ()), is_held(&link)));
+        });
+        let (pipe, pipe_held, linked, link_held) = got.recv_timeout(Duration::from_secs(10)).expect("refused at once");
+        assert!(pipe.is_err() && !pipe_held);
+        assert!(linked.is_err() && !link_held);
+        assert!(!dir.0.join("elsewhere").exists(), "a link is never followed");
+    }
+
+    #[test]
     fn keeps_folders_private() {
         let dir = TempDir::new("halti-private").unwrap();
         let layout = Layout::under(&dir.0).unwrap();
@@ -625,6 +670,9 @@ mod tests {
         let real = Layout::workspace(&boxes, WsId::from_bytes(ACME)).unwrap();
         assert_eq!(real.sockets, PathBuf::from(format!("/tmp/halti-dev-{}/ws", real.uid)));
         assert_eq!(real.socket("dev"), PathBuf::from(format!("/tmp/halti-dev-{}/ws/abcdef012345-dev.sock", real.uid)));
+        // The socket of the halti that keeps the workspace open is never a box's: no box name has a dot.
+        assert_eq!(real.keeper_socket(), Some(PathBuf::from(format!("/tmp/halti-dev-{}/ws/abcdef012345.keep.sock", real.uid))));
+        assert_eq!((acme.keeper_lock(), today.keeper_socket()), (boxes.join("keeper.lock"), None));
 
         // Its sockets' folder is private, and so is the folder it is in.
         acme.prepare().unwrap();
@@ -641,6 +689,7 @@ mod tests {
         longest.sockets_fit(&name).unwrap();
         assert_eq!(longest.vm(&name).len(), 57);
         assert_eq!(longest.browser_vm(&name).len(), 61);
+        assert_eq!(longest.keeper_socket().unwrap().as_os_str().len(), 51);
     }
 
     #[test]

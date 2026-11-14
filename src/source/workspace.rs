@@ -5,8 +5,9 @@
 //! What it holds is core's `Reader`, behind a lock: the keys for values, the store and the audit
 //! log, and the manifest as last read, never a key that seals. Before each lookup it reads the pin
 //! and, if it moved, the manifest again, so a value stored or a policy approved since is used at
-//! once; a pin put back below the one seen makes every lookup fail. A value that doesn't open is
-//! read again once, for a change that landed while it was read.
+//! once; a pin put back below the one seen makes every lookup fail, and is reported once
+//! (`refused_reread`). A value that doesn't open is read again once, for a change that landed
+//! while it was read. Once closed, the keys are wiped, and every lookup fails.
 //!
 //! Every sealed write is refused: values, approvals and box keys change only through the
 //! workspace's commands, which ask for its passphrase. What a run notes outside the store (which
@@ -14,7 +15,9 @@
 //! in the workspace's boxes folder.
 
 use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Result, anyhow, bail};
@@ -34,7 +37,10 @@ use crate::{index, policy};
 pub(super) struct Opened {
     name: WsName,
     id: WsId,
-    reader: Mutex<Reader>,
+    /// None once closed.
+    reader: Mutex<Option<Reader>>,
+    /// A reread was refused for files that went back: 1 until it is reported, then 2.
+    refused: AtomicU8,
     reading: Reading,
     settings: Settings,
     /// WSDIR/policies
@@ -60,17 +66,42 @@ impl Opened {
             blocked: boxes.join("blocked-writes"),
             name,
             id,
-            reader: Mutex::new(reader),
+            reader: Mutex::new(Some(reader)),
+            refused: AtomicU8::new(0),
             reading,
             settings,
         }
     }
 
-    /// The reader, with the manifest read again if the pin moved since.
-    fn read(&self) -> Result<MutexGuard<'_, Reader>> {
-        let mut reader = self.reader.lock().unwrap_or_else(PoisonError::into_inner);
-        reader.reread(self.reading.files(), self.reading.anchor(), &self.name)?;
-        Ok(reader)
+    /// The reader, with the manifest read again if the pin moved since; none once closed.
+    fn read(&self) -> Result<Held<'_>> {
+        let mut held = self.reader.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(reader) = held.as_mut() else { bail!("{} is closed", self.name) };
+        if let Err(error) = reader.reread(self.reading.files(), self.reading.anchor(), &self.name) {
+            if error.downcast_ref::<Refusal>() == Some(&Refusal::Tampered) {
+                let _ = self.refused.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
+            }
+            return Err(error);
+        }
+        Ok(Held(held))
+    }
+
+    /// Wipes the keys: every lookup fails from now on. The reader is dropped where it is: one moved
+    /// out first would be wiped as the copy, and leave its keys here.
+    pub(super) fn close(&self) {
+        *self.reader.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// True once, after a reread was refused because the workspace's files went back to an older
+    /// state: from then on every lookup fails, which reads like a secret that isn't stored.
+    pub(super) fn refused_reread(&self) -> bool {
+        self.refused.compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    }
+
+    /// Keeps the pages that hold the keys out of swap, for a process that holds them all day. They
+    /// are inline in this value.
+    pub(super) fn lock_keys(&self) {
+        crate::ws::lock_pages((self as *const Self).cast(), std::mem::size_of::<Self>());
     }
 
     pub(super) fn settings(&self) -> &Settings {
@@ -235,5 +266,16 @@ impl Opened {
 
     pub(super) fn blocked_dir(&self) -> &Path {
         &self.blocked
+    }
+}
+
+/// The reader of a workspace that is open, while its lock is held.
+struct Held<'a>(MutexGuard<'a, Option<Reader>>);
+
+impl Deref for Held<'_> {
+    type Target = Reader;
+
+    fn deref(&self) -> &Reader {
+        self.0.as_ref().expect("checked to be open")
     }
 }
