@@ -22,6 +22,7 @@ mod shim_names;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -649,6 +650,39 @@ fn ws_stop_seals_sessions_then_stops_both_vms() {
     assert!(String::from_utf8_lossy(&listed.stdout).contains(" locked "), "{}", String::from_utf8_lossy(&listed.stdout));
     let again = home.halti().args(["ws", "stop", &target]).output().unwrap();
     assert!(String::from_utf8_lossy(&again.stderr).ends_with(&format!("halti: box {target} isn't running\n")));
+}
+
+#[test]
+#[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
+fn ctrl_c_twice_reaches_only_halti_and_the_box_is_put_away() {
+    let Some(image) = agent_image() else { return };
+    let home = Home::new("ctrl-c");
+    let name = box_name("ctrl-c");
+    home.workspace_with_box("acme", ACME, &name, &basic("acme", "acme-token-0001"), &image);
+    let target = format!("acme/{name}");
+    // The opener leads a process group, as a terminal's job does; what it starts that needs no
+    // terminal is in a group of its own.
+    let opener = home
+        .halti()
+        .env("HALTI_TEST_PASSPHRASE", ACME)
+        .args(["ws", "run", &target, "--", "sleep", "120"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let vm = until_running("halti-wsbox-", &name);
+    // Ctrl-C as the terminal sends it, to the job's whole group; again while the box is put away.
+    let job = opener.id() as i32;
+    unsafe { libc::kill(-job, libc::SIGINT) };
+    thread::sleep(Duration::from_millis(500));
+    unsafe { libc::kill(-job, libc::SIGINT) };
+    let out = opener.wait_with_output().unwrap();
+    println!("{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!engine::running(&vm) && !engine::running(&vm.replacen("halti-wsbox-", "halti-wsbrowser-", 1)), "both VMs are stopped");
+    // Its lock is free, and its store detached.
+    let listed = home.ws(ACME, "true", &["ws", "box", "ls", "acme"]);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains(" locked "), "{}", String::from_utf8_lossy(&listed.stdout));
 }
 
 #[test]

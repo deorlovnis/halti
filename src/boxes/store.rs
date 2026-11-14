@@ -12,6 +12,7 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -245,9 +246,12 @@ pub fn new_key() -> Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Run `hdiutil`, with the key (if any) on stdin. Returns what it printed.
+/// Run `hdiutil`, with the key (if any) on stdin. Returns what it printed. It needs no terminal, and
+/// starts in a process group of its own, so Ctrl-C reaches halti alone and a detach isn't cut off
+/// half way.
 fn hdiutil(args: &[&std::ffi::OsStr], key: Option<&str>) -> Result<String> {
     let mut child = Command::new("hdiutil")
+        .process_group(0)
         .args(args)
         .stdin(if key.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
