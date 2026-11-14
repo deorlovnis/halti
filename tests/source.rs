@@ -782,3 +782,63 @@ fn ws_names_only_source_free_box_items() {
     assert!(named >= WS_BOX_ITEMS.len(), "the workspace's box commands use the boxes module: {named}");
     assert!(found.is_empty(), "src/ws reaches no source through the boxes module; name only {WS_BOX_ITEMS:?}:\n{}", found.join("\n"));
 }
+
+/// The name of the function of `code` that the text at `at` is in: the last `fn` before it that
+/// starts a line.
+fn enclosing_fn(code: &str, at: usize) -> &str {
+    let header = code[..at]
+        .lines()
+        .rev()
+        .map(|line| line.trim_start().trim_start_matches("pub(crate) ").trim_start_matches("pub "))
+        .find_map(|line| line.strip_prefix("fn "))
+        .expect("in a function");
+    &header[..header.find(['(', '<']).unwrap_or(header.len())]
+}
+
+#[test]
+fn a_function_is_found_by_what_is_in_it() {
+    let code = "fn one() {\n    a();\n}\n\npub fn two<T>() {\n    b();\n}\n\nimpl X {\n    pub(crate) fn three(&self) {\n        c();\n    }\n}\n";
+    let at = |call: &str| enclosing_fn(code, code.find(call).unwrap());
+    assert_eq!((at("a()"), at("b()"), at("c()")), ("one", "two", "three"));
+}
+
+/// Ctrl-C and a closed terminal reach every process of the terminal's group. Only the agent's own
+/// `container exec` and the image builds share it; every other `container` command and every
+/// `hdiutil` starts in a process group of its own, so a second Ctrl-C can't cut a VM's stop, a
+/// store's detach or a browser runner off half way.
+#[test]
+fn only_the_agent_and_the_builds_share_the_terminal() {
+    const ON_TERMINAL: &[&str] = &["exec_command", "build_agent_image", "build_browser_image"];
+    let mut found = Vec::new();
+    let mut hdiutil = 0;
+    for (path, text) in sources(&["src", "core/src"]) {
+        let Some(code) = release_code(&path, &text) else { continue };
+        for (at, _) in code.match_indices("Command::new(\"container\")") {
+            if path != "src/engine.rs" || enclosing_fn(&code, at) != "container_on_terminal" {
+                found.push(format!("{path}: Command::new(\"container\") in {}", enclosing_fn(&code, at)));
+            }
+        }
+        for (at, _) in code.match_indices("container_on_terminal()") {
+            let caller = enclosing_fn(&code, at);
+            if !code[..at].ends_with("fn ") && !ON_TERMINAL.contains(&caller) {
+                found.push(format!("{path}: container_on_terminal() in {caller}"));
+            }
+        }
+        for (at, _) in code.match_indices("Command::new(\"hdiutil\")") {
+            hdiutil += 1;
+            let statement = &code[at..at + code[at..].find(';').unwrap()];
+            if !statement.contains(".process_group(0)") {
+                found.push(format!("{path}: Command::new(\"hdiutil\") in {} has no process group of its own", enclosing_fn(&code, at)));
+            }
+        }
+    }
+    let engine = release_code("src/engine.rs", &fs::read_to_string(root().join("src/engine.rs")).unwrap()).unwrap();
+    let body = |header: &str| {
+        let start = engine.find(header).unwrap_or_else(|| panic!("no `{header}`"));
+        &engine[start..start + engine[start..].find("\n}\n").unwrap()]
+    };
+    assert!(body("fn container() -> Command {").contains("apart(\"container\")"), "src/engine.rs: container() starts its command apart");
+    assert!(body("fn apart(program: &str) -> Command {").contains(".process_group(0)"), "src/engine.rs: apart gives a process group of its own");
+    assert_eq!(hdiutil, 1, "hdiutil is started in one place, store::hdiutil");
+    assert!(found.is_empty(), "a child that needs no terminal starts apart:\n{}", found.join("\n"));
+}

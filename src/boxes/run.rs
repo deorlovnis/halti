@@ -340,6 +340,7 @@ impl Running<'_> {
         if req.confirm {
             let sites = if policy.sites.is_empty() { String::new() } else { format!(" and let it use {}", policy.sites.join(", ")) };
             world.confirm(&format!("open box {}{sites}", req.name))?;
+            self.unless_stopped()?;
         }
         // What a second terminal needs to join a workspace's box, which reads no approval.
         if layout.in_workspace() {
@@ -364,6 +365,7 @@ impl Running<'_> {
             store.shred_on_close();
         }
         self.store = Some(store);
+        self.unless_stopped()?;
         let ca = Arc::new(box_ca(&mnt, req.name, &key, req.persistent)?);
         let sessions = Sessions::new(&mnt, &key, policy.browser.keep_sessions);
         self.sealed = Some(Sessions::new(&mnt, &key, true));
@@ -435,19 +437,34 @@ impl Running<'_> {
         self.browser = browser_vm;
         self.vm_armed = true;
         world.start_vm(&spec)?;
+        self.unless_stopped()?;
         self.door = Some(world.start_door(config)?);
         world.install_ca(&vm, &ca.cert_pem())?;
+        self.unless_stopped()?;
         if policy.docker {
             world.start_docker(&vm)?;
+            self.unless_stopped()?;
         }
         self.started = true;
         Ok(())
     }
 
+    /// A stop asked while the box starts (Ctrl-C or a closed terminal, which no longer reach the
+    /// steps that wait on a child) ends the start: the agent's command never runs.
+    fn unless_stopped(&self) -> Result<(), Refused> {
+        if self.req.stop.load(Ordering::SeqCst) {
+            return Err(Refused::new(No::Failed, stopped_before_the_agent(&self.req.shown)));
+        }
+        Ok(())
+    }
+
     /// Run `command` in the box as the agent, with the terminal if `tty`, until it ends. A stop
-    /// (`req.stop`) stops the agent's VM, which ends it.
+    /// (`req.stop`) stops the agent's VM, which ends it; one asked already runs nothing.
     pub fn work(&self, command: &[String], tty: bool) -> Result<ExitStatus> {
         let (world, vm, stopped, stop) = (self.world, self.vm.as_str(), &self.vm_stopped, self.req.stop);
+        if stop.load(Ordering::SeqCst) {
+            return Err(stopped_before_the_agent(&self.req.shown));
+        }
         let command = guest_command(command);
         let done = AtomicBool::new(false);
         thread::scope(|scope| {
@@ -539,6 +556,10 @@ impl Running<'_> {
             drop(lock);
         }
     }
+}
+
+fn stopped_before_the_agent(shown: &str) -> anyhow::Error {
+    anyhow!("box {shown} was stopped before its agent started")
 }
 
 /// A refusal for a site (or the model) that isn't ready.
@@ -830,6 +851,8 @@ mod tests {
         settles: bool,
         /// Block in exec until the VM is stopped (a signal's doing).
         block: bool,
+        /// Set the flag (as a signal would) during the call that starts with this.
+        stop_at: Option<(&'static str, Arc<AtomicBool>)>,
         key: String,
         /// Runs in exec with the box's work folder.
         hook: Option<Hook>,
@@ -843,7 +866,13 @@ mod tests {
         }
 
         fn note(&self, call: impl Into<String>) {
-            self.seen.lock().unwrap().calls.push(call.into());
+            let call = call.into();
+            if let Some((at, stop)) = &self.stop_at
+                && call.starts_with(at)
+            {
+                stop.store(true, Ordering::SeqCst);
+            }
+            self.seen.lock().unwrap().calls.push(call);
         }
     }
 
@@ -1289,8 +1318,11 @@ mod tests {
         let p = policy(&s, "");
         let fake = Fake { block: true, ..Fake::default() };
         let code = thread::scope(|scope| {
+            // While the agent runs: a stop before that runs no agent at all.
             scope.spawn(|| {
-                thread::sleep(Duration::from_millis(1500));
+                while !fake.calls().iter().any(|c| c == "exec") {
+                    thread::sleep(Duration::from_millis(20));
+                }
                 s.stop.store(true, Ordering::SeqCst);
             });
             run(&s.layout, &fake, &request(&s, &p, false)).unwrap()
@@ -1320,17 +1352,78 @@ mod tests {
     fn start_then_stop_is_today_s_run() {
         let s = setup();
         let p = policy(&s, "");
-        let today = Fake::default();
-        assert_eq!(run(&s.layout, &today, &request(&s, &p, false)).unwrap(), 0);
+        let key = store::new_key().unwrap();
+        store::create(&s.layout, &s.layout.bundle("r"), &key).unwrap();
+        let order = [
+            "available",
+            "bearer: anthropic",
+            "site: anthropic",
+            "site: github",
+            "confirm: open box r and let it use github",
+            "start_vm",
+            "start_door",
+            "install_ca",
+            "exec",
+            "settle",
+            "stop_vm",
+        ];
+        let today = Fake { key: key.clone(), settles: true, ..Fake::default() };
+        assert_eq!(run(&s.layout, &today, &request(&s, &p, true)).unwrap(), 0);
+        assert_eq!(today.calls(), order);
 
-        let split = Fake::default();
-        let req = request(&s, &p, false);
+        let split = Fake { key, settles: true, ..Fake::default() };
+        let req = request(&s, &p, true);
         let running = started(&s, &split, &req);
         assert!(running.work(&p.run, false).unwrap().success());
         running.stop();
-        assert_eq!(split.calls(), today.calls());
-        assert_put_away(&s);
+        assert_eq!(split.calls(), order);
+        assert!(s.layout.bundle("r").exists() && !store::is_mounted(&s.layout.mount_point("r")));
         assert!(store::lock(&s.layout.lock("r")).unwrap().is_some(), "the lock is released");
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn a_stop_while_the_box_starts_lets_no_agent_in() {
+        let s = setup();
+        let mut p = policy(&s, "");
+        p.docker = true;
+        // Where the start waits: the person's yes, the VM, the CA, Docker. What was opened is put away.
+        for (step, last) in [
+            ("confirm", &["confirm: open box r and let it use github"][..]),
+            ("start_vm", &["start_vm", "stop_vm"]),
+            ("install_ca", &["install_ca", "stop_vm"]),
+            ("start_docker", &["start_docker", "stop_vm"]),
+        ] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let fake = Fake { settles: true, stop_at: Some((step, stop.clone())), ..Fake::default() };
+            let req = Request { stop: &stop, ..request(&s, &p, false) };
+            let e = run(&s.layout, &fake, &req).unwrap_err();
+            assert_eq!(e.to_string(), "box r was stopped before its agent started");
+            let calls = fake.calls();
+            assert!(calls[calls.len() - last.len()..] == *last && !calls.iter().any(|c| c == "exec" || c == "settle"), "{step}: {calls:?}");
+            assert_put_away(&s);
+            assert!(store::lock(&s.layout.lock("r")).unwrap().is_some(), "the lock is released");
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let fake = Fake { stop_at: Some(("start_vm", stop.clone())), ..Fake::default() };
+        let req = Request { stop: &stop, ..request(&s, &p, false) };
+        let Err(refused) = start(&s.layout, &fake, &req) else { panic!("started though stopped") };
+        assert_eq!(refused.no, No::Failed);
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn a_box_stopped_before_its_agent_starts_runs_nothing() {
+        let s = setup();
+        let p = policy(&s, "");
+        let fake = Fake::default();
+        let req = request(&s, &p, false);
+        let running = started(&s, &fake, &req);
+        s.stop.store(true, Ordering::SeqCst);
+        assert_eq!(running.work(&p.run, false).unwrap_err().to_string(), "box r was stopped before its agent started");
+        running.stop();
+        assert_eq!(after_start(&fake), ["stop_vm"]);
+        assert_put_away(&s);
     }
 
     #[test]

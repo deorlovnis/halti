@@ -652,26 +652,54 @@ fn ws_stop_seals_sessions_then_stops_both_vms() {
     assert!(String::from_utf8_lossy(&again.stderr).ends_with(&format!("halti: box {target} isn't running\n")));
 }
 
+/// github's policy with its pages to browse: the start page sets a cookie, so a browser closed on
+/// it leaves a session to seal.
+const GITHUB_BROWSED: &str =
+    "[fetch]\nhosts = [\"https://httpbin.org\"]\nauth = \"Basic {token}\"\n\n[browse]\norigins = [\"https://httpbin.org\"]\nstart = \"https://httpbin.org/cookies/set?halti=1\"\n";
+
+/// A shell command for the agent: open a browser on `site` through halti's MCP server, then keep
+/// the connection, and so the browser, open for two minutes. The server's answers go to stdout.
+fn browse_then_wait(site: &str) -> String {
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#;
+    let open = format!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"browse_open","arguments":{{"site":"{site}"}}}}}}"#);
+    format!("{{ printf '%s\\n' '{init}' '{open}'; sleep 120; }} | {} mcp", names::SHIM)
+}
+
 #[test]
 #[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
 fn ctrl_c_twice_reaches_only_halti_and_the_box_is_put_away() {
     let Some(image) = agent_image() else { return };
+    engine::build_browser_image(&Path::new(env!("CARGO_MANIFEST_DIR")).join("box")).unwrap();
     let home = Home::new("ctrl-c");
     let name = box_name("ctrl-c");
     home.workspace_with_box("acme", ACME, &name, &basic("acme", "acme-token-0001"), &image);
+    home.policy("acme", ACME, "github", GITHUB_BROWSED);
     let target = format!("acme/{name}");
     // The opener leads a process group, as a terminal's job does; what it starts that needs no
     // terminal is in a group of its own.
-    let opener = home
+    let mut opener = home
         .halti()
         .env("HALTI_TEST_PASSPHRASE", ACME)
-        .args(["ws", "run", &target, "--", "sleep", "120"])
+        .args(["ws", "run", &target, "--", "sh", "-c", &browse_then_wait("github")])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
         .unwrap();
     let vm = until_running("halti-wsbox-", &name);
+    let browser_vm = vm.replacen("halti-wsbox-", "halti-wsbrowser-", 1);
+    // The agent's browser is open on github, its runner in the browser VM.
+    let mut answers = BufReader::new(opener.stdout.take().unwrap());
+    let opened = loop {
+        let mut line = String::new();
+        assert!(answers.read_line(&mut line).unwrap() > 0, "the agent ended before its browser opened");
+        let answer: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        if answer["id"] == 2 {
+            break answer;
+        }
+    };
+    assert_eq!(opened["result"]["isError"], false, "{opened}");
+    assert!(engine::running(&browser_vm), "the browser VM runs");
     // Ctrl-C as the terminal sends it, to the job's whole group; again while the box is put away.
     let job = opener.id() as i32;
     unsafe { libc::kill(-job, libc::SIGINT) };
@@ -679,10 +707,18 @@ fn ctrl_c_twice_reaches_only_halti_and_the_box_is_put_away() {
     unsafe { libc::kill(-job, libc::SIGINT) };
     let out = opener.wait_with_output().unwrap();
     println!("{}", String::from_utf8_lossy(&out.stderr));
-    assert!(!engine::running(&vm) && !engine::running(&vm.replacen("halti-wsbox-", "halti-wsbrowser-", 1)), "both VMs are stopped");
-    // Its lock is free, and its store detached.
+    drop(answers);
+    assert!(!engine::running(&vm) && !engine::running(&browser_vm), "both VMs are stopped");
+    // Its store is detached, and its lock free.
+    let mounted = Command::new("/sbin/mount").output().unwrap();
+    assert!(!String::from_utf8_lossy(&mounted.stdout).contains(&format!("/open/{name} (")), "the store is still mounted");
     let listed = home.ws(ACME, "true", &["ws", "box", "ls", "acme"]);
-    assert!(String::from_utf8_lossy(&listed.stdout).contains(" locked "), "{}", String::from_utf8_lossy(&listed.stdout));
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    let row = listed.lines().find(|line| line.starts_with(&name)).unwrap_or_else(|| panic!("{listed}"));
+    assert!(row.contains(" locked "), "{row}");
+    // The runner outlived the Ctrl-C, so github's session was sealed as the box was put away: the
+    // row names github as a site and as a session.
+    assert_eq!(row.matches("github").count(), 2, "{row}");
 }
 
 #[test]

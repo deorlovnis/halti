@@ -773,7 +773,9 @@ pub struct Join {
 /// through the place. Then today's run, with no question: opening the workspace was the approval.
 pub fn run_in(start: Start) -> Result<u8> {
     let Start { settings, vms, layout, name, shown, text, policy, mounts, command } = start;
-    ready_in(&name, &shown, &text, policy.keep, KeyStore::of(&settings)).map_err(|refused| refused.why)?;
+    let keys = KeyStore::of(&settings);
+    let approval = policy::status_of_text(&key(&name), &text);
+    ready_in(&shown, approval, policy.keep, || keys.exists(&name), &source::current().hint(Hint::RemoveBox(&name))).map_err(|refused| refused.why)?;
     run::catch_signals();
     let request = run::Request {
         name: &name,
@@ -794,18 +796,19 @@ pub fn run_in(start: Start) -> Result<u8> {
     run_request(&layout, vms, &settings, &request)
 }
 
-/// What a workspace's box `name` (`shown`, as messages name it) needs of the place before it starts:
-/// an approval of `text`, the policy file's bytes as read, and for a box that keeps a store, its
-/// key.
-fn ready_in(name: &str, shown: &str, text: &[u8], keep: bool, keys: KeyStore) -> Result<(), Refused> {
+/// What a workspace's box (`shown`, as messages name it) needs of the place before it starts: an
+/// approval of the policy file's bytes as read (`approval`, what the place says of them), and for a
+/// box that keeps a store, its key (`has_key`, asked only then). `remove` is the place's command
+/// that removes the box.
+fn ready_in(shown: &str, approval: Status, keep: bool, has_key: impl FnOnce() -> bool, remove: &str) -> Result<(), Refused> {
     let approve = format!("halti ws box approve {shown}");
-    match policy::status_of_text(&key(name), text) {
+    match approval {
         Status::Approved => {}
         Status::Changed => return Err(Refused::new(No::Changed, anyhow!("the policy of box {shown} changed since it was approved. approve it with: {approve}"))),
         Status::Unapproved | Status::Missing => return Err(Refused::new(No::Unapproved, anyhow!("box {shown} isn't approved. approve it with: {approve}"))),
     }
-    if keep && !keys.exists(name) {
-        return Err(Refused::new(No::Key, anyhow!("box {shown} has a store but no key. remove it with: {}", source::current().hint(Hint::RemoveBox(name)))));
+    if keep && !has_key() {
+        return Err(Refused::new(No::Key, anyhow!("box {shown} has a store but no key. remove it with: {remove}")));
     }
     Ok(())
 }
@@ -1305,6 +1308,22 @@ mod tests {
         // Today's place keeps them where `[box] keys` says, and says so as before.
         assert_eq!(KeyStore::of(&config::Settings::builtin(Os::Macos)).place(), "in the Keychain");
         assert_eq!(KeyStore(Keys::Place).place(), "in its workspace");
+    }
+
+    #[test]
+    fn a_workspace_s_box_that_isn_t_ready_says_its_kind() {
+        let remove = "halti ws box rm acme/dev";
+        let refused = |approval, keep, has_key: bool| ready_in("acme/dev", approval, keep, || has_key, remove).err().map(|refused| (refused.no, refused.why.to_string()));
+        let unapproved = Some((No::Unapproved, "box acme/dev isn't approved. approve it with: halti ws box approve acme/dev".to_string()));
+        assert_eq!(refused(Status::Unapproved, true, true), unapproved);
+        assert_eq!(refused(Status::Missing, false, true), unapproved);
+        let changed = "the policy of box acme/dev changed since it was approved. approve it with: halti ws box approve acme/dev";
+        assert_eq!(refused(Status::Changed, true, true), Some((No::Changed, changed.to_string())));
+        let keyless = "box acme/dev has a store but no key. remove it with: halti ws box rm acme/dev";
+        assert_eq!(refused(Status::Approved, true, false), Some((No::Key, keyless.to_string())));
+        assert_eq!(refused(Status::Approved, true, true), None);
+        // A box that keeps no store needs no key, and the place isn't asked for one.
+        assert!(ready_in("acme/dev", Status::Approved, false, || panic!("asked for a key"), remove).is_ok());
     }
 
     #[test]
