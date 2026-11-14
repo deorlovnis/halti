@@ -92,6 +92,14 @@ pub const LOCAL_SOCKET: &str = "/run/halti/local.sock";
 /// model gateway).
 pub const DOOR_KIND: &str = "halti";
 
+/// For an engine whose host dials the box over vsock (`halti-shim serve --vsock`): the port the
+/// door dials in place of `DOOR_SOCKET`, and the port of the shim's exec service. Compiled into
+/// the shim; no engine of this crate dials them yet.
+#[allow(dead_code)]
+pub const DOOR_PORT: u32 = 7000;
+#[allow(dead_code)]
+pub const EXEC_PORT: u32 = 7001;
+
 /// What a box holds in place of the model key, which the door's gateway swaps for the real one.
 /// Box homes and the agents' own configs hold it, and other agents built for boxes send it too.
 pub const STANDIN: &str = "halti-managed";
@@ -141,6 +149,7 @@ mod tests {
         assert_eq!([AGENT_IMAGE, AGENT_IMAGE_JVM, AGENT_IMAGE_RUST, BROWSER_IMAGE], ["halti-agent", "halti-agent-jvm", "halti-agent-rust", "halti-browser"]);
         assert_eq!((SHIM, SHIM_PATH), ("halti-shim", "/usr/local/bin/halti-shim"));
         assert_eq!((DOOR_SOCKET, LOCAL_SOCKET, DOOR_KIND), ("/run/halti/door.sock", "/run/halti/local.sock", "halti"));
+        assert_eq!((DOOR_PORT, EXEC_PORT), (7000, 7001));
         assert_eq!((STANDIN, MCP_SERVER_KEY), ("halti-managed", "halti"));
         assert_eq!((BOX_VM_PREFIX, BROWSER_VM_PREFIX), ("halti-box-", "halti-browser-"));
         assert_eq!((WS_BOX_VM_PREFIX, WS_BROWSER_VM_PREFIX, WS_SOCKETS), ("halti-wsbox-", "halti-wsbrowser-", "ws"));

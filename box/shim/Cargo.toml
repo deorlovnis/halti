@@ -7,6 +7,8 @@ description = "Guest side of a halti box's door: pairs the box's connections wit
 publish = false
 
 [dependencies]
+# System calls the standard library has no call for: mount, power off, vsock, terminals.
+libc = "0.2"
 
 [profile.release]
 lto = true
