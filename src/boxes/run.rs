@@ -26,6 +26,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
 use super::browser_vm::BrowserVm;
+use super::nofollow;
 use super::sessions::{InBox, Launch, Sessions};
 use super::store::{self, Layout};
 use super::{BoxPolicy, KeyStore, MountPolicy, MountRule, mount_problem_in};
@@ -287,7 +288,9 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     let _ = store::log_event(&mnt, &log_key, "box", &req.id, 0, "started");
 
     // The folders are changed here, while no VM has them.
-    prepare_home(&mnt.join("home"), policy.docker)?;
+    for replaced in prepare_home(&mnt, policy.docker).with_context(|| format!("box {}", req.shown))? {
+        eprintln!("halti: box {}: {} was a link or a special file, so halti replaced it and followed nothing", req.shown, replaced.display());
+    }
     let mut mounts = vec![
         engine::Mount { host: mnt.join("home"), guest: GUEST_HOME.into(), readonly: false },
         engine::Mount { host: mnt.join("work"), guest: GUEST_WORK.into(), readonly: false },
@@ -537,34 +540,39 @@ fn clone_into(work: &Path, name: &str, host: &Path) -> Result<()> {
 
 /// What the agent needs in its home: Claude Code skips its web-fetch check (the door's rules take
 /// its place), knows halti's tools, and doesn't stop at first-run screens. Merged into what is
-/// there, so what the agent keeps in these files stays.
-fn prepare_home(home: &Path, docker: bool) -> Result<()> {
+/// there, so what the agent keeps in these files stays. `mnt` is the open store; nothing in its
+/// home is reached through a link the agent left there. Returns what was replaced for being a link
+/// or a special file.
+fn prepare_home(mnt: &Path, docker: bool) -> Result<Vec<PathBuf>> {
+    let mut replaced = Vec::new();
     // The Docker CLI hands containers the door's proxy (they can't reach the agent's 127.0.0.1).
     if docker {
-        merge_json(&home.join(".docker/config.json"), |o| {
+        replaced.extend(merge_json(mnt, "home/.docker/config.json", |o| {
             o.insert("proxies".into(), engine::docker_proxies());
-        })?;
+        })?);
     }
-    merge_json(&home.join(".claude/settings.json"), |o| {
+    replaced.extend(merge_json(mnt, "home/.claude/settings.json", |o| {
         o.insert("skipWebFetchPreflight".into(), json!(true));
-    })?;
+    })?);
     // User-scope MCP servers live in ~/.claude.json.
-    merge_json(&home.join(".claude.json"), |o| {
+    replaced.extend(merge_json(mnt, "home/.claude.json", |o| {
         o.insert("hasCompletedOnboarding".into(), json!(true));
         let servers = o.entry("mcpServers").or_insert_with(|| json!({}));
         if let Some(servers) = servers.as_object_mut() {
             servers.insert(names::MCP_SERVER_KEY.into(), json!({ "type": "stdio", "command": names::SHIM, "args": ["mcp"], "env": {} }));
         }
-    })
+    })?);
+    Ok(replaced)
 }
 
-fn merge_json(path: &Path, change: impl FnOnce(&mut Map<String, Value>)) -> Result<()> {
-    let mut value = fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}));
+/// Changes the JSON object in the file `rel` of the store `mnt`; one that isn't there or can't be
+/// read is made anew.
+fn merge_json(mnt: &Path, rel: &str, change: impl FnOnce(&mut Map<String, Value>)) -> Result<Vec<PathBuf>> {
+    let rel = Path::new(rel);
+    let found = nofollow::read(mnt, rel).ok().flatten();
+    let mut value = found.and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}));
     change(value.as_object_mut().expect("an object"));
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_string_pretty(&value)? + "\n").with_context(|| format!("writing {}", path.display()))
+    nofollow::write(mnt, rel, (serde_json::to_string_pretty(&value)? + "\n").as_bytes())
 }
 
 /// Clear what a crashed run left for an id: a mounted store, and a store made for one run.
@@ -1488,7 +1496,7 @@ mod tests {
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::write(home.join(".claude/settings.json"), r#"{"theme":"dark","skipWebFetchPreflight":false}"#).unwrap();
         fs::write(home.join(".claude.json"), r#"{"mcpServers":{"mine":{"command":"x"}},"halti":1}"#).unwrap();
-        prepare_home(&home, false).unwrap();
+        assert!(prepare_home(&dir.0, false).unwrap().is_empty());
         let settings: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude/settings.json")).unwrap()).unwrap();
         assert_eq!((settings["theme"].clone(), settings["skipWebFetchPreflight"].clone()), (json!("dark"), json!(true)));
         let claude: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
@@ -1496,14 +1504,45 @@ mod tests {
         assert_eq!(claude["mcpServers"][names::MCP_SERVER_KEY]["command"], json!(names::SHIM));
 
         fs::write(home.join(".claude.json"), "not json").unwrap();
-        prepare_home(&home, false).unwrap();
+        assert!(prepare_home(&dir.0, false).unwrap().is_empty());
         assert!(fs::read_to_string(home.join(".claude.json")).unwrap().contains(names::SHIM), "a broken file is replaced");
 
         assert!(!home.join(".docker").exists());
         fs::create_dir_all(home.join(".docker")).unwrap();
         fs::write(home.join(".docker/config.json"), r#"{"auths":{"x":{}}}"#).unwrap();
-        prepare_home(&home, true).unwrap();
+        assert!(prepare_home(&dir.0, true).unwrap().is_empty());
         let docker: Value = serde_json::from_str(&fs::read_to_string(home.join(".docker/config.json")).unwrap()).unwrap();
         assert_eq!((docker["auths"]["x"].clone(), docker["proxies"]["default"]["noProxy"].clone()), (json!({}), json!("localhost,127.0.0.1")));
+    }
+
+    #[test]
+    fn a_link_in_the_home_is_not_written_through() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new("halti-home-links").unwrap();
+        let (home, outside) = (dir.0.join("home"), dir.0.join("outside"));
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(outside.join("claude")).unwrap();
+        fs::write(outside.join("notes.txt"), "the person's own").unwrap();
+        fs::write(outside.join("claude/settings.json"), r#"{"theirs":1}"#).unwrap();
+        symlink(outside.join("notes.txt"), home.join(".claude.json")).unwrap();
+        symlink(outside.join("claude"), home.join(".claude")).unwrap();
+        symlink(outside.join("docker"), home.join(".docker")).unwrap();
+
+        let replaced = prepare_home(&dir.0, true).unwrap();
+        assert_eq!(replaced, [".docker", ".claude", ".claude.json"].map(|name| Path::new("home").join(name)), "named as the box sees them");
+        assert_eq!(fs::read_to_string(outside.join("notes.txt")).unwrap(), "the person's own");
+        assert_eq!(fs::read_to_string(outside.join("claude/settings.json")).unwrap(), r#"{"theirs":1}"#);
+        assert!(!outside.join("docker").exists(), "nothing was made outside");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(outside.join("claude")).unwrap().count(), 1);
+
+        // In their place, plain files of halti's, as in a home with no links.
+        for file in [".docker/config.json", ".claude/settings.json", ".claude.json"] {
+            assert!(!fs::symlink_metadata(home.join(file)).unwrap().file_type().is_symlink(), "{file}");
+            assert!(!fs::symlink_metadata(home.join(file).parent().unwrap()).unwrap().file_type().is_symlink(), "{file}");
+        }
+        assert!(fs::read_to_string(home.join(".claude.json")).unwrap().contains(names::SHIM));
+        assert!(prepare_home(&dir.0, true).unwrap().is_empty(), "the next start finds nothing to replace");
     }
 }

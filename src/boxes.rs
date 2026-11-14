@@ -19,6 +19,7 @@
 
 pub mod browser_vm;
 mod login;
+mod nofollow;
 pub(crate) mod run;
 pub(crate) mod sessions;
 pub(crate) mod store;
