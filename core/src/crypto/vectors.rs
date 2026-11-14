@@ -892,3 +892,46 @@ pub(crate) const KAT_MANIFEST_ITEM: &str = "01e0e1e2e3e4e5e6e7e8e9eaebee1baca084
 
 /// The pin's hash of the name acme, the wrap `KAT_HARDWARE_WRAP`, the manifest `KAT_MANIFEST_ITEM` and no policy.
 pub(crate) const KAT_ITEM_PIN_STATE: &str = "f211bede98ed46bf50597eac868e4f433bdc2b73bd67d9f4fd5c56a2d540e9938aec3f46bc7ebb4f872fa72dde6f9b64";
+
+// A policy's approval in the manifest: computed by an independent implementation written from the format as described and
+// not from this code, once it had reproduced `KAT_MANIFEST`, `KAT_WS_PIN_STATE`, `KAT_MANIFEST_ITEM` and
+// `KAT_ITEM_PIN_STATE` above. It takes `KAT_HARDWARE_WRAP` as a fixed input.
+
+/// A policy for github: 43 bytes.
+pub(crate) const POLICY_TEXT: &str = "[fetch]\nhosts = [\"https://api.github.com\"]\n";
+
+/// Its SHA-256.
+pub(crate) const KAT_POLICY_SHA256: &str = "80982e4c451a63e91bbf2d72f3e957e6d5db212eed864fdeb5140c4b5b32e63c";
+
+/// The nonce acme's manifest holding that approval is sealed under.
+pub(crate) fn approval_manifest_nonce() -> [u8; 12] {
+    arr(&seq(0xf0, 12))
+}
+
+/// The plaintext of `KAT_MANIFEST_PLAIN`'s manifest holding the approval of `POLICY_TEXT` as github's policy: after the
+/// items, one approval (`0001`), kind 0x01, the name github and `KAT_POLICY_SHA256`. 196 bytes.
+pub(crate) const KAT_MANIFEST_APPROVAL_PLAIN: &str = "01020105020104010e706173737068726173652d6b65790200000007020b66696c652d616e63686f72020000006003096469722d66696c65730200000060040d\
+    66696c652d6b657973746f7265020000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\
+    00000000000000000000000000000000000000000000000000000001010667697468756280982e4c451a63e91bbf2d72f3e957e6d5db212eed864fdeb5140c4b\
+    5b32e63c";
+
+/// That plaintext sealed under `KAT_KEY_MANIFEST` with `approval_manifest_nonce()`, for acme under its name. 225 bytes.
+pub(crate) const KAT_MANIFEST_APPROVAL: &str = "01f0f1f2f3f4f5f6f7f8f9fafb3e351e1f0496794d8f41a566487f4d53b6bfc1da3e460eec67c034645077f64c4840b0a907716521638c9b0cd48daa440e7dcf\
+    e13c9a28d7be5cb0870da962aa98d17098e6957440c1c1232d1b8fb976fb39ec42cd84bd76c509fcf544fd921f8f2fa9ef2a16c93207133a77ee2197050cf694\
+    6e360b4fab84345635b6c885e23db76ccfe1ab616a2ec9bb70d0d751b635bbaeba9fc5337b9913ca0449fb2176f1463e097f01a5185ce1c1a558f7123163eed2\
+    22e48f663449241e3b94a2bf6ce3a3b848a4dfd10efae40052dfc326e03a89b325";
+
+/// The pin's hash of the name acme, the wrap `KAT_HARDWARE_WRAP`, the manifest `KAT_MANIFEST_APPROVAL` and no policy.
+pub(crate) const KAT_APPROVAL_PIN_STATE: &str = "ec51a47cc9db4b7bb518a14dfab16f5f87e0b46f80c50e6297c42d9806d4a8e9fa52fd8559141ff3180252742d531ff4";
+
+/// The plaintext of `KAT_MANIFEST_ITEM_PLAIN`'s manifest, holding github/token, with the same approval after the item. 249
+/// bytes.
+pub(crate) const KAT_MANIFEST_ITEM_APPROVAL_PLAIN: &str = "01020105020104010e706173737068726173652d6b65790200000007020b66696c652d616e63686f72020000006003096469722d66696c65730200000060040d\
+    66696c652d6b657973746f7265020000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\
+    00000000000000000000000000000000000000000000000000012a4905aa54588e2001b42412b5d8184f5fe226d5cebef8087e45443419468064000000000000\
+    00020667697468756205746f6b656e0001010667697468756280982e4c451a63e91bbf2d72f3e957e6d5db212eed864fdeb5140c4b5b32e63c";
+
+/// What follows the items when there are two approvals: github's of `POLICY_TEXT`, then linear's, whose hash is the SHA-256
+/// of no bytes. 82 bytes.
+pub(crate) const KAT_TWO_APPROVALS: &str = "0002010667697468756280982e4c451a63e91bbf2d72f3e957e6d5db212eed864fdeb5140c4b5b32e63c01066c696e656172e3b0c44298fc1c149afbf4c8996f\
+    b92427ae41e4649b934ca495991b7852b855";

@@ -29,6 +29,7 @@ pub mod key;
 pub mod manifest;
 pub mod passphrase;
 pub mod platform;
+pub mod policy;
 pub mod refusal;
 pub mod store;
 pub mod verbs;

@@ -113,6 +113,7 @@ pub fn ws_new(machine: &Machine<'_>, name: &WsName, fresh: Fresh) -> Result<WsId
         store: Vec::new(),
         keystore_ref: Vec::new(),
         items: Vec::new(),
+        approvals: Vec::new(),
     };
     manifest.check()?;
     if !files.create_new(&FileKey::DirRecord(name.clone()), &record.to_bytes())? {
@@ -326,6 +327,7 @@ mod tests {
             store: Vec::new(),
             keystore_ref: Vec::new(),
             items: Vec::new(),
+            approvals: Vec::new(),
         }
     }
 

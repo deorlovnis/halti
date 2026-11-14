@@ -22,6 +22,7 @@ use crate::ids::{WsId, WsName};
 use crate::item::{ItemKey, Secret, item_name, open_value, seal_value};
 use crate::key::OpenKeys;
 use crate::manifest::{Entry, Manifest};
+use crate::policy::{Edit, Kind, apply};
 use crate::refusal::Refusal;
 use crate::store::Keystore;
 
@@ -133,8 +134,9 @@ pub fn ws_items(machine: &Machine<'_>, name: &WsName) -> Result<Vec<Stored>> {
 }
 
 /// Removes one field, or every field of a resource: one approval (`Change::Remove`). What it
-/// removed, sorted by its text. Naming none is `Refusal::NoSecret`, after the approval and with nothing
-/// written.
+/// removed, sorted by its text. A whole resource also loses its policy's approval, in the same
+/// change. Naming none, and no approval, is `Refusal::NoSecret`, after the approval and with
+/// nothing written.
 ///
 /// The list is replaced first; then each value is deleted. Once the list is replaced the secrets
 /// are gone from it, so a value that can't be deleted is left, sealed and named by no list, and
@@ -145,10 +147,14 @@ pub fn ws_remove(machine: &Machine<'_>, name: &WsName, which: &Which, manifest_n
     }
     with_list(machine, name, Change::Remove, |ws, unlocked, manifest, _| {
         let (gone, kept): (Vec<Entry>, Vec<Entry>) = manifest.items.into_iter().partition(|entry| which.names(&entry.key));
-        if gone.is_empty() {
+        let approvals = match which {
+            Which::Field(_) => manifest.approvals.clone(),
+            Which::Resource(resource) => apply(&manifest.approvals, [Edit::Drop(Kind::Resource, resource)]),
+        };
+        if gone.is_empty() && approvals == manifest.approvals {
             return Err(Refusal::NoSecret { ws: name.clone(), what: which.text() }.into());
         }
-        let sealed = Manifest { items: kept, ..manifest }.seal(unlocked.inner, ws, name, &manifest_nonce)?;
+        let sealed = Manifest { items: kept, approvals, ..manifest }.seal(unlocked.inner, ws, name, &manifest_nonce)?;
         unlocked.replace_manifest(&sealed)?;
         let items = Keystore::bind(ws, machine.keystore);
         for entry in &gone {
@@ -163,7 +169,7 @@ pub fn ws_remove(machine: &Machine<'_>, name: &WsName, which: &Which, manifest_n
 /// Opens the workspace for `change` as `ws_open` does, checks every listed name against its
 /// secret, and hands `then` the workspace's id, the unlock, the manifest and the working keys,
 /// which are wiped when it returns.
-fn with_list<T>(machine: &Machine<'_>, name: &WsName, change: Change, then: impl FnOnce(WsId, &Unlocked<'_>, Manifest, &OpenKeys) -> Result<T>) -> Result<T> {
+pub(super) fn with_list<T>(machine: &Machine<'_>, name: &WsName, change: Change, then: impl FnOnce(WsId, &Unlocked<'_>, Manifest, &OpenKeys) -> Result<T>) -> Result<T> {
     machine.admit()?;
     let record = read_record(machine.host.files, name)?;
     kinds_match(machine, &record)?;
@@ -264,6 +270,7 @@ mod tests {
             store: Vec::new(),
             keystore_ref: Vec::new(),
             items: Vec::new(),
+            approvals: Vec::new(),
         }
     }
 
