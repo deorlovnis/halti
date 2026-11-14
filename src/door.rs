@@ -62,12 +62,19 @@ const MAX_ACTIVE: usize = 256;
 const REDIAL: Duration = Duration::from_millis(200);
 /// The longest `<kind>` line.
 const MAX_KIND: u64 = 16;
+/// How long the VM program behind a socket has to answer a `CONNECT` line.
+const ANSWER_WAIT: Duration = Duration::from_secs(5);
+/// The longest answer to it: `OK ` and a port number.
+const MAX_ANSWER: usize = 32;
 
 pub struct Config {
     /// The box's name, for logs and errors.
     pub name: String,
     /// The published socket to dial.
     pub socket: PathBuf,
+    /// The port in the box to ask for, where the socket is the VM program's end of a vsock device
+    /// (`connect_port`); `None` where it is the box's own listener.
+    pub port: Option<u32>,
     /// `[net] allow`: `"*"` (any host) or patterns like `https://*.wikipedia.org`.
     pub allow: Vec<String>,
     /// The resource whose approved `[fetch]` policy (hosts[0], auth, auth_header) the model
@@ -194,10 +201,14 @@ impl Shared {
     }
 
     /// Dial the socket, trying again until it answers (the box may still be starting) or the
-    /// door stops.
+    /// door stops. With a port, the VM program must first answer for it.
     fn dial(&self, socket: &Path) -> Option<UnixStream> {
         while !self.stopped() {
-            match UnixStream::connect(socket) {
+            let dialed = UnixStream::connect(socket).and_then(|mut stream| match self.cfg.port {
+                Some(port) => connect_port(&mut stream, port, ANSWER_WAIT).map(|()| stream),
+                None => Ok(stream),
+            });
+            match dialed {
                 Ok(stream) => return Some(stream),
                 Err(_) => thread::sleep(REDIAL),
             }
@@ -214,6 +225,39 @@ impl Shared {
         }
         Some(id)
     }
+}
+
+/// Ask the VM program behind a box's socket for `port` in the box: one line `CONNECT <port>`,
+/// before anything else. It answers `OK <number>` once the box listens there, and resets or closes
+/// the connection when nothing does. The answer is read a byte at a time, so nothing the box sends
+/// after it is taken, with a cap on its length and `wait` for all of it: whatever answers is read
+/// as the box's.
+pub fn connect_port(stream: &mut UnixStream, port: u32, wait: Duration) -> io::Result<()> {
+    let refused = |why: &str| io::Error::new(io::ErrorKind::ConnectionRefused, format!("port {port}: {why}"));
+    stream.write_all(format!("CONNECT {port}\n").as_bytes())?;
+    let end = std::time::Instant::now() + wait;
+    let mut line = Vec::new();
+    let mut byte = [0u8];
+    while line.len() <= MAX_ANSWER {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(refused("no answer in time"));
+        }
+        stream.set_read_timeout(Some(left))?;
+        match stream.read(&mut byte) {
+            Ok(0) => return Err(refused("closed with no answer")),
+            Ok(_) if byte[0] == b'\n' => {
+                stream.set_read_timeout(None)?;
+                let ok = line.strip_prefix(b"OK ").is_some_and(|n| !n.is_empty() && n.iter().all(u8::is_ascii_digit));
+                return if ok { Ok(()) } else { Err(refused("an answer that isn't OK")) };
+            }
+            Ok(_) => line.push(byte[0]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => return Err(refused("no answer in time")),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(refused("an answer too long"))
 }
 
 /// Keep `POOL` connections dialed in to `socket`, replacing each as the guest takes it.

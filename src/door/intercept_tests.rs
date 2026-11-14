@@ -198,6 +198,7 @@ fn the_door_ends_tls_for_a_guest_that_trusts_only_the_box_ca() {
         Config {
             name: "testbox".into(),
             socket,
+            port: None,
             allow: vec!["*".into()],
             model: None,
             sites: vec![],
@@ -317,12 +318,15 @@ fn real_vm_tools_trust_the_door_and_only_the_door() {
         mounts: vec![],
         docker: false,
         rosetta: false,
+        disk: None,
+        console: None,
     };
     let ca = Arc::new(BoxCa::generate("e2e").unwrap());
     let log = dir.join("log").join("door.log");
     let config = Config {
         name: name.clone(),
         socket: spec.socket.clone(),
+        port: None,
         allow: vec!["*".into()],
         model: None,
         sites: vec![],

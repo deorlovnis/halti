@@ -126,6 +126,10 @@ pub struct VmSpec {
     pub docker: bool,
     /// Rosetta in the VM, for x86-64 programs and containers.
     pub rosetta: bool,
+    /// The box's own disk, for an engine that is given one in place of mounts (`Vms::takes_disk`).
+    pub disk: Option<PathBuf>,
+    /// Where such an engine writes what the VM prints while it starts.
+    pub console: Option<PathBuf>,
 }
 
 /// What a box asks of the engine that runs its VMs. `[box] engine` picks one (`boxes::vms`):
@@ -144,6 +148,12 @@ pub trait Vms: Sync {
     fn start_docker(&self, name: &str) -> Result<()>;
     /// The pinned reference of a local image.
     fn image_digest(&self, reference: &str) -> Result<String>;
+    /// Whether this engine is given the box's disk (`VmSpec::disk`), which the VM mounts itself,
+    /// in place of folders mounted from this machine.
+    fn takes_disk(&self) -> bool;
+    /// Run a command in the VM as the agent, with `input` on its standard input, and return what
+    /// it wrote to its standard output. A command that fails is an error.
+    fn pipe(&self, name: &str, cmd: &[String], input: &[u8]) -> Result<Vec<u8>>;
 }
 
 /// Apple's `container`: the functions of this module.
@@ -180,6 +190,14 @@ impl Vms for Container {
 
     fn image_digest(&self, reference: &str) -> Result<String> {
         image_digest(reference)
+    }
+
+    fn takes_disk(&self) -> bool {
+        false
+    }
+
+    fn pipe(&self, name: &str, cmd: &[String], input: &[u8]) -> Result<Vec<u8>> {
+        pipe(name, cmd, input)
     }
 }
 
@@ -314,6 +332,24 @@ pub fn exec_command(name: &str, env: &[(String, String)], cmd: &[String], tty: b
     c
 }
 
+/// Run a command in the VM as the agent with `input` on its standard input, and return its
+/// standard output. A failure carries what it wrote to its standard error.
+pub fn pipe(name: &str, cmd: &[String], input: &[u8]) -> Result<Vec<u8>> {
+    let mut child =
+        exec_command(name, &[], cmd, false).process_group(0).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().context("running container exec")?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let input = input.to_vec();
+    // Written apart from the reading, so a command that answers before it has read all its input
+    // never holds both ends up.
+    let writer = thread::spawn(move || stdin.write_all(&input));
+    let out = child.wait_with_output().context("running container exec")?;
+    let _ = writer.join();
+    if !out.status.success() {
+        bail!("running {} in {name}: {}", cmd.first().map_or("", String::as_str), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(out.stdout)
+}
+
 /// Make the box's CA (a public certificate, PEM) trusted in the VM: written where
 /// `update-ca-certificates` looks and added to the system bundle, as root. The VM's system is
 /// thrown away when it stops, so this is done at every start.
@@ -345,12 +381,24 @@ const DOCKER_BRIDGE: &str = "172.17.0.1";
 /// like everything else. The agent uses its socket through the group `agent`: that makes the agent
 /// root in the VM, which holds no secret and no rule (the door, outside, keeps them), so the VM
 /// stays the boundary.
+pub fn start_docker(name: &str) -> Result<()> {
+    let mut cmd = container();
+    cmd.args(["exec", "--uid", "0", "--gid", "0"]);
+    for (key, value) in docker_env() {
+        cmd.arg("-e").arg(format!("{key}={value}"));
+    }
+    capture(cmd.args([name, "sh", "-c", &docker_script()]), &format!("starting Docker in {name}"))?;
+    Ok(())
+}
+
+/// The script that starts dockerd in a VM, as root, and waits until it answers: the same text for
+/// every engine, which each runs its own way.
 ///
 /// The cgroup steps are what Docker's own `dind` script does: with cgroup v2, a cgroup can hand
 /// controllers to children only while it has no processes of its own, so everything moves into a
 /// child first.
-pub fn start_docker(name: &str) -> Result<()> {
-    let script = format!(
+pub fn docker_script() -> String {
+    format!(
         "set -e; command -v dockerd >/dev/null || {{ echo 'the image has no Docker Engine: build it again with install.sh and pin the new digest' >&2; exit 1; }}; \
          mkdir -p /sys/fs/cgroup/init; \
          for p in $(cat /sys/fs/cgroup/cgroup.procs); do echo $p > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || :; done; \
@@ -360,14 +408,12 @@ pub fn start_docker(name: &str) -> Result<()> {
          i=0; until docker version >/dev/null 2>&1; do \
            i=$((i + 1)); [ $i -le 300 ] || {{ tail -n 20 {DOCKER_DATA}/dockerd.log >&2; exit 1; }}; sleep 0.1; \
          done"
-    );
-    let mut cmd = container();
-    cmd.args(["exec", "--uid", "0", "--gid", "0"]);
-    for (key, value) in [("HTTPS_PROXY", PROXY), ("HTTP_PROXY", PROXY), ("NO_PROXY", NO_PROXY)] {
-        cmd.arg("-e").arg(format!("{key}={value}"));
-    }
-    capture(cmd.args([name, "sh", "-c", &script]), &format!("starting Docker in {name}"))?;
-    Ok(())
+    )
+}
+
+/// What `docker_script` runs with: the door's proxy, for dockerd's pulls.
+pub fn docker_env() -> [(&'static str, &'static str); 3] {
+    [("HTTPS_PROXY", PROXY), ("HTTP_PROXY", PROXY), ("NO_PROXY", NO_PROXY)]
 }
 
 /// The Docker CLI's proxy settings (`proxies` in ~/.docker/config.json), which it hands to the
@@ -404,7 +450,18 @@ pub fn run_browser(spec: &BrowserSpec) -> Result<()> {
         DirBuilder::new().recursive(true).mode(0o700).create(host).with_context(|| format!("creating {}", host.display()))?;
         mounts.push(Mount { host: host.clone(), guest: BROWSER_DOWNLOADS.into(), readonly: false });
     }
-    run(&VmSpec { name: spec.name.clone(), image: spec.image.clone(), cpus: 2, memory: "2G".into(), socket: spec.socket.clone(), mounts, docker: false, rosetta: false })
+    run(&VmSpec {
+        name: spec.name.clone(),
+        image: spec.image.clone(),
+        cpus: 2,
+        memory: "2G".into(),
+        socket: spec.socket.clone(),
+        mounts,
+        docker: false,
+        rosetta: false,
+        disk: None,
+        console: None,
+    })
 }
 
 /// Start a runner in the browser VM (`node /opt/runner/runner.mjs`, as the VM's user 1000),
@@ -572,6 +629,8 @@ mod tests {
             ],
             docker: false,
             rosetta: false,
+            disk: None,
+            console: None,
         }
     }
 
@@ -713,6 +772,25 @@ mod tests {
         let proxies = docker_proxies();
         assert_eq!(proxies["default"]["httpsProxy"], format!("http://{DOCKER_BRIDGE}:3128"));
         assert_eq!(proxies["default"]["httpProxy"], proxies["default"]["httpsProxy"]);
+    }
+
+    /// Moved out of `start_docker` so another engine runs the same text: byte for byte what it was.
+    #[test]
+    fn the_docker_script_is_the_text_it_was() {
+        assert_eq!(
+            docker_script(),
+            "set -e; command -v dockerd >/dev/null || { echo 'the image has no Docker Engine: build it again with install.sh and pin the new digest' >&2; exit 1; }; \
+             mkdir -p /sys/fs/cgroup/init; \
+             for p in $(cat /sys/fs/cgroup/cgroup.procs); do echo $p > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || :; done; \
+             sed -e 's/ / +/g' -e 's/^/+/' /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control; \
+             mount --make-rshared /; \
+             setsid dockerd --group agent --bip 172.17.0.1/16 > /var/lib/docker/dockerd.log 2>&1 < /dev/null & \
+             i=0; until docker version >/dev/null 2>&1; do \
+             i=$((i + 1)); [ $i -le 300 ] || { tail -n 20 /var/lib/docker/dockerd.log >&2; exit 1; }; sleep 0.1; \
+             done"
+        );
+        assert_eq!(docker_env(), [("HTTPS_PROXY", "http://127.0.0.1:3128"), ("HTTP_PROXY", "http://127.0.0.1:3128"), ("NO_PROXY", NO_PROXY)]);
+        assert!(!Container.takes_disk(), "Apple's engine mounts folders");
     }
 
     #[test]

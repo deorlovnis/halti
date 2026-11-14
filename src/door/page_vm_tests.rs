@@ -249,6 +249,7 @@ fn scenario() {
         Config {
             name: id.clone(),
             socket: short.join("agent.sock"),
+            port: None,
             allow: vec![],
             model: None,
             sites: vec!["example".into(), "files".into()],
@@ -525,6 +526,7 @@ fn session_scenario() {
         Config {
             name: id.clone(),
             socket: short.join("agent.sock"),
+            port: None,
             allow: vec![],
             model: None,
             sites: vec!["files".into()],

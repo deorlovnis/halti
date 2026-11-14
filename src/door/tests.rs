@@ -314,6 +314,7 @@ fn scenario(dir: &Path) {
         Config {
             name: "testbox".into(),
             socket: socket.clone(),
+            port: None,
             allow: vec!["https://allowed.example.com".into(), "https://*.wiki.example.org".into(), "https://rebind.example.com".into()],
             model: Some("anthropic".into()),
             sites: vec!["notes".into()],
@@ -510,6 +511,7 @@ fn model_refusals(dir: &Path) {
         let config = Config {
             name: "second".into(),
             socket,
+            port: None,
             allow: vec![],
             model: model.map(String::from),
             sites: vec![],
@@ -587,6 +589,7 @@ fn live_door() {
     let door = Door::start(Config {
         name: "live".into(),
         socket: socket.into(),
+        port: None,
         allow,
         model: None,
         sites: vec![],
@@ -611,6 +614,7 @@ fn bad_allow_patterns_stop_the_door_from_starting() {
     let cfg = Config {
         name: "x".into(),
         socket: dir.0.join("s"),
+        port: None,
         allow: vec!["example.com".into()],
         model: None,
         sites: vec![],
@@ -624,4 +628,112 @@ fn bad_allow_patterns_stop_the_door_from_starting() {
     };
     let err = Door::start(cfg).err().expect("should fail");
     assert!(format!("{err:#}").contains("example.com"), "{err:#}");
+}
+
+/// The VM program's end of a box's vsock device: a socket that takes a `CONNECT <port>` line and
+/// answers it as `answer` says, then stands in for the shim's pool on that connection.
+fn vm_program(dir: &Path, answer: impl Fn(u32) -> Vec<u8> + Send + 'static) -> (std::path::PathBuf, Receiver<(String, UnixStream)>) {
+    let socket = dir.join("vsock.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for (n, stream) in listener.incoming().flatten().enumerate() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut stream = stream;
+            let _ = stream.write_all(&answer(n as u32));
+            if tx.send((line, stream)).is_err() {
+                return;
+            }
+        }
+    });
+    (socket, rx)
+}
+
+fn dialing_door(dir: &Path, socket: std::path::PathBuf, port: u32) -> Door {
+    Door::start(Config {
+        name: "vsock".into(),
+        socket,
+        port: Some(port),
+        allow: vec![],
+        model: None,
+        sites: vec![],
+        net: Default::default(),
+        log: dir.join("log"),
+        ca: None,
+        log_key: LOG_KEY,
+        browser_socket: None,
+        browser_tokens: Default::default(),
+        browser: None,
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_dial_with_a_port_says_connect_first() {
+    let dir = TempDir::new("halti-door-port").unwrap();
+    let (socket, dialed) = vm_program(&dir.0, |n| format!("OK {}\n", 1073741824 + n).into_bytes());
+    let _door = dialing_door(&dir.0, socket, 7000);
+    let (line, stream) = dialed.recv_timeout(WAIT).unwrap();
+    assert_eq!(line, "CONNECT 7000\n");
+    // The answer was read and nothing more: the connection is the pool's, and serves a guest.
+    let mut guest = Conn { reader: BufReader::new(stream.try_clone().unwrap()), stream, seen: Vec::new() };
+    guest.send("proxy\nCONNECT nowhere.example.com:443 HTTP/1.1\r\nHost: nowhere.example.com:443\r\n\r\n");
+    assert_eq!(guest.head().status, 403);
+}
+
+#[test]
+fn a_dial_that_gets_no_ok_is_dropped() {
+    let dir = TempDir::new("halti-door-no-ok").unwrap();
+    // The first answers are no OK, as when nothing in the box listens yet: each is dropped.
+    let (socket, dialed) = vm_program(&dir.0, |n| match n {
+        0 => b"NO\n".to_vec(),
+        1 => b"OK\n".to_vec(),
+        2 => b"OK 12x\n".to_vec(),
+        _ => b"OK 1073741830\n".to_vec(),
+    });
+    let _door = dialing_door(&dir.0, socket, 7000);
+    for n in 0..3 {
+        let (_, mut stream) = dialed.recv_timeout(WAIT).unwrap();
+        // a socket the door has already closed may refuse a timeout (macOS)
+        let _ = stream.set_read_timeout(Some(WAIT));
+        let mut rest = Vec::new();
+        assert!(matches!(stream.read_to_end(&mut rest), Ok(0) | Err(_)), "answer {n}: the door hung up");
+    }
+    let (line, stream) = dialed.recv_timeout(WAIT).unwrap();
+    assert_eq!(line, "CONNECT 7000\n");
+    let mut guest = Conn { reader: BufReader::new(stream.try_clone().unwrap()), stream, seen: Vec::new() };
+    guest.send("proxy\nCONNECT nowhere.example.com:443 HTTP/1.1\r\nHost: nowhere.example.com:443\r\n\r\n");
+    assert_eq!(guest.head().status, 403);
+}
+
+#[test]
+fn an_endless_answer_line_is_dropped() {
+    use super::connect_port;
+    let answers: [(&[u8], bool); 6] =
+        [(b"OK 1073741824\n", true), (b"OK 7\nhalti\n", true), (b"", false), (b"OK 1073741824", false), (b"OK OK OK OK OK OK OK OK OK OK OK OK\n", false), (&[b'O'; 4096], false)];
+    for (answer, ok) in answers {
+        let (mut door, mut vm) = UnixStream::pair().unwrap();
+        let sent = answer.to_vec();
+        let vm_side = thread::spawn(move || {
+            let mut line = [0u8; 13];
+            vm.read_exact(&mut line).unwrap();
+            assert_eq!(&line, b"CONNECT 7001\n");
+            let _ = vm.write_all(&sent);
+            // held open, so only the time limit or the cap ends a cut-off answer
+            thread::sleep(Duration::from_millis(600));
+        });
+        let started = Instant::now();
+        let got = connect_port(&mut door, 7001, Duration::from_millis(300));
+        assert_eq!(got.is_ok(), ok, "{:?}: {got:?}", String::from_utf8_lossy(answer));
+        assert!(started.elapsed() < Duration::from_millis(550), "{:?} took {:?}", String::from_utf8_lossy(answer), started.elapsed());
+        if answer.starts_with(b"OK 7\n") {
+            // what the box sent after the answer is left for the door's connection to read
+            let mut kind = [0u8; 6];
+            door.read_exact(&mut kind).unwrap();
+            assert_eq!(&kind, b"halti\n");
+        }
+        vm_side.join().unwrap();
+    }
 }

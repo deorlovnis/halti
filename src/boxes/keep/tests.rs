@@ -125,6 +125,14 @@ impl World for Fake {
     fn exec(&self, _vm: &str, _env: &[(String, String)], _cmd: &[String], _tty: bool) -> Result<ExitStatus> {
         bail!("the keeper runs no agent's command")
     }
+
+    fn takes_disk(&self) -> bool {
+        false
+    }
+
+    fn pipe(&self, _vm: &str, _cmd: &[String], _input: &[u8]) -> Result<Vec<u8>> {
+        bail!("the keeper runs no agent's command")
+    }
 }
 
 impl Vms for Fake {
@@ -160,6 +168,14 @@ impl Vms for Fake {
 
     fn image_digest(&self, _reference: &str) -> Result<String> {
         bail!("no images here")
+    }
+
+    fn takes_disk(&self) -> bool {
+        false
+    }
+
+    fn pipe(&self, _name: &str, _cmd: &[String], _input: &[u8]) -> Result<Vec<u8>> {
+        bail!("the keeper runs no agent's command")
     }
 }
 
