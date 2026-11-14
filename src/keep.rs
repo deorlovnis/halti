@@ -47,6 +47,10 @@ const CONNECT_WAIT: Duration = Duration::from_secs(2);
 /// is put away.
 pub const PING_WAIT: Duration = Duration::from_secs(1);
 pub const CLOSE_WAIT: Duration = Duration::from_secs(300);
+/// How long a client waits for the answer to a `start`, which comes once the box runs, and to a
+/// `stop`, which comes once it is put away.
+pub const START_WAIT: Duration = Duration::from_secs(180);
+pub const STOP_WAIT: Duration = Duration::from_secs(90);
 
 /// The kind of a refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,9 +356,45 @@ pub fn connect(path: &Path) -> Option<UnixStream> {
 /// Sends `request` to the open workspace at `path`, and reads the line that answers it within
 /// `wait`. None if nothing answered in time, or not with one of the words.
 pub fn ask(path: &Path, request: &Request, wait: Duration) -> Option<Reply> {
-    let mut stream = connect(path)?;
-    write_line(&mut stream, &request.line()).ok()?;
-    Reply::parse(&read_line(&mut stream, wait)?)
+    match ask_held(path, request, wait) {
+        Asked::Answered(reply, _) => Some(reply),
+        Asked::Ended | Asked::Unanswered => None,
+    }
+}
+
+/// What came of a request whose connection is wanted with its answer.
+pub enum Asked {
+    /// The word that answered it, and the connection, nothing read past it: after `started` or
+    /// `running` it is the session.
+    Answered(Reply, UnixStream),
+    /// The connection ended with no line: what was at the socket went while it worked on it.
+    Ended,
+    /// Nothing let us in, no line came in time, or it wasn't one of the words.
+    Unanswered,
+}
+
+/// As `ask`, and the connection with it.
+pub fn ask_held(path: &Path, request: &Request, wait: Duration) -> Asked {
+    let Some(mut stream) = connect(path) else { return Asked::Unanswered };
+    if write_line(&mut stream, &request.line()).is_err() {
+        return Asked::Unanswered;
+    }
+    match read_line(&mut stream, wait) {
+        Some(line) => Reply::parse(&line).map_or(Asked::Unanswered, |reply| Asked::Answered(reply, stream)),
+        None if ended(&mut stream) => Asked::Ended,
+        None => Asked::Unanswered,
+    }
+}
+
+/// Whether the other end has closed `stream` and nothing is left to read: looked at without waiting.
+fn ended(stream: &mut UnixStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
+    match stream.read(&mut [0u8; 1]) {
+        Ok(read) => read == 0,
+        Err(e) => !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted),
+    }
 }
 
 #[cfg(test)]
@@ -518,6 +558,32 @@ mod tests {
         let started = Instant::now();
         assert_eq!(ask(&path, &Request::Ping(acme()), Duration::from_millis(300)), None);
         assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(ask_held(&path, &Request::Ping(acme()), Duration::from_millis(300)), Asked::Unanswered));
+    }
+
+    #[test]
+    fn a_connection_that_ends_unanswered_is_told_from_one_that_stays() {
+        let dir = TempDir::new("halti-keep-ended").unwrap();
+        let path = dir.0.join("t.keep.sock");
+        let listener = bind(&path).unwrap().unwrap();
+        // It reads the request, then goes, as a killed open workspace does: seen at once.
+        let going = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_line(&mut stream, LINE_WAIT).unwrap();
+        });
+        let started = Instant::now();
+        assert!(matches!(ask_held(&path, &Request::Start(acme(), "dev".into()), START_WAIT), Asked::Ended));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        going.join().unwrap();
+        // One that reads it and stays, saying nothing, is no answer once the wait is over.
+        let listener = bind(&path).unwrap().unwrap();
+        let staying = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_line(&mut stream, LINE_WAIT).unwrap();
+            stream
+        });
+        assert!(matches!(ask_held(&path, &Request::Start(acme(), "dev".into()), Duration::from_millis(300)), Asked::Unanswered));
+        drop(staying.join().unwrap());
     }
 
     #[test]

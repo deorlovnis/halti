@@ -11,7 +11,8 @@
 //!
 //! A workspace that `halti open` keeps open (`ws::keep`) starts its boxes after the same checks of
 //! their files, which are made here and handed to it (`keep`); `Kept` is where other commands find
-//! it: its lock and its socket.
+//! it: its lock and its socket. While it is open, `ws run` and `ws stop` ask it, with names, and
+//! ask nothing themselves.
 //!
 //! What is shown before an approval is what is sealed: a policy's file is read once, checked
 //! against the workspace's mount rule and plain text, and those bytes are shown and sent to core.
@@ -34,7 +35,7 @@ use jiff::tz::TimeZone;
 
 use super::files::{PolicyFiles, Reading, boxes_dir, remove_boxes, stores_in};
 use super::tty::TtyPassphrase;
-use super::{Here, Said, Way, approved, declined, memory, random, saved, saved_means};
+use super::{Here, Said, Way, approved, declined, keep, memory, random, saved, saved_means};
 use crate::approval::{Action, Real};
 use crate::boxes::store::Layout;
 use crate::boxes::{self, BoxPolicy, MountRule};
@@ -399,15 +400,19 @@ fn rm_with(here: &Here, found: &Found, vms: Option<&dyn Vms>, way: &Way<'_>, typ
 
 // --- running, stopping, the log ---
 
-/// What `ws run` hands `main`: a box to join, or the workspace opened and the box to start in it.
+/// What `ws run` hands `main`: a box to join, one to join while its session of an open workspace is
+/// held, or the workspace opened and the box to start in it.
 pub enum Run {
     Join(Box<boxes::Join>),
+    Session { join: Box<boxes::Join>, session: Box<keep::Session> },
     Start { source: Box<Source>, start: Box<boxes::Start> },
 }
 
-/// `halti ws run WS/BOX [--type] [-- CMD]`: reads the settings once. A box that runs is joined, and
-/// nothing is asked. Otherwise its policy file is read once and checked, against the copy kept when
-/// it was approved too, and so are its store and its sockets; then the workspace is opened, as
+/// `halti ws run WS/BOX [--type] [-- CMD]`: reads the settings once. A workspace that `halti open`
+/// keeps open is asked to start the box, or join it if it runs, and nothing is asked here: the box
+/// is joined while the session is held. Otherwise a box that runs is joined, and nothing is asked.
+/// Otherwise its policy file is read once and checked, against the copy kept when it was approved
+/// too, and so are its store and its sockets; then the workspace is opened, as
 /// `[workspace.approval] open` says. `main` chooses it as the place and starts the box.
 pub fn run(target_text: &str, command: Vec<String>, type_it: bool) -> Result<Run> {
     let (name, box_name) = target(target_text)?;
@@ -418,6 +423,26 @@ pub fn run(target_text: &str, command: Vec<String>, type_it: bool) -> Result<Run
     let found = find(&here, &name, box_name)?;
     let rule = MountRule::workspace(&settings);
     let command = (!command.is_empty()).then_some(command);
+    let kept = Kept::of(&here, found.id)?;
+    if kept.held() {
+        let session = match keep::start(&kept, &name, box_name)? {
+            keep::Started::Elsewhere => None,
+            keep::Started::Gone => return Err(keep::lost(&name, &found.shown, put_away_lost(&found.layout, box_name, &found.shown, vms))),
+            keep::Started::Session(stream) => {
+                // A session that loses the open workspace stops the box, as `ws stop` does.
+                let (layout, stopped, shown) = (found_in(&here.root, &name, found.id, box_name)?.layout, box_name.to_string(), found.shown.clone());
+                let lost = move || put_away_lost(&layout, &stopped, &shown, vms);
+                Some(keep::Session::hold(stream, &found.name, &found.shown, Box::new(lost))?)
+            }
+        };
+        let text = found.files.read(box_name)?.ok_or_else(|| no_box(&found.shown))?;
+        let Found { box_name, shown, layout, .. } = found;
+        let join = Box::new(boxes::Join { vms, layout, name: box_name, shown, text, mounts: rule, command });
+        return Ok(match session {
+            Some(session) => Run::Session { join, session: Box::new(session) },
+            None => Run::Join(join),
+        });
+    }
     if boxes::store::is_held(&found.layout.lock(box_name)) {
         let text = found.files.read(box_name)?.ok_or_else(|| no_box(&found.shown))?;
         let Found { box_name, shown, layout, .. } = found;
@@ -469,44 +494,87 @@ fn open_for(here: &Here, found: &Found, way: &Way<'_>, what: &str, command: &str
 /// How long a box another halti runs is waited for once it is stopped: 60 times this.
 const LET_GO_EVERY: Duration = Duration::from_millis(250);
 
-/// `halti ws stop WS/BOX`: stops the box's VM, asks nothing. The halti that runs it then puts it
-/// away; once it lets go of the box, what is left is cleared here, and the browser VM is stopped if
-/// it still runs (that halti stops it before it lets go, unless it died). Until then its VM is
-/// stopped whenever it is seen running: a box that is still starting brings it up meanwhile.
+/// `halti ws stop WS/BOX`: asks nothing. A workspace that `halti open` keeps open is asked to stop
+/// the box; once it says it did, the box's lock is waited for here all the same, never taken, and
+/// nothing is stopped: a start that comes after the word is another run's. Otherwise, or if it
+/// doesn't run the box, the box is stopped as `stop_box` does.
 pub fn stop(target_text: &str) -> Result<()> {
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
     let vms = boxes::vms(&settings)?;
     let here = Here::at(&settings.workspaces.path);
     let found = find(&here, &name, box_name)?;
-    let vm = found.layout.vm(box_name);
-    let mut was_running = vms.running(&vm);
-    if was_running {
-        vms.stop(&vm)?;
-    }
-    let lock = found.layout.lock(box_name);
-    if lock.exists() {
-        for _ in 0..60 {
-            if let Some(_held) = boxes::store::lock(&lock)? {
-                boxes::run::sweep(&found.layout, box_name)?;
-                let browser = found.layout.browser_vm(box_name);
-                if vms.running(&browser) {
-                    vms.stop(&browser)?;
-                }
-                break;
-            }
-            thread::sleep(LET_GO_EVERY);
-            if vms.running(&vm) {
-                was_running = true;
-                vms.stop(&vm)?;
-            }
+    let kept = Kept::of(&here, found.id)?;
+    if kept.held() && keep::stop(&kept, &name, box_name)? == keep::Stopped::Said {
+        if !let_go(&found.layout.lock(box_name)) {
+            bail!("box {} is being opened or closed: try again in a moment", found.shown);
         }
+        println!("stopped box {}", found.shown);
+        return Ok(());
     }
+    let (was_running, _) = stop_box(&found.layout, box_name, vms)?;
     if !was_running {
         bail!("box {} isn't running", found.shown);
     }
     println!("stopped box {}", found.shown);
     Ok(())
+}
+
+/// Stops box `box_name`'s VM. The halti that runs it then puts it away; once it lets go of the
+/// box, what is left is cleared here, and the browser VM is stopped if it still runs (that halti
+/// stops it before it lets go, unless it died). Until then its VM is stopped whenever it is seen
+/// running: a box that is still starting brings it up meanwhile. Returns whether its VM was seen
+/// running, and whether the box was let go of.
+fn stop_box(layout: &Layout, box_name: &str, vms: &dyn Vms) -> Result<(bool, bool)> {
+    let vm = layout.vm(box_name);
+    let mut was_running = vms.running(&vm);
+    if was_running {
+        vms.stop(&vm)?;
+    }
+    let lock = layout.lock(box_name);
+    if !lock.exists() {
+        return Ok((was_running, true));
+    }
+    for _ in 0..60 {
+        if let Some(_held) = boxes::store::lock(&lock)? {
+            boxes::run::sweep(layout, box_name)?;
+            let browser = layout.browser_vm(box_name);
+            if vms.running(&browser) {
+                vms.stop(&browser)?;
+            }
+            return Ok((was_running, true));
+        }
+        thread::sleep(LET_GO_EVERY);
+        if vms.running(&vm) {
+            was_running = true;
+            vms.stop(&vm)?;
+        }
+    }
+    Ok((was_running, false))
+}
+
+/// Waits for the box lock at `lock` to be let go of, without taking it: 60 times `LET_GO_EVERY` at
+/// most. False if it is still held.
+fn let_go(lock: &Path) -> bool {
+    for _ in 0..60 {
+        if !boxes::store::is_held(lock) {
+            return true;
+        }
+        thread::sleep(LET_GO_EVERY);
+    }
+    !boxes::store::is_held(lock)
+}
+
+/// Puts away box `box_name` (`shown`) of a run that lost its open workspace, as `ws stop` does:
+/// whether it was let go of and cleared. A failure is said.
+fn put_away_lost(layout: &Layout, box_name: &str, shown: &str, vms: &dyn Vms) -> bool {
+    match stop_box(layout, box_name, vms) {
+        Ok((_, let_go)) => let_go,
+        Err(e) => {
+            warn(&format!("stopping box {shown}: {e:#}"));
+            false
+        }
+    }
 }
 
 /// `halti ws box log WS/BOX [-n N] [--type]`: the last lines of what went through the box's door. A

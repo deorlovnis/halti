@@ -385,8 +385,10 @@ enum WsCmd {
         #[command(subcommand)]
         action: WsBoxCmd,
     },
-    /// Start a box of a workspace (asks as halti config says for open), or join it if it runs (asks nothing)
-    #[command(after_help = "Without CMD, runs the box policy's `run` (claude). Ctrl-C or closing the terminal stops the box.")]
+    /// Start a box of a workspace (asks as halti config says for open, or nothing while it is open), or join it if it runs (asks nothing)
+    #[command(
+        after_help = "Without CMD, runs the box policy's `run` (claude). Ctrl-C or closing the terminal stops the box; while the workspace is open, the box stops once its last run ends."
+    )]
     Run {
         #[arg(value_name = "WS/BOX", value_parser = parse_ws_box)]
         target: String,
@@ -991,6 +993,7 @@ fn main() -> ExitCode {
         Cmd::Config { show, default } => ok(config::command(show, default)),
         Cmd::Ws { action: WsCmd::Run { target, type_it, command } } => match ws::boxes::run(&target, command, type_it) {
             Ok(ws::boxes::Run::Join(join)) => boxes::join_in(*join),
+            Ok(ws::boxes::Run::Session { join, session }) => session.end(boxes::join_in(*join)),
             Ok(ws::boxes::Run::Start { source, start }) => {
                 source::choose(*source).expect("ws run chose where secrets are kept once");
                 boxes::run_in(*start)

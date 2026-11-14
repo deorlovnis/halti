@@ -307,7 +307,10 @@ mod backend {
         bail!("the Keychain needs macOS")
     }
 
-    pub fn no_prompts() -> Option<std::convert::Infallible> {
+    /// Stands in for the Mac's lock, which is never had here.
+    pub struct NoPrompts;
+
+    pub fn no_prompts() -> Option<NoPrompts> {
         None
     }
 

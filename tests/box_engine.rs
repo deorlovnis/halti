@@ -485,14 +485,14 @@ impl Home {
     }
 
     /// Workspace `ws` with a model and github, its token `token` (`basic`'s, for httpbin's
-    /// /basic-auth), and a box `name` that may use github.
+    /// /basic-auth), and a box `name` that may use github, and reach its host and no other.
     fn workspace_with_box(&self, ws: &str, passphrase: &str, name: &str, token: &str, image: &str) {
         assert!(self.ws(passphrase, "true", &["ws", "new", ws]).status.success());
         self.set(ws, passphrase, "anthropic", "token", "model-token-not-used");
         self.policy(ws, passphrase, "anthropic", "[fetch]\nhosts = [\"https://api.anthropic.com\"]\nauth = \"Bearer {token}\"\n");
         self.set(ws, passphrase, "github", "token", token);
         self.policy(ws, passphrase, "github", GITHUB);
-        let text = format!("run = [\"claude\"]\nimage = \"{image}\"\nmodel = \"anthropic\"\nsites = [\"github\"]\nkeep = true\ncpus = 2\nmemory = \"2G\"\n\n[net]\nallow = []\n");
+        let text = format!("{}\n[net]\nallow = [\"https://httpbin.org\"]\n", github_box(image));
         let target = format!("{ws}/{name}");
         assert!(self.ws(passphrase, &self.editor(&text), &["ws", "box", "new", &target]).status.success());
         self.boxes.lock().unwrap().push(target);
@@ -523,6 +523,12 @@ fn agent_image() -> Option<String> {
     }
     engine::available().unwrap();
     Some(engine::image_digest(&env::var("HALTI_E2E_AGENT_IMAGE").unwrap_or_else(|_| engine::AGENT_IMAGE.to_string())).unwrap())
+}
+
+/// The policy of a box of `image` that may use github, without its `[net]`: the door lets the
+/// agent reach only the hosts `[net] allow` lists, and a site's hosts are no exception.
+fn github_box(image: &str) -> String {
+    format!("run = [\"claude\"]\nimage = \"{image}\"\nmodel = \"anthropic\"\nsites = [\"github\"]\nkeep = true\ncpus = 2\nmemory = \"2G\"\n")
 }
 
 /// github's policy: httpbin, with the token sent as Basic credentials.
@@ -582,11 +588,16 @@ fn a_workspace_box_reaches_only_its_sites() {
     assert!(home.halti().args(["policy", "approve", "github"]).output().unwrap().status.success());
     home.workspace_with_box("globex", GLOBEX, &name, &globex, &image);
     home.workspace_with_box("acme", ACME, &name, &acme, &image);
-    // Only acme's credentials are accepted: the door sent acme's token, and no other.
-    let script = statuses_then_headers(&[("acme", "acme-token-0001"), ("globex", "globex-token-0001"), ("keychain", "keychain-token-0001")]);
+    // github's hosts take in one that the box's [net] allow doesn't list.
+    home.policy("acme", ACME, "github", "[fetch]\nhosts = [\"https://httpbin.org\", \"https://example.org\"]\nauth = \"Basic {token}\"\n");
+    // The door answers 403 to the agent's CONNECT to a host [net] allow doesn't list, github's
+    // own, then one no site names. Only acme's credentials are accepted: the door sent acme's
+    // token, and no other.
+    let refused = "curl -sS -m 10 -o /dev/null -w '%{http_connect} ' https://example.org; curl -sS -m 10 -o /dev/null -w '%{http_connect} ' https://example.com; ";
+    let script = refused.to_string() + &statuses_then_headers(&[("acme", "acme-token-0001"), ("globex", "globex-token-0001"), ("keychain", "keychain-token-0001")]);
     let out = home.ws(ACME, "true", &["ws", "run", &format!("acme/{name}"), "--", "sh", "-c", &script]);
     let seen = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success() && seen.starts_with("200 401 401 "), "acme's alone: {seen}");
+    assert!(out.status.success() && seen.starts_with("403 403 200 401 401 "), "allowed hosts and acme's token alone: {seen}");
     assert!(seen.contains(MASKED), "acme's token, masked: {seen}");
     assert!(![&acme, &globex, &keychain].iter().any(|token| seen.contains(token.as_str())), "{seen}");
 }
@@ -747,8 +758,8 @@ fn a_keychain_box_of_the_same_name_keeps_running() {
 
 // --- a workspace kept open by `halti open` ---
 //
-// The open workspace starts and stops boxes when asked on its socket: these speak its lines as a
-// client will, and join its boxes with `ws run`, which asks nothing for a box that runs.
+// The open workspace starts and stops boxes when asked on its socket: some of these speak its lines
+// themselves, and the others are its clients, `ws run` and `ws stop`, which ask nothing.
 
 impl Home {
     /// The id of workspace `ws`, as its directory record holds it.
@@ -758,7 +769,7 @@ impl Home {
     }
 
     /// `halti open WS`, once it says it is open, with its stdout still to read.
-    fn open(&self, ws: &str, passphrase: &str) -> (std::process::Child, BufReader<std::process::ChildStdout>) {
+    fn open(&self, ws: &str, passphrase: &str) -> (Keeper, BufReader<std::process::ChildStdout>) {
         let mut child = self.halti().env("HALTI_TEST_PASSPHRASE", passphrase).args(["open", ws]).stdout(Stdio::piped()).process_group(0).spawn().unwrap();
         let mut said = BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
@@ -769,7 +780,9 @@ impl Home {
                 panic!("halti open ended before it was open");
             }
         }
-        (child, said)
+        let mut close = self.halti();
+        close.args(["close", ws]).stdout(Stdio::null()).stderr(Stdio::null());
+        (Keeper { child, close }, said)
     }
 
     /// Where open workspace `ws` listens.
@@ -782,6 +795,67 @@ impl Home {
         let out = self.halti().args(["close", ws]).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+}
+
+/// A `halti open` that keeps a workspace open. A test that fails while it runs closes it as it
+/// ends, before its home goes: `halti close`, then a signal as Ctrl-C sends, then kill.
+struct Keeper {
+    child: std::process::Child,
+    close: Command,
+}
+
+impl Keeper {
+    /// Whether it ended within `wait`.
+    fn ended_within(&mut self, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        while matches!(self.child.try_wait(), Ok(None)) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        true
+    }
+}
+
+impl std::ops::Deref for Keeper {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for Keeper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for Keeper {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        let _ = self.close.status();
+        if self.ended_within(Duration::from_secs(10)) {
+            return;
+        }
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGINT) };
+        if !self.ended_within(Duration::from_secs(120)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// The socket a killed `halti open` left: removed as the test ends, however it ends, so no later
+/// test or run finds it.
+struct Planted(PathBuf);
+
+impl Drop for Planted {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -863,10 +937,10 @@ fn closing_stops_a_box_another_terminal_runs() {
     let home = Home::new("keep-other");
     let name = box_name("keep-other");
     home.workspace_with_box("acme", ACME, &name, &basic("acme", "acme-token-0001"), &image);
-    let (mut keeper, _said) = home.open("acme", ACME);
-    // Started by `ws run` beside the open workspace: it asks, and holds acme's keys in its own process.
+    // Started by `ws run` before acme was open: it asked, and holds acme's keys in its own process.
     let mut other = home.start(ACME, &format!("acme/{name}"), &["sleep", "120"]);
     let vm = until_running("halti-wsbox-", &name);
+    let (mut keeper, _said) = home.open("acme", ACME);
     assert_eq!(home.close("acme"), "closed acme and stopped 1 box\n");
     assert!(keeper.wait().unwrap().success());
     other.wait().unwrap();
@@ -970,4 +1044,142 @@ fn a_closed_terminal_puts_every_box_away() {
     assert!(rest.ends_with(&format!("stopped box acme/{name}\nclosed acme\n")), "{rest}");
     assert!(!engine::running(&vm) && !engine::running(&vm.replacen("halti-wsbox-", "halti-wsbrowser-", 1)) && !mounted(&name));
     assert!(!home.keeper_socket("acme").exists());
+}
+
+/// Reads lines of `said` (an open workspace's stdout) until one is `line`, or it ends.
+fn until_said(said: &mut BufReader<std::process::ChildStdout>, line: &str) {
+    let mut read = String::new();
+    while read != line {
+        read.clear();
+        assert!(said.read_line(&mut read).unwrap() > 0, "never said: {line}");
+    }
+}
+
+#[test]
+#[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
+fn ws_run_of_an_open_workspace_asks_nothing_and_its_box_stops_with_its_last_run() {
+    let Some(image) = agent_image() else { return };
+    let home = Home::new("keep-run");
+    let name = box_name("keep-run");
+    home.workspace_with_box("acme", ACME, &name, &basic("acme", "acme-token-0001"), &image);
+    let (mut keeper, mut said) = home.open("acme", ACME);
+    let target = format!("acme/{name}");
+    // Nothing answers a passphrase here: none is asked. The box starts for the first run, and the
+    // second joins it.
+    let first = home.halti().args(["ws", "run", &target, "--", "sleep", "120"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    until_said(&mut said, &format!("started box {target}\n"));
+    let vm = until_running("halti-wsbox-", &name);
+    let out = home.halti().args(["ws", "run", &target, "--", "sh", "-c", "exit 7"]).output().unwrap();
+    assert!(out.status.code() == Some(7) && !String::from_utf8_lossy(&out.stderr).contains("[test] asked"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(engine::running(&vm), "the first run still holds it");
+    // Stopped from a third terminal: its last run ends with it.
+    let out = home.halti().args(["ws", "stop", &target]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("stopped box {target}\n"));
+    until_said(&mut said, &format!("stopped box {target}\n"));
+    let out = first.wait_with_output().unwrap();
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("no longer open"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!engine::running(&vm) && !mounted(&name));
+    // Run again and left by itself: the box stops once that run ends.
+    let out = home.halti().args(["ws", "run", &target, "--", "true"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    until_said(&mut said, &format!("stopped box {target}\n"));
+    assert!(!engine::running(&vm) && !mounted(&name));
+    assert_eq!(home.close("acme"), "closed acme\n");
+    assert!(keeper.wait().unwrap().success());
+}
+
+#[test]
+#[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
+fn two_boxes_of_one_workspace_run_side_by_side() {
+    let Some(image) = agent_image() else { return };
+    let home = Home::new("keep-side");
+    let (one, two) = (box_name("keep-side-one"), box_name("keep-side-two"));
+    home.workspace_with_box("acme", ACME, &one, &basic("acme", "acme-token-0001"), &image);
+    let text = format!("{}\n[net]\nallow = [\"https://httpbin.org\"]\n", github_box(&image));
+    assert!(home.ws(ACME, &home.editor(&text), &["ws", "box", "new", &format!("acme/{two}")]).status.success());
+    home.boxes.lock().unwrap().push(format!("acme/{two}"));
+    let (mut keeper, _said) = home.open("acme", ACME);
+    // Both reach github through their own door, in the one process that keeps acme open.
+    let script = statuses_then_headers(&[("acme", "acme-token-0001")]);
+    let mut runs: Vec<_> = [&one, &two]
+        .into_iter()
+        .map(|name| home.halti().args(["ws", "run", &format!("acme/{name}"), "--", "sh", "-c", &format!("{script}; sleep 120")]).stdout(Stdio::piped()).spawn().unwrap())
+        .collect();
+    let (vm_one, vm_two) = (until_running("halti-wsbox-", &one), until_running("halti-wsbox-", &two));
+    // A run's first line comes only once the open workspace said its box started: then both count.
+    // Their output stays open until they are killed, so neither ends on a closed pipe.
+    let mut outs = Vec::new();
+    for run in &mut runs {
+        let mut out = BufReader::new(run.stdout.take().unwrap());
+        let mut seen = String::new();
+        out.read_line(&mut seen).unwrap();
+        assert!(seen.starts_with("200 "), "{seen}");
+        outs.push(out);
+    }
+    assert_eq!(keeper_ask(&home.keeper_socket("acme"), "halti-keep/1 ping acme\n"), "halti-keep/1 open 2\n");
+    for mut run in runs {
+        run.kill().unwrap();
+        run.wait().unwrap();
+    }
+    drop(outs);
+    // Each stops once its one run has gone: its VM first, then its store is detached.
+    let up = || engine::running(&vm_one) || engine::running(&vm_two) || mounted(&one) || mounted(&two);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while up() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(500));
+    }
+    assert!(!engine::running(&vm_one) && !engine::running(&vm_two), "both VMs are stopped");
+    assert!(!mounted(&one) && !mounted(&two), "both stores are detached");
+    assert_eq!(home.close("acme"), "closed acme\n");
+    assert!(keeper.wait().unwrap().success());
+}
+
+#[test]
+#[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
+fn a_killed_keeper_s_box_reaches_nothing_and_is_stopped_by_its_session() {
+    let Some(image) = agent_image() else { return };
+    let home = Home::new("keep-killed");
+    let name = box_name("keep-killed");
+    home.workspace_with_box("acme", ACME, &name, &basic("acme", "acme-token-0001"), &image);
+    let (mut keeper, _said) = home.open("acme", ACME);
+    let target = format!("acme/{name}");
+    // The agent asks github every second, and says each status.
+    let ask = "while true; do curl -sS -m 5 -o /dev/null -w '%{http_code}\\n' https://httpbin.org/basic-auth/acme/acme-token-0001; sleep 1; done";
+    let mut run = home.halti().args(["ws", "run", &target, "--", "sh", "-c", ask]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let vm = until_running("halti-wsbox-", &name);
+    let mut statuses = BufReader::new(run.stdout.take().unwrap());
+    let mut status = String::new();
+    statuses.read_line(&mut status).unwrap();
+    assert_eq!(status, "200\n", "through the door while acme is open");
+    // Killed, as by kill -9: its door goes with it. The run, which would put the box away at once,
+    // is held meanwhile, so the agent asks with no door; the agent's statuses come straight from
+    // the VM. Its socket stays until the next open takes its place, or is removed as the test ends.
+    let socket = home.keeper_socket("acme");
+    unsafe { libc::kill(run.id() as i32, libc::SIGSTOP) };
+    unsafe { libc::kill(keeper.id() as i32, libc::SIGKILL) };
+    let _ = keeper.wait();
+    let _left = Planted(socket);
+    let mut after = Vec::new();
+    while after.len() < 4 {
+        let mut status = String::new();
+        if statuses.read_line(&mut status).unwrap_or(0) == 0 {
+            break;
+        }
+        after.push(status);
+    }
+    // Let go, the run puts the box away by itself.
+    unsafe { libc::kill(run.id() as i32, libc::SIGCONT) };
+    println!("statuses after the kill: {after:?}");
+    // One request may have been on its way as the door went; the three after it reach nothing.
+    assert!(after.len() == 4 && after[1..].iter().all(|status| status != "200\n"), "reached github with no door, or stopped asking: {after:?}");
+    let out = run.wait_with_output().unwrap();
+    assert!(!out.status.success(), "the run fails");
+    assert!(String::from_utf8_lossy(&out.stderr).ends_with(&format!("halti: acme is no longer open, so box {target} was stopped\n")), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!engine::running(&vm) && !engine::running(&vm.replacen("halti-wsbox-", "halti-wsbrowser-", 1)) && !mounted(&name));
+    let listed = home.ws(ACME, "true", &["ws", "box", "ls", "acme"]);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains(" locked "), "no box lock of acme is held");
+    // What the killed open left is its socket and lock file: the next open takes their place.
+    let (mut keeper, _said) = home.open("acme", ACME);
+    assert_eq!(home.close("acme"), "closed acme\n");
+    assert!(keeper.wait().unwrap().success());
 }

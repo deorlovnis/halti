@@ -126,10 +126,10 @@ pub fn login(name: &str, only: Option<&str>, all: bool) -> Result<()> {
 /// need no screen.
 fn headed() -> bool {
     #[cfg(halti_dev)]
-    if crate::util::dev_var("HALTI_TEST_LOGIN_RUNNER").is_some() {
-        return false;
-    }
-    true
+    let stand_in = crate::util::dev_var("HALTI_TEST_LOGIN_RUNNER").is_some();
+    #[cfg(not(halti_dev))]
+    let stand_in = false;
+    !stand_in
 }
 
 fn spawn() -> Result<Child> {
