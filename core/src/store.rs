@@ -145,6 +145,9 @@ impl<'p> Keystore<'p> {
 pub enum FileKey {
     DirRecord(WsName),
     Manifest(WsId),
+    /// A manifest written to replace the one there, kept only until it is put in its place: the
+    /// pin moves on to it in between, so a crash leaves one of the two covered.
+    NextManifest(WsId),
     Policy(WsId),
     Log(WsId),
     /// What the key holder needs to find the workspace's key again (`holder::KeyRef`).

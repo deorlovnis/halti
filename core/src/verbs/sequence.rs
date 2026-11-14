@@ -6,7 +6,13 @@
 //! `Refusal::Unreadable`, whichever it is. The holder's "no" is `Refusal::Declined`. A check that
 //! fails after the holder proved its answer is `Refusal::Tampered`. What an adapter fails with (a
 //! lock already held, a disk) passes through as it is.
+//!
+//! A change replaces the manifest through a second file, so a crash part way never leaves a
+//! manifest the pin does not cover: the new one is written beside it, the pin is moved on to it,
+//! and only then is it put in the old one's place. The next `unlock` finishes or drops what a crash
+//! left, before anything is asked (see `unlock`).
 
+use std::cell::Cell;
 use std::fmt;
 
 use anyhow::{Result, bail};
@@ -74,11 +80,66 @@ pub(crate) fn create_key(host: &Host<'_>, ws: WsId, name: &WsName, build: Build,
     host.anchor.advance(ws, &pin)
 }
 
+/// What `unlock` hands its closure: the inner key, the key ref the pin named and the manifest the
+/// pin was checked over, and what is needed to move the pin on by exactly one.
+pub(crate) struct Unlocked<'u> {
+    pub inner: &'u InnerKey,
+    pub key_ref: &'u KeyRef,
+    pub manifest: &'u [u8],
+    host: &'u Host<'u>,
+    ws: WsId,
+    name: &'u WsName,
+    pin: Pin,
+    wrap: &'u [u8],
+    policy: &'u [u8],
+    replaced: Cell<bool>,
+}
+
+impl Unlocked<'_> {
+    /// The version the pin will have once this change is made: what a value stored in it is sealed
+    /// for.
+    pub(crate) fn next(&self) -> Result<u64> {
+        match self.pin.version.checked_add(1) {
+            Some(next) => Ok(next),
+            None => bail!("workspace {} can't be changed again: its pin is at the last version", self.ws),
+        }
+    }
+
+    /// Replaces the manifest with `sealed`, and moves the pin on by one to cover it, at most once
+    /// for each unlock. The new manifest is written beside the old, the pin is moved, then the new
+    /// one is put in the old one's place. A failure before the pin moves is returned, and leaves
+    /// the old manifest the one that opens; the next `unlock` drops what was written. Once the pin
+    /// has moved the change is made: a failure after it is not returned, and the next `unlock`
+    /// finishes it.
+    ///
+    /// A second call is refused even after a first that failed: an anchor that fails may still
+    /// have moved the pin over the first one's manifest, which a second would overwrite.
+    #[cfg_attr(not(test), expect(dead_code, reason = "storing a secret is its first caller outside tests"))]
+    pub(crate) fn replace_manifest(&self, sealed: &[u8]) -> Result<()> {
+        if self.replaced.replace(true) {
+            bail!("the manifest was already replaced in this change");
+        }
+        let (files, ws) = (self.host.files, self.ws);
+        let pin = Pin { version: self.next()?, state: state_hash(ws, self.name, self.wrap, sealed, self.policy), ..self.pin };
+        files.write_atomic(&FileKey::NextManifest(ws), sealed)?;
+        // A failed advance may still have written the pin, so the new manifest stays for the next
+        // `unlock`, which keeps whichever of the two the pin covers.
+        self.host.anchor.advance(ws, &pin)?;
+        let _ = files.write_atomic(&FileKey::Manifest(ws), sealed).and_then(|()| files.remove(&FileKey::NextManifest(ws)));
+        Ok(())
+    }
+}
+
 /// Unlocks a workspace for one change: every check before the one decapsulation and the
-/// commitment right after it, then `then`, still under the lock, with the inner key, the key ref
-/// the pin named and the manifest file the pin covers. No inner key leaves the call; it is wiped
-/// before it returns.
-pub(crate) fn unlock<T>(host: &Host<'_>, ws: WsId, name: &WsName, build: Build, change: Change, then: impl FnOnce(&InnerKey, &KeyRef, &[u8]) -> Result<T>) -> Result<T> {
+/// commitment right after it, then `then`, still under the lock, with what `Unlocked` holds. No
+/// inner key leaves the call; it is wiped before it returns.
+///
+/// A manifest replacement a crash cut short is settled first, under the lock and before anything
+/// is asked, by which file the pin covers. The manifest covered: any new one beside it was never
+/// committed, or is already in place, and is removed. Only the new one covered: the pin was moved
+/// and the new one never put in place, so it is put there now. Neither: refused, as any file the
+/// pin does not cover is. Nothing is trusted that the pin did not already cover.
+pub(crate) fn unlock<T>(host: &Host<'_>, ws: WsId, name: &WsName, build: Build, change: Change, then: impl FnOnce(&Unlocked<'_>) -> Result<T>) -> Result<T> {
     let _held = host.files.lock(ws)?;
     let Some(pin) = host.anchor.read(ws)?.filter(|pin| pin.version > 0) else { return Err(Refusal::Unreadable.into()) };
     let (Some(key_ref), Some(wrap)) = (host.files.read(&FileKey::KeyRef(ws))?, host.files.read(&FileKey::Wrap(ws))?) else { return Err(Refusal::Unreadable.into()) };
@@ -87,9 +148,20 @@ pub(crate) fn unlock<T>(host: &Host<'_>, ws: WsId, name: &WsName, build: Build, 
     let public = host.holder.public(&key_ref)?;
     check(public_key_hash(ws, &public) == pin.public_key)?;
     // Read once: what `then` is handed is what the pin was checked over.
-    let manifest = host.files.read(&FileKey::Manifest(ws))?.unwrap_or_default();
+    let mut manifest = host.files.read(&FileKey::Manifest(ws))?.unwrap_or_default();
     let policy = host.files.read(&FileKey::Policy(ws))?.unwrap_or_default();
-    check(state_hash(ws, name, &wrap, &manifest, &policy) == pin.state)?;
+    let covered = |manifest: &[u8]| state_hash(ws, name, &wrap, manifest, &policy) == pin.state;
+    let next = host.files.read(&FileKey::NextManifest(ws))?;
+    if covered(&manifest) {
+        if next.is_some() {
+            host.files.remove(&FileKey::NextManifest(ws))?;
+        }
+    } else {
+        let Some(next) = next.filter(|next| covered(next)) else { return Err(Refusal::Unreadable.into()) };
+        host.files.write_atomic(&FileKey::Manifest(ws), &next)?;
+        host.files.remove(&FileKey::NextManifest(ws))?;
+        manifest = next;
+    }
     // Before anything is asked: a wrap of another length, format or suite would otherwise be found
     // only by its tag, after the holder had answered.
     check(wrap.len() == WRAP_LEN)?;
@@ -102,7 +174,8 @@ pub(crate) fn unlock<T>(host: &Host<'_>, ws: WsId, name: &WsName, build: Build, 
     if inner.commitment() != released.commitment {
         return Err(Refusal::Tampered.into());
     }
-    then(&inner, &key_ref, manifest.as_slice())
+    let unlocked = Unlocked { inner: &inner, key_ref: &key_ref, manifest: &manifest, host, ws, name, pin, wrap: &wrap, policy: &policy, replaced: Cell::new(false) };
+    then(&unlocked)
 }
 
 /// The working keys of an unwrapped inner key, split for each place.
@@ -136,6 +209,7 @@ mod tests {
     use crate::holder::KeyKind;
     use crate::passphrase::{KdfParams, Passphrase, PassphraseRecord};
     use crate::platform::{Adapter, Label};
+    use crate::store::Held;
 
     // The tests that name a passphrase derive a key at 64 MiB once for each ask, and once more where a record is sealed: six in
     // all here. The others hold their key in software and derive nothing.
@@ -150,7 +224,7 @@ mod tests {
 
     /// Opening as the verbs do, without the manifest: every check, one decapsulation, the keys split.
     fn open(host: &Host<'_>, ws: WsId, name: &WsName, build: Build) -> Result<Opened> {
-        unlock(host, ws, name, build, Change::Open, |inner, _, _| Ok(opened(inner)))
+        unlock(host, ws, name, build, Change::Open, |unlocked| Ok(opened(unlocked.inner)))
     }
 
     /// The known answers' inner key and wrap randomness, as the caller would have drawn them.
@@ -206,6 +280,89 @@ mod tests {
             let pin = Pin { version, key_ref: key_ref_hash(ws, self.holder.kind(), &key_ref), public_key: public_key_hash(ws, &public), state };
             self.anchor.advance(ws, &pin).unwrap();
         }
+
+        /// Unlocks acme and replaces its manifest with `sealed`, as a change does.
+        fn replace(&self, sealed: &[u8]) -> Result<()> {
+            replace(&self.host(), sealed)
+        }
+
+        /// The manifest an unlock of acme hands its closure.
+        fn handed(&self) -> Result<Vec<u8>> {
+            handed(&self.host())
+        }
+
+        fn file(&self, file: FileKey) -> Option<Vec<u8>> {
+            self.files.read(&file).unwrap()
+        }
+
+        fn pin(&self) -> Pin {
+            self.anchor.read(acme()).unwrap().unwrap()
+        }
+
+        /// Moves acme's pin on by one to cover `manifest` instead of its manifest file: a replacement's second step.
+        fn pin_over(&self, manifest: &[u8]) {
+            let pin = self.pin();
+            let state = state_hash(acme(), &ws_name("acme"), &hex(KAT_HARDWARE_WRAP), manifest, b"");
+            self.anchor.advance(acme(), &Pin { version: pin.version + 1, state, ..pin }).unwrap();
+        }
+    }
+
+    /// Unlocks acme and replaces its manifest with `sealed`.
+    fn replace(host: &Host<'_>, sealed: &[u8]) -> Result<()> {
+        unlock(host, acme(), &ws_name("acme"), Build::Release, Change::Open, |unlocked| unlocked.replace_manifest(sealed))
+    }
+
+    /// The manifest an unlock of acme hands its closure.
+    fn handed(host: &Host<'_>) -> Result<Vec<u8>> {
+        unlock(host, acme(), &ws_name("acme"), Build::Release, Change::Open, |unlocked| Ok(unlocked.manifest.to_vec()))
+    }
+
+    /// Files in memory whose next write of the one file set in `fail` fails, as a disk would.
+    #[derive(Default)]
+    struct WriteFails {
+        files: MemFiles,
+        fail: Cell<Option<FileKey>>,
+    }
+
+    impl Adapter for WriteFails {
+        fn label(&self) -> Label {
+            self.files.label()
+        }
+    }
+
+    impl Files for WriteFails {
+        fn read(&self, k: &FileKey) -> Result<Option<Vec<u8>>> {
+            self.files.read(k)
+        }
+
+        fn write_atomic(&self, k: &FileKey, bytes: &[u8]) -> Result<()> {
+            let fail = self.fail.take();
+            if fail.as_ref() == Some(k) {
+                bail!("{k:?} could not be written");
+            }
+            self.fail.set(fail);
+            self.files.write_atomic(k, bytes)
+        }
+
+        fn create_new(&self, k: &FileKey, bytes: &[u8]) -> Result<bool> {
+            self.files.create_new(k, bytes)
+        }
+
+        fn append(&self, k: &FileKey, line: &[u8]) -> Result<()> {
+            self.files.append(k, line)
+        }
+
+        fn remove(&self, k: &FileKey) -> Result<()> {
+            self.files.remove(k)
+        }
+
+        fn names(&self) -> Result<Vec<WsName>> {
+            self.files.names()
+        }
+
+        fn lock(&self, ws: WsId) -> Result<Box<dyn Held>> {
+            self.files.lock(ws)
+        }
     }
 
     /// No workspace yet, and a key held in software.
@@ -241,6 +398,38 @@ mod tests {
         assert_eq!((opened.door.secrets(), opened.door.logs(), opened.door.sessions()), (door.secrets(), door.logs(), door.sessions()));
         assert_eq!(opened.door.policy_verify(), door.policy_verify());
         assert_eq!((opened.store.as_bytes(), opened.names.as_bytes()), (store.as_bytes(), names.as_bytes()));
+    }
+
+    /// An anchor whose next advance keeps the pin and still fails, as one might whose write was made but not
+    /// confirmed.
+    #[derive(Default)]
+    struct KeepsThenFails {
+        anchor: MemAnchor,
+        fail: Cell<bool>,
+    }
+
+    impl Adapter for KeepsThenFails {
+        fn label(&self) -> Label {
+            self.anchor.label()
+        }
+    }
+
+    impl Anchor for KeepsThenFails {
+        fn read(&self, ws: WsId) -> Result<Option<Pin>> {
+            self.anchor.read(ws)
+        }
+
+        fn advance(&self, ws: WsId, pin: &Pin) -> Result<()> {
+            self.anchor.advance(ws, pin)?;
+            if self.fail.replace(false) {
+                bail!("the anchor was written but not confirmed");
+            }
+            Ok(())
+        }
+
+        fn forget(&self, ws: WsId) -> Result<()> {
+            self.anchor.forget(ws)
+        }
     }
 
     /// An anchor that reads the one pin it was given, whatever it is: for a pin `MemAnchor` would not keep.
@@ -586,5 +775,174 @@ mod tests {
         assert_eq!(world.holder.decapsulations(), 0);
         assert!(world.create_acme().is_err());
         assert_eq!(world.holder.creates(), 1);
+    }
+
+    #[test]
+    fn replacing_the_manifest_moves_the_pin_on_by_one_and_opens_after() {
+        let world = created();
+        let first = world.pin();
+        // Inside the change, the version the pin will move to.
+        let next = unlock(&world.host(), acme(), &ws_name("acme"), Build::Release, Change::Open, |unlocked| unlocked.next()).unwrap();
+        assert_eq!((first.version, next), (1, 2));
+        world.replace(b"second").unwrap();
+        assert_eq!(world.holder.decapsulations(), 2);
+        // One version on, over the new manifest; the key ref and the public key are the ones it had.
+        let state = state_hash(acme(), &ws_name("acme"), &hex(KAT_HARDWARE_WRAP), b"second", b"");
+        assert_eq!(world.pin(), Pin { version: 2, state, ..first });
+        assert_eq!((world.file(FileKey::Manifest(acme())), world.file(FileKey::NextManifest(acme()))), (Some(b"second".to_vec()), None));
+        // The next unlock is handed it, and one more replacement moves the pin to 3.
+        assert_eq!(world.handed().unwrap(), b"second");
+        world.replace(b"third").unwrap();
+        assert_eq!((world.pin().version, world.handed().unwrap()), (3, b"third".to_vec()));
+        assert_eq!(world.holder.decapsulations(), 5);
+        opens_to_the_inner_key(&world.open_as("acme").unwrap());
+
+        // Once per change: a second replacement in the same unlock fails, and the first stands.
+        let twice = unlock(&world.host(), acme(), &ws_name("acme"), Build::Release, Change::Open, |unlocked| {
+            unlocked.replace_manifest(b"fourth")?;
+            unlocked.replace_manifest(b"fifth")
+        });
+        assert!(twice.unwrap_err().to_string().contains("already replaced"));
+        assert_eq!((world.pin().version, world.handed().unwrap()), (4, b"fourth".to_vec()));
+        assert_eq!(world.file(FileKey::NextManifest(acme())), None);
+    }
+
+    #[test]
+    fn a_replacement_cut_short_before_the_pin_is_dropped_before_any_prompt() {
+        let world = created();
+        world.replace(b"second").unwrap();
+        let pin = world.pin();
+        // Written beside it, and the pin never moved: a crash, or a disk that failed it.
+        world.files.write_atomic(&FileKey::NextManifest(acme()), b"third").unwrap();
+        // Before the holder is asked, and so even when it says no, the new one is dropped.
+        world.holder.decline(true);
+        let decapsulations = world.holder.decapsulations();
+        assert_eq!(refused(world.handed()), Refusal::Declined);
+        assert_eq!(world.file(FileKey::NextManifest(acme())), None);
+        world.holder.decline(false);
+        // It opens to the manifest the pin covers, with one decapsulation, and nothing was moved.
+        assert_eq!(world.handed().unwrap(), b"second");
+        assert_eq!(world.holder.decapsulations(), decapsulations + 1);
+        assert_eq!((world.pin(), world.file(FileKey::Manifest(acme()))), (pin, Some(b"second".to_vec())));
+
+        // Nor is one already put in place, and left beside it by a crash, kept.
+        world.files.write_atomic(&FileKey::NextManifest(acme()), b"second").unwrap();
+        assert_eq!(world.handed().unwrap(), b"second");
+        assert_eq!(world.file(FileKey::NextManifest(acme())), None);
+        assert_eq!(world.pin(), pin);
+    }
+
+    #[test]
+    fn a_replacement_cut_short_after_the_pin_is_finished_before_any_prompt() {
+        let world = created();
+        world.replace(b"second").unwrap();
+        // Written beside it and covered by the pin, but never put in its place.
+        world.files.write_atomic(&FileKey::NextManifest(acme()), b"third").unwrap();
+        world.pin_over(b"third");
+        let pin = world.pin();
+        // Before the holder is asked, and so even when it says no, the new one is put in place.
+        world.holder.decline(true);
+        let decapsulations = world.holder.decapsulations();
+        assert_eq!(refused(world.handed()), Refusal::Declined);
+        assert_eq!((world.file(FileKey::Manifest(acme())), world.file(FileKey::NextManifest(acme()))), (Some(b"third".to_vec()), None));
+        world.holder.decline(false);
+        // It opens to the new one, with one decapsulation, and the pin is as it was moved.
+        assert_eq!(world.handed().unwrap(), b"third");
+        assert_eq!((world.holder.decapsulations(), world.pin()), (decapsulations + 1, pin));
+        opens_to_the_inner_key(&world.open_as("acme").unwrap());
+    }
+
+    #[test]
+    fn a_next_manifest_the_pin_does_not_cover_opens_nothing() {
+        let world = created();
+        world.replace(b"second").unwrap();
+        let (asked, decapsulations) = (world.holder.asked().len(), world.holder.decapsulations());
+        // The manifest changed, and a new one beside it that the pin does not cover either; then the manifest removed.
+        world.files.write_atomic(&FileKey::Manifest(acme()), b"changed").unwrap();
+        world.files.write_atomic(&FileKey::NextManifest(acme()), b"planted").unwrap();
+        assert_eq!(refused(world.handed()), Refusal::Unreadable);
+        world.files.remove(&FileKey::Manifest(acme())).unwrap();
+        assert_eq!(refused(world.handed()), Refusal::Unreadable);
+        // Nothing was asked, and nothing written: the new one is left as it was.
+        assert_eq!((world.holder.asked().len(), world.holder.decapsulations()), (asked, decapsulations));
+        assert_eq!((world.file(FileKey::Manifest(acme())), world.file(FileKey::NextManifest(acme()))), (None, Some(b"planted".to_vec())));
+        // Neither manifest, and none beside it, is refused as before.
+        world.files.remove(&FileKey::NextManifest(acme())).unwrap();
+        assert_eq!(refused(world.handed()), Refusal::Unreadable);
+        assert_eq!(world.holder.decapsulations(), decapsulations);
+    }
+
+    #[test]
+    fn a_failed_advance_leaves_the_old_manifest_opening() {
+        let world = created();
+        world.replace(b"second").unwrap();
+        let pin = world.pin();
+        world.anchor.fail_next_advance();
+        let error = world.replace(b"third").unwrap_err();
+        assert!(error.to_string().contains("could not be written"), "{error}");
+        assert_eq!((world.pin(), world.file(FileKey::Manifest(acme()))), (pin, Some(b"second".to_vec())));
+        // The next unlock keeps the manifest the pin covers, and drops the one beside it.
+        assert_eq!(world.handed().unwrap(), b"second");
+        assert_eq!(world.file(FileKey::NextManifest(acme())), None);
+        // And the change can be made again.
+        world.replace(b"third").unwrap();
+        assert_eq!((world.pin().version, world.handed().unwrap()), (3, b"third".to_vec()));
+    }
+
+    #[test]
+    fn a_replacement_whose_last_write_fails_is_made_and_finished_by_the_next_unlock() {
+        let (files, anchor, holder) = (WriteFails::default(), MemAnchor::new(), SoftKey::from_seed(hardware_seed()));
+        let host = Host { files: &files, holder: &holder, anchor: &anchor };
+        create_key(&host, acme(), &ws_name("acme"), Build::Release, draws(), |_| Ok(())).unwrap();
+        replace(&host, b"second").unwrap();
+        // The pin moved, so the change is made: the failed write after it is not reported.
+        files.fail.set(Some(FileKey::Manifest(acme())));
+        replace(&host, b"third").unwrap();
+        assert!(files.fail.take().is_none(), "the write was tried, and failed");
+        assert_eq!(anchor.read(acme()).unwrap().map(|pin| pin.version), Some(3));
+        let file = |file: FileKey| files.read(&file).unwrap();
+        assert_eq!((file(FileKey::Manifest(acme())), file(FileKey::NextManifest(acme()))), (Some(b"second".to_vec()), Some(b"third".to_vec())));
+        // The next unlock puts it in place and is handed it.
+        assert_eq!(handed(&host).unwrap(), b"third");
+        assert_eq!((file(FileKey::Manifest(acme())), file(FileKey::NextManifest(acme()))), (Some(b"third".to_vec()), None));
+        assert_eq!(holder.decapsulations(), 3);
+    }
+
+    #[test]
+    fn a_replacement_whose_first_write_fails_moves_nothing() {
+        let (files, anchor, holder) = (WriteFails::default(), MemAnchor::new(), SoftKey::from_seed(hardware_seed()));
+        let host = Host { files: &files, holder: &holder, anchor: &anchor };
+        create_key(&host, acme(), &ws_name("acme"), Build::Release, draws(), |_| Ok(())).unwrap();
+        replace(&host, b"second").unwrap();
+        let pin = anchor.read(acme()).unwrap();
+        // The new manifest is on disk before the pin moves: when it can't be written, the pin is not moved.
+        files.fail.set(Some(FileKey::NextManifest(acme())));
+        let error = replace(&host, b"third").unwrap_err();
+        assert!(error.to_string().contains("could not be written"), "{error}");
+        assert!(files.fail.take().is_none(), "the write was tried, and failed");
+        assert_eq!(anchor.read(acme()).unwrap(), pin);
+        let file = |file: FileKey| files.read(&file).unwrap();
+        assert_eq!((file(FileKey::Manifest(acme())), file(FileKey::NextManifest(acme()))), (Some(b"second".to_vec()), None));
+        assert_eq!(handed(&host).unwrap(), b"second");
+    }
+
+    #[test]
+    fn a_second_replacement_after_an_advance_that_kept_the_pin_and_failed_is_refused() {
+        let (files, anchor, holder) = (MemFiles::new(), KeepsThenFails::default(), SoftKey::from_seed(hardware_seed()));
+        let host = Host { files: &files, holder: &holder, anchor: &anchor };
+        create_key(&host, acme(), &ws_name("acme"), Build::Release, draws(), |_| Ok(())).unwrap();
+        replace(&host, b"second").unwrap();
+        // The pin is moved over "third" and the advance still fails, so a closure tries again: that is refused, and leaves
+        // "third", the one the pin covers, in place beside the manifest.
+        anchor.fail.set(true);
+        let retried =
+            unlock(&host, acme(), &ws_name("acme"), Build::Release, Change::Open, |unlocked| unlocked.replace_manifest(b"third").or_else(|_| unlocked.replace_manifest(b"fourth")));
+        assert!(retried.unwrap_err().to_string().contains("already replaced"));
+        assert_eq!(anchor.read(acme()).unwrap().map(|pin| pin.version), Some(3));
+        let file = |file: FileKey| files.read(&file).unwrap();
+        assert_eq!((file(FileKey::Manifest(acme())), file(FileKey::NextManifest(acme()))), (Some(b"second".to_vec()), Some(b"third".to_vec())));
+        // The next unlock puts it in place and is handed it.
+        assert_eq!(handed(&host).unwrap(), b"third");
+        assert_eq!((file(FileKey::Manifest(acme())), file(FileKey::NextManifest(acme()))), (Some(b"third".to_vec()), None));
     }
 }
