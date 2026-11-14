@@ -42,6 +42,7 @@ use crate::chain::{self, Chain};
 use crate::config::{Engine, Settings};
 use crate::door::inspect::parse_prefix;
 use crate::engine::Vms;
+use crate::keep::{No, Refused};
 use crate::policy::{self, Approval, Mode, Site, Status};
 use crate::source::{self, BoxItem, Hint};
 use crate::util::{config_dir, expand_home, home, store_root};
@@ -772,15 +773,7 @@ pub struct Join {
 /// through the place. Then today's run, with no question: opening the workspace was the approval.
 pub fn run_in(start: Start) -> Result<u8> {
     let Start { settings, vms, layout, name, shown, text, policy, mounts, command } = start;
-    let approve = format!("halti ws box approve {shown}");
-    match policy::status_of_text(&key(&name), &text) {
-        Status::Approved => {}
-        Status::Changed => bail!("the policy of box {shown} changed since it was approved. approve it with: {approve}"),
-        Status::Unapproved | Status::Missing => bail!("box {shown} isn't approved. approve it with: {approve}"),
-    }
-    if policy.keep && !KeyStore::of(&settings).exists(&name) {
-        bail!("box {shown} has a store but no key. remove it with: {}", source::current().hint(Hint::RemoveBox(&name)));
-    }
+    ready_in(&name, &shown, &text, policy.keep, KeyStore::of(&settings)).map_err(|refused| refused.why)?;
     run::catch_signals();
     let request = run::Request {
         name: &name,
@@ -799,6 +792,22 @@ pub fn run_in(start: Start) -> Result<u8> {
         confirm: false,
     };
     run_request(&layout, vms, &settings, &request)
+}
+
+/// What a workspace's box `name` (`shown`, as messages name it) needs of the place before it starts:
+/// an approval of `text`, the policy file's bytes as read, and for a box that keeps a store, its
+/// key.
+fn ready_in(name: &str, shown: &str, text: &[u8], keep: bool, keys: KeyStore) -> Result<(), Refused> {
+    let approve = format!("halti ws box approve {shown}");
+    match policy::status_of_text(&key(name), text) {
+        Status::Approved => {}
+        Status::Changed => return Err(Refused::new(No::Changed, anyhow!("the policy of box {shown} changed since it was approved. approve it with: {approve}"))),
+        Status::Unapproved | Status::Missing => return Err(Refused::new(No::Unapproved, anyhow!("box {shown} isn't approved. approve it with: {approve}"))),
+    }
+    if keep && !keys.exists(name) {
+        return Err(Refused::new(No::Key, anyhow!("box {shown} has a store but no key. remove it with: {}", source::current().hint(Hint::RemoveBox(name)))));
+    }
+    Ok(())
 }
 
 /// Joins a workspace's box that runs: no place, no question (`run::join`).

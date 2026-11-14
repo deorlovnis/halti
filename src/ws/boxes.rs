@@ -36,6 +36,7 @@ use crate::boxes::store::Layout;
 use crate::boxes::{self, BoxPolicy, MountRule};
 use crate::config::{self, Settings};
 use crate::engine::{self, Vms};
+use crate::keep::{No, Refused};
 use crate::policy;
 use crate::source::Source;
 use crate::util::sha256_hex;
@@ -413,17 +414,8 @@ pub fn run(target_text: &str, command: Vec<String>, type_it: bool) -> Result<Run
         let Found { box_name, shown, layout, .. } = found;
         return Ok(Run::Join(Box::new(boxes::Join { vms, layout, name: box_name, shown, text, mounts: rule, command })));
     }
-    let (text, parsed) = read_checked(&found, &rule)?.ok_or_else(|| no_box(&found.shown))?;
+    let (text, parsed) = start_check(&found, &rule).map_err(|refused| refused.why)?;
     let shown = found.shown.clone();
-    match found.files.approved_copy(box_name).ok().flatten() {
-        None => bail!("box {shown} isn't approved. approve it with: halti ws box approve {shown}"),
-        Some(copy) if copy != text => bail!("the policy of box {shown} changed since it was approved. approve it with: halti ws box approve {shown}"),
-        Some(_) => {}
-    }
-    if parsed.keep && !found.layout.bundle(box_name).exists() {
-        return Err(no_store(&shown));
-    }
-    found.layout.sockets_fit(box_name)?;
     let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsOpen, type_it), detail: Some(format!("to run box {box_name}")) };
     let reader = open_for(&here, &found, &way, &format!("box {shown} was not started"), &format!("ws run {shown}"), &|| TtyPassphrase::new(false))?;
     // The keys are wiped once read; this process lives as long as the box.
@@ -432,6 +424,26 @@ pub fn run(target_text: &str, command: Vec<String>, type_it: bool) -> Result<Run
     let Found { box_name, layout, .. } = found;
     let start = boxes::Start { settings, vms, layout, name: box_name, shown, text, policy: parsed, mounts: rule, command };
     Ok(Run::Start { source: Box::new(source), start: Box::new(start) })
+}
+
+/// What starting the box `found` needs of its files, checked before anything is asked or opened: its
+/// policy file, read once and checked under `rule`, is the copy kept when it was approved; a box
+/// that keeps a store has one; its sockets fit. Returns the file's bytes and what they parse to.
+fn start_check(found: &Found, rule: &MountRule) -> Result<(Vec<u8>, BoxPolicy), Refused> {
+    let shown = &found.shown;
+    let (text, parsed) = read_checked(found, rule)?.ok_or_else(|| Refused::new(No::Box, no_box(shown)))?;
+    match found.files.approved_copy(&found.box_name).ok().flatten() {
+        None => return Err(Refused::new(No::Unapproved, anyhow!("box {shown} isn't approved. approve it with: halti ws box approve {shown}"))),
+        Some(copy) if copy != text => {
+            return Err(Refused::new(No::Changed, anyhow!("the policy of box {shown} changed since it was approved. approve it with: halti ws box approve {shown}")));
+        }
+        Some(_) => {}
+    }
+    if parsed.keep && !found.layout.bundle(&found.box_name).exists() {
+        return Err(Refused::new(No::Store, no_store(shown)));
+    }
+    found.layout.sockets_fit(&found.box_name)?;
+    Ok((text, parsed))
 }
 
 /// Opens the workspace of `found` the way `way` says, and checks it is the one its record named
@@ -446,8 +458,8 @@ fn open_for(here: &Here, found: &Found, way: &Way<'_>, what: &str, command: &str
 }
 
 /// `halti ws stop WS/BOX`: stops the box's VM, asks nothing. The halti that runs it then puts it
-/// away; once it lets go of the box, what is left is cleared here, and the browser VM, which that
-/// halti stops last, is stopped if it still runs.
+/// away; once it lets go of the box, what is left is cleared here, and the browser VM is stopped if
+/// it still runs (that halti stops it before it lets go, unless it died).
 pub fn stop(target_text: &str) -> Result<()> {
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
@@ -696,6 +708,33 @@ mod tests {
         assert!(next.join("in-the-way").exists(), "it failed after the store was made");
         assert!(!found.layout.bundle("dev").exists(), "the store is shredded");
         assert_eq!(found.files.approved_copy("dev").unwrap(), None);
+    }
+
+    #[test]
+    fn a_start_s_checks_say_their_kind() {
+        let dir = TempDir::new("halti-ws-box-checks").unwrap();
+        let here = Here::at(&dir.0.join("ws"));
+        let acme = WsName::parse("acme").unwrap();
+        new_with(&here, &acme, &TtyPassphrase::new(false).answering(ACME), &OneCopy(Cell::new(None))).unwrap();
+        let rule = MountRule::Workspace(Vec::new());
+        let refused = |found: &Found| start_check(found, &rule).err().map(|refused| (refused.no, refused.why.to_string()));
+
+        let found = find(&here, &acme, "dev").unwrap();
+        assert_eq!(refused(&found), Some((No::Box, "there is no box acme/dev. make one with: halti ws box new acme/dev".to_string())));
+        found.files.create("dev", SCRATCH).unwrap();
+        assert_eq!(refused(&found), Some((No::Unapproved, "box acme/dev isn't approved. approve it with: halti ws box approve acme/dev".to_string())));
+        found.files.keep_approved("dev", b"run = [\"bash\"]\nkeep = false\n").unwrap();
+        assert_eq!(refused(&found).unwrap().0, No::Changed);
+        found.files.keep_approved("dev", SCRATCH.as_bytes()).unwrap();
+        assert_eq!(start_check(&found, &rule).unwrap().0, SCRATCH.as_bytes());
+
+        let kept = find(&here, &acme, "kept").unwrap();
+        let text = "run = [\"claude\"]\nkeep = true\n";
+        kept.files.create("kept", text).unwrap();
+        kept.files.keep_approved("kept", text.as_bytes()).unwrap();
+        assert_eq!(refused(&kept), Some((No::Store, "box acme/kept has no store. make one with: halti ws box new acme/kept".to_string())));
+        kept.files.create("broken", "run = 1\n").unwrap();
+        assert_eq!(refused(&find(&here, &acme, "broken").unwrap()).unwrap().0, No::Failed);
     }
 
     #[test]
