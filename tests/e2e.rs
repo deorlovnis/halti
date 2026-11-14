@@ -2134,6 +2134,9 @@ fn a_value_pasted_in_more_lines_is_refused_and_the_shell_reads_none_of_it() {
         });
     }
     let mut child = shell.spawn().unwrap();
+    // The command keeps its copy of the terminal until dropped. Kept, Linux never ends what the
+    // terminal shows, so the reading below would wait forever.
+    drop(shell);
     // What the terminal shows, read as it comes: a shell leaving a terminal waits for that.
     let mut shown = person.try_clone().unwrap();
     let screen = thread::spawn(move || {
@@ -3304,7 +3307,7 @@ impl Env {
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\nsystem) [ \"$2\" = status ] ;;\ninspect) [ -e {vm} ] && echo '[{{\"status\":{{\"state\":\"running\"}}}}]' ;;\nstop) rm -f {vm} ;;\n\
              exec) for arg; do case \"$arg\" in halti-*) name=\"$arg\"; break ;; esac; done\n  : > {agent}-working\n  \
-             while [ -e {agent} ] && [ \"$(cat {agent})\" != done ]; do sleep 0.05; done; exit 7 ;;\n*) exit 1 ;;\nesac\n"
+             while [ -e {agent} ] && [ \"$(cat {agent} 2>/dev/null)\" != done ]; do sleep 0.05; done; exit 7 ;;\n*) exit 1 ;;\nesac\n"
         );
         fs::write(bin.join("container"), script).unwrap();
         fs::set_permissions(bin.join("container"), fs::Permissions::from_mode(0o755)).unwrap();

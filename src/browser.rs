@@ -180,7 +180,7 @@ fn decode(conversion: i64, compression: i64, bytes: &[u8]) -> Result<String> {
     if raw.len() % 2 != 0 {
         bail!("Firefox value is not UTF-16");
     }
-    let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
     String::from_utf16(&units).context("Firefox value is not UTF-16")
 }
 
