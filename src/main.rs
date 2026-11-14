@@ -950,6 +950,10 @@ fn cmd_build_info() {
 }
 
 fn main() -> ExitCode {
+    util::quiet_closed_stdout(run)
+}
+
+fn run() -> ExitCode {
     util::blocking_stdio();
     // Without an absolute home, every path halti uses would be relative to the current folder.
     if !util::home().is_absolute() {
