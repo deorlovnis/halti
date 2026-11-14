@@ -526,7 +526,7 @@ fn agent_image() -> Option<String> {
 }
 
 /// The policy of a box of `image` that may use github, without its `[net]`: the door lets the
-/// agent reach only the hosts `[net] allow` lists, a site's hosts too.
+/// agent reach only the hosts `[net] allow` lists, and a site's hosts are no exception.
 fn github_box(image: &str) -> String {
     format!("run = [\"claude\"]\nimage = \"{image}\"\nmodel = \"anthropic\"\nsites = [\"github\"]\nkeep = true\ncpus = 2\nmemory = \"2G\"\n")
 }
@@ -588,11 +588,16 @@ fn a_workspace_box_reaches_only_its_sites() {
     assert!(home.halti().args(["policy", "approve", "github"]).output().unwrap().status.success());
     home.workspace_with_box("globex", GLOBEX, &name, &globex, &image);
     home.workspace_with_box("acme", ACME, &name, &acme, &image);
-    // Only acme's credentials are accepted: the door sent acme's token, and no other.
-    let script = statuses_then_headers(&[("acme", "acme-token-0001"), ("globex", "globex-token-0001"), ("keychain", "keychain-token-0001")]);
+    // github's hosts take in one that the box's [net] allow doesn't list.
+    home.policy("acme", ACME, "github", "[fetch]\nhosts = [\"https://httpbin.org\", \"https://example.org\"]\nauth = \"Basic {token}\"\n");
+    // The door answers 403 to the agent's CONNECT to a host [net] allow doesn't list, github's
+    // own, then one no site names. Only acme's credentials are accepted: the door sent acme's
+    // token, and no other.
+    let refused = "curl -sS -m 10 -o /dev/null -w '%{http_connect} ' https://example.org; curl -sS -m 10 -o /dev/null -w '%{http_connect} ' https://example.com; ";
+    let script = refused.to_string() + &statuses_then_headers(&[("acme", "acme-token-0001"), ("globex", "globex-token-0001"), ("keychain", "keychain-token-0001")]);
     let out = home.ws(ACME, "true", &["ws", "run", &format!("acme/{name}"), "--", "sh", "-c", &script]);
     let seen = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success() && seen.starts_with("200 401 401 "), "acme's alone: {seen}");
+    assert!(out.status.success() && seen.starts_with("403 403 200 401 401 "), "allowed hosts and acme's token alone: {seen}");
     assert!(seen.contains(MASKED), "acme's token, masked: {seen}");
     assert!(![&acme, &globex, &keychain].iter().any(|token| seen.contains(token.as_str())), "{seen}");
 }
@@ -841,6 +846,16 @@ impl Drop for Keeper {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+}
+
+/// The socket a killed `halti open` left: removed as the test ends, however it ends, so no later
+/// test or run finds it.
+struct Planted(PathBuf);
+
+impl Drop for Planted {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -1136,13 +1151,27 @@ fn a_killed_keeper_s_box_reaches_nothing_and_is_stopped_by_its_session() {
     let mut status = String::new();
     statuses.read_line(&mut status).unwrap();
     assert_eq!(status, "200\n", "through the door while acme is open");
-    // Killed, as by kill -9: its door goes with it, and the run puts the box away by itself.
+    // Killed, as by kill -9: its door goes with it. The run, which would put the box away at once,
+    // is held meanwhile, so the agent asks with no door; the agent's statuses come straight from
+    // the VM. Its socket stays until the next open takes its place, or is removed as the test ends.
+    let socket = home.keeper_socket("acme");
+    unsafe { libc::kill(run.id() as i32, libc::SIGSTOP) };
     unsafe { libc::kill(keeper.id() as i32, libc::SIGKILL) };
     let _ = keeper.wait();
-    let mut after = String::new();
-    statuses.read_to_string(&mut after).unwrap();
-    // One request may have been on its way as the door went.
-    assert!(after.lines().skip(1).all(|status| status != "200"), "reached github with no door: {after}");
+    let _left = Planted(socket);
+    let mut after = Vec::new();
+    while after.len() < 4 {
+        let mut status = String::new();
+        if statuses.read_line(&mut status).unwrap_or(0) == 0 {
+            break;
+        }
+        after.push(status);
+    }
+    // Let go, the run puts the box away by itself.
+    unsafe { libc::kill(run.id() as i32, libc::SIGCONT) };
+    println!("statuses after the kill: {after:?}");
+    // One request may have been on its way as the door went; the three after it reach nothing.
+    assert!(after.len() == 4 && after[1..].iter().all(|status| status != "200\n"), "reached github with no door, or stopped asking: {after:?}");
     let out = run.wait_with_output().unwrap();
     assert!(!out.status.success(), "the run fails");
     assert!(String::from_utf8_lossy(&out.stderr).ends_with(&format!("halti: acme is no longer open, so box {target} was stopped\n")), "{}", String::from_utf8_lossy(&out.stderr));
