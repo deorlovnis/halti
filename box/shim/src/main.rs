@@ -206,6 +206,13 @@ fn accept_loop<C: Conn, H: Conn>(incoming: impl Iterator<Item = io::Result<C>>, 
     }
 }
 
+/// The door's connections over vsock: those from the host go into the pool, and any other is
+/// closed unread, so a program in the box can't pose as halti.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn door_hosts<H: Conn>(accepted: impl Iterator<Item = io::Result<(H, u32)>>, pool: Arc<Pool<H>>) {
+    collect_hosts(vsock::host_only(accepted), pool)
+}
+
 /// Everything the Mac dials in goes into the pool.
 fn collect_hosts<H: Conn>(hosts: impl Iterator<Item = io::Result<H>>, pool: Arc<Pool<H>>) {
     for host in hosts {
@@ -233,18 +240,18 @@ fn serve(proxy: (&str, u16)) -> io::Result<()> {
     run_dir()?;
     // Only root may connect to the door socket: a program in the box must not pose as the Mac.
     let door = bind_unix(DOOR_SOCK, 0o600)?;
-    listen(std::iter::repeat_with(move || door.accept().map(|(host, _)| host)), proxy)
+    listen(move |pool| collect_hosts(std::iter::repeat_with(move || door.accept().map(|(host, _)| host)), pool), proxy)
 }
 
 /// `serve --vsock`, started by `boot`: the door is a vsock port, and the exec service listens on
-/// another. Both take connections from the host only.
+/// another. Both take connections from the host only (`door_hosts`, `exec::host_service`).
 #[cfg(target_os = "linux")]
 fn serve_vsock(proxy: (&str, u16)) -> io::Result<()> {
     run_dir()?;
     let door = vsock::Listener::bind(names::DOOR_PORT)?;
     let exec = vsock::Listener::bind(names::EXEC_PORT)?;
-    thread::spawn(move || exec::accept_loop(vsock::host_only(exec.incoming()), Arc::new(exec::Users::guest())));
-    listen(vsock::host_only(door.incoming()), proxy)
+    thread::spawn(move || exec::host_service(exec.incoming(), Arc::new(exec::Users::guest())));
+    listen(move |pool| door_hosts(door.incoming(), pool), proxy)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -257,15 +264,15 @@ fn run_dir() -> io::Result<()> {
     fs::set_permissions(RUN_DIR, fs::Permissions::from_mode(0o755))
 }
 
-/// The box's listeners, and the pool that the door's connections (`hosts`) fill.
-fn listen<H: Conn>(hosts: impl Iterator<Item = io::Result<H>> + Send + 'static, proxy: (&str, u16)) -> io::Result<()> {
+/// The box's listeners, and the pool that `fill` fills with the door's connections.
+fn listen<H: Conn>(fill: impl FnOnce(Arc<Pool<H>>) + Send + 'static, proxy: (&str, u16)) -> io::Result<()> {
     let pool = Arc::new(Pool::default());
     let local = bind_unix(LOCAL_SOCK, 0o666)?;
     let proxy = bind_tcp(proxy)?;
     let halti = bind_tcp(HALTI_ADDR)?;
 
     let p = pool.clone();
-    thread::spawn(move || collect_hosts(hosts, p));
+    thread::spawn(move || fill(p));
     let p = pool.clone();
     thread::spawn(move || accept_loop(local.incoming(), "mcp", p));
     let p = pool.clone();
@@ -492,5 +499,28 @@ mod tests {
         let mut line = [0u8; 6];
         mac.read_exact(&mut line).unwrap();
         assert_eq!(&line, b"halti\n");
+    }
+
+    /// Of the door's vsock connections, only the host's join the pool; one from inside the box is
+    /// closed unread.
+    #[test]
+    fn the_door_pools_only_the_host_s_connections() {
+        use std::os::fd::OwnedFd;
+        let pool = Arc::new(Pool::<vsock::Stream>::default());
+        let (mut inside, inside_shim) = dialed();
+        let (mut host, host_shim) = dialed();
+        inside.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let accepted = [(inside_shim, 3), (host_shim, vsock::HOST_CID)].map(|(s, peer)| Ok((vsock::Stream::from(OwnedFd::from(s)), peer)));
+        door_hosts(accepted.into_iter(), pool.clone());
+
+        let mut rest = Vec::new();
+        inside.read_to_end(&mut rest).expect("closed, not kept");
+        assert!(rest.is_empty(), "closed with nothing sent");
+        assert_eq!(pool.idle.lock().unwrap().len(), 1);
+        let (_program, client) = tcp_pair();
+        thread::spawn(move || serve_client(client, "proxy", &pool));
+        let mut line = [0u8; 6];
+        host.read_exact(&mut line).unwrap();
+        assert_eq!(&line, b"proxy\n");
     }
 }

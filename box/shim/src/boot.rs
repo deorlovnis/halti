@@ -101,7 +101,8 @@ pub fn plan(bridges: bool) -> Vec<Step> {
         ("sysfs", "/sys", "sysfs", NOSUID | NODEV | NOEXEC, ""),
         ("cgroup2", "/sys/fs/cgroup", "cgroup2", NOSUID | NODEV | NOEXEC, ""),
         ("devtmpfs", "/dev", "devtmpfs", NOSUID, "mode=0755"),
-        ("devpts", "/dev/pts", "devpts", NOSUID | NOEXEC, "ptmxmode=0666,mode=0620"),
+        // a terminal's group is tty (5 in the image), as in a box that Apple's tool runs
+        ("devpts", "/dev/pts", "devpts", NOSUID | NOEXEC, "ptmxmode=0666,mode=0620,gid=5"),
         ("tmpfs", "/dev/shm", "tmpfs", NOSUID | NODEV, "mode=1777"),
         ("tmpfs", "/run", "tmpfs", NOSUID | NODEV, "mode=0755"),
         ("tmpfs", "/tmp", "tmpfs", NOSUID | NODEV, "mode=1777"),
@@ -171,7 +172,9 @@ pub enum Reaped {
 
 /// What being the first process asks of the kernel.
 pub trait Init {
-    /// Wait for a signal, at most `timeout`.
+    /// The time since a fixed moment; it only goes forward.
+    fn now(&mut self) -> Duration;
+    /// Wait for a signal, at most `timeout`. Any signal of the set ends the wait early.
     fn wait(&mut self, timeout: Duration) -> Option<Signal>;
     /// Reap one ended child, if there is one.
     fn reap(&mut self) -> Reaped;
@@ -212,9 +215,10 @@ pub fn init(sys: &mut impl Init, main: i32) {
     sys.power_off();
 }
 
-/// Reap until no child is left, for at most `limit`. Whether none is left.
+/// Reap until no child is left, for at most `limit` of the clock: each ended child wakes the wait
+/// early, so the waits can't be counted instead. Whether none is left.
 fn drain(sys: &mut impl Init, limit: Duration) -> bool {
-    let mut waited = Duration::ZERO;
+    let end = sys.now() + limit;
     loop {
         loop {
             match sys.reap() {
@@ -223,11 +227,11 @@ fn drain(sys: &mut impl Init, limit: Duration) -> bool {
                 Reaped::NoChildren => return true,
             }
         }
-        if waited >= limit {
+        let now = sys.now();
+        if now >= end {
             return false;
         }
-        sys.wait(TICK);
-        waited += TICK;
+        sys.wait(TICK.min(end - now));
     }
 }
 
@@ -252,12 +256,26 @@ mod linux {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use std::{env, fs, io, process, ptr};
 
     /// The signals that ask the VM to stop: SIGTERM (as `container stop` sends), SIGINT (what
     /// Ctrl-Alt-Del becomes, once turned into a signal) and SIGPWR (a power failure).
+    ///
+    /// A VM program's own stop sends none of them. Its power button reaches the guest as a key
+    /// press of an input device, which no program here reads, and its shutdown ends the VM without
+    /// asking the guest; then what the box wrote last may not be on its disk. So the host asks for
+    /// a stop from inside: `kill -TERM 1` as root through the exec service, which reaches this
+    /// process because it blocks SIGTERM (a blocked signal is never dropped, even for the first
+    /// process). That command is stopped with the rest, so its connection may end with no last
+    /// frame. The host then waits for the VM to end, and uses the VM program's stop and kill
+    /// only after that.
     pub const STOP_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGPWR];
+
+    /// The open files a process of the box may have, soft and hard: what Apple's `container`
+    /// gives every process of a box, and the kernel's default ceiling. The kernel gives the first
+    /// process 1024, too few for `serve`, which holds four for each of the door's 256 connections.
+    pub const FILES: libc::rlim_t = 1 << 20;
 
     pub fn main(bridges: bool) -> io::Result<()> {
         if process::id() != 1 {
@@ -279,17 +297,38 @@ mod linux {
         Err(io::Error::other("the VM did not power off"))
     }
 
-    /// `serve --vsock`, started with no signal blocked: std would start it with the signals this
-    /// process blocks.
+    /// `serve --vsock`, which every other process of the box descends from.
     pub fn serve(bridges: bool) -> Command {
         let mut serve = Command::new(names::SHIM_PATH);
         serve.args(["serve", "--vsock"]);
         if bridges {
             serve.arg("--bridges");
         }
-        // SAFETY: `fresh_signals` makes only async-signal-safe calls.
-        unsafe { serve.pre_exec(exec::fresh_signals) };
-        serve
+        child(serve)
+    }
+
+    /// `cmd`, to start as this process's child: with no signal blocked, where std would hand on
+    /// the signals this process blocks, and with `FILES` open files.
+    pub fn child(mut cmd: Command) -> Command {
+        // SAFETY: `fresh_signals` and `files_limit` make only async-signal-safe calls.
+        unsafe { cmd.pre_exec(exec::fresh_signals).pre_exec(files_limit) };
+        cmd
+    }
+
+    /// `FILES`, soft and hard; where that can't be had (a hard limit below it, and no root), the
+    /// soft limit raised to the hard one.
+    fn files_limit() -> io::Result<()> {
+        let want = libc::rlimit { rlim_cur: FILES, rlim_max: FILES };
+        // SAFETY: setrlimit(2) and getrlimit(2) reading and writing live values.
+        unsafe {
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &want) == 0 {
+                return Ok(());
+            }
+            let mut have = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            cvt(libc::getrlimit(libc::RLIMIT_NOFILE, &mut have))?;
+            have.rlim_cur = have.rlim_max;
+            cvt(libc::setrlimit(libc::RLIMIT_NOFILE, &have))
+        }
     }
 
     struct Real {
@@ -297,6 +336,7 @@ mod linux {
         /// two waits. The first process gets only signals it handles or blocks.
         signals: libc::sigset_t,
         agent: (u32, u32),
+        started: Instant,
     }
 
     fn cvt(result: libc::c_int) -> io::Result<()> {
@@ -322,7 +362,7 @@ mod linux {
                 libc::reboot(libc::RB_DISABLE_CAD);
             }
             let agent = exec::Users::guest().agent;
-            Ok(Self { signals, agent: (agent.uid, agent.gid) })
+            Ok(Self { signals, agent: (agent.uid, agent.gid), started: Instant::now() })
         }
     }
 
@@ -393,6 +433,10 @@ mod linux {
     }
 
     impl Init for Real {
+        fn now(&mut self) -> Duration {
+            self.started.elapsed()
+        }
+
         fn wait(&mut self, timeout: Duration) -> Option<Signal> {
             let ts = libc::timespec { tv_sec: timeout.as_secs() as libc::time_t, tv_nsec: timeout.subsec_nanos() as _ };
             // SAFETY: the set and the timeout are live values; no siginfo is asked for.
@@ -455,6 +499,9 @@ mod tests {
         }
         assert_eq!(kind(DISK_MOUNT), (DISK_TYPE, NOSUID | NODEV));
         assert!(plain.iter().all(|(t, _, _)| t != "/var/lib/docker"), "Docker's data only for a box with Docker");
+        // a terminal's group is tty, so its owner may let others write to it (`mesg`)
+        let devpts = plan(false).into_iter().find_map(|s| if let Step::Mount { target, data, .. } = s { (target == "/dev/pts").then_some(data) } else { None }).unwrap();
+        assert!(devpts.split(',').any(|o| o == "gid=5"), "{devpts}");
 
         // with Docker: its data in memory too, as `--tmpfs /var/lib/docker`, and nothing else
         let docker = mounts(&plan(true));
@@ -536,17 +583,27 @@ mod tests {
     }
 
     /// A VM's processes, played by a script: what each wait returns, which children end on their
-    /// own (at which wait), and which ignore SIGTERM.
+    /// own (at which wait), and which ignore SIGTERM. A wait takes all its time, except one that a
+    /// slow child ends (`slow`).
     struct FakeInit {
         waits: VecDeque<Option<Signal>>,
         running: Vec<i32>,
         /// (pid, the wait after which it ends on its own)
         ends: Vec<(i32, usize)>,
         stubborn: Vec<i32>,
+        /// Processes that ignore SIGTERM but end on their own while the stop waits, one per wait,
+        /// each after `SLOW`.
+        slow: VecDeque<i32>,
         ended: VecDeque<i32>,
         waited: usize,
+        clock: Duration,
+        /// When each `signal_all` came.
+        signalled: Vec<Duration>,
         log: Vec<String>,
     }
+
+    /// How long a slow child takes to end once a wait has begun.
+    const SLOW: Duration = Duration::from_millis(10);
 
     impl FakeInit {
         fn new(waits: &[Option<Signal>], running: &[i32], ends: &[(i32, usize)], stubborn: &[i32]) -> Self {
@@ -555,8 +612,11 @@ mod tests {
                 running: running.to_vec(),
                 ends: ends.to_vec(),
                 stubborn: stubborn.to_vec(),
+                slow: VecDeque::new(),
                 ended: VecDeque::new(),
                 waited: 0,
+                clock: Duration::ZERO,
+                signalled: Vec::new(),
                 log: Vec::new(),
             }
         }
@@ -570,18 +630,29 @@ mod tests {
     }
 
     impl Init for FakeInit {
+        fn now(&mut self) -> Duration {
+            self.clock
+        }
+
         fn wait(&mut self, timeout: Duration) -> Option<Signal> {
-            assert_eq!(timeout, TICK);
+            assert!(!timeout.is_zero() && timeout <= TICK, "{timeout:?}");
             self.waited += 1;
             for (pid, at) in self.ends.clone() {
                 if at == self.waited {
                     self.end(pid);
                 }
             }
-            if self.log.iter().any(|l| l.starts_with("signal")) {
-                // stopping: time passes, nothing new is scripted
+            if !self.signalled.is_empty() {
+                // stopping: time passes, and a slow child's end cuts a wait short
+                if let Some(pid) = self.slow.pop_front() {
+                    self.clock += SLOW.min(timeout);
+                    self.end(pid);
+                    return Some(Signal::Child);
+                }
+                self.clock += timeout;
                 return None;
             }
+            self.clock += timeout;
             self.waits.pop_front().unwrap_or_else(|| panic!("waited past the script: {:?}", self.log))
         }
 
@@ -598,6 +669,7 @@ mod tests {
 
         fn signal_all(&mut self, kill: bool) {
             self.log.push(format!("signal {}", if kill { "KILL" } else { "TERM" }));
+            self.signalled.push(self.clock);
             for pid in self.running.clone() {
                 if kill || !self.stubborn.contains(&pid) {
                     self.end(pid);
@@ -632,13 +704,31 @@ mod tests {
         let mut sys = FakeInit::new(&[Some(Signal::Stop)], &[SERVE, 10], &[], &[10]);
         init(&mut sys, SERVE);
         assert_eq!(sys.log, ["signal TERM", "reaped 2", "signal KILL", "reaped 10", "power off"]);
-        assert_eq!(sys.waited, 1 + (GRACE.as_millis() / TICK.as_millis()) as usize, "it waited the grace out");
+        assert_eq!(sys.signalled, [TICK, TICK + GRACE], "it waited the grace out");
+    }
+
+    /// Children that end one by one wake each wait early; the grace is still the clock's 5 s, not
+    /// so many wake-ups.
+    #[test]
+    fn the_grace_is_time_however_often_a_child_ends() {
+        let slow: Vec<i32> = (20..60).collect();
+        let stubborn: Vec<i32> = [10].into_iter().chain(slow.iter().copied()).collect();
+        let running: Vec<i32> = [SERVE].into_iter().chain(stubborn.iter().copied()).collect();
+        let mut sys = FakeInit::new(&[Some(Signal::Stop)], &running, &[], &stubborn);
+        sys.slow = slow.into_iter().collect();
+        init(&mut sys, SERVE);
+        assert_eq!(sys.signalled, [TICK, TICK + GRACE], "{:?}", sys.log);
+        assert!(sys.slow.is_empty() && sys.log.contains(&"reaped 59".to_string()), "every slow child ended before the kill: {:?}", sys.log);
+        assert_eq!(sys.log.last().unwrap(), "power off");
     }
 
     #[test]
     fn the_vm_powers_off_even_if_a_process_outlives_the_kill() {
         struct Unkillable(usize);
         impl Init for Unkillable {
+            fn now(&mut self) -> Duration {
+                TICK * self.0 as u32
+            }
             fn wait(&mut self, _: Duration) -> Option<Signal> {
                 self.0 += 1;
                 (self.0 == 1).then_some(Signal::Stop)
@@ -663,6 +753,51 @@ mod tests {
             [NOSUID, NODEV, NOEXEC, BIND, REC, PRIVATE].map(|f| f as libc::c_ulong),
             [libc::MS_NOSUID, libc::MS_NODEV, libc::MS_NOEXEC, libc::MS_BIND, libc::MS_REC, libc::MS_PRIVATE]
         );
+    }
+
+    /// What `boot` starts starts with no signal blocked and with a box's open-file limit, whatever
+    /// it would inherit from the first process: here those signals blocked and the kernel's soft
+    /// limit for the first process, set before `child`'s own steps.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn boot_s_child_starts_with_no_signal_blocked_and_a_box_s_files_limit() {
+        use std::os::unix::process::CommandExt;
+        // grep itself, not a shell: a shell may clear its own mask as it starts
+        let mut cmd = std::process::Command::new("grep");
+        cmd.args(["-h", "-E", "^(SigBlk|Max open files)", "/proc/self/status", "/proc/self/limits"]);
+        // SAFETY: sigemptyset, sigaddset, sigprocmask(2), getrlimit(2) and setrlimit(2), on live
+        // values, in the new process only.
+        unsafe {
+            cmd.pre_exec(|| {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                for signal in linux::STOP_SIGNALS.into_iter().chain([libc::SIGCHLD]) {
+                    libc::sigaddset(&mut set, signal);
+                }
+                let mut files = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                if libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) == -1 || libc::getrlimit(libc::RLIMIT_NOFILE, &mut files) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                files.rlim_cur = files.rlim_cur.min(1024);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &files) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = linux::child(cmd).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        let lines: Vec<Vec<&str>> = text.lines().map(|l| l.split_whitespace().collect()).collect();
+        assert_eq!(lines[0][..2], ["SigBlk:", "0000000000000000"], "{text}");
+        let (soft, hard) = (lines[1][3], lines[1][4]);
+        assert_eq!(soft, hard, "the soft limit is the hard one: {text}");
+        // SAFETY: getrlimit(2) into a live value.
+        let mut ours = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut ours) }, 0);
+        if ours.rlim_max >= linux::FILES {
+            assert_eq!(soft, linux::FILES.to_string(), "{text}");
+        }
     }
 
     /// `boot` starts `serve` with its listeners on vsock, and Docker's bridges if asked.

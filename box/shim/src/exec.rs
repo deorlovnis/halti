@@ -174,9 +174,12 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
     Ok(Some((kind[0], payload)))
 }
 
-/// One frame, in one write, so frames from several threads never interleave.
+/// One frame, in one write, so frames from several threads never interleave. A payload over
+/// `MAX_FRAME` is refused, and nothing is written.
 pub fn write_frame(w: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
-    debug_assert!(payload.len() <= MAX_FRAME);
+    if payload.len() > MAX_FRAME {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("a frame of {} bytes, over the limit of {MAX_FRAME}", payload.len())));
+    }
     let mut frame = Vec::with_capacity(5 + payload.len());
     frame.push(kind);
     frame.extend((payload.len() as u32).to_be_bytes());
@@ -208,11 +211,22 @@ impl Users {
     }
 }
 
+/// Who `request` runs as.
+fn who<'a>(request: &Request, users: &'a Users) -> &'a User {
+    if request.root { &users.root } else { &users.agent }
+}
+
 /// The variables every command gets before the request's own. `container exec` starts from the
 /// image's configured environment; a VM booted from the image's files has none, so this stands in
 /// for it.
 fn base_env(user: &User) -> [(&'static str, String); 2] {
     [("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()), ("HOME", user.home.clone())]
+}
+
+/// The service on a listener: the connections of `accepted` (each with its peer's id) from the
+/// host only (`vsock::from_host`); any other is closed unread.
+pub fn host_service<S: Conn>(accepted: impl Iterator<Item = io::Result<(S, u32)>>, users: Arc<Users>) {
+    accept_loop(crate::vsock::host_only(accepted), users)
 }
 
 /// Serve each connection on a thread of its own.
@@ -242,7 +256,7 @@ pub fn serve<S: Conn>(mut host: S, users: &Users) {
     };
     match request.and_then(|request| run(request, host, &out, users)) {
         Ok(status) => out.last(EXIT, &status.into_raw().to_be_bytes()),
-        Err(why) => out.last(FAILED, why.as_bytes()),
+        Err(why) => out.last(FAILED, &why.as_bytes()[..why.len().min(MAX_FRAME)]),
     }
 }
 
@@ -270,7 +284,7 @@ impl<S: Conn> Out<S> {
 /// Start the command, carry its streams, and wait for it. An error is a command that did not
 /// start.
 fn run<S: Conn>(request: Request, host: S, out: &Arc<Out<S>>, users: &Users) -> Result<ExitStatus, String> {
-    let user = if request.root { &users.root } else { &users.agent };
+    let user = who(&request, users);
     let program = OsStr::from_bytes(&request.argv[0]);
     let mut cmd = Command::new(program);
     cmd.args(request.argv[1..].iter().map(|a| OsStr::from_bytes(a)))
@@ -282,7 +296,7 @@ fn run<S: Conn>(request: Request, host: S, out: &Arc<Out<S>>, users: &Users) -> 
         .gid(user.gid);
     // SAFETY: `fresh_signals` makes only async-signal-safe calls.
     unsafe { cmd.pre_exec(fresh_signals) };
-    let failed = |e: io::Error| format!("running {}: {e}", program.to_string_lossy());
+    let failed = |e: io::Error| format!("running {}: {e}", shown(&request.argv[0]));
 
     let (done, finished) = mpsc::channel();
     let pump = |from: File, kind: u8| {
@@ -294,7 +308,7 @@ fn run<S: Conn>(request: Request, host: S, out: &Arc<Out<S>>, users: &Users) -> 
     };
     let (child, input, pumps) = match request.tty {
         Some(size) => {
-            let (terminal, other_end) = open_terminal(size).map_err(|e| format!("opening a terminal: {e}"))?;
+            let (terminal, other_end) = open_terminal(size, user.uid).map_err(|e| format!("opening a terminal: {e}"))?;
             cmd.stdin(Stdio::from(other_end.try_clone().map_err(failed)?)).stdout(Stdio::from(other_end.try_clone().map_err(failed)?)).stderr(Stdio::from(other_end));
             // SAFETY: `take_terminal` makes only async-signal-safe calls (setsid, ioctl).
             unsafe { cmd.pre_exec(take_terminal) };
@@ -323,6 +337,14 @@ fn run<S: Conn>(request: Request, host: S, out: &Arc<Out<S>>, users: &Users) -> 
         }
     }
     Ok(status)
+}
+
+/// A program's name in a message, cut to a few hundred bytes, so the message fits in a frame
+/// whatever name a request carries.
+fn shown(name: &[u8]) -> String {
+    const MOST: usize = 200;
+    let cut = &name[..name.len().min(MOST)];
+    format!("{}{}", String::from_utf8_lossy(cut), if cut.len() < name.len() { "..." } else { "" })
 }
 
 /// Wait for the command, reaping it only with the lock held, so a hang-up (`feed`) never signals
@@ -396,25 +418,68 @@ fn winsize(size: Size) -> libc::winsize {
     libc::winsize { ws_row: size.rows, ws_col: size.cols, ws_xpixel: 0, ws_ypixel: 0 }
 }
 
-/// A new terminal of `size`: (halti's end, the command's end), neither inherited by a command.
-fn open_terminal(size: Size) -> io::Result<(File, OwnedFd)> {
-    let (mut ours, mut theirs) = (-1, -1);
-    let mut ws = winsize(size);
-    // SAFETY: openpty(3) writes two descriptors, which `OwnedFd` then owns alone; it reads the
-    // size, and the name and settings it is given are null.
-    if unsafe { libc::openpty(&mut ours, &mut theirs, std::ptr::null_mut(), std::ptr::null_mut(), &raw mut ws) } == -1 {
+/// A new terminal of `size`, owned by `uid`: (halti's end, the command's end).
+///
+/// Both ends are close-on-exec from the moment they exist. Another thread may start a command at
+/// any time; a descriptor it inherited, even for an instant, would let it type into this
+/// terminal and read it, which for a root session is root. So no `openpty`, which opens them
+/// inheritable and sets the flag after.
+///
+/// The command's end is given to the user it runs as, so a program that opens its terminal by
+/// name (`screen`, gpg's pinentry) may, as in `container exec`. Its group is the one devpts
+/// gives (tty, in a VM that `boot` set up).
+fn open_terminal(size: Size, uid: u32) -> io::Result<(File, OwnedFd)> {
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: posix_openpt(3) returns a new descriptor, which `OwnedFd` then owns alone.
+    let ours = unsafe { libc::posix_openpt(flags) };
+    if ours == -1 {
         return Err(io::Error::last_os_error());
     }
-    let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(ours), OwnedFd::from_raw_fd(theirs)) };
-    // Another thread can start a command before these are set: it would hold this terminal open
-    // until it ends, which delays a hang-up but gives it nothing to read.
-    for fd in [&ours, &theirs] {
-        // SAFETY: fcntl(2) setting a flag of a descriptor owned here.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+    let ours = unsafe { OwnedFd::from_raw_fd(ours) };
+    // SAFETY: grantpt(3) and unlockpt(3) on the descriptor opened above.
+    if unsafe { libc::grantpt(ours.as_raw_fd()) } == -1 || unsafe { libc::unlockpt(ours.as_raw_fd()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let theirs = open_other_end(&ours, flags)?;
+    // SAFETY: fchown(2) of a descriptor owned here; the group (-1) is left as it is.
+    if unsafe { libc::fchown(theirs.as_raw_fd(), uid, libc::gid_t::MAX) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let ours = File::from(ours);
+    resize(&ours, size)?;
+    Ok((ours, theirs))
+}
+
+/// The command's end of the terminal whose other end is `ours`, opened by the kernel from it.
+#[cfg(target_os = "linux")]
+fn open_other_end(ours: &OwnedFd, flags: libc::c_int) -> io::Result<OwnedFd> {
+    // SAFETY: ioctl(2) TIOCGPTPEER returns a new descriptor, which `OwnedFd` then owns alone.
+    let fd = unsafe { libc::ioctl(ours.as_raw_fd(), libc::TIOCGPTPEER as _, flags) };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The command's end, opened by its name, for the tests on a Mac: ptsname(3) shares one buffer,
+/// so a lock keeps two threads from reading it at once.
+#[cfg(not(target_os = "linux"))]
+fn open_other_end(ours: &OwnedFd, flags: libc::c_int) -> io::Result<OwnedFd> {
+    static NAME: Mutex<()> = Mutex::new(());
+    let _lock = NAME.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: ptsname(3) returns null or a C string that stays put until the next call, which the
+    // lock holds off; open(2) reads it.
+    let fd = unsafe {
+        let name = libc::ptsname(ours.as_raw_fd());
+        if name.is_null() {
             return Err(io::Error::last_os_error());
         }
+        libc::open(name, flags)
+    };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
     }
-    Ok((File::from(ours), theirs))
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 fn resize(terminal: &File, size: Size) -> io::Result<()> {
@@ -543,6 +608,63 @@ mod tests {
         }
     }
 
+    /// Which ids each request runs with. A test that isn't root can take on no ids but its own, so
+    /// there root is given ids that aren't the test's: a request as root then can't start, and
+    /// one as the agent runs with the test's ids. As root, the agent is given the ids of nobody,
+    /// and its terminal is its own.
+    #[test]
+    fn a_command_runs_with_the_ids_of_the_user_asked() {
+        let guest = Users::guest();
+        assert_eq!((guest.agent.uid, guest.agent.gid, guest.agent.home.as_str()), (1000, 1000, "/home/agent"));
+        assert_eq!((guest.root.uid, guest.root.gid, guest.root.home.as_str()), (0, 0, "/root"));
+        assert_eq!(guest.workdir, "/home/agent");
+        for root in [false, true] {
+            let want = if root { &guest.root } else { &guest.agent };
+            assert!(std::ptr::eq(who(&request(root, None, &["true"], &[]), &guest), want));
+        }
+
+        // SAFETY: geteuid(2) can't fail.
+        let am_root = unsafe { libc::geteuid() } == 0;
+        let ids = "echo \"$(id -u) $(id -g)\"";
+        for root in [false, true] {
+            let (mut users, dir) = users(if root { "ids-root" } else { "ids-agent" });
+            let (uid, gid) = (users.agent.uid, users.agent.gid);
+            if am_root {
+                (users.agent.uid, users.agent.gid) = (65534, 65534);
+                (users.root.uid, users.root.gid) = (0, 0);
+            } else {
+                (users.root.uid, users.root.gid) = (uid.wrapping_add(1), gid.wrapping_add(1));
+            }
+            let mut s = Session::start(users, &request(root, None, &["sh", "-c", ids], &[]));
+            match (am_root, root) {
+                (false, false) => {
+                    assert!(s.status().success());
+                    assert_eq!(s.text(OUTPUT), format!("{uid} {gid}\n"));
+                }
+                (false, true) => {
+                    let (kind, why) = s.end();
+                    assert_eq!(kind, FAILED, "ran as root with this test's ids: {}", String::from_utf8_lossy(&why));
+                }
+                (true, _) => {
+                    assert!(s.status().success());
+                    assert_eq!(s.text(OUTPUT), if root { "0 0\n" } else { "65534 65534\n" });
+                }
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[cfg(target_os = "linux")]
+        if am_root {
+            let (mut users, dir) = users("ids-tty");
+            (users.agent.uid, users.agent.gid) = (65534, 65534);
+            (users.root.uid, users.root.gid) = (0, 0);
+            let mut s = Session::start(users, &request(false, Some(Size { rows: 24, cols: 80 }), &["sh", "-c", "stat -c '%u %g' \"$(tty)\""], &[]));
+            assert!(s.status().success());
+            assert!(s.text(OUTPUT).starts_with("65534 "), "{:?}", s.text(OUTPUT));
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[test]
     fn pipes_carry_input_output_and_errors() {
         let (users, dir) = users("pipes");
@@ -634,8 +756,32 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// However long a program's name, the answer that it did not start is one frame the host can
+    /// read: a name that fills a request, and one whose bytes each become three in the message.
+    #[test]
+    fn a_failure_fits_in_a_frame_whatever_the_name() {
+        for name in [vec![b'a'; MAX_FRAME - 15], vec![0xff; 22_000]] {
+            let req = Request { root: false, tty: None, argv: vec![name], env: Vec::new() };
+            assert!(req.encode().len() <= MAX_FRAME);
+            let (users, dir) = users("long-name");
+            let mut s = Session::start(users, &req);
+            let (kind, why) = s.end();
+            assert_eq!(kind, FAILED);
+            assert!(why.len() < 1024, "{} bytes", why.len());
+            assert!(why.starts_with(b"running "), "{}", String::from_utf8_lossy(&why));
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[test]
     fn an_oversized_frame_is_refused() {
+        // not sent: nothing is written
+        let mut sent = Vec::new();
+        assert_eq!(write_frame(&mut sent, OUTPUT, &vec![0; MAX_FRAME + 1]).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(sent.is_empty());
+        write_frame(&mut sent, OUTPUT, &vec![0; MAX_FRAME]).unwrap();
+        assert_eq!(read_frame(&mut &sent[..]).unwrap().unwrap().1.len(), MAX_FRAME);
+
         let mut header = vec![REQUEST];
         header.extend((MAX_FRAME as u32 + 1).to_be_bytes());
         let err = read_frame(&mut &header[..]).unwrap_err();
@@ -680,8 +826,40 @@ mod tests {
         assert_eq!(Request::decode(&request(false, None, &["true"], &[("", "c")]).encode()), Err("a bad variable name"));
     }
 
+    /// Only the host's connections are served; one from inside the box is closed unread.
     #[test]
-    fn random_frames_never_panic_and_never_allocate_past_the_cap() {
+    fn a_connection_from_inside_the_box_runs_nothing() {
+        let (users, dir) = users("peers");
+        let (mut hosts, mut accepted) = (Vec::new(), Vec::new());
+        for peer in [3, 1, crate::vsock::HOST_CID] {
+            let marker = dir.join(format!("ran-{peer}"));
+            let req = request(false, None, &["sh", "-c", &format!("touch '{}'", marker.display())], &[]);
+            let (mut host, shim) = UnixStream::pair().unwrap();
+            write_frame(&mut host, REQUEST, &req.encode()).unwrap();
+            hosts.push((peer, host, marker));
+            accepted.push(Ok((shim, peer)));
+        }
+        host_service(accepted.into_iter(), Arc::new(users));
+        for (peer, mut host, marker) in hosts {
+            // closed with the request unread: end-of-file, or on Linux a reset
+            let first = match read_frame(&mut host) {
+                Ok(frame) => frame.map(|(kind, _)| kind),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => None,
+                Err(e) => panic!("peer {peer}: {e}"),
+            };
+            if peer == crate::vsock::HOST_CID {
+                assert_eq!(first, Some(EXIT));
+                assert!(marker.exists());
+            } else {
+                assert_eq!(first, None, "peer {peer} was answered");
+                assert!(!marker.exists(), "peer {peer}'s command ran");
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn random_frames_never_panic_and_an_oversized_length_is_refused_unread() {
         // xorshift: the same bytes every run
         let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
         let mut next = move || {
@@ -702,9 +880,15 @@ mod tests {
             }
             let _ = Request::decode(&bytes);
             let mut stream = &bytes[..];
-            while let Ok(Some((_, payload))) = read_frame(&mut stream) {
-                assert!(payload.len() <= MAX_FRAME);
-            }
+            while let Ok(Some(_)) = read_frame(&mut stream) {}
+
+            // a length over the cap, followed by as many bytes as it asks for: refused before
+            // any is read
+            let len = MAX_FRAME as u64 + 1 + next() % (3 * MAX_FRAME as u64);
+            let mut header = vec![next() as u8];
+            header.extend((len as u32).to_be_bytes());
+            let err = read_frame(&mut (&header[..]).chain(io::repeat(0))).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
     }
 }

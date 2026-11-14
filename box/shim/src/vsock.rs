@@ -12,8 +12,9 @@ use std::net::Shutdown;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 /// The peer id the host's connections arrive with: the well-known id of the host
-/// (`VMADDR_CID_HOST`). A program in the box that dials the shim's own ports arrives with the
-/// VM's id, or the local one (1).
+/// (`VMADDR_CID_HOST`). A program in the box that dials the shim's own ports is expected to
+/// arrive with the VM's own id (3 or more) or the local one (1); that is not yet seen in a Linux
+/// VM, and either way only this id is served.
 pub const HOST_CID: u32 = 2;
 
 /// Whether a connection from `peer` may be served. Only the host may: a program in the box that
@@ -150,7 +151,8 @@ mod tests {
 
     #[test]
     fn a_connection_from_inside_the_box_is_refused() {
-        // The VM's own id (3 in a Mac trial), the local id and an unassigned one, against the host.
+        // The lowest id a VM can have (3) and the next, the local id, the hypervisor's (0) and the
+        // wildcard, against the host.
         assert!(from_host(HOST_CID));
         for inside in [0, 1, 3, 4, u32::MAX] {
             assert!(!from_host(inside), "peer {inside} is not the host");
