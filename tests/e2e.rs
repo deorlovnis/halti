@@ -1739,14 +1739,30 @@ fn a_run_and_a_stop_of_an_open_workspace_say_each_answer_in_their_own_words() {
     }
     let out = ask(&["ws", "stop", "acme/dev"], "stopped", "halti-keep/1 stop acme dev\n");
     assert!(out.status.success() && stdout(&out) == "stopped box acme/dev\n", "{}", stderr(&out));
-    // Told it stopped, while something still holds the box: the word alone isn't believed.
+    // Once told it stopped, the box's lock is waited for, and nothing is stopped here: a VM up by
+    // then is a start that came after the word, another run's.
+    let (path, vms) = env.engine_of_files();
+    let vm = vms.join(format!("halti-wsbox-{}-dev", &ws_id(&env, "acme")[..12]));
+    fs::write(&vm, "").unwrap();
+    let stopped = || {
+        let keeper = answer_once(&socket, "stopped");
+        let out = env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["ws", "stop", "acme/dev"]).output().unwrap();
+        assert_eq!(keeper.join().unwrap().0, "halti-keep/1 stop acme dev\n");
+        out
+    };
+    let out = stopped();
+    assert!(out.status.success() && stdout(&out) == "stopped box acme/dev\n", "{}", stderr(&out));
+    assert!(vm.exists(), "a start that came after the word is left alone");
+    // Told it stopped, while something still holds the box: the word alone isn't believed, and
+    // what holds it is left alone too.
     let open = wsdir(&env, "acme").join("boxes/open");
     fs::create_dir_all(&open).unwrap();
     let held = fs::File::create(open.join("dev.lock")).unwrap();
     held.lock().unwrap();
-    let out = ask(&["ws", "stop", "acme/dev"], "stopped", "halti-keep/1 stop acme dev\n");
+    let out = stopped();
     assert!(!out.status.success() && stdout(&out).is_empty(), "{}", stdout(&out));
     assert_eq!(stderr(&out), "halti: box acme/dev is being opened or closed: try again in a moment\n");
+    assert!(vm.exists());
     let _ = fs::remove_file(&socket);
 }
 
@@ -1766,7 +1782,7 @@ fn a_run_of_an_open_workspace_holds_its_session_and_stops_its_box_once_it_is_gon
     fs::write(boxes.join("open/dev.policy"), sha256(text.as_bytes())).unwrap();
     fs::write(boxes.join("open/dev.bearer"), "0").unwrap();
     let vm = vms.join(format!("halti-wsbox-{}-dev", &ws_id(&env, "acme")[..12]));
-    let _lock = hold_keeper_lock(&env, "acme");
+    let lock = hold_keeper_lock(&env, "acme");
     let socket = keeper_socket(&env, "acme");
     let run = || {
         let mut command = env.ws_box_command(PASSPHRASE, "true");
@@ -1814,12 +1830,34 @@ fn a_run_of_an_open_workspace_holds_its_session_and_stops_its_box_once_it_is_gon
     assert_eq!(stderr(&out), "halti: acme is no longer open, so box acme/dev was stopped\n");
     assert!(!vm.exists(), "its VM is stopped");
 
-    // Another halti runs the box: joined as without an open workspace, with no session.
+    // Another halti runs the box: joined as without an open workspace, with no session. The open
+    // workspace ends the connection once it has answered, and the box is left to that halti.
+    let (agent, session) = started("elsewhere");
+    drop(session);
+    thread::sleep(Duration::from_millis(500));
     fs::write(&vm, "done").unwrap();
-    let keeper = answer_once(&socket, "elsewhere");
+    let out = agent.wait_with_output().unwrap();
+    assert!(out.status.code() == Some(7) && asked(&out) == 0 && stderr(&out).is_empty(), "{}", stderr(&out));
+    assert!(vm.exists(), "the box is left to the halti that runs it");
+
+    // The open workspace goes while it starts the box, which may be up with no door: the run puts
+    // it away, and says so, rather than that acme is being opened.
+    fs::write(&vm, "").unwrap();
+    let _ = fs::remove_file(&socket);
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let going = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        // Killed: its lock is let go of, and the connection ends with no word.
+        drop(lock);
+        line
+    });
     let out = env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["ws", "run", "acme/dev", "--", "true"]).output().unwrap();
-    assert_eq!(keeper.join().unwrap().0, "halti-keep/1 start acme dev\n");
-    assert!(out.status.code() == Some(7) && asked(&out) == 0, "{}", stderr(&out));
+    assert_eq!(going.join().unwrap(), "halti-keep/1 start acme dev\n");
+    assert!(!out.status.success() && asked(&out) == 0, "{}", stderr(&out));
+    assert_eq!(stderr(&out), "halti: acme is no longer open, so box acme/dev was stopped\n");
+    assert!(!vm.exists(), "its VM is stopped");
     let _ = fs::remove_file(&socket);
 }
 

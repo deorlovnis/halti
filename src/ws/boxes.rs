@@ -425,21 +425,17 @@ pub fn run(target_text: &str, command: Vec<String>, type_it: bool) -> Result<Run
     let command = (!command.is_empty()).then_some(command);
     let kept = Kept::of(&here, found.id)?;
     if kept.held() {
-        let started = keep::start(&kept, &name, box_name)?;
-        let text = found.files.read(box_name)?.ok_or_else(|| no_box(&found.shown))?;
-        let session = match started {
+        let session = match keep::start(&kept, &name, box_name)? {
             keep::Started::Elsewhere => None,
+            keep::Started::Gone => return Err(keep::lost(&name, &found.shown, put_away_lost(&found.layout, box_name, &found.shown, vms))),
             keep::Started::Session(stream) => {
                 // A session that loses the open workspace stops the box, as `ws stop` does.
-                let (layout, stopped) = (found_in(&here.root, &name, found.id, box_name)?.layout, box_name.to_string());
-                let lost = move || {
-                    if let Err(e) = stop_box(&layout, &stopped, vms) {
-                        warn(&format!("stopping box {name}/{stopped}: {e:#}"));
-                    }
-                };
+                let (layout, stopped, shown) = (found_in(&here.root, &name, found.id, box_name)?.layout, box_name.to_string(), found.shown.clone());
+                let lost = move || put_away_lost(&layout, &stopped, &shown, vms);
                 Some(keep::Session::hold(stream, &found.name, &found.shown, Box::new(lost))?)
             }
         };
+        let text = found.files.read(box_name)?.ok_or_else(|| no_box(&found.shown))?;
         let Found { box_name, shown, layout, .. } = found;
         let join = Box::new(boxes::Join { vms, layout, name: box_name, shown, text, mounts: rule, command });
         return Ok(match session {
@@ -499,8 +495,9 @@ fn open_for(here: &Here, found: &Found, way: &Way<'_>, what: &str, command: &str
 const LET_GO_EVERY: Duration = Duration::from_millis(250);
 
 /// `halti ws stop WS/BOX`: asks nothing. A workspace that `halti open` keeps open is asked to stop
-/// the box; once it says it did, the box's lock is waited for here all the same. Otherwise, or if
-/// it doesn't run the box, the box is stopped as `stop_box` does.
+/// the box; once it says it did, the box's lock is waited for here all the same, never taken, and
+/// nothing is stopped: a start that comes after the word is another run's. Otherwise, or if it
+/// doesn't run the box, the box is stopped as `stop_box` does.
 pub fn stop(target_text: &str) -> Result<()> {
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
@@ -509,8 +506,7 @@ pub fn stop(target_text: &str) -> Result<()> {
     let found = find(&here, &name, box_name)?;
     let kept = Kept::of(&here, found.id)?;
     if kept.held() && keep::stop(&kept, &name, box_name)? == keep::Stopped::Said {
-        let (_, let_go) = stop_box(&found.layout, box_name, vms)?;
-        if !let_go {
+        if !let_go(&found.layout.lock(box_name)) {
             bail!("box {} is being opened or closed: try again in a moment", found.shown);
         }
         println!("stopped box {}", found.shown);
@@ -555,6 +551,30 @@ fn stop_box(layout: &Layout, box_name: &str, vms: &dyn Vms) -> Result<(bool, boo
         }
     }
     Ok((was_running, false))
+}
+
+/// Waits for the box lock at `lock` to be let go of, without taking it: 60 times `LET_GO_EVERY` at
+/// most. False if it is still held.
+fn let_go(lock: &Path) -> bool {
+    for _ in 0..60 {
+        if !boxes::store::is_held(lock) {
+            return true;
+        }
+        thread::sleep(LET_GO_EVERY);
+    }
+    !boxes::store::is_held(lock)
+}
+
+/// Puts away box `box_name` (`shown`) of a run that lost its open workspace, as `ws stop` does:
+/// whether it was let go of and cleared. A failure is said.
+fn put_away_lost(layout: &Layout, box_name: &str, shown: &str, vms: &dyn Vms) -> bool {
+    match stop_box(layout, box_name, vms) {
+        Ok((_, let_go)) => let_go,
+        Err(e) => {
+            warn(&format!("stopping box {shown}: {e:#}"));
+            false
+        }
+    }
 }
 
 /// `halti ws box log WS/BOX [-n N] [--type]`: the last lines of what went through the box's door. A

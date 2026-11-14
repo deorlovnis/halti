@@ -1027,19 +1027,27 @@ fn two_boxes_of_one_workspace_run_side_by_side() {
     let (mut keeper, _said) = home.open("acme", ACME);
     // Both reach github through their own door, in the one process that keeps acme open.
     let script = statuses_then_headers(&[("acme", "acme-token-0001")]);
-    let runs: Vec<_> = [&one, &two]
+    let mut runs: Vec<_> = [&one, &two]
         .into_iter()
         .map(|name| home.halti().args(["ws", "run", &format!("acme/{name}"), "--", "sh", "-c", &format!("{script}; sleep 120")]).stdout(Stdio::piped()).spawn().unwrap())
         .collect();
     let (vm_one, vm_two) = (until_running("halti-wsbox-", &one), until_running("halti-wsbox-", &two));
+    // A run's first line comes only once the open workspace said its box started: then both count.
+    // Their output stays open until they are killed, so neither ends on a closed pipe.
+    let mut outs = Vec::new();
+    for run in &mut runs {
+        let mut out = BufReader::new(run.stdout.take().unwrap());
+        let mut seen = String::new();
+        out.read_line(&mut seen).unwrap();
+        assert!(seen.starts_with("200 "), "{seen}");
+        outs.push(out);
+    }
     assert_eq!(keeper_ask(&home.keeper_socket("acme"), "halti-keep/1 ping acme\n"), "halti-keep/1 open 2\n");
     for mut run in runs {
-        let mut seen = String::new();
-        BufReader::new(run.stdout.take().unwrap()).read_line(&mut seen).unwrap();
-        assert!(seen.starts_with("200 "), "{seen}");
         run.kill().unwrap();
         run.wait().unwrap();
     }
+    drop(outs);
     // Each stops once its one run has gone.
     let deadline = Instant::now() + Duration::from_secs(120);
     while (engine::running(&vm_one) || engine::running(&vm_two)) && Instant::now() < deadline {

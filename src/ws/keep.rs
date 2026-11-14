@@ -37,7 +37,7 @@ use super::tty::TtyPassphrase;
 use super::{Here, Reading, Way, memory, open_with, saved, saved_means};
 use crate::approval::{Action, Real};
 use crate::config;
-use crate::keep::{self, No, Reply, Request};
+use crate::keep::{self, Asked, No, Reply, Request};
 use crate::source::Source;
 
 /// How often a session looks whether its client has left.
@@ -145,6 +145,9 @@ pub(super) enum Started {
     Session(UnixStream),
     /// Another halti runs the box: join it there.
     Elsewhere,
+    /// The open workspace went while it started the box, and has let go of its lock: what it
+    /// started is left with no door, for this run to put away.
+    Gone,
 }
 
 /// Asks the open workspace `name`, which `kept` found, to start its box `box_name`, or join it if it
@@ -153,13 +156,24 @@ pub(super) enum Started {
 pub(super) fn start(kept: &Kept, name: &WsName, box_name: &str) -> Result<Started> {
     let shown = format!("{name}/{box_name}");
     match keep::ask_held(&kept.socket(), &Request::Start(name.clone(), box_name.to_string()), keep::START_WAIT) {
-        Some((Reply::Started | Reply::Running, stream)) => Ok(Started::Session(stream)),
-        Some((Reply::Elsewhere, _)) => Ok(Started::Elsewhere),
-        Some((Reply::Busy, _)) => Err(box_busy(&shown)),
-        Some((Reply::Full, _)) => bail!("{name} has too many sessions: end one first"),
-        Some((Reply::No(no), _)) => Err(not_started(name, &shown, &no)),
-        Some((Reply::Other, _)) => Err(other(name)),
+        Asked::Answered(Reply::Started | Reply::Running, stream) => Ok(Started::Session(stream)),
+        Asked::Answered(Reply::Elsewhere, _) => Ok(Started::Elsewhere),
+        Asked::Answered(Reply::Busy, _) => Err(box_busy(&shown)),
+        Asked::Answered(Reply::Full, _) => bail!("{name} has too many sessions: end one first"),
+        Asked::Answered(Reply::No(no), _) => Err(not_started(name, &shown, &no)),
+        Asked::Answered(Reply::Other, _) => Err(other(name)),
+        Asked::Ended if kept.let_go() => Ok(Started::Gone),
         _ => Err(opening(name)),
+    }
+}
+
+/// What a run says once it has lost the open workspace `name`, and has put away box `shown` itself
+/// (`put_away`), or failed to.
+pub(super) fn lost(name: &WsName, shown: &str, put_away: bool) -> anyhow::Error {
+    if put_away {
+        anyhow!("{name} is no longer open, so box {shown} was stopped")
+    } else {
+        anyhow!("{name} is no longer open, and box {shown} may still run. stop it with: halti ws stop {shown}")
     }
 }
 
@@ -206,35 +220,31 @@ pub(super) fn stop(kept: &Kept, name: &WsName, box_name: &str) -> Result<Stopped
 pub struct Session {
     stream: UnixStream,
     left: Arc<AtomicBool>,
-    watch: Option<JoinHandle<bool>>,
+    /// Whether the box was put away here, if the open workspace was lost.
+    watch: Option<JoinHandle<Option<bool>>>,
     name: WsName,
     shown: String,
 }
 
 impl Session {
-    /// Holds `stream`, the session of box `shown` of `name`, and watches it.
-    pub(super) fn hold(stream: UnixStream, name: &WsName, shown: &str, lost: Box<dyn FnOnce() + Send>) -> Result<Session> {
+    /// Holds `stream`, the session of box `shown` of `name`, and watches it. `lost` puts the box
+    /// away, and says whether it did.
+    pub(super) fn hold(stream: UnixStream, name: &WsName, shown: &str, lost: Box<dyn FnOnce() -> bool + Send>) -> Result<Session> {
         let watched = stream.try_clone()?;
         let left = Arc::new(AtomicBool::new(false));
         let leaving = left.clone();
-        let watch = thread::spawn(move || {
-            let gone = watch(watched, &leaving);
-            if gone {
-                lost();
-            }
-            gone
-        });
+        let watch = thread::spawn(move || watch(watched, &leaving).then(lost));
         Ok(Session { stream, left, watch: Some(watch), name: name.clone(), shown: shown.to_string() })
     }
 
     /// Ends the session once the agent's command ended with `result`: the box stops if this was its
-    /// last. If the open workspace was gone, the box was put away here, and that is what is said.
+    /// last. If the open workspace was gone, the box was put away here, or that failed, and that is
+    /// what is said.
     pub fn end(mut self, result: Result<u8>) -> Result<u8> {
         self.left.store(true, Ordering::SeqCst);
         let _ = self.stream.shutdown(Shutdown::Both);
-        let lost = self.watch.take().is_some_and(|watch| watch.join().unwrap_or(false));
-        if lost {
-            bail!("{} is no longer open, so box {} was stopped", self.name, self.shown);
+        if let Some(put_away) = self.watch.take().and_then(|watch| watch.join().ok().flatten()) {
+            return Err(lost(&self.name, &self.shown, put_away));
         }
         result
     }
@@ -307,13 +317,22 @@ mod tests {
         WsName::parse("acme").unwrap()
     }
 
-    /// A session of acme/dev on one end of a pair, and whether it put its box away.
-    fn held() -> (Session, UnixStream, Arc<AtomicBool>) {
+    /// A session of acme/dev on one end of a pair, and whether it tried to put its box away: it
+    /// does so as `put_away` says.
+    fn held_putting_away(put_away: bool) -> (Session, UnixStream, Arc<AtomicBool>) {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let stopped = Arc::new(AtomicBool::new(false));
         let noted = stopped.clone();
-        let session = Session::hold(ours, &acme(), "acme/dev", Box::new(move || noted.store(true, Ordering::SeqCst))).unwrap();
+        let lost = move || {
+            noted.store(true, Ordering::SeqCst);
+            put_away
+        };
+        let session = Session::hold(ours, &acme(), "acme/dev", Box::new(lost)).unwrap();
         (session, theirs, stopped)
+    }
+
+    fn held() -> (Session, UnixStream, Arc<AtomicBool>) {
+        held_putting_away(true)
     }
 
     fn until(done: &AtomicBool) -> bool {
@@ -333,6 +352,15 @@ mod tests {
         assert!(until(&stopped), "the box is put away while the agent still works");
         let said = session.end(Ok(0)).unwrap_err();
         assert_eq!(said.to_string(), "acme is no longer open, so box acme/dev was stopped");
+    }
+
+    #[test]
+    fn a_lost_box_that_could_not_be_put_away_is_not_said_stopped() {
+        let (session, theirs, stopped) = held_putting_away(false);
+        drop(theirs);
+        assert!(until(&stopped));
+        let said = session.end(Ok(0)).unwrap_err();
+        assert_eq!(said.to_string(), "acme is no longer open, and box acme/dev may still run. stop it with: halti ws stop acme/dev");
     }
 
     #[test]
