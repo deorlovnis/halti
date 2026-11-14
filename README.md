@@ -6,7 +6,7 @@ Secrets are grouped by **resource**, one thing you sign in to (`github`, `aws`, 
 
 ## Install
 
-Requires macOS, Rust (`mise use -g rust@stable`, or rustup), and Node.js for the sandboxed browser.
+Requires macOS, Rust (`mise use -g rust@stable`, or rustup), and Node.js for the sandboxed browser. For a Linux server, see On a Linux server.
 
 ```sh
 git clone https://github.com/deorlovnis/halti.git ~/Git/halti
@@ -52,6 +52,28 @@ rm -f key.pem cert.pem halti.p12 /tmp/halti-cert.cnf
 When `codesign` asks to use the key, choose **Allow**, never **Always Allow**: a key anything can use silently lets any program running as you sign a lookalike halti that the Keychain trusts. `install.sh` signs with `HALTI_SIGN_IDENTITY` if set, else "halti code signing". After switching identities, run `halti reseal` so each item trusts only the new halti, then approve your policies again.
 
 Items halti writes itself, policy approvals included, stay tied to the exact build that wrote them: without an Apple Developer Team ID, macOS can't tie them to the signing identity. Approvals are read without allowing a prompt, so after an update they read as missing and every resource is blocked until you approve again. `install.sh` does that at the end. Keychain prompts take your login password; Touch ID only appears in halti's own approval prompts.
+
+### On a Linux server
+
+On x86-64 or arm64 Linux, halti keeps workspaces (see Workspaces): you make one, store its secrets, write and approve its policies and open it over `ssh -t`, typing the passphrase into the server's terminal. Boxes don't run on Linux yet, and the Keychain commands (`halti set`, `policy`, `box`) find nothing there. Requires Rust and sudo.
+
+```sh
+git clone https://github.com/deorlovnis/halti.git ~/halti
+~/halti/check.sh             # must pass on this machine before halti is installed on it
+~/halti/install-linux.sh     # builds and installs /usr/local/bin/halti (root-owned), then warns about sudo and swap
+ssh -t server halti ws new acme   # from your Mac
+```
+
+Run `install-linux.sh` as the user that runs halti, not as root. `./install-linux.sh --dry-run` lists what it would write and changes nothing. It installs only a build with no test hooks, on a processor `check.sh` builds and tests on (`halti build-info` names it).
+
+Nothing that opens a workspace is saved on the server: after a reboot every workspace is closed. But the server is someone else's machine. Whoever controls it while it runs (root, or its provider) can take every secret of a workspace that is open, and each passphrase typed there later. Use one workspace per client, tokens with narrow rights, and `halti close` when the work is done. Against the rest, halti on a server holds only under four conditions. `install-linux.sh` checks the two it can and warns; it stops nothing.
+
+- **SSH.** Log in by key only, with password login off. Note the server's host key when you set it up and compare it at your first connection: a passphrase typed to the wrong host is leaked, so treat that workspace's secrets as leaked too. Never `ssh -A` to the server: a broken server could use your forwarded keys elsewhere. A private network (WireGuard, Tailscale) keeps the port off the internet.
+- **sudo.** The user that runs halti must not have sudo without a password. halti's approved settings are owned by root so that a program running as you can't change them (see Settings); if sudo asks nothing, that program is root, and can replace `/usr/local/bin/halti`, change the approved settings and catch every passphrase typed later. Some server images set this up for the login user: give the user a password and remove the rule (in `/etc/sudoers.d/`, with `sudo visudo -f`). sudo with a password is weaker than it sounds too: a program running as you can wait for you to type it.
+- **Swap.** No swap, or encrypted swap. Tokens and workspace keys in halti's memory can be written to swap, and a copy of the disk taken later then holds them. `install-linux.sh` warns about swap that isn't on a dm-crypt device, a swap file by the disk it is on (zram is memory, and fine). Turn it off with `sudo swapoff -a`, and remove it from `/etc/fstab`.
+- **An encrypted data disk.** Keep the workspaces folder on a disk you unlock yourself over SSH after each boot (LUKS), and point `[paths] workspaces` at it before you make a workspace (see Settings; on Linux too it is `~/Library/Application Support/halti/ws` otherwise). A workspace's secrets are sealed under its passphrase either way, but its audit log and its policy files, which name the sites a client uses, are plain files. A disk that unlocks itself at boot, with a key file or a TPM chip, protects nothing against whoever can boot the server.
+
+Not covered by any of these: the halti program and the approved settings are on the system disk. Whoever can write that disk while the server is off, or use your hosting account (a rescue boot, the console, a reinstall), can replace them and get the next passphrase typed. Protect the hosting account as you would the server. If the server is ever taken over: rebuild it, change every secret of the workspaces that were open at their sites, and make every workspace that was on it again, with a new passphrase.
 
 ## Use
 

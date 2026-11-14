@@ -120,7 +120,7 @@ fn the_old_names_stay_in_legacy() {
     for dir in ["src", "tests", "box", "core"] {
         all_files(&root().join(dir), &mut files);
     }
-    files.extend(["install.sh", "mise.toml", "check.sh"].map(|f| root().join(f)));
+    files.extend(["install.sh", "install-linux.sh", "mise.toml", "check.sh"].map(|f| root().join(f)));
     let mut found = Vec::new();
     for path in files {
         let rel = path.strip_prefix(root()).unwrap().display().to_string();
