@@ -1,5 +1,5 @@
 [tools]
-rust = "stable"
+rust = "1.92.0"
 
 [tasks.check]
 description = "Format, lints, all tests that need no human, and a release build's check: run before pushing"

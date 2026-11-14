@@ -6,7 +6,7 @@ Secrets are grouped by **resource**, one thing you sign in to (`github`, `aws`, 
 
 ## Install
 
-Requires macOS, Rust (`mise use -g rust@stable`, or rustup), and Node.js for the sandboxed browser.
+Requires macOS, Rust through rustup (`rust-toolchain.toml` pins the version, which rustup fetches), and Node.js for the sandboxed browser.
 
 ```sh
 git clone https://github.com/deorlovnis/halti.git ~/Git/halti
