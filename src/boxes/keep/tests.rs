@@ -14,6 +14,7 @@ use halti_core::ids::WsId;
 
 use super::*;
 use crate::engine::VmSpec;
+use crate::ws::boxes::{put_away_left, stop_others};
 use crate::{chain, door};
 
 const IMAGE: &str = "agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -199,11 +200,14 @@ struct Bench {
     close: AtomicBool,
     /// When the keys were wiped: the VMs that ran then.
     wiped: Mutex<Option<BTreeSet<String>>>,
+    /// The workspace's files went back, until the keeper is told so; and how often it looked.
+    went_back: AtomicBool,
+    looked: AtomicUsize,
 }
 
 impl Bench {
     fn new(fake: Fake) -> Bench {
-        Bench { dir: Short::new(), fake, close: AtomicBool::new(false), wiped: Mutex::new(None) }
+        Bench { dir: Short::new(), fake, close: AtomicBool::new(false), wiped: Mutex::new(None), went_back: AtomicBool::new(false), looked: AtomicUsize::new(0) }
     }
 
     fn layout(&self) -> Layout {
@@ -231,6 +235,8 @@ impl Bench {
             let (text, policy) = policy(extra);
             Ok(Checked { text, policy })
         };
+        let names: Vec<String> = boxes.iter().map(|(name, _)| name.to_string()).collect();
+        let (left_in, others_in) = (self.layout(), self.layout());
         Keep {
             name: acme(),
             lock,
@@ -238,8 +244,9 @@ impl Bench {
             mounts: MountRule::Workspace(Vec::new()),
             vms: None,
             settings: Settings::builtin(crate::ws::OS),
-            boxes: boxes.iter().map(|(name, _)| name.to_string()).collect(),
             check: Box::new(check),
+            left: Box::new(move |vms| put_away_left(&left_in, vms, &names)),
+            others: Box::new(move |vms| stop_others(&others_in, vms)),
         }
     }
 
@@ -248,13 +255,17 @@ impl Bench {
         let keep = self.keep(boxes);
         let ready = |_: &str, _: &str, _: &Checked| Ok(());
         let wipe = || *self.wiped.lock().unwrap() = Some(self.fake.up());
+        let refused = || {
+            self.looked.fetch_add(1, Ordering::SeqCst);
+            self.went_back.swap(false, Ordering::SeqCst)
+        };
         let outside = Outside {
             world: engine.then_some(&self.fake as &dyn World),
             vms: engine.then_some(&self.fake as &dyn Vms),
             ready: &ready,
             close: &self.close,
             wipe: &wipe,
-            refused: &|| false,
+            refused: &refused,
         };
         let socket = self.socket();
         thread::scope(|scope| {
@@ -480,6 +491,45 @@ fn a_box_another_halti_runs_is_elsewhere_and_close_stops_it() {
 }
 
 #[test]
+fn close_stops_a_box_of_another_terminal_whose_vm_comes_up_while_it_waits() {
+    let bench = Bench::new(Fake::default());
+    let layout = bench.layout();
+    layout.prepare().unwrap();
+    let dev = layout.vm("dev");
+    let code = bench.keeping(&[("dev", "")], true, |socket| {
+        // Another halti holds dev and is still starting it: its VM comes up only once the close
+        // waits for it to let go, and then it lets go once its VM is stopped.
+        let held = store::lock(&layout.lock("dev")).unwrap().unwrap();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_secs(1));
+                bench.fake.up.lock().unwrap().insert(dev.clone());
+                until(|| !bench.fake.up().contains(&dev));
+                drop(held);
+            });
+            assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(1)));
+        });
+    });
+    assert_eq!(code.unwrap(), 0);
+    assert!(bench.fake.up().is_empty() && store::lock(&layout.lock("dev")).unwrap().is_some());
+}
+
+#[test]
+fn a_box_of_another_terminal_that_holds_on_leaves_the_workspace_not_closed() {
+    let bench = Bench::new(Fake::default());
+    let layout = bench.layout();
+    layout.prepare().unwrap();
+    // Another halti holds dev, and never lets go.
+    let _held = store::lock(&layout.lock("dev")).unwrap().unwrap();
+    let code = bench.keeping(&[("dev", "")], true, |socket| {
+        assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
+    });
+    // Its keys are wiped and its socket is gone, but it isn't said to be closed.
+    assert_eq!(code.unwrap(), 1);
+    assert!(bench.wiped.lock().unwrap().is_some() && !bench.socket().exists());
+}
+
+#[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
 fn close_waits_for_a_box_that_is_still_starting_and_a_start_during_close_is_refused() {
     let bench = Bench::new(Fake { slow_start: Duration::from_secs(2), ..Fake::default() });
@@ -563,4 +613,76 @@ fn a_second_keeper_never_takes_a_socket_that_answers() {
     let error = serve_with(bench.keep(&[]), &outside).unwrap_err();
     assert_eq!(error.to_string(), "another workspace is open at acme's socket");
     assert!(socket.exists());
+}
+
+#[test]
+fn a_box_is_stopping_as_its_last_session_leaves_or_a_stop_is_asked() {
+    let bench = Bench::new(Fake::default());
+    let (name, layout, mounts) = (acme(), bench.layout(), MountRule::Workspace(Vec::new()));
+    let check = |_: &str| -> Result<Checked, Refused> { Err(Refused::new(No::Box, anyhow!("no box here"))) };
+    let ready = |_: &str, _: &str, _: &Checked| Ok(());
+    let keeper = Keeper {
+        name: &name,
+        layout: &layout,
+        mounts: &mounts,
+        write: None,
+        world: None,
+        check: &check,
+        ready: &ready,
+        close: &bench.close,
+        table: Mutex::default(),
+        changed: Condvar::new(),
+        waiting: AtomicUsize::new(0),
+        closers: Mutex::default(),
+        done: AtomicBool::new(false),
+    };
+    let running = |round| Slot { round, state: State::Running, sessions: 1, stop: Arc::default(), word: None };
+    let state = |box_name: &str| keeper.table().boxes[box_name].state;
+    keeper.table().boxes.insert("dev".into(), running(1));
+    assert!(!keeper.last_left("dev", 1));
+    // Its last session leaves: as the box's thread sees that, the box is stopping, so a start
+    // that comes after is busy, and never joins a box that is being put away.
+    keeper.leave("dev", 1);
+    assert!(keeper.last_left("dev", 1));
+    assert_eq!(state("dev"), State::Stopping);
+    // A stop: stopping as it is asked, and answered once the box is put away.
+    keeper.table().boxes.insert("web".into(), running(2));
+    thread::scope(|scope| {
+        let stopping = scope.spawn(|| keeper.stop("web"));
+        until(|| state("web") == State::Stopping);
+        assert!(keeper.table().boxes["web"].stop.load(Ordering::SeqCst));
+        keeper.table().boxes.remove("web");
+        keeper.changed.notify_all();
+        assert_eq!(stopping.join().unwrap(), Reply::Stopped);
+    });
+}
+
+#[test]
+fn the_33rd_connection_waiting_to_send_is_closed_with_no_answer() {
+    let bench = Bench::new(Fake::default());
+    let code = bench.keeping(&[], false, |socket| {
+        // 32 send nothing. Each is taken before the next, so the 33rd finds them all waiting.
+        let waiting: Vec<UnixStream> = (0..32).map(|_| keep::connect(socket).unwrap()).collect();
+        let mut one_more = keep::connect(socket).unwrap();
+        let _ = keep::write_line(&mut one_more, &Request::Ping(acme()).line());
+        assert_eq!(keep::read_line(&mut one_more, LONG), None);
+        // Once they go, it answers again.
+        drop(waiting);
+        until(|| running(socket) == Some(Reply::Open(0)));
+        assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
+    });
+    assert_eq!(code.unwrap(), 0);
+}
+
+#[test]
+fn files_that_went_back_are_looked_for_while_open() {
+    let bench = Bench::new(Fake::default());
+    bench.went_back.store(true, Ordering::SeqCst);
+    let code = bench.keeping(&[], false, |socket| {
+        // Looked for again and again while it is open; what was found is taken, and said, once.
+        until(|| bench.looked.load(Ordering::SeqCst) >= 3);
+        assert!(!bench.went_back.load(Ordering::SeqCst));
+        assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
+    });
+    assert_eq!(code.unwrap(), 0);
 }

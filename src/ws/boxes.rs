@@ -42,7 +42,7 @@ use crate::config::{self, Settings};
 use crate::engine::{self, Vms};
 use crate::keep::{No, Refused};
 use crate::source::Source;
-use crate::util::sha256_hex;
+use crate::util::{sha256_hex, warn};
 use crate::{names, policy};
 
 /// `acme/dev`: a workspace's name, then after the first `/` a box, each as core checks it.
@@ -466,9 +466,13 @@ fn open_for(here: &Here, found: &Found, way: &Way<'_>, what: &str, command: &str
     Ok(reader)
 }
 
+/// How long a box another halti runs is waited for once it is stopped: 60 times this.
+const LET_GO_EVERY: Duration = Duration::from_millis(250);
+
 /// `halti ws stop WS/BOX`: stops the box's VM, asks nothing. The halti that runs it then puts it
 /// away; once it lets go of the box, what is left is cleared here, and the browser VM is stopped if
-/// it still runs (that halti stops it before it lets go, unless it died).
+/// it still runs (that halti stops it before it lets go, unless it died). Until then its VM is
+/// stopped whenever it is seen running: a box that is still starting brings it up meanwhile.
 pub fn stop(target_text: &str) -> Result<()> {
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
@@ -476,7 +480,7 @@ pub fn stop(target_text: &str) -> Result<()> {
     let here = Here::at(&settings.workspaces.path);
     let found = find(&here, &name, box_name)?;
     let vm = found.layout.vm(box_name);
-    let was_running = vms.running(&vm);
+    let mut was_running = vms.running(&vm);
     if was_running {
         vms.stop(&vm)?;
     }
@@ -491,7 +495,11 @@ pub fn stop(target_text: &str) -> Result<()> {
                 }
                 break;
             }
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(LET_GO_EVERY);
+            if vms.running(&vm) {
+                was_running = true;
+                vms.stop(&vm)?;
+            }
         }
     }
     if !was_running {
@@ -616,6 +624,79 @@ impl Leftovers {
 /// What keeps a workspace open, as `halti open` hands it on.
 pub type Keep = boxes::keep::Keep;
 
+/// Puts away what a `halti open` or a `ws run` that ended without cleaning up left of these boxes:
+/// for each whose lock is free, its VMs if they run, its store if it is still attached, and a store
+/// made for one run. Returns the boxes that had something left.
+pub fn put_away_left(layout: &Layout, vms: &dyn Vms, names: &[String]) -> Vec<String> {
+    let mut left = Vec::new();
+    for name in names {
+        let lock = layout.lock(name);
+        if !lock.exists() {
+            continue;
+        }
+        let Ok(Some(_held)) = boxes::store::lock(&lock) else { continue };
+        let running: Vec<String> = [layout.vm(name), layout.browser_vm(name)].into_iter().filter(|vm| vms.running(vm)).collect();
+        if running.is_empty() && !boxes::store::is_mounted(&layout.mount_point(name)) && !layout.ephemeral_bundle(name).exists() {
+            continue;
+        }
+        for vm in &running {
+            if let Err(e) = vms.stop(vm) {
+                warn(&format!("stopping {vm}: {e:#}"));
+            }
+        }
+        if let Err(e) = boxes::run::sweep(layout, name) {
+            warn(&format!("box {name}: {e:#}"));
+        }
+        left.push(name.clone());
+    }
+    left
+}
+
+/// Stops the boxes in this layout that another halti runs, as `ws stop` does, names only: a box
+/// started while its workspace wasn't open holds the workspace's keys in the process that runs it.
+/// Each is waited for until that halti lets go of it, its VM stopped whenever it is seen running
+/// (one still starting brings it up meanwhile), and what is left is cleared. Returns the boxes that
+/// were stopped, and those whose halti held on.
+pub fn stop_others(layout: &Layout, vms: &dyn Vms) -> (Vec<String>, Vec<String>) {
+    let mut names: Vec<String> = fs::read_dir(layout.open_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.strip_suffix(".lock").map(str::to_string))
+        .filter(|name| check_box(name).is_ok())
+        .collect();
+    names.sort();
+    let (mut stopped, mut held) = (Vec::new(), Vec::new());
+    for name in names {
+        let lock = layout.lock(&name);
+        if !boxes::store::is_held(&lock) {
+            continue;
+        }
+        let vm = layout.vm(&name);
+        let let_go = (0..60).any(|_| {
+            if vms.running(&vm)
+                && let Err(e) = vms.stop(&vm)
+            {
+                warn(&format!("stopping {vm}: {e:#}"));
+            }
+            let Ok(Some(_free)) = boxes::store::lock(&lock) else {
+                thread::sleep(LET_GO_EVERY);
+                return false;
+            };
+            let _ = boxes::run::sweep(layout, &name);
+            let browser = layout.browser_vm(&name);
+            if vms.running(&browser)
+                && let Err(e) = vms.stop(&browser)
+            {
+                warn(&format!("stopping {browser}: {e:#}"));
+            }
+            true
+        });
+        if let_go { stopped.push(name) } else { held.push(name) }
+    }
+    (stopped, held)
+}
+
 /// An open workspace as other commands find it, by the id its record names: the lock that
 /// `halti open` holds while it keeps the workspace open, its socket, and its boxes.
 pub(super) struct Kept {
@@ -632,13 +713,6 @@ impl Kept {
     /// running as you can hold it.
     pub(super) fn held(&self) -> bool {
         boxes::store::is_held(&self.layout.keeper_lock())
-    }
-
-    /// The lock, unless another process holds it. Its folder is made first: a workspace that never
-    /// had a box has none.
-    pub(super) fn take(&self) -> Result<Option<boxes::store::Lock>> {
-        self.layout.prepare()?;
-        boxes::store::lock(&self.layout.keeper_lock())
     }
 
     /// Waits a while for the lock to be let go of; false if it is still held.
@@ -660,21 +734,25 @@ impl Kept {
     /// with something left. Nothing where there is no engine.
     pub(super) fn left(&self, settings: &Settings) -> Result<Vec<String>> {
         let Ok(vms) = boxes::vms(settings) else { return Ok(Vec::new()) };
-        Ok(boxes::keep::put_away_left(&self.layout, vms, &self.files.names()?))
+        Ok(put_away_left(&self.layout, vms, &self.files.names()?))
     }
 
     /// Stops the boxes that other terminals run, names only: the boxes stopped, and those whose
     /// halti held on.
     pub(super) fn others(&self, settings: &Settings) -> (Vec<String>, Vec<String>) {
         let Ok(vms) = boxes::vms(settings) else { return (Vec::new(), Vec::new()) };
-        boxes::keep::stop_others(&self.layout, vms)
+        stop_others(&self.layout, vms)
     }
 }
 
-/// What keeps workspace `name` (id `id`) open, once it is opened and chosen: `lock`, which
-/// `halti open` took, its boxes as `kept` found them, the settings read once, and the checks of a
-/// box's files before it starts, which are `ws run`'s (`start_check`).
-pub(super) fn keep(here: &Here, name: &WsName, id: WsId, kept: Kept, lock: boxes::store::Lock, settings: &Settings) -> Result<Keep> {
+/// What keeps workspace `name` (id `id`) open, made before anything is asked: its lock, taken here
+/// (None if another process holds it), its boxes as `kept` found them, the settings read once, the
+/// checks of a box's files before it starts, which are `ws run`'s (`start_check`), and what puts
+/// away leftovers and stops the boxes other terminals run. The lock's folder is made first: a
+/// workspace that never had a box has none.
+pub(super) fn keep(here: &Here, name: &WsName, id: WsId, kept: Kept, settings: &Settings) -> Result<Option<Keep>> {
+    kept.layout.prepare()?;
+    let Some(lock) = boxes::store::lock(&kept.layout.keeper_lock())? else { return Ok(None) };
     let rule = MountRule::workspace(settings);
     let (root, ws, checked_under) = (here.root.clone(), name.clone(), rule.clone());
     let check = move |box_name: &str| -> Result<boxes::keep::Checked, Refused> {
@@ -682,17 +760,20 @@ pub(super) fn keep(here: &Here, name: &WsName, id: WsId, kept: Kept, lock: boxes
         let (text, policy) = start_check(&found, &checked_under)?;
         Ok(boxes::keep::Checked { text, policy })
     };
-    let boxes_named = kept.files.names()?;
-    Ok(boxes::keep::Keep {
+    let names = kept.files.names()?;
+    let layout = || Layout::workspace(&boxes_dir(&here.root, id), id);
+    let (left_in, others_in) = (layout()?, layout()?);
+    Ok(Some(boxes::keep::Keep {
         name: name.clone(),
         lock,
         layout: kept.layout,
         mounts: rule,
         vms: boxes::vms(settings).ok(),
         settings: settings.clone(),
-        boxes: boxes_named,
         check: Box::new(check),
-    })
+        left: Box::new(move |vms| put_away_left(&left_in, vms, &names)),
+        others: Box::new(move |vms| stop_others(&others_in, vms)),
+    }))
 }
 
 #[cfg(all(test, halti_dev))]

@@ -8,7 +8,7 @@
 //! from the first moment every start is refused (`busy`); every box is asked to stop and is put
 //! away, one that is still starting once its start is done; the boxes of the workspace that other
 //! terminals run are stopped; the keys are wiped; whoever asked is answered; the socket goes, and
-//! the lock last.
+//! the lock last. It says it closed only if no other terminal's box held on.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -20,7 +20,6 @@ use std::thread::{self, Scope};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use halti_core::boxkey::check_box;
 use halti_core::ids::WsName;
 
 use super::run::{self, Begun, World};
@@ -39,8 +38,6 @@ const SESSIONS: usize = 32;
 const WAITING: usize = 32;
 /// How often the keeper looks for a signal, a new connection, or a session that left.
 const LOOK_EVERY: Duration = Duration::from_millis(100);
-/// How long a box another halti runs is waited for once it is stopped: 60 times this.
-const LET_GO_EVERY: Duration = Duration::from_millis(250);
 
 /// A box's policy file, read once and checked before it starts: the copy kept when it was approved
 /// is the same, a box that keeps a store has one, and its sockets fit. Its bytes, and what they
@@ -53,6 +50,14 @@ pub struct Checked {
 /// The checks of a box's files before it starts, by its name, which the workspace's commands make.
 pub type Check = Box<dyn Fn(&str) -> Result<Checked, Refused> + Send + Sync>;
 
+/// Puts away what a halti that ended without cleaning up left of the workspace's boxes, through
+/// these VMs: the boxes that had something left. The workspace's commands make it.
+pub type Left = Box<dyn Fn(&dyn Vms) -> Vec<String> + Send + Sync>;
+
+/// Stops the boxes of the workspace that other terminals run, through these VMs: those stopped, and
+/// those whose halti held on. The workspace's commands make it.
+pub type Others = Box<dyn Fn(&dyn Vms) -> (Vec<String>, Vec<String>) + Send + Sync>;
+
 /// What `halti open` hands on once the workspace is opened, to keep it open.
 pub struct Keep {
     pub name: WsName,
@@ -64,9 +69,11 @@ pub struct Keep {
     pub vms: Option<&'static dyn Vms>,
     /// Read once, before the workspace was opened.
     pub settings: Settings,
-    /// The boxes with a policy file, whose leftovers are put away before anything starts.
-    pub boxes: Vec<String>,
     pub check: Check,
+    /// Run before anything starts.
+    pub left: Left,
+    /// Run once the keeper's own boxes are put away.
+    pub others: Others,
 }
 
 /// Keeps the workspace open until it is closed: by `halti close`, or a signal (Ctrl-C, a closed
@@ -105,10 +112,10 @@ struct Outside<'a> {
 }
 
 fn serve_with(keep: Keep, outside: &Outside) -> Result<u8> {
-    let Keep { name, lock, layout, mounts, vms: _, settings, boxes, check } = keep;
+    let Keep { name, lock, layout, mounts, vms: _, settings, check, left: put_away_left, others: stop_others } = keep;
     let socket = layout.keeper_socket().ok_or_else(|| anyhow!("only a workspace stays open"))?;
     if let Some(vms) = outside.vms {
-        let left = put_away_left(&layout, vms, &boxes);
+        let left = put_away_left(vms);
         if !left.is_empty() {
             say(&format!("put away what the last open of {name} left: {}", left.join(", ")));
         }
@@ -134,7 +141,7 @@ fn serve_with(keep: Keep, outside: &Outside) -> Result<u8> {
         closers: Mutex::default(),
         done: AtomicBool::new(false),
     };
-    thread::scope(|scope| {
+    let held = thread::scope(|scope| {
         let keeper = &keeper;
         let listener = &listener;
         scope.spawn(move || keeper.accept(scope, listener));
@@ -145,21 +152,24 @@ fn serve_with(keep: Keep, outside: &Outside) -> Result<u8> {
             thread::sleep(LOOK_EVERY);
         }
         let mut stopped = keeper.put_all_away();
-        if let Some(vms) = outside.vms {
-            let (others, held) = stop_others(&layout, vms);
-            for box_name in &others {
-                say(&format!("stopped box {name}/{box_name}"));
-            }
-            for box_name in &held {
-                warn(&format!("box {name}/{box_name} still runs in another terminal. stop it with: halti ws stop {name}/{box_name}"));
-            }
-            stopped += others.len();
+        let (others, held) = outside.vms.map(stop_others).unwrap_or_default();
+        for box_name in &others {
+            say(&format!("stopped box {name}/{box_name}"));
         }
+        for box_name in &held {
+            warn(&format!("box {name}/{box_name} still runs in another terminal. stop it with: halti ws stop {name}/{box_name}"));
+        }
+        stopped += others.len();
         (outside.wipe)();
         keeper.answer_close(u32::try_from(stopped).unwrap_or(u32::MAX));
+        held
     });
     let _ = fs::remove_file(&socket);
     drop(lock);
+    // A box another terminal still runs holds the workspace's keys: it isn't closed.
+    if !held.is_empty() {
+        return Ok(1);
+    }
     say(&format!("closed {name}"));
     Ok(0)
 }
@@ -371,6 +381,17 @@ impl<'a> Keeper<'a> {
         self.changed.notify_all();
     }
 
+    /// Whether the last session of a running box has left. It is then stopping, as it is seen: a
+    /// start that comes after is `busy`, never joined to a box that is being put away.
+    fn last_left(&self, name: &str, round: u64) -> bool {
+        let mut table = self.table();
+        let Some(slot) = table.slot(name, round).filter(|slot| slot.sessions == 0) else { return false };
+        slot.state = State::Stopping;
+        drop(table);
+        self.changed.notify_all();
+        true
+    }
+
     /// One box, from its start to its end, on its own thread: checked, started, kept until it is
     /// asked to stop, its last session leaves or its VM is gone, then put away.
     fn run_box(&self, name: &str, round: u64, stop: &AtomicBool) {
@@ -406,7 +427,7 @@ impl<'a> Keeper<'a> {
             Ok(Begun::Here(running)) => {
                 self.set(name, round, State::Running);
                 say(&format!("started box {shown}"));
-                running.wait(&|| self.table().boxes.get(name).is_some_and(|slot| slot.round == round && slot.sessions == 0));
+                running.wait(&|| self.last_left(name, round));
                 self.set(name, round, State::Stopping);
                 (*running).stop();
                 say(&format!("stopped box {shown}"));
@@ -453,17 +474,20 @@ impl<'a> Keeper<'a> {
         self.changed.notify_all();
     }
 
-    /// `stop`: the box is asked to stop, and answered once it is put away.
+    /// `stop`: the box is asked to stop, and answered once it is put away. It is stopping from
+    /// then on, so a start that comes after is `busy`.
     fn stop(&self, name: &str) -> Reply {
         let mut table = self.table();
         if self.closing_in(&table) {
             return Reply::Busy;
         }
-        let Some((round, state, stop)) = table.boxes.get(name).map(|slot| (slot.round, slot.state, slot.stop.clone())) else { return Reply::Idle };
-        if state != State::Running {
+        let Some(slot) = table.boxes.get_mut(name) else { return Reply::Idle };
+        if slot.state != State::Running {
             return Reply::Busy;
         }
-        stop.store(true, Ordering::SeqCst);
+        slot.state = State::Stopping;
+        slot.stop.store(true, Ordering::SeqCst);
+        let round = slot.round;
         while table.has(name, round) {
             table = self.wait(table);
         }
@@ -504,78 +528,6 @@ impl<'a> Keeper<'a> {
         }
         self.done.store(true, Ordering::SeqCst);
     }
-}
-
-/// Puts away what a halti that ended without cleaning up left of these boxes: for each whose lock
-/// is free, its VMs if they run, its store if it is still attached, and a store made for one run.
-/// Returns the boxes that had something left.
-pub fn put_away_left(layout: &Layout, vms: &dyn Vms, boxes: &[String]) -> Vec<String> {
-    let mut left = Vec::new();
-    for name in boxes {
-        let lock = layout.lock(name);
-        if !lock.exists() {
-            continue;
-        }
-        let Ok(Some(_held)) = store::lock(&lock) else { continue };
-        let running: Vec<String> = [layout.vm(name), layout.browser_vm(name)].into_iter().filter(|vm| vms.running(vm)).collect();
-        if running.is_empty() && !store::is_mounted(&layout.mount_point(name)) && !layout.ephemeral_bundle(name).exists() {
-            continue;
-        }
-        for vm in &running {
-            if let Err(e) = vms.stop(vm) {
-                warn(&format!("stopping {vm}: {e:#}"));
-            }
-        }
-        if let Err(e) = run::sweep(layout, name) {
-            warn(&format!("box {name}: {e:#}"));
-        }
-        left.push(name.clone());
-    }
-    left
-}
-
-/// Stops the boxes in this layout that another halti runs, as `ws stop` does, names only: a box
-/// started while its workspace wasn't open holds the workspace's keys in the process that runs it.
-/// Each is waited for until that halti lets go of it, and what is left is cleared. Returns the
-/// boxes that were stopped, and those whose halti held on.
-pub fn stop_others(layout: &Layout, vms: &dyn Vms) -> (Vec<String>, Vec<String>) {
-    let mut names: Vec<String> = fs::read_dir(layout.open_dir())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.strip_suffix(".lock").map(str::to_string))
-        .filter(|name| check_box(name).is_ok())
-        .collect();
-    names.sort();
-    let (mut stopped, mut held) = (Vec::new(), Vec::new());
-    for name in names {
-        let lock = layout.lock(&name);
-        if !store::is_held(&lock) {
-            continue;
-        }
-        let vm = layout.vm(&name);
-        if vms.running(&vm)
-            && let Err(e) = vms.stop(&vm)
-        {
-            warn(&format!("stopping {vm}: {e:#}"));
-        }
-        let let_go = (0..60).any(|_| {
-            let Ok(Some(_free)) = store::lock(&lock) else {
-                thread::sleep(LET_GO_EVERY);
-                return false;
-            };
-            let _ = run::sweep(layout, &name);
-            let browser = layout.browser_vm(&name);
-            if vms.running(&browser)
-                && let Err(e) = vms.stop(&browser)
-            {
-                warn(&format!("stopping {browser}: {e:#}"));
-            }
-            true
-        });
-        if let_go { stopped.push(name) } else { held.push(name) }
-    }
-    (stopped, held)
 }
 
 #[cfg(test)]

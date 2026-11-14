@@ -421,9 +421,20 @@ pub struct Lock(#[allow(dead_code)] File);
 
 /// Take the lock; `None` if another process holds it. A busy lock is tried again for a moment:
 /// a child that one of our threads has forked but not yet exec'd still shares the lock of a
-/// file we just let go of.
+/// file we just let go of. Opening never waits and follows no link: a pipe or a link planted in
+/// the lock file's place is refused at once.
 pub fn lock(path: &Path) -> Result<Option<Lock>> {
-    let file = OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    if !file.metadata().with_context(|| format!("reading {}", path.display()))?.is_file() {
+        bail!("{} isn't a plain file", path.display());
+    }
     for attempt in 0..20 {
         match file.try_lock() {
             Ok(()) => return Ok(Some(Lock(file))),
@@ -435,7 +446,8 @@ pub fn lock(path: &Path) -> Result<Option<Lock>> {
     Ok(None)
 }
 
-/// Whether some process holds the lock right now (a missing lock file is nobody's).
+/// Whether some process holds the lock right now (a missing lock file is nobody's, and so is one
+/// that can't be opened).
 pub fn is_held(path: &Path) -> bool {
     path.exists() && matches!(lock(path), Ok(None))
 }
@@ -584,6 +596,25 @@ mod tests {
         assert!(lock(&path).unwrap().is_none(), "held");
         drop(first);
         assert!(lock(&path).unwrap().is_some(), "released");
+    }
+
+    #[test]
+    fn a_pipe_or_a_link_in_a_lock_s_place_is_refused_at_once() {
+        let dir = TempDir::new("halti-lock-planted").unwrap();
+        // A pipe with no one at the other end: an open that waited would wait for good.
+        let fifo = dir.0.join("pipe.lock");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let link = dir.0.join("link.lock");
+        symlink(dir.0.join("elsewhere"), &link).unwrap();
+        let (sent, got) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = sent.send((lock(&fifo).map(|_| ()), is_held(&fifo), lock(&link).map(|_| ()), is_held(&link)));
+        });
+        let (pipe, pipe_held, linked, link_held) = got.recv_timeout(Duration::from_secs(10)).expect("refused at once");
+        assert!(pipe.is_err() && !pipe_held);
+        assert!(linked.is_err() && !link_held);
+        assert!(!dir.0.join("elsewhere").exists(), "a link is never followed");
     }
 
     #[test]

@@ -86,9 +86,10 @@ impl Opened {
         Ok(Held(held))
     }
 
-    /// Wipes the keys: every lookup fails from now on.
+    /// Wipes the keys: every lookup fails from now on. The reader is dropped where it is: one moved
+    /// out first would be wiped as the copy, and leave its keys here.
     pub(super) fn close(&self) {
-        drop(self.reader.lock().unwrap_or_else(PoisonError::into_inner).take());
+        *self.reader.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// True once, after a reread was refused because the workspace's files went back to an older

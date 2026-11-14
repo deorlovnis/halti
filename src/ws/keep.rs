@@ -46,7 +46,7 @@ pub fn open(typed: Option<&str>, type_it: bool) -> Result<Opened> {
     if kept.held() {
         return Err(open_already());
     }
-    let Some(lock) = kept.take()? else { return Err(open_already()) };
+    let Some(keep) = boxes::keep(&here, &name, id, kept, &settings)? else { return Err(open_already()) };
     let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsOpen, type_it), detail: None };
     let (reader, said) = open_with(&here, &name, &way, &|| TtyPassphrase::new(false))?;
     // Its boxes, and its lock, were found by the id the record named.
@@ -56,7 +56,6 @@ pub fn open(typed: Option<&str>, type_it: bool) -> Result<Opened> {
     said.print();
     // The keys are wiped once it closes; this process lives as long as it is open.
     memory::release();
-    let keep = boxes::keep(&here, &name, id, kept, lock, &settings)?;
     let source = Source::workspace(name, reader, Reading::at(&here.root), settings);
     Ok(Opened { source: Box::new(source), keep: Box::new(keep) })
 }
@@ -94,13 +93,15 @@ pub fn close(typed: Option<&str>) -> Result<()> {
             if !kept.let_go() {
                 bail!("{name} is still open. close it in its own terminal with Ctrl-C");
             }
+            // A box another terminal still runs holds the workspace's keys: then it isn't closed.
             let (others, held) = kept.others(&settings);
+            still_running(&name, &held)?;
             let stopped = stopped as usize + others.len();
             match stopped {
                 0 => println!("closed {name}"),
                 _ => println!("closed {name} and stopped {}", count(stopped)),
             }
-            still_running(&name, &held)
+            Ok(())
         }
         Some(Reply::Other) => bail!("{name}'s record names another workspace, which is open. nothing was done"),
         _ => bail!("{name} is being opened or closed: try again in a moment"),
