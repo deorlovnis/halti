@@ -485,14 +485,14 @@ impl Home {
     }
 
     /// Workspace `ws` with a model and github, its token `token` (`basic`'s, for httpbin's
-    /// /basic-auth), and a box `name` that may use github.
+    /// /basic-auth), and a box `name` that may use github, and reach its host and no other.
     fn workspace_with_box(&self, ws: &str, passphrase: &str, name: &str, token: &str, image: &str) {
         assert!(self.ws(passphrase, "true", &["ws", "new", ws]).status.success());
         self.set(ws, passphrase, "anthropic", "token", "model-token-not-used");
         self.policy(ws, passphrase, "anthropic", "[fetch]\nhosts = [\"https://api.anthropic.com\"]\nauth = \"Bearer {token}\"\n");
         self.set(ws, passphrase, "github", "token", token);
         self.policy(ws, passphrase, "github", GITHUB);
-        let text = format!("run = [\"claude\"]\nimage = \"{image}\"\nmodel = \"anthropic\"\nsites = [\"github\"]\nkeep = true\ncpus = 2\nmemory = \"2G\"\n\n[net]\nallow = []\n");
+        let text = format!("{}\n[net]\nallow = [\"https://httpbin.org\"]\n", github_box(image));
         let target = format!("{ws}/{name}");
         assert!(self.ws(passphrase, &self.editor(&text), &["ws", "box", "new", &target]).status.success());
         self.boxes.lock().unwrap().push(target);
@@ -523,6 +523,12 @@ fn agent_image() -> Option<String> {
     }
     engine::available().unwrap();
     Some(engine::image_digest(&env::var("HALTI_E2E_AGENT_IMAGE").unwrap_or_else(|_| engine::AGENT_IMAGE.to_string())).unwrap())
+}
+
+/// The policy of a box of `image` that may use github, without its `[net]`: the door lets the
+/// agent reach only the hosts `[net] allow` lists, a site's hosts too.
+fn github_box(image: &str) -> String {
+    format!("run = [\"claude\"]\nimage = \"{image}\"\nmodel = \"anthropic\"\nsites = [\"github\"]\nkeep = true\ncpus = 2\nmemory = \"2G\"\n")
 }
 
 /// github's policy: httpbin, with the token sent as Basic credentials.
@@ -758,7 +764,7 @@ impl Home {
     }
 
     /// `halti open WS`, once it says it is open, with its stdout still to read.
-    fn open(&self, ws: &str, passphrase: &str) -> (std::process::Child, BufReader<std::process::ChildStdout>) {
+    fn open(&self, ws: &str, passphrase: &str) -> (Keeper, BufReader<std::process::ChildStdout>) {
         let mut child = self.halti().env("HALTI_TEST_PASSPHRASE", passphrase).args(["open", ws]).stdout(Stdio::piped()).process_group(0).spawn().unwrap();
         let mut said = BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
@@ -769,7 +775,9 @@ impl Home {
                 panic!("halti open ended before it was open");
             }
         }
-        (child, said)
+        let mut close = self.halti();
+        close.args(["close", ws]).stdout(Stdio::null()).stderr(Stdio::null());
+        (Keeper { child, close }, said)
     }
 
     /// Where open workspace `ws` listens.
@@ -782,6 +790,57 @@ impl Home {
         let out = self.halti().args(["close", ws]).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+}
+
+/// A `halti open` that keeps a workspace open. A test that fails while it runs closes it as it
+/// ends, before its home goes: `halti close`, then a signal as Ctrl-C sends, then kill.
+struct Keeper {
+    child: std::process::Child,
+    close: Command,
+}
+
+impl Keeper {
+    /// Whether it ended within `wait`.
+    fn ended_within(&mut self, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        while matches!(self.child.try_wait(), Ok(None)) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        true
+    }
+}
+
+impl std::ops::Deref for Keeper {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for Keeper {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for Keeper {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
+        let _ = self.close.status();
+        if self.ended_within(Duration::from_secs(10)) {
+            return;
+        }
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGINT) };
+        if !self.ended_within(Duration::from_secs(120)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -1021,7 +1080,7 @@ fn two_boxes_of_one_workspace_run_side_by_side() {
     let home = Home::new("keep-side");
     let (one, two) = (box_name("keep-side-one"), box_name("keep-side-two"));
     home.workspace_with_box("acme", ACME, &one, &basic("acme", "acme-token-0001"), &image);
-    let text = format!("run = [\"claude\"]\nimage = \"{image}\"\nmodel = \"anthropic\"\nsites = [\"github\"]\nkeep = true\ncpus = 2\nmemory = \"2G\"\n");
+    let text = format!("{}\n[net]\nallow = [\"https://httpbin.org\"]\n", github_box(&image));
     assert!(home.ws(ACME, &home.editor(&text), &["ws", "box", "new", &format!("acme/{two}")]).status.success());
     home.boxes.lock().unwrap().push(format!("acme/{two}"));
     let (mut keeper, _said) = home.open("acme", ACME);
@@ -1048,12 +1107,14 @@ fn two_boxes_of_one_workspace_run_side_by_side() {
         run.wait().unwrap();
     }
     drop(outs);
-    // Each stops once its one run has gone.
+    // Each stops once its one run has gone: its VM first, then its store is detached.
+    let up = || engine::running(&vm_one) || engine::running(&vm_two) || mounted(&one) || mounted(&two);
     let deadline = Instant::now() + Duration::from_secs(120);
-    while (engine::running(&vm_one) || engine::running(&vm_two)) && Instant::now() < deadline {
+    while up() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(500));
     }
-    assert!(!engine::running(&vm_one) && !engine::running(&vm_two) && !mounted(&one) && !mounted(&two));
+    assert!(!engine::running(&vm_one) && !engine::running(&vm_two), "both VMs are stopped");
+    assert!(!mounted(&one) && !mounted(&two), "both stores are detached");
     assert_eq!(home.close("acme"), "closed acme\n");
     assert!(keeper.wait().unwrap().success());
 }
