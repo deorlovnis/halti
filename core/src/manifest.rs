@@ -7,14 +7,17 @@
 //!           ‖ n (1) ‖ n × (role (1) ‖ length (1) ‖ name (1 to 32 of a-z, 0-9, -) ‖ grade (1) ‖ lacks (4, big-endian bits))
 //!           ‖ pin version (8) ‖ log count (8) ‖ log MAC (48)
 //!           ‖ store length (2) ‖ store (at most 1024) ‖ keystore ref length (2) ‖ keystore ref (at most 1024)
-//!           ‖ m (4) ‖ m × (item name (32) ‖ version (8))
+//!           ‖ m (4) ‖ m × (item name (32) ‖ version (8) ‖ length (1) ‖ resource ‖ length (1) ‖ field)
 //! sealed  = aead::seal(manifest key, nonce, aad, plain)
 //! aad     = ws (16) ‖ length of the name (1) ‖ name
 //! ```
 //!
 //! Every number is big-endian. Roles and item names are strictly increasing, and nothing follows
 //! the items, so each manifest has one encoding and every encoding read back is written the same.
-//! The places after the adapters are kept for later steps, empty or zero until then.
+//! The places between the adapters and the items are kept for later steps, empty or zero until
+//! then. Each item's resource and field are what a person calls it (`item::ItemKey`), each 1 to
+//! 32 bytes, so an item takes at least 44 bytes. A manifest with no items is written as it was
+//! before items had a resource and field.
 //!
 //! The workspace's id and name are not fields: the seal binds them, so a manifest copied from
 //! another workspace, or read under another name, does not open. Whoever holds the inner key can
@@ -27,6 +30,7 @@ use zeroize::Zeroizing;
 use crate::crypto::aead;
 use crate::holder::KeyKind;
 use crate::ids::{WsId, WsName};
+use crate::item::ItemKey;
 use crate::key::InnerKey;
 use crate::platform::{Build, Grade, Label, Lacks, Os, Role};
 use crate::refusal::Refusal;
@@ -37,6 +41,10 @@ const FORMAT: u8 = 0x01;
 
 /// The longest name an adapter's label can have in a manifest.
 const MAX_ADAPTER: usize = 32;
+
+/// The fewest bytes an item takes: its name, its version, and a resource and a field of one byte
+/// each, with their lengths.
+const MIN_ITEM: usize = 32 + 8 + 1 + 1 + 1 + 1;
 
 /// What a workspace was made with, sealed so that only its inner key reads or writes it. The
 /// directory keeps the name, id and two kinds in clear; this is what they are checked against.
@@ -60,8 +68,8 @@ pub struct Manifest {
     /// Which vault or keystore account holds its items, as that keystore names it; empty for a
     /// keystore that needs none.
     pub keystore_ref: Vec<u8>,
-    /// Each accepted item and its version, in name order; empty until items are stored.
-    pub items: Vec<(ItemName, u64)>,
+    /// Each stored secret, in name order; empty until one is stored.
+    pub items: Vec<Entry>,
 }
 
 impl fmt::Debug for Manifest {
@@ -80,6 +88,16 @@ impl fmt::Debug for Manifest {
             .field("items", &format_args!("{} items", self.items.len()))
             .finish()
     }
+}
+
+/// One stored secret as a manifest lists it: the name it is kept under, the pin version it was
+/// sealed for, and what a person calls it. The name is derived from the key under the workspace's
+/// names key; nothing here checks that, since only the verbs hold that key.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Entry {
+    pub name: ItemName,
+    pub version: u64,
+    pub key: ItemKey,
 }
 
 /// One adapter as a manifest records it.
@@ -117,11 +135,12 @@ impl Manifest {
 
     /// Refuses, with `Refusal::Unreadable`, one whose bytes would not read back as it is: an
     /// adapter name that is not 1 to 32 of a-z, 0-9 and -, roles or items out of order or
-    /// repeated, a reference over `MAX_REF` bytes.
+    /// repeated, a reference over `MAX_REF` bytes. An item's resource and field are well formed
+    /// already: an `ItemKey` can't be made otherwise.
     pub fn check(&self) -> Result<(), Refusal> {
         let names = self.adapters.iter().all(|recorded| adapter_name(recorded.adapter.as_bytes()));
         let roles = self.adapters.windows(2).all(|pair| pair[0].role < pair[1].role);
-        let items = self.items.windows(2).all(|pair| pair[0].0 < pair[1].0) && u32::try_from(self.items.len()).is_ok();
+        let items = self.items.windows(2).all(|pair| pair[0].name < pair[1].name) && u32::try_from(self.items.len()).is_ok();
         let refs = self.store.len() <= Manifest::MAX_REF && self.keystore_ref.len() <= Manifest::MAX_REF;
         if names && roles && items && refs { Ok(()) } else { Err(Refusal::Unreadable) }
     }
@@ -173,9 +192,13 @@ fn encode(m: &Manifest) -> Vec<u8> {
         out.extend_from_slice(reference);
     }
     out.extend_from_slice(&u32::try_from(m.items.len()).expect("a checked manifest has fewer than 2^32 items").to_be_bytes());
-    for (item, version) in &m.items {
-        out.extend_from_slice(item.as_bytes());
-        out.extend_from_slice(&version.to_be_bytes());
+    for entry in &m.items {
+        out.extend_from_slice(entry.name.as_bytes());
+        out.extend_from_slice(&entry.version.to_be_bytes());
+        for part in [entry.key.resource(), entry.key.field()] {
+            out.push(u8::try_from(part.len()).expect("a resource or field is at most 32 bytes"));
+            out.extend_from_slice(part.as_bytes());
+        }
     }
     out
 }
@@ -213,17 +236,23 @@ fn decode(bytes: &[u8]) -> Option<Manifest> {
     let store = r.reference()?;
     let keystore_ref = r.reference()?;
     let count = r.u32()?;
-    // The items are last: exactly their bytes must be left, before any is read.
-    if usize::try_from(count).ok()?.checked_mul(40)? != r.0.len() {
+    // The items are last: at least their fewest bytes must be left, before any is read.
+    if usize::try_from(count).ok()?.checked_mul(MIN_ITEM)? > r.0.len() {
         return None;
     }
-    let mut items: Vec<(ItemName, u64)> = Vec::new();
+    let mut items: Vec<Entry> = Vec::new();
     for _ in 0..count {
-        let item = ItemName::from_bytes(r.array::<32>()?);
-        if items.last().is_some_and(|(last, _)| *last >= item) {
+        let name = ItemName::from_bytes(r.array::<32>()?);
+        if items.last().is_some_and(|last| last.name >= name) {
             return None;
         }
-        items.push((item, r.u64()?));
+        let version = r.u64()?;
+        let resource = r.text()?;
+        let field = r.text()?;
+        items.push(Entry { name, version, key: ItemKey::parse(resource, field).ok()? });
+    }
+    if !r.0.is_empty() {
+        return None;
     }
     Some(Manifest { built_by, origin, key, keystore, trial, adapters, pin_version, log_head, store, keystore_ref, items })
 }
@@ -267,6 +296,12 @@ impl<'b> Reader<'b> {
         self.array::<8>().map(u64::from_be_bytes)
     }
 
+    /// Text of one byte's length: what an item's resource or field is checked from.
+    fn text(&mut self) -> Option<&'b str> {
+        let len = usize::from(self.byte()?);
+        str::from_utf8(self.take(len)?).ok()
+    }
+
     /// A reference: its length in two bytes, at most `Manifest::MAX_REF`, then its bytes.
     fn reference(&mut self) -> Option<Vec<u8>> {
         let len = usize::from(self.u16()?);
@@ -281,7 +316,10 @@ impl<'b> Reader<'b> {
 mod tests {
     use super::*;
     use crate::anchor::state_hash;
-    use crate::crypto::vectors::{KAT_HARDWARE_WRAP, KAT_KEY_MANIFEST, KAT_MANIFEST, KAT_MANIFEST_PLAIN, KAT_WS_PIN_STATE, arr, hex, inner_bytes, manifest_nonce, seq, ws_bytes};
+    use crate::crypto::vectors::{
+        KAT_HARDWARE_WRAP, KAT_ITEM_NAME, KAT_ITEM_PIN_STATE, KAT_KEY_MANIFEST, KAT_MANIFEST, KAT_MANIFEST_ITEM, KAT_MANIFEST_ITEM_PLAIN, KAT_MANIFEST_PLAIN, KAT_WS_PIN_STATE,
+        arr, hex, inner_bytes, item_manifest_nonce, manifest_nonce, seq, ws_bytes,
+    };
     use crate::passphrase::LABEL;
     use crate::platform::Property;
 
@@ -323,9 +361,15 @@ mod tests {
         }
     }
 
-    /// An item of the map: its name all `byte`, at `version`.
-    fn item(byte: u8, version: u64) -> (ItemName, u64) {
-        (ItemName::from_bytes([byte; 32]), version)
+    /// An item of the list: its name all `byte`, at `version`, called `resource/field`.
+    fn entry(byte: u8, version: u64, resource: &str, field: &str) -> Entry {
+        Entry { name: ItemName::from_bytes([byte; 32]), version, key: ItemKey::parse(resource, field).unwrap() }
+    }
+
+    /// The known answers' manifest with github/token stored in it, at version 2.
+    fn with_a_secret() -> Manifest {
+        let token = Entry { name: ItemName::from_bytes(arr(&hex(KAT_ITEM_NAME))), version: 2, key: ItemKey::parse("github", "token").unwrap() };
+        Manifest { items: vec![token], ..release() }
     }
 
     #[test]
@@ -364,23 +408,26 @@ mod tests {
     #[test]
     fn a_manifest_has_one_reading_and_one_encoding() {
         let known = hex(KAT_MANIFEST_PLAIN);
+        let with_item = hex(KAT_MANIFEST_ITEM_PLAIN);
         // Every other value of every byte is refused, or read as a manifest that is written back as exactly those bytes.
-        let mut one_bit = 0;
-        for (i, &byte) in known.iter().enumerate() {
-            for value in (0..=255).filter(|&value| value != byte) {
-                let mut changed = known.clone();
-                changed[i] = value;
-                if let Some(manifest) = decode(&changed) {
-                    assert!(encode(&manifest) == changed, "byte {i} as {value:#04x}");
-                    one_bit += usize::from(value == (byte ^ 0x01));
+        let mut one_bit = [0, 0];
+        for (n, plain) in [&known, &with_item].into_iter().enumerate() {
+            for (i, &byte) in plain.iter().enumerate() {
+                for value in (0..=255).filter(|&value| value != byte) {
+                    let mut changed = plain.clone();
+                    changed[i] = value;
+                    if let Some(manifest) = decode(&changed) {
+                        assert!(encode(&manifest) == changed, "manifest {n}, byte {i} as {value:#04x}");
+                        one_bit[n] += usize::from(value == (byte ^ 0x01));
+                    }
                 }
             }
+            for len in 0..plain.len() {
+                assert_eq!(decode(&plain[..len]), None, "manifest {n}, cut to {len} bytes");
+            }
         }
-        // Of the changes to bit 0, the independent implementation reads the same 118 as manifests.
-        assert_eq!(one_bit, 118);
-        for len in 0..known.len() {
-            assert_eq!(decode(&known[..len]), None, "cut to {len} bytes");
-        }
+        // Of the changes to bit 0 of the manifest with no items, the independent implementation reads the same 118 as manifests.
+        assert_eq!(one_bit[0], 118);
 
         // Each of these breaks a rule: `check` refuses it, and so does `decode` as it is written.
         let adapters = release().adapters;
@@ -392,8 +439,8 @@ mod tests {
         let broken = [
             Manifest { adapters: vec![adapters[1].clone(), adapters[0].clone(), adapters[2].clone(), adapters[3].clone()], ..release() },
             Manifest { adapters: vec![adapters[0].clone(), adapters[0].clone(), adapters[2].clone(), adapters[3].clone()], ..release() },
-            Manifest { items: vec![item(0x08, 2), item(0x07, 1)], ..release() },
-            Manifest { items: vec![item(0x07, 1), item(0x07, 9)], ..release() },
+            Manifest { items: vec![entry(0x08, 2, "github", "token"), entry(0x07, 1, "linear", "token")], ..release() },
+            Manifest { items: vec![entry(0x07, 1, "github", "token"), entry(0x07, 9, "github", "user")], ..release() },
             named("Mem-Files"),
             named(""),
             named(&"a".repeat(33)),
@@ -414,26 +461,64 @@ mod tests {
             (with(7, &[0x05]), "role 0x05, kept for the door"),
             (with(24, &0x2000u32.to_be_bytes()), "a lacks bit past the last property"),
             (with(150, &[0xff; 4]), "0xffffffff items, and none behind"),
+            ([&known[..150], &[0, 0, 0, 1], &[0; MIN_ITEM - 1]].concat(), "one item, and a byte too few behind"),
+            ([&with_item[..150], &[0, 0, 0, 2], &with_item[154..]].concat(), "two items, and one behind"),
+            ([with_item.as_slice(), [0x00].as_slice()].concat(), "one byte more after the items"),
+            ([&with_item[..194], &[0x03], b"Git", &with_item[201..]].concat(), "the resource Git"),
+            ([&with_item[..194], &[0x06], b"git/hu", &with_item[201..]].concat(), "a resource with a slash"),
+            ([&with_item[..194], &[0x21], &[b'a'; 33], &with_item[201..]].concat(), "a resource of 33 bytes"),
+            ([&with_item[..194], &[0x06], b"githu\xff", &with_item[201..]].concat(), "a resource that is not UTF-8"),
+            ([&with_item[..201], &[0x00]].concat(), "an empty field"),
+            ([&with_item[..201], &[0x05], b"Token"].concat(), "the field Token"),
+            ([&with_item[..194], &[0x00, 0x05], b"token"].concat(), "an empty resource"),
         ];
         for (bytes, what) in unwritten {
             assert_eq!(decode(&bytes), None, "{what}");
         }
 
-        // Every place kept for later, full, reads back.
+        // Every place kept for later, full, and items with the shortest and the longest resource and field, read back.
+        let longest = "z".repeat(ItemKey::MAX);
         let full = Manifest {
             pin_version: 7,
             log_head: LogHead { count: 3, mac: arr(&seq(0x40, 48)) },
             store: vec![b's'; Manifest::MAX_REF],
             keystore_ref: vec![b'k'; Manifest::MAX_REF],
-            items: vec![item(0x07, 1), item(0x08, 2)],
+            items: vec![entry(0x07, 1, "a", "b"), entry(0x08, 2, "github", "token"), entry(0xf0, u64::MAX, &longest, &longest)],
             ..release()
         };
         assert_eq!(full.check(), Ok(()));
         let plain = encode(&full);
-        assert_eq!(plain.len(), 154 + 1024 + 1024 + 2 * 40);
+        assert_eq!(plain.len(), 154 + 1024 + 1024 + MIN_ITEM + (MIN_ITEM + 5 + 4) + (MIN_ITEM + 31 + 31));
         assert_eq!(decode(&plain), Some(full.clone()));
         let sealed = full.seal(&inner(), acme(), &ws_name("acme"), &manifest_nonce()).unwrap();
         assert_eq!(Manifest::open(&inner(), acme(), &ws_name("acme"), &sealed), Ok(full));
+        // One item as short as an item is: exactly the fewest bytes are left after the count, and it reads back.
+        let shortest = Manifest { items: vec![entry(0x07, 1, "a", "b")], ..release() };
+        let plain = encode(&shortest);
+        assert_eq!(plain.len(), 154 + MIN_ITEM);
+        assert_eq!(decode(&plain), Some(shortest));
+    }
+
+    #[test]
+    fn a_manifest_with_a_secret_is_unchanged() {
+        let plain = encode(&with_a_secret());
+        assert_eq!(plain.len(), 207);
+        // Piece by piece first, so that a difference says where it is.
+        let known = hex(KAT_MANIFEST_PLAIN);
+        assert_eq!(plain[..150], known[..150], "all before the items, as with none");
+        assert_eq!(plain[150..154], [0, 0, 0, 1], "one item");
+        assert_eq!(plain[154..186], hex(KAT_ITEM_NAME), "its name");
+        assert_eq!(plain[186..194], 2u64.to_be_bytes(), "its version");
+        assert_eq!(plain[194..], hex("06 676974687562 05 746f6b656e"), "github, then token");
+        assert_eq!(plain, hex(KAT_MANIFEST_ITEM_PLAIN));
+        assert_eq!(decode(&plain), Some(with_a_secret()), "and it reads back");
+
+        let sealed = with_a_secret().seal(&inner(), acme(), &ws_name("acme"), &item_manifest_nonce()).unwrap();
+        assert_eq!(sealed.len(), 236);
+        assert_eq!(sealed, hex(KAT_MANIFEST_ITEM));
+        let key: [u8; 32] = arr(&hex(KAT_KEY_MANIFEST));
+        assert_eq!(*aead::open(&key, &aad(acme(), &ws_name("acme")), &sealed).unwrap(), hex(KAT_MANIFEST_ITEM_PLAIN));
+        assert_eq!(Manifest::open(&inner(), acme(), &ws_name("acme"), &sealed), Ok(with_a_secret()), "it opens back to the manifest");
     }
 
     #[test]
@@ -461,9 +546,9 @@ mod tests {
 
     #[test]
     fn a_manifest_prints_no_reference_or_item_name() {
-        let manifest = Manifest { store: b"acme-store".to_vec(), keystore_ref: b"acme-vault".to_vec(), items: vec![item(0x07, 1)], ..release() };
+        let manifest = Manifest { store: b"acme-store".to_vec(), keystore_ref: b"acme-vault".to_vec(), ..with_a_secret() };
         for shown in [format!("{manifest:?}"), format!("{manifest:#?}")] {
-            assert!(!shown.contains("acme") && !shown.contains("0707"), "{shown}");
+            assert!(!shown.contains("acme") && !shown.contains("github") && !shown.contains("token") && !shown.contains(&KAT_ITEM_NAME[..8]), "{shown}");
             assert!(shown.contains("10 bytes") && shown.contains("1 items"), "{shown}");
         }
     }
@@ -472,5 +557,8 @@ mod tests {
     fn the_pin_of_a_workspace_with_its_manifest_is_unchanged() {
         let state = state_hash(acme(), &ws_name("acme"), &hex(KAT_HARDWARE_WRAP), &hex(KAT_MANIFEST), b"");
         assert_eq!(state.as_slice(), hex(KAT_WS_PIN_STATE));
+        // And once github/token is stored in it.
+        let state = state_hash(acme(), &ws_name("acme"), &hex(KAT_HARDWARE_WRAP), &hex(KAT_MANIFEST_ITEM), b"");
+        assert_eq!(state.as_slice(), hex(KAT_ITEM_PIN_STATE));
     }
 }

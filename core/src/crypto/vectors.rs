@@ -840,3 +840,55 @@ pub(crate) const KAT_DEV_MANIFEST: &str = "01b0b1b2b3b4b5b6b7b8b9babb0796e446d88
 /// The pin's hash of the name acme, the wrap `KAT_HARDWARE_WRAP`, the manifest `KAT_DEV_MANIFEST` and no policy: the state of
 /// acme's first pin when a debug build makes it with a key held in software.
 pub(crate) const KAT_DEV_PIN_STATE: &str = "623c145f562b8922a6892b431050eda1a041e0f191e4536cb94a32e37199d422d48fb2e991eacd4e0911f14e42791d4c";
+
+// A stored secret, its name and the manifest that lists it: computed by an independent implementation written from the
+// specification and not from this code, once it had reproduced `KAT_KEY_SECRETS`, `KAT_KEY_ITEM_NAMES`, `KAT_KEY_MANIFEST`,
+// `KAT_MANIFEST_PLAIN`, `KAT_MANIFEST` and `KAT_WS_PIN_STATE` above. It takes `KAT_HARDWARE_WRAP` as a fixed input.
+
+/// The value of github/token in acme: 17 bytes.
+pub(crate) const ITEM_VALUE: &str = "acme github token";
+
+/// The nonce that value is sealed under.
+pub(crate) fn value_nonce() -> [u8; 12] {
+    arr(&seq(0xd0, 12))
+}
+
+/// The nonce acme's second manifest, the one that lists the value, is sealed under.
+pub(crate) fn item_manifest_nonce() -> [u8; 12] {
+    arr(&seq(0xe0, 12))
+}
+
+/// The name of github/token in acme: under `KAT_KEY_ITEM_NAMES`, `name` under `ITEM_ID` over `github/token`, its first 32 bytes.
+pub(crate) const KAT_ITEM_NAME: &str = "2a4905aa54588e2001b42412b5d8184f5fe226d5cebef8087e45443419468064";
+
+/// The name of github/user in acme.
+pub(crate) const KAT_ITEM_NAME_GITHUB_USER: &str = "7a223b4df330ebdd5241e2d0b6aaf6aab7ff4a4d3cddd34b67ce2366449a15f6";
+
+/// The name of linear/token in acme.
+pub(crate) const KAT_ITEM_NAME_LINEAR_TOKEN: &str = "4cb584b8175284ceee61d1733f5a6d46e63c4f0a9eed9f298ca5ebaad8b60201";
+
+/// The name of github/token in globex: under the names key of the inner key `[0x22; 32]`.
+pub(crate) const KAT_ITEM_NAME_GLOBEX: &str = "38e50c220286d1412840b3e6c4f8e2c8c96706c7a6285aa0bf29ea3a78a86231";
+
+/// What the seal of github/token's value in acme at version 2 binds: the version string, `ITEM_ID`, the workspace id, the
+/// name `KAT_ITEM_NAME` and the version. 73 bytes.
+pub(crate) const KAT_ITEM_AAD: &str = "776f726b73706163652d76314954454d01101112131415161718191a1b1c1d1e1f2a4905aa54588e2001b42412b5d8184f5fe226d5cebef8087e454434194680\
+    640000000000000002";
+
+/// `ITEM_VALUE` sealed under `KAT_KEY_SECRETS` with `value_nonce()`, bound by `KAT_ITEM_AAD`. 46 bytes.
+pub(crate) const KAT_ITEM_VALUE: &str = "01d0d1d2d3d4d5d6d7d8d9dadbb1f97fd0bca15a8ecf705e91ab12f8cc5e82c0ad54fec795acaf1845ac8fc7ff4b";
+
+/// The plaintext of `KAT_MANIFEST_PLAIN`'s manifest holding github/token: one entry, `KAT_ITEM_NAME` at version 2. 207 bytes.
+pub(crate) const KAT_MANIFEST_ITEM_PLAIN: &str = "01020105020104010e706173737068726173652d6b65790200000007020b66696c652d616e63686f72020000006003096469722d66696c65730200000060040d\
+    66696c652d6b657973746f7265020000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\
+    00000000000000000000000000000000000000000000000000012a4905aa54588e2001b42412b5d8184f5fe226d5cebef8087e45443419468064000000000000\
+    00020667697468756205746f6b656e";
+
+/// That plaintext sealed under `KAT_KEY_MANIFEST` with `item_manifest_nonce()`, for acme under its name. 236 bytes.
+pub(crate) const KAT_MANIFEST_ITEM: &str = "01e0e1e2e3e4e5e6e7e8e9eaebee1baca084b73c9e6e31fc98a33a7e5a67cd31fd7104f9ac235e7e8c707fc57bd1baa0dbe4b789c558b9c4dd153c4ebc086f27\
+    84ed8c6e7e22ea258b6d6f250375ae83b6315ca1a901cf85f083eef429e553d2b037be172255e35d0ece714704c5d5423fc77f403b21b8fd4daaa2427828cf70\
+    9630ea37751b64a8782ec17f8474bb35875f366b1de9ada71c179de59176b5986b315bc8d85b6819f1068ae189664d31fb7714aeb3b4305fd26b16e3d27cff4c\
+    9229cd197849078b20c76c45fc66bd8802cfd9a381de86cd6c8d3266e2bc600f71bc1baa679688b49150e8f2";
+
+/// The pin's hash of the name acme, the wrap `KAT_HARDWARE_WRAP`, the manifest `KAT_MANIFEST_ITEM` and no policy.
+pub(crate) const KAT_ITEM_PIN_STATE: &str = "f211bede98ed46bf50597eac868e4f433bdc2b73bd67d9f4fd5c56a2d540e9938aec3f46bc7ebb4f872fa72dde6f9b64";
