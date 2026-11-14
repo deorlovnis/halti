@@ -1347,12 +1347,30 @@ impl Open {
 }
 
 impl Drop for Open {
-    /// A test that fails leaves nothing running.
+    /// A test that fails leaves nothing running, and nothing at the socket: it is closed as Ctrl-C
+    /// closes it, and killed only if it doesn't end.
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
+            if matches!(child.try_wait(), Ok(None)) {
+                unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// A socket a test makes at an open workspace's place, or one a killed `halti open` left there:
+/// removed as the test ends, however it ends, so no later test or run finds it.
+struct Planted(PathBuf);
+
+impl Drop for Planted {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -1446,6 +1464,7 @@ fn a_killed_keeper_is_cleaned_up_by_the_next_open() {
     assert!(!open.wait().status.success());
     let socket = keeper_socket(&env, "acme");
     assert!(socket.exists());
+    let _left = Planted(socket);
     let boxes = wsdir(&env, "acme").join("boxes");
     fs::create_dir_all(boxes.join("policies")).unwrap();
     fs::write(boxes.join("policies/dev.toml"), box_text(false)).unwrap();
@@ -1554,6 +1573,7 @@ fn close_says_still_open_when_the_lock_stays_held() {
     let _lock = hold_keeper_lock(&env, "acme");
     // A program at acme's socket that answers what it likes, and never lets go of the lock.
     let socket = keeper_socket(&env, "acme");
+    let _planted = Planted(socket.clone());
     fs::create_dir_all(socket.parent().unwrap()).unwrap();
     let said = [
         ("closed 0", "halti: acme is still open. close it in its own terminal with Ctrl-C\n"),
@@ -1574,7 +1594,6 @@ fn close_says_still_open_when_the_lock_stays_held() {
         assert!(!closed.status.success() && stdout(&closed).is_empty(), "{answer}: {}", stdout(&closed));
         assert_eq!(stderr(&closed), error);
     }
-    let _ = fs::remove_file(&socket);
 }
 
 /// Holds box `box_name` of workspace `name` as the halti that runs it in another terminal does,
@@ -1695,6 +1714,7 @@ fn a_run_and_a_stop_of_an_open_workspace_say_each_answer_in_their_own_words() {
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
     let _lock = hold_keeper_lock(&env, "acme");
     let socket = keeper_socket(&env, "acme");
+    let _planted = Planted(socket.clone());
     let ask = |args: &[&str], answer: &str, line: &str| {
         let keeper = answer_once(&socket, answer);
         let out = env.ws_box(PASSPHRASE, "true", args);
@@ -1763,7 +1783,6 @@ fn a_run_and_a_stop_of_an_open_workspace_say_each_answer_in_their_own_words() {
     assert!(!out.status.success() && stdout(&out).is_empty(), "{}", stdout(&out));
     assert_eq!(stderr(&out), "halti: box acme/dev is being opened or closed: try again in a moment\n");
     assert!(vm.exists());
-    let _ = fs::remove_file(&socket);
 }
 
 #[test]
@@ -1784,6 +1803,7 @@ fn a_run_of_an_open_workspace_holds_its_session_and_stops_its_box_once_it_is_gon
     let vm = vms.join(format!("halti-wsbox-{}-dev", &ws_id(&env, "acme")[..12]));
     let lock = hold_keeper_lock(&env, "acme");
     let socket = keeper_socket(&env, "acme");
+    let _planted = Planted(socket.clone());
     let run = || {
         let mut command = env.ws_box_command(PASSPHRASE, "true");
         command.env("PATH", &path).args(["ws", "run", "acme/dev", "--", "true"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()
@@ -1858,7 +1878,6 @@ fn a_run_of_an_open_workspace_holds_its_session_and_stops_its_box_once_it_is_gon
     assert!(!out.status.success() && asked(&out) == 0, "{}", stderr(&out));
     assert_eq!(stderr(&out), "halti: acme is no longer open, so box acme/dev was stopped\n");
     assert!(!vm.exists(), "its VM is stopped");
-    let _ = fs::remove_file(&socket);
 }
 
 // --- a workspace's secrets ---
