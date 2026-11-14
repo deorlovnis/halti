@@ -1,5 +1,6 @@
 //! Workspaces on this machine: where their files are, how a passphrase and a secret's value are
-//! read, and what `ws new`, `ws ls`, `ws set`, `ws rm`, `ws delete`, `open` and `close` print. What
+//! read, and what `ws new`, `ws ls`, `ws set`, `ws rm`, `ws delete`, `ws policy` (`policies`),
+//! `open` and `close` print. What
 //! a workspace is, every check on it, and how its secrets are sealed are core's
 //! (`halti_core::verbs`); nothing here decides whether one opens, and no key of a workspace's
 //! reaches this side.
@@ -8,7 +9,8 @@
 //! workspace gets unless `ws new` says, whether a password manager keeps it (`saved`), and what
 //! approves opening one or listing its secrets, storing a secret, removing secrets, and deleting
 //! one: the passphrase typed, which core asks for, or, where a manager keeps it, the means their
-//! line names before halti takes it from there. With `--type` it is typed whatever they say. Each
+//! line names before halti takes it from there; approving a workspace's policies has a line of its
+//! own. With `--type` it is typed whatever they say. Each
 //! command asks for one approval; a saved copy that can't be used is typed instead, once. A
 //! workspace opens with what it was made with, which its own records hold.
 //!
@@ -20,13 +22,14 @@
 
 mod files;
 mod memory;
+pub mod policies;
 mod saved;
 mod tty;
 
 use std::cell::Cell;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use halti_core::anchor::Anchor;
@@ -46,7 +49,7 @@ use zeroize::Zeroizing;
 use crate::approval::{Action, Declined, Means, Real, World};
 use crate::config::{self, Manager, PassphraseMode, Settings};
 use crate::names;
-use files::{DirFiles, FileAnchor, FileKeystore};
+use files::{DirFiles, FileAnchor, FileKeystore, PolicyFiles, orphan_policies};
 use saved::{Copies, KeychainPassphrase};
 use tty::TtyPassphrase;
 
@@ -61,12 +64,19 @@ struct Here {
     files: DirFiles,
     anchor: FileAnchor,
     keystore: FileKeystore,
+    /// The workspaces folder, where the policies beside each workspace's files are.
+    root: PathBuf,
 }
 
 impl Here {
     /// Over the workspaces folder `root`, with stored secrets in halti's files.
     fn at(root: &Path) -> Here {
-        Here { files: DirFiles::at(root), anchor: FileAnchor::at(root), keystore: FileKeystore::at(root) }
+        Here { files: DirFiles::at(root), anchor: FileAnchor::at(root), keystore: FileKeystore::at(root), root: root.to_path_buf() }
+    }
+
+    /// The policies of the resources of the workspace with this id.
+    fn policies(&self, id: WsId) -> PolicyFiles {
+        PolicyFiles::resources(&self.root, id)
     }
 
     fn machine<'a>(&'a self, holder: &'a dyn KeyHolder) -> Machine<'a> {
@@ -105,6 +115,8 @@ struct Way<'a> {
     world: &'a dyn World,
     copies: &'a dyn Copies,
     means: Option<Means>,
+    /// What an approval of policies names, beside the workspace (`KeychainPassphrase::naming`).
+    detail: Option<String>,
 }
 
 /// The means that releases the saved passphrase for `action`, or none if it is typed: with `--type`,
@@ -220,7 +232,7 @@ pub fn open(typed: Option<&str>, type_it: bool) -> Result<()> {
     memory::harden();
     let here = Here::at(&settings.workspaces.path);
     let name = resolve_name(&here.files, typed)?;
-    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsOpen, type_it) };
+    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsOpen, type_it), detail: None };
     open_with(&here, &name, &way, &|| TtyPassphrase::new(false))?.print();
     Ok(())
 }
@@ -248,7 +260,7 @@ fn approved<T>(
     };
     let found = here.id_of(name).is_some_and(|id| way.copies.exists(id));
     if found {
-        let holder = KeychainPassphrase::new(way.copies, way.world, means, action);
+        let holder = KeychainPassphrase::new(way.copies, way.world, means, action).naming(way.detail.clone());
         match verb(&here.machine(&holder)) {
             Ok(done) => return Ok((done, None)),
             Err(error) if error.is::<Declined>() => bail!("{declined}"),
@@ -318,7 +330,7 @@ pub fn ls(typed: Option<&str>, type_it: bool) -> Result<()> {
         let name = WsName::parse(typed)?;
         memory::harden();
         let here = Here::at(&settings.workspaces.path);
-        let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsOpen, type_it) };
+        let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsOpen, type_it), detail: None };
         items_with(&here, &name, &way, &|| TtyPassphrase::new(false))?.print();
         return Ok(());
     }
@@ -355,7 +367,7 @@ pub fn names_in(root: &Path) -> Vec<String> {
 }
 
 /// `halti ws delete NAME [--type]`: one approval, then the workspace's items, pin, key and files,
-/// its record, and its saved passphrase. One with no pin (never fully created, a delete cut short,
+/// its record, its saved passphrase, and its policies. One with no pin (never fully created, a delete cut short,
 /// or its pin removed) goes with no approval: its record and its files go, its key file among them
 /// (the passphrase key is nowhere else), and any stored items are left, which with the key gone
 /// nothing can open.
@@ -364,13 +376,14 @@ pub fn delete(name: &str, type_it: bool) -> Result<()> {
     let settings = config::settings();
     memory::harden();
     let here = Here::at(&settings.workspaces.path);
-    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsDelete, type_it) };
+    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsDelete, type_it), detail: None };
     delete_with(&here, &name, &way, &|| TtyPassphrase::new(false))?.print();
     Ok(())
 }
 
-/// Deletes `name` the way `way` says (`approved`), then removes its saved passphrase by the id its
-/// record named, whichever way it went.
+/// Deletes `name` the way `way` says (`approved`), then removes its saved passphrase and its
+/// policies by the id its record named, whichever way it went; and then the policies any earlier
+/// delete left behind (`orphan_policies`).
 fn delete_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
     // Core refuses to delete what fails its checks, and removes nothing of it.
     let refused = |error: anyhow::Error| {
@@ -394,6 +407,18 @@ fn delete_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> T
     {
         said.notes.push(format!("the saved passphrase of {name} is still in the keychain. remove the item named {}{id} in keychain access", names::WS_KEYCHAIN_PREFIX));
     }
+    if let Some(id) = id {
+        let policies = here.policies(id);
+        if policies.remove_all().is_err() {
+            said.notes.push(format!("the policies of {name} are still in {}. remove that folder", policies.dir().display()));
+        }
+    }
+    for orphan in orphan_policies(&here.root).unwrap_or_default() {
+        let policies = here.policies(orphan);
+        if policies.remove_all().is_err() {
+            said.notes.push(format!("the policies of a deleted workspace are still in {}. remove that folder", policies.dir().display()));
+        }
+    }
     Ok(said)
 }
 
@@ -413,7 +438,7 @@ pub fn set(target_text: &str, field: &str, type_it: bool) -> Result<()> {
     let settings = config::settings();
     memory::harden();
     let here = Here::at(&settings.workspaces.path);
-    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsSet, type_it) };
+    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsSet, type_it), detail: None };
     set_with(&here, &name, &key, &way, &|| TtyPassphrase::new(false), &|| tty::read_value(&key))?.print();
     Ok(())
 }
@@ -441,8 +466,9 @@ fn set_with(here: &Here, name: &WsName, key: &ItemKey, way: &Way<'_>, typing: &d
     Ok(Said { out: vec![format!("{done} {key} in {name}")], notes: Vec::new() })
 }
 
-/// `halti ws rm WS/RESOURCE [FIELD] [--type]`: removes one field, or every field of the resource,
-/// approved as `[workspace.approval] rm` says.
+/// `halti ws rm WS/RESOURCE [FIELD] [--type]`: removes one field, or every field of the resource
+/// and the approval of its policy, approved as `[workspace.approval] rm` says. The policy's file
+/// stays.
 pub fn rm(target_text: &str, field: Option<&str>, type_it: bool) -> Result<()> {
     let (name, resource) = target(target_text)?;
     let which = match field {
@@ -452,20 +478,29 @@ pub fn rm(target_text: &str, field: Option<&str>, type_it: bool) -> Result<()> {
     let settings = config::settings();
     memory::harden();
     let here = Here::at(&settings.workspaces.path);
-    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsRm, type_it) };
+    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsRm, type_it), detail: None };
     rm_with(&here, &name, &which, &way, &|| TtyPassphrase::new(false))?.print();
     Ok(())
 }
 
-/// Removes what `which` names from `name` the way `way` says (`approved`).
+/// Removes what `which` names from `name` the way `way` says (`approved`). A whole resource's
+/// approved copy of its policy goes after it, by the id the record named.
 fn rm_with(here: &Here, name: &WsName, which: &Which, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
     let (what, command) = match which {
         Which::Field(key) => (key.to_string(), format!("ws rm {name}/{} {}", key.resource(), key.field())),
         Which::Resource(resource) => (resource.clone(), format!("ws rm {name}/{resource}")),
     };
+    let id = here.id_of(name);
     let remove = |machine: &Machine<'_>| ws_remove(machine, name, which, *random::<12>()?);
     approved(here, name, way, Action::WsRm, &declined(&format!("{what} was not removed"), &command), typing, &remove)?;
-    Ok(Said { out: vec![format!("removed {what} from {name}")], notes: Vec::new() })
+    let mut said = Said { out: vec![format!("removed {what} from {name}")], notes: Vec::new() };
+    if let (Which::Resource(resource), Some(id)) = (which, id) {
+        let policies = here.policies(id);
+        if policies.forget_approved(resource).is_err() {
+            said.notes.push(format!("the approved copy of {resource} in {name} couldn't be removed. remove {}", policies.copy_path(resource).display()));
+        }
+    }
+    Ok(said)
 }
 
 /// The secrets of `name`, approved as opening it is: what a listing gets from core.
@@ -592,7 +627,11 @@ mod tests {
         assert_eq!(saved_means(&managed, Action::WsSet, false), Some(Means::Sudo));
         // A line left out types it.
         assert_eq!(saved_means(&managed, Action::WsRm, false), None);
+        assert_eq!(saved_means(&managed, Action::WsPolicy, false), None);
         assert_eq!(saved_means(&managed, Action::WsSet, true), None);
+        // Approving a policy follows its own line.
+        let policy = settings("[passwords]\nmanager = \"keychain\"\n\n[workspace.approval]\nset = \"sudo\"\npolicy = \"touchid\"\n");
+        assert_eq!((saved_means(&policy, Action::WsPolicy, false), saved_means(&policy, Action::WsPolicy, true)), (Some(Means::TouchId), None));
         // `--type` types it, whatever the settings say.
         assert_eq!((saved_means(&managed, Action::WsOpen, true), saved_means(&managed, Action::WsDelete, true)), (None, None));
         // A line that says passphrase types it, and so does the template, with or without a manager.

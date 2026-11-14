@@ -45,7 +45,7 @@ pub struct Policy {
 }
 
 /// What `halti run` may do.
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Run {
     #[serde(default)]
@@ -83,7 +83,7 @@ pub struct Refresh {
     pub from: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Agent {
     #[serde(default)]
@@ -839,17 +839,33 @@ pub fn edit(res: &str) -> Result<()> {
 /// Open an approvable file in $EDITOR and check what was saved. A file approved before shows
 /// what the edit changed (false if nothing); a new one is shown whole when approved.
 pub fn edit_file(key: &str, p: &Path, check: impl FnOnce(&str) -> Result<()>) -> Result<bool> {
+    let read = |p: &Path| Ok(fs::read_to_string(p)?.into_bytes());
+    Ok(edit_against(p, read, || approved_text(key), &label(key), check)?.is_some())
+}
+
+/// Opens the file in $EDITOR, then reads it once with `read` and checks it. Only then is the
+/// `approved` text asked for: if there is one, what the edit changed from it is shown, and an edit
+/// that changed nothing says so and gives none; `label` names the policy in that line. The bytes
+/// read are what was checked and shown, so they are what an approval that follows may take.
+pub fn edit_against(
+    p: &Path,
+    read: impl Fn(&Path) -> Result<Vec<u8>>,
+    approved: impl FnOnce() -> Option<String>,
+    label: &str,
+    check: impl FnOnce(&str) -> Result<()>,
+) -> Result<Option<Vec<u8>>> {
     run_editor(p)?;
-    let text = fs::read_to_string(p)?;
-    check(&text).with_context(|| p.display().to_string())?;
-    if let Some(old) = approved_text(key) {
+    let bytes = read(p)?;
+    let text = std::str::from_utf8(&bytes).with_context(|| format!("{} isn't UTF-8", p.display()))?;
+    check(text).with_context(|| p.display().to_string())?;
+    if let Some(old) = approved() {
         if old == text {
-            println!("no change from the approved policy for {}", label(key));
-            return Ok(false);
+            println!("no change from the approved policy for {label}");
+            return Ok(None);
         }
-        println!("{}", diff(&old, &text, io::stdout().is_terminal()));
+        println!("{}", diff(&old, text, io::stdout().is_terminal()));
     }
-    Ok(true)
+    Ok(Some(bytes))
 }
 
 /// Opens the file in $VISUAL, else $EDITOR, else vi, and waits for it to end.
@@ -870,6 +886,66 @@ pub fn offer_approval(p: &Path, approve_cmd: &str, approve_now: impl FnOnce() ->
     }
     Ok(())
 }
+
+/// Whether a policy may be approved in a workspace, where it is kept apart from the Keychain's.
+/// It isn't empty. Its text is plain: printable ASCII, tab and line feed, so nothing in it reads as
+/// other than it is (a look-alike letter in a host, a control that reorders a line). A line that is
+/// only a comment may also have other letters and signs, as the Keychain's template does, but no
+/// control or invisible character; a text with a multi-line string has none of those lines, since
+/// a line in such a string may only look like a comment. And it uses only what the workspace's
+/// commands keep to: no `[refresh]` yet, and `[run]` and `[agent]` as an empty policy has them, so
+/// nothing approved now takes effect unseen once a later command honours it.
+pub fn in_workspace(text: &[u8], policy: &Policy) -> Result<()> {
+    if text.is_empty() {
+        bail!("an empty policy can't be approved");
+    }
+    let plain = |byte: &u8| matches!(byte, b' '..=b'~' | b'\t' | b'\n');
+    let multi_line = text.windows(3).any(|three| three == b"\"\"\"" || three == b"'''");
+    for (at, line) in text.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        if line.iter().all(plain) {
+            continue;
+        }
+        let comment = !multi_line && line.iter().find(|byte| !matches!(byte, b' ' | b'\t')) == Some(&b'#');
+        match std::str::from_utf8(line) {
+            Ok(line) if comment => {
+                if line.chars().any(|c| if c.is_ascii() { !plain(&(c as u8)) } else { hidden(c) }) {
+                    bail!("line {} has a control or invisible character", at + 1);
+                }
+            }
+            _ => bail!("line {} has a character that isn't plain ASCII. write a host with other letters in its xn-- form", at + 1),
+        }
+    }
+    let empty = Policy::default();
+    if !policy.refresh.is_empty() || policy.run != empty.run || policy.agent != empty.agent {
+        bail!("in a workspace, [refresh] can't be used yet, and [run] and [agent] must keep their defaults");
+    }
+    Ok(())
+}
+
+/// A character that isn't seen, or that changes how the text around it reads: a control (C0, C1,
+/// delete), a format character (bidi, zero-width, soft hyphen, tags) or a line or paragraph
+/// separator.
+fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{ad}' | '\u{61c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{e0000}'..='\u{e007f}')
+}
+
+/// The policy `ws policy edit` starts from. RES becomes the resource, WS the workspace. Only what a
+/// workspace's policy may hold (`in_workspace`), all of it commented out.
+pub const WORKSPACE_TEMPLATE: &str = r#"# halti policy for RES in WS. It takes effect only once approved: halti ws policy approve WS/RES
+
+# [fetch]
+# hosts = ["https://api.example.com"]
+# writes = "deny"                           # requests other than GET/HEAD: deny | ask | allow
+# auth = "Bearer {token}"                   # header value, {field} placeholders
+# auth_header = "Authorization"
+# headers = { "x-client-id" = "web" }       # fixed, non-secret headers the site expects
+
+# [[tool]]
+# name = "item"
+# about = "Get one item"
+# request = "GET https://api.example.com/items/{id}"
+"#;
 
 /// The policy `policy edit` starts from. CONFIG becomes the config folder, RES the resource.
 /// The `run` line's comment lines up with the others once CONFIG is expanded.
@@ -908,6 +984,7 @@ mod tests {
 
     use super::*;
     use crate::approval::fake_tests::Fake;
+    use crate::util::sha256_hex;
 
     #[test]
     fn a_box_s_policy_is_approved_as_its_settings_say() {
@@ -1063,6 +1140,88 @@ mod tests {
         let colored = diff(old, new, true);
         assert!(colored.contains("\x1b[31m-mode = \"ask\"\x1b[0m\n") && colored.contains("\x1b[32m+mode = \"allow\"\x1b[0m\n"));
         assert!(diff_from("template", old, new, false).starts_with("--- template\n+++ now\n@@ -1,2 +1,2 @@\n"));
+    }
+
+    /// The Keychain's template, byte for byte as it was before a workspace had policies: its own
+    /// template is another constant.
+    #[test]
+    fn the_keychain_template_is_unchanged() {
+        assert_eq!((TEMPLATE.len(), sha256_hex(TEMPLATE.as_bytes()).as_str()), (1247, "5d0d61cdea29269010dde2117f54201df0c9166cb267f03556ff316e9f0e68d4"));
+    }
+
+    /// Parsed, then held to what a workspace's policy may be.
+    fn in_a_workspace(text: &str) -> Result<()> {
+        in_workspace(text.as_bytes(), &Policy::parse(text)?)
+    }
+
+    #[test]
+    fn a_policy_in_a_workspace_can_t_refresh_or_change_run_or_agent() {
+        let refused = [
+            "[refresh.token]\nrun = \"~/refresh/app.sh\"\n",
+            "[refresh.session]\nfrom = \"firefox:https://app.example.com#session_token\"\n",
+            "[run]\nmode = \"allow\"\n",
+            "[run]\nexport = { token = \"APP_TOKEN\" }\n",
+            "[agent]\nconsent = \"none\"\n",
+            "[agent]\nconsent_minutes = 0\n",
+            GOOD,
+        ];
+        for text in refused {
+            let error = in_a_workspace(text).unwrap_err().to_string();
+            assert_eq!(error, "in a workspace, [refresh] can't be used yet, and [run] and [agent] must keep their defaults", "{text}");
+        }
+        // Today's template with a resource filled in passes as it is: [run] and [agent] as their defaults, and its
+        // one line that isn't plain ASCII a comment, with an ellipsis.
+        let keychain = TEMPLATE.replace("CONFIG", names::CONFIG_DIR).replace("RES", "github");
+        assert!(!keychain.is_ascii());
+        let workspace = WORKSPACE_TEMPLATE.replace("RES", "github").replace("WS", "acme");
+        let defaults = "[run]\nmode = \"deny\"\nexport = {}\n\n[agent]\nconsent = \"session\"\nconsent_minutes = 240\n\n[refresh]\n";
+        for text in [keychain.as_str(), workspace.as_str(), "\n", "[fetch]\nhosts = [\"https://api.github.com\"]\n", defaults] {
+            in_a_workspace(text).unwrap_or_else(|e| panic!("{text}: {e:#}"));
+        }
+        // An empty one parses, but has nothing to approve.
+        assert_eq!(in_a_workspace("").unwrap_err().to_string(), "an empty policy can't be approved");
+        assert!(workspace.starts_with("# halti policy for github in acme. It takes effect only once approved: halti ws policy approve acme/github\n"));
+        assert!(!workspace.contains("[run]") && !workspace.contains("[agent]") && !workspace.contains("refresh"), "{workspace}");
+        let (empty, parsed) = (Policy::default(), Policy::parse("").unwrap());
+        assert!(empty.run == parsed.run && empty.agent == parsed.agent && empty.refresh.is_empty());
+    }
+
+    #[test]
+    fn a_policy_in_a_workspace_is_plain_ascii() {
+        let refused = |line: usize| format!("line {line} has a character that isn't plain ASCII. write a host with other letters in its xn-- form");
+        // A Cyrillic a in a host parses, as a host in its xn-- form, and reads as github's.
+        let look_alike = "[fetch]\nhosts = [\"https://\u{430}pi.github.com\"]\n";
+        assert!(Policy::parse(look_alike).is_ok());
+        assert_eq!(in_a_workspace(look_alike).unwrap_err().to_string(), refused(2));
+        let empty = Policy::default();
+        for (text, line) in [
+            ("[fetch]\nhosts = [\"https://api.github.com\u{200b}\"]\n", 2),
+            ("[fetch]\nhosts = [\"https://api.github.com\"] # reads the other way \u{202e}moc.buhtig\n", 2),
+            ("[[tool]]\nname = \"item\"\nabout = \"caf\u{e9}\"\n", 3),
+            ("[fetch]\nhosts = [\"https://api.github.com\"]\nwrites = \"deny\"\r\n", 3),
+            // In a multi-line string, a line that looks like a comment is the string's.
+            ("[[tool]]\nname = \"item\"\nabout = \"\"\"\n# caf\u{e9}\n\"\"\"\n", 4),
+            ("[[tool]]\nname = \"item\"\nabout = '''\n  # \u{2026}\n'''\n", 4),
+        ] {
+            assert_eq!(in_workspace(text.as_bytes(), &empty).unwrap_err().to_string(), refused(line), "{text:?}");
+        }
+        assert_eq!(in_workspace(b"# not text \xff\n", &empty).unwrap_err().to_string(), refused(1));
+        // A line that is only a comment may have other letters and signs, but nothing that hides or reorders text.
+        let hidden = |line: usize| format!("line {line} has a control or invisible character");
+        for (text, line) in [
+            ("# reads the other way \u{202e}moc.buhtig\n", 1),
+            ("# one\n# two\n# a control of U+0080 to U+009F \u{85}\n", 3),
+            ("# a carriage return\r\n", 1),
+            ("# delete \x7f\n", 1),
+            ("# zero\u{200b}width\n", 1),
+            ("# caf\u{e9}\u{2028}hosts = [\"https://evil.example\"]\n", 1),
+        ] {
+            assert_eq!(in_workspace(text.as_bytes(), &empty).unwrap_err().to_string(), hidden(line), "{text:?}");
+        }
+        for text in ["# caf\u{e9}\n", "[fetch]\n  # firefox-cookie:\u{2026} reads a cookie\nhosts = [\"https://api.github.com\"]\n"] {
+            in_a_workspace(text).unwrap_or_else(|e| panic!("{text}: {e:#}"));
+        }
+        in_a_workspace("[fetch]\nhosts = [\"https://xn--bcher-kva.example\"]\n\twrites = \"deny\"\n").unwrap();
     }
 
     #[test]

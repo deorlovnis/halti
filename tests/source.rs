@@ -632,3 +632,51 @@ fn lookup_code_never_chooses() {
     assert!(main.contains("source::choose(") && main.contains("Source::keychain("), "src/main.rs chooses the source");
     assert!(found.is_empty(), "only main chooses where secrets are kept:\n{}", found.join("\n"));
 }
+
+/// What the workspace commands (src/ws.rs and src/ws/) may name of the binary's policy module:
+/// the items that reach no source. Every other one finds its files and approvals through
+/// `source::current()`, and a workspace's command chooses no source.
+const WS_POLICY_ITEMS: &[&str] = &["Policy::parse(", "run_editor(", "diff_from(", "offer_approval(", "edit_against(", "WORKSPACE_TEMPLATE", "in_workspace("];
+
+/// The workspace commands name only the policy items that reach no source, by their path through
+/// the module, never imported one by one where this check couldn't see them; they never choose a
+/// source, and never name the Keychain module.
+#[test]
+fn ws_names_only_source_free_policy_items() {
+    let mut found = Vec::new();
+    let mut named = 0;
+    for (path, text) in sources(&["src"]) {
+        if path != "src/ws.rs" && !path.starts_with("src/ws/") {
+            continue;
+        }
+        let Some(code) = release_code(&path, &text) else { continue };
+        for (n, line) in code.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for (at, _) in line.match_indices("policy::") {
+                let before = &line[..at];
+                if before.ends_with("halti_core::") || before.ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                match WS_POLICY_ITEMS.iter().find(|item| line[at + "policy::".len()..].starts_with(*item)) {
+                    Some(_) => named += 1,
+                    None => found.push(format!("{path}:{}: {}", n + 1, line.trim())),
+                }
+            }
+            for word in ["choose(", "keychain::"] {
+                if line.contains(word) {
+                    found.push(format!("{path}:{}: {word}", n + 1));
+                }
+            }
+        }
+        for statement in uses(&code) {
+            let own = statement.replace("halti_core::policy", "");
+            if own.contains("policy::") || own.contains("policy as ") {
+                found.push(format!("{path}: {}", statement.trim()));
+            }
+        }
+    }
+    assert!(named >= WS_POLICY_ITEMS.len(), "the workspace commands use the policy module: {named}");
+    assert!(found.is_empty(), "src/ws reaches no source through the policy module; name only {WS_POLICY_ITEMS:?}:\n{}", found.join("\n"));
+}

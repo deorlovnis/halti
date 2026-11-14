@@ -4,15 +4,23 @@
 //! the store root):
 //!
 //! ```text
-//! ws/                    0700
-//!   dir/NAME             0600   a directory record
-//!   pins/ID              0600   a pin, its 153 bytes
-//!   locks/ID             0600   the workspace's lock, held with flock; left in place but
-//!                               for the id of a create that failed
-//!   ID/                  0700   key, wrap, manifest, policy, log
-//!   ID/manifest.next     0600   a manifest replacing the one there, until it takes its place
-//!   ID/items/ITEM        0600   one stored item, named by 64 hex characters
+//! ws/                             0700
+//!   dir/NAME                      0600   a directory record
+//!   pins/ID                       0600   a pin, its 153 bytes
+//!   locks/ID                      0600   the workspace's lock, held with flock; left in place
+//!                                        but for the id of a create that failed
+//!   ID/                           0700   key, wrap, manifest, policy, log
+//!   ID/manifest.next              0600   a manifest replacing the one there, until it takes
+//!                                        its place
+//!   ID/items/ITEM                 0600   one stored item, named by 64 hex characters
+//!   ID/policies/                  0700   the policies, made by `ws policy edit`
+//!   ID/policies/RES.toml          0600   a resource's policy, as the editor left it
+//!   ID/policies/approved/         0700
+//!   ID/policies/approved/RES.toml 0600   the text last approved, written once it was
 //! ```
+//!
+//! A policy's file is read as halti's own are, and at most 64 KiB of it. Whether a policy is
+//! approved is sealed in the manifest; the copy beside it is only what a change is shown against.
 //!
 //! The workspaces folder is used only if it isn't there yet, or is this user's alone and holds
 //! nothing or only what halti puts there (`root_problem`): a folder halti didn't make is never
@@ -35,8 +43,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use halti_core::anchor::{Anchor, Pin};
+use halti_core::directory::DirRecord;
 use halti_core::ids::{WsId, WsName};
+use halti_core::item::ItemKey;
 use halti_core::platform::{Adapter, Grade, Label, Lacks, Property};
+use halti_core::policy::Approval;
 use halti_core::store::{FileKey, Files, Held, ItemName, KeystoreBackend, KeystoreKind};
 
 /// What `DirFiles` says of itself.
@@ -119,6 +130,15 @@ const MOST: u64 = 16 << 20;
 /// anything that isn't a plain file: opening never waits, so a pipe planted in its place is
 /// refused at once instead of hanging the command.
 fn read(path: &Path) -> Result<Option<Vec<u8>>> {
+    let bytes = read_at_most(path, MOST)?;
+    if bytes.as_ref().is_some_and(|bytes| bytes.len() as u64 > MOST) {
+        bail!("{} is larger than any file halti writes", path.display());
+    }
+    Ok(bytes)
+}
+
+/// As `read`, with at most `most` bytes and one more read: one more says the file is larger.
+fn read_at_most(path: &Path, most: u64) -> Result<Option<Vec<u8>>> {
     let file = match OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -126,10 +146,7 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>> {
     };
     plain(&file, path)?;
     let mut bytes = Vec::new();
-    file.take(MOST + 1).read_to_end(&mut bytes).with_context(|| format!("reading {}", path.display()))?;
-    if bytes.len() as u64 > MOST {
-        bail!("{} is larger than any file halti writes", path.display());
-    }
+    file.take(most + 1).read_to_end(&mut bytes).with_context(|| format!("reading {}", path.display()))?;
     Ok(Some(bytes))
 }
 
@@ -508,6 +525,175 @@ impl KeystoreBackend for FileKeystore {
     }
 }
 
+/// One kind's policies in a workspace: DIR/RES.toml, and the copies last approved in
+/// DIR/approved/. A policy is named as a resource is (`ItemKey::check_resource`).
+pub struct PolicyFiles {
+    dir: PathBuf,
+    root: PathBuf,
+}
+
+impl PolicyFiles {
+    /// The policies of a workspace's resources: WSDIR/policies, in the workspaces folder `root`.
+    pub fn resources(root: &Path, ws: WsId) -> PolicyFiles {
+        PolicyFiles { dir: root.join(ws.to_string()).join("policies"), root: root.to_path_buf() }
+    }
+
+    /// The folder they are in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(format!("{name}.toml"))
+    }
+
+    /// Where the copy kept at the policy's last approval is.
+    pub fn copy_path(&self, name: &str) -> PathBuf {
+        self.dir.join("approved").join(format!("{name}.toml"))
+    }
+
+    /// The workspace's folder, which holds this one.
+    fn ws_dir(&self) -> &Path {
+        self.dir.parent().expect("a workspace's policies are in its folder")
+    }
+
+    /// The names of the `*.toml` files, sorted. A name starting with a dot, and any other name, is
+    /// left out: an editor's leftovers (`.github.toml.swp`, `github.toml~`, `4913`) and the
+    /// approved copies' folder. A `*.toml` name that isn't a policy's is refused, not left out (on
+    /// a disk that ignores case, `GitHub.toml` opens as `github`), and so is one that isn't a plain
+    /// file.
+    pub fn names(&self) -> Result<Vec<String>> {
+        let found = match fs::read_dir(&self.dir) {
+            Ok(found) => found,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", self.dir.display())),
+        };
+        let mut names = Vec::new();
+        for entry in found {
+            let entry = entry.with_context(|| format!("reading {}", self.dir.display()))?;
+            let name = entry.file_name().into_string().map_err(|_| anyhow!("{} holds a file whose name isn't text", self.dir.display()))?;
+            let Some(stem) = name.strip_suffix(".toml").filter(|_| !name.starts_with('.')) else { continue };
+            if ItemKey::check_resource(stem).is_err() {
+                bail!("{} isn't a policy file name: use a-z, 0-9 and -", entry.path().display());
+            }
+            if !entry.file_type().with_context(|| format!("reading {}", self.dir.display()))?.is_file() {
+                bail!("{} isn't a plain file", entry.path().display());
+            }
+            names.push(stem.to_string());
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    /// The policy's bytes, or none if there is no file: read as `read` does, and refused if it
+    /// holds more than a policy can.
+    pub fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        read_policy(&self.path(name))
+    }
+
+    /// Writes `text` as the policy, only if there is no file: the workspaces folder, the
+    /// workspace's and this one made private first. Says whether it wrote it.
+    pub fn create(&self, name: &str, text: &str) -> Result<bool> {
+        self.ready(&self.dir)?;
+        create_new(&self.path(name), text.as_bytes())
+    }
+
+    /// The copy kept at the policy's last approval, if there is one.
+    pub fn approved_copy(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        read_policy(&self.copy_path(name))
+    }
+
+    /// Keeps `bytes` as the copy of what was approved, in place of any.
+    pub fn keep_approved(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        let path = self.copy_path(name);
+        self.ready(path.parent().expect("a copy is in the approved folder"))?;
+        replace(&path, bytes)
+    }
+
+    /// Removes the copy of what was approved, if there is one.
+    pub fn forget_approved(&self, name: &str) -> Result<()> {
+        remove(&self.copy_path(name)).map(drop)
+    }
+
+    /// The workspaces folder and each folder down to `dir`, made private, before anything is
+    /// written in it.
+    fn ready(&self, dir: &Path) -> Result<()> {
+        ready_root(&self.root)?;
+        for folder in [self.ws_dir(), self.dir.as_path(), dir] {
+            private_dir(folder)?;
+        }
+        Ok(())
+    }
+
+    /// Removes the folder and all in it, then the workspace's folder if nothing else is left in it.
+    /// A link or a file in the folder's place is removed itself, and what it points at is left.
+    pub fn remove_all(&self) -> Result<()> {
+        let ws = self.ws_dir();
+        match fs::symlink_metadata(ws) {
+            Ok(meta) if meta.is_dir() && meta.uid() == unsafe { libc::getuid() } => {}
+            Ok(_) => bail!("{} isn't a folder of yours", ws.display()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", ws.display())),
+        }
+        match fs::symlink_metadata(&self.dir) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&self.dir).with_context(|| format!("removing {}", self.dir.display()))?,
+            Ok(_) => fs::remove_file(&self.dir).with_context(|| format!("removing {}", self.dir.display()))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("reading {}", self.dir.display())),
+        }
+        tidy(&self.dir)
+    }
+}
+
+/// A policy's file, read as `read` reads any, and at most a policy's longest text.
+fn read_policy(path: &Path) -> Result<Option<Vec<u8>>> {
+    let most = Approval::MAX_TEXT as u64;
+    let bytes = read_at_most(path, most).map_err(|e| {
+        // What O_NOFOLLOW says of a link.
+        if e.downcast_ref::<io::Error>().and_then(io::Error::raw_os_error) == Some(libc::ELOOP) { anyhow!("{} isn't a plain file", path.display()) } else { e }
+    })?;
+    if bytes.as_ref().is_some_and(|bytes| bytes.len() as u64 > most) {
+        bail!("{} is larger than 64 KiB", path.display());
+    }
+    Ok(bytes)
+}
+
+/// The workspaces in the folder `root` that are gone but for their policies: id folders that no
+/// directory record names and that hold nothing but `policies/` (and Finder's `.DS_Store`). A
+/// crash between a workspace's delete and the removal of its policies leaves one. While any record
+/// can't be read, none is.
+pub fn orphan_policies(root: &Path) -> Result<Vec<WsId>> {
+    let files = DirFiles::at(root);
+    let mut named = Vec::new();
+    for name in files.names()? {
+        let Some(record) = files.read(&FileKey::DirRecord(name))?.and_then(|bytes| DirRecord::from_bytes(&bytes).ok()) else { return Ok(Vec::new()) };
+        named.push(record.id);
+    }
+    let found = match fs::read_dir(root) {
+        Ok(found) => found,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
+    };
+    let mut orphans = Vec::new();
+    for entry in found {
+        let entry = entry.with_context(|| format!("reading {}", root.display()))?;
+        let Some(id) = entry.file_name().to_str().and_then(unhex::<16>).map(WsId::from_bytes) else { continue };
+        if named.contains(&id) || !entry.file_type().with_context(|| format!("reading {}", root.display()))?.is_dir() {
+            continue;
+        }
+        let inside: Vec<String> = fs::read_dir(entry.path())
+            .with_context(|| format!("reading {}", entry.path().display()))?
+            .map(|inner| inner.map(|inner| inner.file_name().to_string_lossy().into_owned()))
+            .collect::<io::Result<_>>()
+            .with_context(|| format!("reading {}", entry.path().display()))?;
+        if inside.iter().any(|name| name == "policies") && inside.iter().all(|name| name == "policies" || name == ".DS_Store") {
+            orphans.push(id);
+        }
+    }
+    orphans.sort();
+    Ok(orphans)
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
@@ -745,6 +931,102 @@ mod tests {
         drop(held);
         files.forget_lock(acme).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn policy_files_list_only_policy_names() {
+        let dir = TempDir::new("halti-ws-policy-names").unwrap();
+        let root = dir.0.join("ws");
+        let acme = WsId::from_bytes([0x10; 16]);
+        let policies = PolicyFiles::resources(&root, acme);
+        assert_eq!(policies.names().unwrap(), Vec::<String>::new(), "no folder yet: none");
+        assert!(policies.create("github", "[fetch]\n").unwrap());
+        assert!(!policies.create("github", "another\n").unwrap(), "a file there is never replaced");
+        assert_eq!(policies.read("github").unwrap().as_deref(), Some(&b"[fetch]\n"[..]));
+        policies.keep_approved("github", b"[fetch]\n").unwrap();
+        // An editor's leftovers, and the approved copies' folder, are no policies.
+        let folder = root.join(acme.to_string()).join("policies");
+        for left in [".github.toml.swp", "github.toml~", "4913", ".DS_Store"] {
+            fs::write(folder.join(left), b"left").unwrap();
+        }
+        assert_eq!(policies.names().unwrap(), ["github"]);
+        let mode = |p: &Path| fs::symlink_metadata(p).unwrap().mode() & 0o777;
+        assert_eq!((mode(&folder), mode(&folder.join("github.toml")), mode(&folder.join("approved")), mode(&folder.join("approved/github.toml"))), (0o700, 0o600, 0o700, 0o600));
+        // A name that isn't a policy's is refused, not left out: on a disk that ignores case it would open as github.
+        fs::write(folder.join("Git.toml"), b"[fetch]\n").unwrap();
+        let error = policies.names().unwrap_err().to_string();
+        assert_eq!(error, format!("{} isn't a policy file name: use a-z, 0-9 and -", folder.join("Git.toml").display()));
+        fs::remove_file(folder.join("Git.toml")).unwrap();
+        // So is a link, whatever it points at.
+        symlink(folder.join("github.toml"), folder.join("x.toml")).unwrap();
+        assert_eq!(policies.names().unwrap_err().to_string(), format!("{} isn't a plain file", folder.join("x.toml").display()));
+    }
+
+    #[test]
+    fn policy_files_never_follow_a_link_at_a_file_and_go_with_their_workspace() {
+        let dir = TempDir::new("halti-ws-policy-links").unwrap();
+        let root = dir.0.join("ws");
+        let acme = WsId::from_bytes([0x10; 16]);
+        let policies = PolicyFiles::resources(&root, acme);
+        policies.create("linear", "[fetch]\n").unwrap();
+        let folder = root.join(acme.to_string()).join("policies");
+        let outside = dir.0.join("outside.toml");
+        fs::write(&outside, b"[fetch]\nhosts = [\"https://evil.example\"]\n").unwrap();
+        // A link at a file: refused when read, as a policy or as its approved copy.
+        symlink(&outside, folder.join("github.toml")).unwrap();
+        assert_eq!(policies.read("github").unwrap_err().to_string(), format!("{} isn't a plain file", folder.join("github.toml").display()));
+        fs::create_dir(folder.join("approved")).unwrap();
+        symlink(&outside, folder.join("approved/github.toml")).unwrap();
+        assert!(policies.approved_copy("github").is_err());
+        // Larger than a policy can be: refused, not read whole.
+        File::create(folder.join("big.toml")).unwrap().set_len(65537).unwrap();
+        assert_eq!(policies.read("big").unwrap_err().to_string(), format!("{} is larger than 64 KiB", folder.join("big.toml").display()));
+        File::create(folder.join("big.toml")).unwrap().set_len(65536).unwrap();
+        assert_eq!(policies.read("big").unwrap().map(|bytes| bytes.len()), Some(65536));
+        assert_eq!(policies.read("slack").unwrap(), None);
+        // Removing them all takes leftovers and the workspace's folder, and leaves what a link pointed at.
+        fs::write(folder.join(".linear.toml.swp"), b"left").unwrap();
+        policies.remove_all().unwrap();
+        assert!(!root.join(acme.to_string()).exists() && outside.exists());
+        policies.remove_all().unwrap();
+        // A link in the folder's place is unlinked, and what it points at is left.
+        let elsewhere = dir.0.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::write(elsewhere.join("github.toml"), b"not halti's").unwrap();
+        fs::create_dir_all(root.join(acme.to_string())).unwrap();
+        fs::write(root.join(acme.to_string()).join("key"), b"key").unwrap();
+        symlink(&elsewhere, &folder).unwrap();
+        assert!(policies.create("github", "x").is_err(), "nothing is written through it");
+        policies.remove_all().unwrap();
+        assert!(fs::symlink_metadata(&folder).is_err() && elsewhere.join("github.toml").exists());
+        assert!(root.join(acme.to_string()).join("key").exists(), "a workspace's folder with other files in it stays");
+        // A link in the workspace's folder's place: nothing is removed through it.
+        let globex = WsId::from_bytes([0x02; 16]);
+        fs::create_dir(elsewhere.join("policies")).unwrap();
+        symlink(&elsewhere, root.join(globex.to_string())).unwrap();
+        assert!(PolicyFiles::resources(&root, globex).remove_all().is_err());
+        assert!(elsewhere.join("policies").exists());
+    }
+
+    #[test]
+    fn orphaned_policies_are_found() {
+        let dir = TempDir::new("halti-ws-orphans").unwrap();
+        let root = dir.0.join("ws");
+        assert_eq!(orphan_policies(&root).unwrap(), []);
+        let files = DirFiles::at(&root);
+        let (acme, globex, initech) = (WsId::from_bytes([0x10; 16]), WsId::from_bytes([0x02; 16]), WsId::from_bytes([0x03; 16]));
+        let record = |id: WsId| DirRecord { id, key: halti_core::holder::KeyKind::Passphrase, keystore: KeystoreKind::Files }.to_bytes();
+        files.write_atomic(&FileKey::DirRecord(WsName::parse("acme").unwrap()), &record(acme)).unwrap();
+        for id in [acme, globex, initech] {
+            PolicyFiles::resources(&root, id).create("github", "[fetch]\n").unwrap();
+        }
+        fs::write(root.join(globex.to_string()).join(".DS_Store"), b"finder's").unwrap();
+        // initech has other files beside its policies: not only policies are left of it.
+        files.write_atomic(&FileKey::KeyRef(initech), b"key").unwrap();
+        assert_eq!(orphan_policies(&root).unwrap(), [globex], "acme has a record");
+        // While a record can't be read, it could name any: none is an orphan.
+        fs::write(root.join("dir/umbrella"), b"not a record").unwrap();
+        assert_eq!(orphan_policies(&root).unwrap(), []);
     }
 
     #[test]
