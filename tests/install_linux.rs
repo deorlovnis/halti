@@ -2,7 +2,8 @@
 //! it runs on a Mac too), `id`, `sudo` and `cargo`. The stand-in sudo writes down what it was
 //! asked to install and runs nothing; the stand-in cargo makes a halti that only says its
 //! build-info. Nothing is installed, and no real sudo or cargo is run. And what check.sh writes for
-//! it: what it could not run here, with stand-ins for `unshare`, `sysctl` and the debug halti.
+//! it: what it could not run here, with stand-ins for `unshare`, `sysctl` and the debug halti. And
+//! box/to-disk.sh, which turns a box image into the disk a box boots from, by hand on Linux.
 
 #![cfg(unix)]
 
@@ -297,4 +298,97 @@ fn check_sh_names_the_escape_tests_and_cargo_test_runs_them() {
     let names: Vec<String> = tests.into_iter().map(|(name, _)| name).collect();
     assert_eq!(names.len(), 11, "{names:?}");
     assert_eq!(check_sh_list("escape_tests"), names);
+}
+
+/// A test folder and a podman image, removed however the test ends.
+struct Made {
+    dir: PathBuf,
+    image: String,
+}
+
+impl Drop for Made {
+    fn drop(&mut self) {
+        let _ = Command::new("podman").args(["rmi", "-f", &self.image]).output();
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The id and group of a file in an ext4 disk image, as debugfs reads them without mounting it.
+fn owner_in(disk: &Path, path: &str) -> String {
+    let debugfs = ["/usr/sbin/debugfs", "/sbin/debugfs"].into_iter().find(|p| Path::new(p).is_file()).unwrap_or("debugfs");
+    let out = Command::new(debugfs).args(["-R", &format!("stat {path}")]).arg(disk).output().unwrap();
+    let said = text(&out.stdout);
+    let field = |name: &str| said.split(name).nth(1).and_then(|rest| rest.split_whitespace().next()).unwrap_or("?").to_string();
+    format!("{}:{}", field("User:"), field("Group:"))
+}
+
+/// box/to-disk.sh on a small image podman builds here from an archive whose files have the owners
+/// a box image's do: root's, the agent's (1000), the shadow group's (42), and the ids of the
+/// machines that built Docker's and uv's archives (1001, and group 117), which the image doesn't
+/// name. The disk keeps the image's owners and writes the others as root's. Needs Linux, podman
+/// as this user (with subordinate ids), mkfs.ext4 and debugfs:
+///
+///     cargo test --test install_linux -- --ignored to_disk
+#[test]
+#[ignore = "needs Linux, podman as this user, mkfs.ext4 and debugfs: see above"]
+fn to_disk_keeps_the_image_s_owners_and_makes_the_others_root_s() {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    let made = Made {
+        dir: env::temp_dir().join(format!("halti-to-disk-{}-{}", std::process::id(), COUNT.fetch_add(1, Ordering::Relaxed))),
+        image: format!("localhost/halti-to-disk-test:{}", std::process::id()),
+    };
+    let (dir, image) = (&made.dir, &made.image);
+    let _ = fs::remove_dir_all(dir);
+    let root = dir.join("root");
+    for folder in ["etc", "home/agent", "usr/local/bin"] {
+        fs::create_dir_all(root.join(folder)).unwrap();
+    }
+    fs::write(root.join("etc/passwd"), "root:x:0:0:root:/root:/bin/sh\nagent:x:1000:1000::/home/agent:/bin/bash\n").unwrap();
+    fs::write(root.join("etc/group"), "root:x:0:\nshadow:x:42:\nagent:x:1000:\n").unwrap();
+    fs::write(root.join("etc/shadow"), "root:*:1::::::\n").unwrap();
+    for program in ["dockerd", "uv", "halti-shim"] {
+        fs::write(root.join("usr/local/bin").join(program), format!("#!/bin/sh\necho {program}\n")).unwrap();
+    }
+    // The archive, a set of files at a time, each set with its owner.
+    let tar = dir.join("ctx/root.tar");
+    fs::create_dir_all(tar.parent().unwrap()).unwrap();
+    for (n, (owner, group, paths)) in [
+        ("0", "0", &[".", "etc", "etc/passwd", "etc/group", "home", "usr", "usr/local", "usr/local/bin", "usr/local/bin/halti-shim"][..]),
+        ("0", "42", &["etc/shadow"]),
+        ("1000", "1000", &["home/agent"]),
+        ("1001", "1001", &["usr/local/bin/dockerd"]),
+        ("1001", "117", &["usr/local/bin/uv"]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = Command::new("tar")
+            .args([if n == 0 { "-cf" } else { "-rf" }])
+            .arg(&tar)
+            .args(["--numeric-owner", &format!("--owner={owner}"), &format!("--group={group}"), "--no-recursion", "-C"])
+            .arg(&root)
+            .args(paths)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "tar: {}", text(&out.stderr));
+    }
+    fs::write(dir.join("ctx/Containerfile"), "FROM scratch\nADD root.tar /\n").unwrap();
+    let built = Command::new("podman").args(["build", "-q", "-t", image, "-f"]).arg(dir.join("ctx/Containerfile")).arg(dir.join("ctx")).output().unwrap();
+    assert!(built.status.success(), "podman build: {}", text(&built.stderr));
+
+    let disk = dir.join("agent.img");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("box/to-disk.sh");
+    let out = Command::new(&script).arg(image).arg(&disk).output().unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).ends_with("; 2 whose owner the image doesn't name are root's\n"), "{}", text(&out.stdout));
+    let owners: Vec<String> = ["/", "/etc/shadow", "/home/agent", "/usr/local/bin/halti-shim", "/usr/local/bin/dockerd", "/usr/local/bin/uv"]
+        .iter()
+        .map(|p| format!("{p} {}", owner_in(&disk, p)))
+        .collect();
+    assert_eq!(owners, ["/ 0:0", "/etc/shadow 0:42", "/home/agent 1000:1000", "/usr/local/bin/halti-shim 0:0", "/usr/local/bin/dockerd 0:0", "/usr/local/bin/uv 0:0"]);
+    // Nothing is left beside it, and it is never made over a file that is there.
+    let beside: Vec<String> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with('.')).collect();
+    assert!(beside.is_empty(), "{beside:?}");
+    let again = Command::new(&script).arg(image).arg(&disk).output().unwrap();
+    assert!(!again.status.success() && text(&again.stderr).contains("already exists"), "{}", text(&again.stderr));
 }

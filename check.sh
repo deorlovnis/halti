@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Everything a change must pass that needs no human: formatting, lints, the tests, a release build
 # and what its build-info says, the shim, and the syntax of the runner, install.sh,
-# install-linux.sh (and its dry run) and macos-check.sh. Run before pushing (`mise run check` runs
-# this). When every step passes with no changes to the files, it writes the commit it passed at to
-# check-passed in the target folder: install-linux.sh installs only that commit.
+# install-linux.sh (and its dry run), box/to-disk.sh and macos-check.sh. Run before pushing
+# (`mise run check` runs this). When every step passes with no changes to the files, it writes the
+# commit it passed at to check-passed in the target folder: install-linux.sh installs only that
+# commit.
 #
 # The release build's run with every test hook set and the escape tests need user namespaces. Where
 # the system restricts them (Ubuntu 24.04 does, through AppArmor), they are not run: check.sh ends
@@ -244,6 +245,7 @@ node --check runner/runner.mjs
 bash -n install.sh
 bash -n install-linux.sh
 ./install-linux.sh --dry-run >/dev/null
+bash -n box/to-disk.sh
 bash -n macos-check.sh
 
 if [ -n "$head" ] && [ "$(clean_head)" = "$head" ]; then

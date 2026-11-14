@@ -147,6 +147,10 @@ fn a_box_boots_runs_as_the_agent_and_as_root_and_keeps_its_disk_across_a_stop() 
     let mounts = sh(&engine, &name, false, "for d in /home/agent /work /downloads; do stat -c '%n %u' $d; done; ls /sys/class/net");
     println!("folders and network devices: {}", mounts.trim().replace('\n', " | "));
     assert_eq!(mounts, "/home/agent 1000\n/work 1000\n/downloads 1000\nlo\n");
+    // The programs the image unpacked from others' archives are root's, as the image's own are.
+    let owners = sh(&engine, &name, false, "stat -c '%n %u:%g' /usr/local/bin/dockerd /usr/local/bin/gh /usr/local/bin/uv /usr/local/bin/halti-shim");
+    println!("owners in the image: {}", owners.trim().replace('\n', " | "));
+    assert_eq!(owners, "/usr/local/bin/dockerd 0:0\n/usr/local/bin/gh 0:0\n/usr/local/bin/uv 0:0\n/usr/local/bin/halti-shim 0:0\n");
 
     // The CA, as a run installs it, and a request through the door over vsock: a host the box
     // may not reach is refused by the door, which logs it.
