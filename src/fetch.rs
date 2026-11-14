@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow, bail};
 use ureq::http;
 
 use crate::policy::{self, Approved, METHODS, Mode};
-use crate::{approve, keychain};
+use crate::{approve, source};
 
 /// Response bodies are cut off after this many bytes.
 const BODY_LIMIT: usize = 256 * 1024;
@@ -39,7 +39,7 @@ pub fn perform(res: &str, approved: &Approved, req: &Request) -> Result<String> 
 
     let mut request = http::Request::builder().method(method.as_str()).uri(url.as_str());
     if let Some(template) = &fetch.auth {
-        let value = policy::fill(template, |field| keychain::get(res, field).ok_or_else(|| anyhow!("{res}/{field} isn't stored (halti set {res} {field})")))?;
+        let value = policy::fill(template, |field| source::current().value(res, field).ok_or_else(|| anyhow!("{res}/{field} isn't stored (halti set {res} {field})")))?;
         request = request.header(fetch.auth_header.as_str(), value);
     }
     for (name, value) in &fetch.headers {

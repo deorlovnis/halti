@@ -3,8 +3,6 @@
 //! decided by the resource's approved policy.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::{fs, io};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -15,8 +13,7 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 
-use crate::keychain;
-use crate::util::{self, config_dir};
+use crate::{source, util};
 
 /// Auto-refresh a field once it is this close to its exact expiry. Short: some tokens only
 /// live an hour, and a larger margin would renew them on every use.
@@ -94,39 +91,16 @@ impl Field {
 }
 
 pub struct Index {
-    path: PathBuf,
     pub map: BTreeMap<String, Resource>,
 }
 
 impl Index {
-    fn path() -> PathBuf {
-        // Tests keep an index of their own. Release builds don't contain this.
-        #[cfg(halti_dev)]
-        if let Some(path) = util::dev_var("HALTI_INDEX") {
-            return path.into();
-        }
-        config_dir().join("index.json")
-    }
-
     pub fn load() -> Result<Self> {
-        let path = Self::path();
-        let map = match fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).with_context(|| format!("reading {}", path.display()))?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-        };
-        Ok(Self { path, map })
+        Ok(Self { map: source::current().index()? })
     }
 
     pub fn save(&self) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        // Write then rename, so a crash never leaves a half-written index.
-        let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(&self.map)? + "\n")?;
-        fs::rename(&tmp, &self.path)?;
-        Ok(())
+        source::current().save_index(&self.map)
     }
 
     pub fn get(&self, res: &str) -> Result<&Resource> {
@@ -136,7 +110,7 @@ impl Index {
     /// The stored values of a resource's fields, for masking them in output.
     pub fn values(&self, res: &str) -> Vec<String> {
         let Some(r) = self.map.get(res) else { return Vec::new() };
-        r.fields.keys().filter_map(|n| keychain::get(res, n)).collect()
+        r.fields.keys().filter_map(|n| source::current().value(res, n)).collect()
     }
 }
 
@@ -182,7 +156,7 @@ pub enum Expiry {
 
 /// Store a field's value and metadata; returns " (expires …)" for the caller's message.
 pub fn store(res: &str, field: &str, value: &str, expiry: Expiry, meta: &Meta) -> Result<String> {
-    keychain::set(res, field, value)?;
+    source::current().store_value(res, field, value)?;
     let mut idx = Index::load()?;
     let r = idx.map.entry(res.to_string()).or_default();
     r.apply(meta);

@@ -41,20 +41,14 @@ use crate::config::{Engine, Keys, Settings};
 use crate::door::inspect::parse_prefix;
 use crate::engine::Vms;
 use crate::policy::{self, Approval, Mode, Site, Status};
+use crate::source::{self, BoxItem};
 use crate::util::{config_dir, expand_home, home, store_root};
-use crate::{approve, config, engine, keychain, legacy, names, parse_env, parse_resource};
+use crate::{approve, config, engine, legacy, names, parse_env, parse_resource};
 pub use login::login;
 use store::Layout;
 
 /// Keychain names of box items start with this. Resource names can't contain a dot.
 pub const KEY_PREFIX: &str = "box.";
-/// The Keychain field of a box's store key. Field names can't start with "_".
-const KEY_FIELD: &str = "_key";
-/// The Keychain field of where the box's door log stood when it last stopped (`chain::Head`).
-pub const LOG_HEAD_FIELD: &str = "_loghead";
-/// The Keychain field with the names of the sites that have a sealed session, kept by the halti that
-/// sealed them so `halti box ls` can show them without opening the store.
-const SESSIONS_FIELD: &str = "_sessions";
 /// A box's name also names its VM and its socket (104-byte limit), so it stays short.
 const MAX_NAME: usize = 32;
 
@@ -71,12 +65,7 @@ pub fn parse_name(s: &str) -> Result<String, String> {
 }
 
 pub fn dir() -> PathBuf {
-    // Tests keep their box policies apart. Release builds don't contain this.
-    #[cfg(halti_dev)]
-    if let Some(dir) = crate::util::dev_var("HALTI_BOX_DIR") {
-        return dir.into();
-    }
-    config_dir().join("box")
+    source::current().box_dir().to_path_buf()
 }
 
 pub fn path(name: &str) -> PathBuf {
@@ -434,28 +423,28 @@ impl KeyStore {
 
     fn get(self, name: &str) -> Option<String> {
         match self.0? {
-            Keys::Keychain => keychain::get(&key(name), KEY_FIELD),
+            Keys::Keychain => source::current().box_item(name, BoxItem::Key),
         }
     }
 
     /// Whether there is one, without reading it.
     fn exists(self, name: &str) -> bool {
         match self.0 {
-            Some(Keys::Keychain) => keychain::exists(&key(name), KEY_FIELD),
+            Some(Keys::Keychain) => source::current().has_box_item(name, BoxItem::Key),
             None => false,
         }
     }
 
     fn set(self, name: &str, value: &str) -> Result<()> {
         match self.0 {
-            Some(Keys::Keychain) => keychain::set(&key(name), KEY_FIELD, value),
+            Some(Keys::Keychain) => source::current().set_box_item(name, BoxItem::Key, value),
             None => bail!("a box's key can't be kept on this system"),
         }
     }
 
     fn delete(self, name: &str) -> bool {
         match self.0 {
-            Some(Keys::Keychain) => keychain::delete(&key(name), KEY_FIELD),
+            Some(Keys::Keychain) => source::current().remove_box_item(name, BoxItem::Key),
             None => false,
         }
     }
@@ -495,15 +484,15 @@ fn log_key(key: &str) -> [u8; 32] {
 /// Note which sites of the box have a sealed session (names only).
 fn keep_session_names(name: &str, sites: &[String]) -> Result<()> {
     if sites.is_empty() {
-        keychain::delete(&key(name), SESSIONS_FIELD);
+        source::current().remove_box_item(name, BoxItem::Sessions);
         return Ok(());
     }
-    keychain::set(&key(name), SESSIONS_FIELD, &sites.join(","))
+    source::current().set_box_item(name, BoxItem::Sessions, &sites.join(","))
 }
 
 /// The sites of the box that had a sealed session when it was last put away.
 fn session_names(name: &str) -> Vec<String> {
-    keychain::get_silently(&key(name), SESSIONS_FIELD).map(|s| s.split(',').filter(|n| !n.is_empty()).map(str::to_string).collect()).unwrap_or_default()
+    source::current().box_item(name, BoxItem::Sessions).map(|s| s.split(',').filter(|n| !n.is_empty()).map(str::to_string).collect()).unwrap_or_default()
 }
 
 /// Make a box: its policy (edited from a template), a key where `[box] keys` says and an empty store.
@@ -650,7 +639,7 @@ pub fn log(name: &str, last: usize, verify: bool) -> Result<()> {
         if verify {
             let chain = Chain::new(&store::door_log(mnt), log_key(&keys.open_key(name)?));
             let found = chain.verify().with_context(|| format!("the log of box {name}"))?;
-            let head = keychain::get_silently(&key(name), LOG_HEAD_FIELD).and_then(|h| serde_json::from_str::<chain::Head>(&h).ok());
+            let head = source::current().box_item(name, BoxItem::LogHead).and_then(|h| serde_json::from_str::<chain::Head>(&h).ok());
             if let Some(head) = &head {
                 found.check(head).with_context(|| format!("the log of box {name}"))?;
             }
@@ -777,8 +766,8 @@ pub fn rm(name: &str) -> Result<()> {
     ask_for(&approval::Real, &settings, Action::BoxDelete, &format!("delete box {name}: its data can never be read again"))?;
     // The key goes first: without it the store is noise, whatever happens to the files.
     keys.delete(name);
-    keychain::delete(&k, LOG_HEAD_FIELD);
-    keychain::delete(&k, SESSIONS_FIELD);
+    source::current().remove_box_item(name, BoxItem::LogHead);
+    source::current().remove_box_item(name, BoxItem::Sessions);
     policy::revoke(&k);
     store::shred(&bundle)?;
     run::sweep(&layout, name)?;
@@ -1006,7 +995,7 @@ mod tests {
         assert!(parse_name(&"a".repeat(MAX_NAME)).is_ok() && parse_name(&"a".repeat(MAX_NAME + 1)).is_err());
         assert_eq!(key("research"), "box.research");
         assert!(parse_resource(&key("research")).is_err(), "no resource can be named like a box key");
-        assert!(parse_field(KEY_FIELD).is_err(), "no field can be named like the key");
+        assert!(parse_field("_key").is_err(), "no field can be named like the key");
     }
 
     #[test]

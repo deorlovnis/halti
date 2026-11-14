@@ -28,7 +28,7 @@ use zeroize::Zeroizing;
 
 use super::tty;
 use crate::approval::{self, Action, Declined, Means, World};
-use crate::keychain;
+use crate::source;
 
 /// What a workspace made with a saved copy of its passphrase records, and what opening it from the
 /// copy says: everything a typed passphrase lacks, and that others can touch it.
@@ -56,19 +56,19 @@ pub struct Keychain;
 
 impl Copies for Keychain {
     fn exists(&self, ws: WsId) -> bool {
-        keychain::ws_exists(&ws.to_string())
+        source::saved_exists(&ws.to_string())
     }
 
     fn add(&self, ws: WsId, passphrase: &str) -> Result<()> {
-        keychain::ws_add(&ws.to_string(), passphrase)
+        source::saved_add(&ws.to_string(), passphrase)
     }
 
     fn get(&self, ws: WsId) -> Option<Zeroizing<String>> {
-        keychain::ws_get(&ws.to_string())
+        source::saved_get(&ws.to_string())
     }
 
     fn remove(&self, ws: WsId) -> bool {
-        keychain::ws_delete(&ws.to_string())
+        source::saved_remove(&ws.to_string())
     }
 }
 

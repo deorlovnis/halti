@@ -12,19 +12,15 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::mask::{MASK, Masker};
-use crate::util::config_dir;
-use crate::{keychain, legacy};
+use crate::{legacy, source};
 
-/// Keychain item of the HMAC key. Resource names can't start with "_".
-const KEY_RES: &str = "_audit";
-const KEY_FIELD: &str = "hmac";
 /// The last line is looked for in this many bytes at the end of the file.
 const TAIL: u64 = 8192;
 /// Longest text kept for a site, tool or URL, so lines stay short.
@@ -164,25 +160,6 @@ fn chain_mac(key: &[u8], prev: &str, body: &Body) -> Result<String> {
     Ok(hmac_sha256(key, &[prev.as_bytes(), b"\n", serde_json::to_string(body)?.as_bytes()]))
 }
 
-fn keychain_key(create: bool) -> Result<Vec<u8>> {
-    // Tests inject a key instead of touching the Keychain. Release builds don't contain this.
-    #[cfg(halti_dev)]
-    if let Some(key) = crate::util::dev_var("HALTI_AUDIT_KEY") {
-        return Ok(key.into_encoded_bytes());
-    }
-    if keychain::exists(KEY_RES, KEY_FIELD) {
-        return keychain::get(KEY_RES, KEY_FIELD).map(String::into_bytes).ok_or_else(|| anyhow!("can't read the audit key from the Keychain"));
-    }
-    if !create {
-        bail!("the audit key isn't in the Keychain, so the log can't be verified");
-    }
-    let mut bytes = [0u8; 32];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    let key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    keychain::set(KEY_RES, KEY_FIELD, &key)?;
-    Ok(key.into_bytes())
-}
-
 pub struct Log {
     path: PathBuf,
     key_source: Box<dyn Fn() -> Result<Vec<u8>>>,
@@ -196,12 +173,8 @@ impl Log {
 
     /// The log in its usual place with its key in the Keychain, created on first use if `create_key`.
     pub fn standard(create_key: bool) -> Self {
-        // Tests run with a log of their own. Release builds don't contain this.
-        #[cfg(halti_dev)]
-        if let Some(path) = crate::util::dev_var("HALTI_AUDIT") {
-            return Self::new(path.into(), move || keychain_key(create_key));
-        }
-        Self::new(config_dir().join("audit.log"), move || keychain_key(create_key))
+        let source = source::current();
+        Self::new(source.audit_log().to_path_buf(), move || source.audit_key(create_key))
     }
 
     fn key(&mut self) -> Result<Vec<u8>> {
