@@ -152,6 +152,7 @@ mod tests {
             keystore_ref: Vec::new(),
             items: Vec::new(),
             approvals: Vec::new(),
+            boxes: Vec::new(),
         }
     }
 

@@ -22,6 +22,10 @@ pub(crate) const KEYS_ID: &[u8] = b"KEYS\x01";
 pub(crate) const PIN_ID: &[u8] = b"PIN\x01";
 /// The id of a stored secret's name and seal. Its last byte is their format.
 pub(crate) const ITEM_ID: &[u8] = b"ITEM\x01";
+/// The id of a box key's name and seal. Its last byte is their format.
+pub(crate) const BOX_ID: &[u8] = b"BOX\x01";
+/// The id of the key a workspace's boxes chain their audit log with. Its last byte is its version.
+pub(crate) const AUDIT_ID: &[u8] = b"AUDIT\x01";
 
 // Under any id: a scalar from 32 bytes.
 const DKP_PRK: &[u8] = b"dkp_prk";
@@ -55,6 +59,12 @@ pub(crate) const PIN_STATE: &[u8] = b"state";
 
 // Under `ITEM_ID`: a secret's name, from the workspace's names key and the secret's text (`item`).
 pub(crate) const ITEM_NAME: &[u8] = b"name";
+
+// Under `BOX_ID`: a box key's name, from the workspace's names key and the box's name (`boxkey`).
+pub(crate) const BOX_NAME: &[u8] = b"name";
+
+// Under `AUDIT_ID`: the audit log's key, from the workspace's logs key and its id (`verbs::Reader`).
+pub(crate) const AUDIT_KEY: &[u8] = b"mcp";
 
 /// HKDF-Extract. The parts of `ikm` are fed in order, as if joined. An empty salt is 48 zero bytes
 /// (RFC 5869 section 2.2).
@@ -185,6 +195,9 @@ mod tests {
         // A secret's name and seal: its id ends in their format, 0x01.
         assert_eq!((ITEM_ID, ITEM_NAME), (b"ITEM\x01".as_slice(), b"name".as_slice()));
         assert_eq!(ITEM_ID.last(), Some(&0x01));
+        // A box key's name and seal, and the audit log's key: their ids end in 0x01.
+        assert_eq!((BOX_ID, BOX_NAME, AUDIT_ID, AUDIT_KEY), (b"BOX\x01".as_slice(), b"name".as_slice(), b"AUDIT\x01".as_slice(), b"mcp".as_slice()));
+        assert_eq!((BOX_ID.last(), AUDIT_ID.last()), (Some(&0x01), Some(&0x01)));
 
         // The one suite's tag, which the ids of the key pair and of sealing end in.
         let tag = Suite::MlKem1024P256V1.tag();
@@ -195,15 +208,17 @@ mod tests {
         }
 
         // No id and label, joined, starts another: no two derivations or hashes can be fed the same bytes.
-        let used: [(&[u8], &[&[u8]]); 5] = [
+        let used: [(&[u8], &[&[u8]]); 7] = [
             (KEM_ID, &[DKP_PRK, CANDIDATE, EAE_PRK, SHARED_SECRET]),
             (SEAL_ID, &[PSK_ID_HASH, INFO_HASH, SECRET, KEY, BASE_NONCE]),
             (KEYS_ID, &[DKP_PRK, CANDIDATE, INNER, SECRETS, LOGS, SESSIONS, STORE, ITEM_NAMES, MANIFEST]),
             (PIN_ID, &[PIN_KEY_REF, PIN_PUBLIC_KEY, PIN_STATE]),
             (ITEM_ID, &[ITEM_NAME]),
+            (BOX_ID, &[BOX_NAME]),
+            (AUDIT_ID, &[AUDIT_KEY]),
         ];
         let joined: Vec<Vec<u8>> = used.iter().flat_map(|(id, labels)| labels.iter().map(move |label| [*id, *label].concat())).collect();
-        assert_eq!(joined.len(), 22);
+        assert_eq!(joined.len(), 24);
         for (i, one) in joined.iter().enumerate() {
             for (j, other) in joined.iter().enumerate() {
                 assert!(i == j || !other.starts_with(one), "{one:?} starts {other:?}");

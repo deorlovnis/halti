@@ -54,6 +54,10 @@ pub enum Refusal {
     /// A policy was shown against a copy of what was approved, or as new, and the workspace says
     /// otherwise, so nothing was approved. `name` is a checked resource.
     NotTheBase { name: String },
+    /// The workspace already has a box of that name. `name` is a checked box name.
+    BoxExists { ws: WsName, name: String },
+    /// The text isn't a box's name. It is never echoed.
+    BadBox,
 }
 
 impl fmt::Display for Refusal {
@@ -80,6 +84,8 @@ impl fmt::Display for Refusal {
             Refusal::NoSecret { ws, what } => write!(f, "there is no {what} in {ws}"),
             Refusal::BadPolicy => write!(f, "that policy can't be approved: a policy is 1 to {} bytes, for a resource of a-z, 0-9 and -", Approval::MAX_TEXT),
             Refusal::NotTheBase { name } => write!(f, "the approved copy of {name} isn't what was approved, so nothing was approved"),
+            Refusal::BoxExists { ws, name } => write!(f, "box {ws}/{name} exists already"),
+            Refusal::BadBox => write!(f, "that isn't a box: 1 to 32 of a-z, 0-9 and -"),
         }
     }
 }

@@ -1,18 +1,31 @@
 //! The workspace verbs: make, open, delete and list. Each admits first, reads the workspace's
 //! directory record, and reaches its key only through the sequences, so nothing is made without
 //! its record and manifest or opened without their checks.
+//!
+//! Opening hands out a `Reader`: the keys an open workspace holds and the manifest as last read,
+//! which it reads again when the pin moves. It holds the key the manifest is sealed under, to open
+//! it, and never the inner key, so it can't seal anything.
+
+use std::fmt;
 
 use anyhow::{Result, bail};
+use zeroize::Zeroizing;
 
+use super::items::{names_hold, with_list};
 use super::sequence::{Draws, Host, Opened, Unlocked, create_key, opened, unlock};
-use crate::anchor::Anchor;
+use crate::anchor::{Anchor, Pin, state_hash};
+use crate::boxkey::{BoxKey, open_box_key};
+use crate::crypto::kdf::{AUDIT_ID, AUDIT_KEY, labeled_extract};
 use crate::directory::DirRecord;
 use crate::holder::{Change, KeyKind};
 use crate::ids::{WsId, WsName};
+use crate::item::{ItemKey, Secret, open_value};
+use crate::key::{DoorKeys, NamesKey, StoreKey};
 use crate::manifest::{LogHead, Manifest, Recorded};
 use crate::platform::{Build, Label, Lacks, Os, Role, admit};
+use crate::policy::{Approval, Kind};
 use crate::refusal::Refusal;
-use crate::store::{FileKey, Files, Keystore, KeystoreBackend};
+use crate::store::{FileKey, Files, Keystore, KeystoreBackend, KeystoreKind};
 
 /// Every workspace is marked trial while its formats may still change.
 const TRIAL: bool = true;
@@ -52,12 +65,133 @@ pub struct Fresh {
     pub manifest: [u8; 12],
 }
 
-/// What opening hands out: the working keys, split, and what the workspace was made with.
-#[derive(Debug)]
-pub struct Workspace {
-    pub id: WsId,
-    pub keys: Opened,
-    pub manifest: Manifest,
+/// An open workspace: its keys for the door and the store, and the manifest as last read. It holds
+/// the manifest key to read the manifest again, never the inner key, and has no method that seals.
+/// It can't be cloned, and printing it shows nothing of it.
+pub struct Reader {
+    ws: WsId,
+    door: DoorKeys,
+    store: StoreKey,
+    names: NamesKey,
+    manifest_key: Zeroizing<[u8; 32]>,
+    manifest: Manifest,
+    /// The pin the manifest was read under.
+    pin: Pin,
+    /// What the open checked a manifest against, to check one read later the same way: the kinds
+    /// the record named, the build, and each adapter in use.
+    kinds: (KeyKind, KeystoreKind),
+    build: Build,
+    now: [(Role, Label); 4],
+}
+
+impl fmt::Debug for Reader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Reader(..)")
+    }
+}
+
+impl Reader {
+    pub fn id(&self) -> WsId {
+        self.ws
+    }
+
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    /// The pin version last read.
+    pub fn seen(&self) -> u64 {
+        self.pin.version
+    }
+
+    /// Reads the pin and, if it moved, the manifest it covers, with the same checks as the open:
+    /// the manifest opens for this workspace under `name`, agrees with the record, was made by
+    /// this kind of build, lacks nothing more now, and every item and box is named as its text
+    /// says. Writes nothing, and takes no lock: the manifest beside is read before the one in
+    /// place, so a change cut short between moving the pin and putting its manifest in place, or
+    /// one that finishes while it reads, is read as the pin covers it. True if anything changed.
+    ///
+    /// A pin lower than the one seen, or another pin at the same version, is `Refusal::Tampered`,
+    /// and so is a pin whose files don't match it once read twice over. Nothing it holds changes
+    /// unless every check passes.
+    pub fn reread(&mut self, files: &dyn Files, anchor: &dyn Anchor, name: &WsName) -> Result<bool> {
+        // A change made while the files are read moves the pin again: read once more, then give up.
+        for _ in 0..3 {
+            let Some(pin) = anchor.read(self.ws)? else { return Err(Refusal::Tampered.into()) };
+            if pin == self.pin {
+                return Ok(false);
+            }
+            if pin.version <= self.pin.version || pin.key_ref != self.pin.key_ref || pin.public_key != self.pin.public_key {
+                return Err(Refusal::Tampered.into());
+            }
+            let wrap = files.read(&FileKey::Wrap(self.ws))?.unwrap_or_default();
+            let policy = files.read(&FileKey::Policy(self.ws))?.unwrap_or_default();
+            let covered = |manifest: &Vec<u8>| state_hash(self.ws, name, &wrap, manifest, &policy) == pin.state;
+            // Beside it first: a change puts its manifest in place before it removes the one beside
+            // it, so with that one gone or not covered, the one in place is covered, unless the pin
+            // moved again.
+            let sealed = match files.read(&FileKey::NextManifest(self.ws))?.filter(covered) {
+                Some(sealed) => Some(sealed),
+                None => files.read(&FileKey::Manifest(self.ws))?.filter(covered),
+            };
+            let Some(sealed) = sealed else {
+                if anchor.read(self.ws)? == Some(pin) {
+                    return Err(Refusal::Tampered.into());
+                }
+                continue;
+            };
+            let manifest = Manifest::open_under(&self.manifest_key, self.ws, name, &sealed)?;
+            if (manifest.key, manifest.keystore) != self.kinds {
+                return Err(Refusal::Tampered.into());
+            }
+            if manifest.built_by != self.build {
+                return Err(Refusal::OtherBuild(manifest.built_by).into());
+            }
+            not_weaker(&manifest, &self.now)?;
+            if !names_hold(&manifest, self.names.as_bytes()) {
+                return Err(Refusal::Tampered.into());
+            }
+            self.manifest = manifest;
+            self.pin = pin;
+            return Ok(true);
+        }
+        Err(Refusal::Tampered.into())
+    }
+
+    /// The secrets the manifest lists.
+    pub fn items(&self) -> impl Iterator<Item = &ItemKey> {
+        self.manifest.items.iter().map(|entry| &entry.key)
+    }
+
+    /// A secret's value: none if the manifest doesn't list it. Listed, and missing, changed or of
+    /// another version than the one listed, it is `Refusal::Unreadable`.
+    pub fn value(&self, keystore: &dyn KeystoreBackend, key: &ItemKey) -> Result<Option<Secret>> {
+        let Some(entry) = self.manifest.items.iter().find(|entry| entry.key == *key) else { return Ok(None) };
+        let Some(blob) = Keystore::bind(self.ws, keystore).get(&entry.name)? else { return Err(Refusal::Unreadable.into()) };
+        Ok(Some(open_value(self.door.secrets(), self.ws, &entry.name, entry.version, &blob)?))
+    }
+
+    /// The approval of this kind and name, if the manifest holds one.
+    pub fn approval(&self, kind: Kind, name: &str) -> Option<&Approval> {
+        self.manifest.approvals.iter().find(|approval| approval.is(kind, name))
+    }
+
+    /// A box's store key: none if the manifest lists no key for that box. Listed, and missing,
+    /// changed or of another version, it is `Refusal::Unreadable`.
+    pub fn box_key(&self, keystore: &dyn KeystoreBackend, name: &str) -> Result<Option<BoxKey>> {
+        let Some(entry) = self.manifest.boxes.iter().find(|entry| entry.name == name) else { return Ok(None) };
+        let Some(blob) = Keystore::bind(self.ws, keystore).get(&entry.item)? else { return Err(Refusal::Unreadable.into()) };
+        Ok(Some(open_box_key(self.store.as_bytes(), self.ws, &entry.item, entry.version, &blob)?))
+    }
+
+    /// The key this workspace's boxes chain their audit log with: derived from the logs key under
+    /// its own id, over the workspace's id.
+    pub fn audit_key(&self) -> Zeroizing<[u8; 32]> {
+        let prk = labeled_extract(self.door.logs(), AUDIT_ID, AUDIT_KEY, &[self.ws.as_bytes().as_slice()]);
+        let mut key = Zeroizing::new([0; 32]);
+        key.copy_from_slice(&prk[..32]);
+        key
+    }
 }
 
 /// One workspace as the directory lists it, without opening it.
@@ -114,6 +248,7 @@ pub fn ws_new(machine: &Machine<'_>, name: &WsName, fresh: Fresh) -> Result<WsId
         keystore_ref: Vec::new(),
         items: Vec::new(),
         approvals: Vec::new(),
+        boxes: Vec::new(),
     };
     manifest.check()?;
     if !files.create_new(&FileKey::DirRecord(name.clone()), &record.to_bytes())? {
@@ -131,19 +266,19 @@ pub fn ws_new(machine: &Machine<'_>, name: &WsName, fresh: Fresh) -> Result<WsId
     Ok(ws)
 }
 
-/// Opens a workspace: the checks that need no answer, one decapsulation, then the manifest.
-/// Nothing is handed out unless every check passes.
+/// Opens a workspace: the checks that need no answer, one decapsulation (`Change::Open`), then
+/// the manifest. Nothing is handed out unless every check passes.
 ///
 /// The record's kinds are checked before the key holder is asked; what the manifest says, after,
 /// since only the inner key opens it: that it agrees with the record, that a build of this kind
-/// made it, and that nothing is lacking now that was not lacking then.
-pub fn ws_open(machine: &Machine<'_>, name: &WsName) -> Result<Workspace> {
-    machine.admit()?;
-    let record = read_record(machine.host.files, name)?;
-    kinds_match(machine, &record)?;
-    unlock(&machine.host, record.id, name, machine.build, Change::Open, |unlocked| {
-        let manifest = opened_manifest(machine, &record, name, unlocked)?;
-        Ok(Workspace { id: record.id, keys: opened(unlocked.inner), manifest })
+/// made it, that nothing is lacking now that was not lacking then, and that every item and box is
+/// named as its text says.
+pub fn ws_open(machine: &Machine<'_>, name: &WsName) -> Result<Reader> {
+    with_list(machine, name, Change::Open, |ws, unlocked, manifest, _| {
+        let Opened { door, store, names } = opened(unlocked.inner);
+        let kinds = (manifest.key, manifest.keystore);
+        let manifest_key = unlocked.inner.manifest_key();
+        Ok(Reader { ws, door, store, names, manifest_key, manifest, pin: unlocked.pin(), kinds, build: machine.build, now: machine.adapters() })
     })
 }
 
@@ -264,15 +399,18 @@ mod tests {
 
     use super::*;
     use crate::anchor::{Pin, key_ref_hash, public_key_hash, state_hash};
+    use crate::boxkey::box_name;
     use crate::crypto::vectors::{
-        KAT_DEV_MANIFEST, KAT_DEV_PIN_STATE, KAT_HARDWARE_WRAP, KAT_KEY_ITEM_NAMES, KAT_KEY_STORE, KAT_PASSPHRASE_RECORD, PASSPHRASE, hardware_rand, hardware_seed, hex,
-        inner_bytes, manifest_nonce, passphrase_nonce, passphrase_salt, recovery_rand, recovery_seed, ws_bytes,
+        KAT_AUDIT_KEY, KAT_DEV_MANIFEST, KAT_DEV_PIN_STATE, KAT_HARDWARE_WRAP, KAT_KEY_ITEM_NAMES, KAT_KEY_LOGS, KAT_KEY_STORE, KAT_PASSPHRASE_RECORD, PASSPHRASE, POLICY_TEXT,
+        box_key_bytes, hardware_rand, hardware_seed, hex, inner_bytes, manifest_nonce, passphrase_nonce, passphrase_salt, recovery_rand, recovery_seed, ws_bytes,
     };
     use crate::fakes::{FixedPassphrase, MemAnchor, MemFiles, MemKeystore, SoftKey};
     use crate::holder::{KeyHolder, KeyRef};
     use crate::key::InnerKey;
     use crate::platform::{Adapter, Grade, Property};
+    use crate::policy::{Base, Proposal};
     use crate::store::{ItemName, KeystoreKind};
+    use crate::verbs::{BoxNonces, Nonces, Which, ws_approve, ws_box_new, ws_items, ws_remove, ws_set};
 
     // Only `a_new_workspace_with_a_passphrase_takes_one_ask_to_make_and_one_to_open` derives a key at 64 MiB, once to make and
     // once to open. Every other test here holds its key in software and derives nothing.
@@ -328,6 +466,7 @@ mod tests {
             keystore_ref: Vec::new(),
             items: Vec::new(),
             approvals: Vec::new(),
+            boxes: Vec::new(),
         }
     }
 
@@ -375,7 +514,7 @@ mod tests {
             ws_new(&self.machine(holder, Build::Dev), &ws_name(text), fresh)
         }
 
-        fn open(&self, holder: &dyn KeyHolder, text: &str) -> Result<Workspace> {
+        fn open(&self, holder: &dyn KeyHolder, text: &str) -> Result<Reader> {
             ws_open(&self.machine(holder, Build::Dev), &ws_name(text))
         }
 
@@ -442,10 +581,10 @@ mod tests {
         let workspace = world.open(&world.acme, "acme").unwrap();
         assert_eq!((world.acme.creates(), world.acme.decapsulations()), (1, 1));
         assert_eq!(world.acme.asked()[1], (acme(), ws_name("acme"), Change::Open, "[DEV, not protected] open workspace acme".to_string()));
-        assert_eq!(workspace.id, acme());
+        assert_eq!(workspace.id(), acme());
         assert_eq!(workspace.manifest, dev_manifest(KeyKind::Soft, "soft-key"));
-        assert_eq!(workspace.keys.store.as_bytes().as_slice(), hex(KAT_KEY_STORE));
-        assert_eq!(workspace.keys.names.as_bytes().as_slice(), hex(KAT_KEY_ITEM_NAMES));
+        assert_eq!(workspace.store.as_bytes().as_slice(), hex(KAT_KEY_STORE));
+        assert_eq!(workspace.names.as_bytes().as_slice(), hex(KAT_KEY_ITEM_NAMES));
     }
 
     #[test]
@@ -461,7 +600,7 @@ mod tests {
         let workspace = world.open(&holder, "acme").unwrap();
         assert_eq!(holder.asks(), 2);
         assert_eq!(workspace.manifest, dev_manifest(KeyKind::Passphrase, "fixed-passphrase"));
-        assert_eq!(workspace.keys.store.as_bytes().as_slice(), hex(KAT_KEY_STORE));
+        assert_eq!(workspace.store.as_bytes().as_slice(), hex(KAT_KEY_STORE));
     }
 
     #[test]
@@ -823,5 +962,373 @@ mod tests {
         assert_eq!(read, ["acme", "globex", "initech"].map(|text| FileKey::DirRecord(ws_name(text))));
         assert_eq!((world.acme.asked().len(), world.globex.asked().len()), (1, 1));
         assert_eq!((world.acme.decapsulations(), world.globex.decapsulations()), (0, 0));
+    }
+
+    /// Every file of acme and globex, their pins, and the names of every blob.
+    type AllKept = (Vec<Option<Vec<u8>>>, Vec<Option<Pin>>, Vec<Vec<ItemName>>);
+
+    /// What a box's policy says, for the tests that make one.
+    const BOX_TEXT: &[u8] = b"run = [\"claude\"]\nkeep = true\n";
+
+    fn key(resource: &str, field: &str) -> ItemKey {
+        ItemKey::parse(resource, field).unwrap()
+    }
+
+    /// The text of a value a reader gives, or what it failed with.
+    fn read(reader: &Reader, world: &World, item: &ItemKey) -> Result<Option<String>, Refusal> {
+        match reader.value(&world.keystore, item) {
+            Ok(value) => Ok(value.map(|secret| String::from_utf8(secret.as_bytes().to_vec()).unwrap())),
+            Err(error) => Err(error.downcast::<Refusal>().expect("a refusal")),
+        }
+    }
+
+    impl World {
+        /// Each change a reader may see, made in a debug build with its own ask. `n` makes the nonces fresh.
+        fn set(&self, holder: &dyn KeyHolder, text: &str, item: &ItemKey, value: &str, n: u8) {
+            let value = || Ok(Secret::new(Zeroizing::new(value.as_bytes().to_vec()))?);
+            ws_set(&self.machine(holder, Build::Dev), &ws_name(text), item, value, Nonces { value: [n; 12], manifest: [0x80 | n; 12] }).unwrap();
+        }
+
+        fn approve(&self, holder: &dyn KeyHolder, text: &str, resource: &str, policy: &[u8], n: u8) {
+            let proposal = Proposal { kind: Kind::Resource, name: resource, text: policy, base: Base::Shown };
+            ws_approve(&self.machine(holder, Build::Dev), &ws_name(text), &[proposal], [0x80 | n; 12]).unwrap();
+        }
+
+        fn make_box(&self, holder: &dyn KeyHolder, text: &str, name: &str, key: [u8; 32], n: u8) {
+            let proposal = Proposal { kind: Kind::Box, name, text: BOX_TEXT, base: Base::New };
+            let key = BoxKey::from_bytes(Zeroizing::new(key));
+            ws_box_new(&self.machine(holder, Build::Dev), &ws_name(text), Some(&key), &proposal, || Ok(()), BoxNonces { key: [n; 12], manifest: [0x80 | n; 12] }).unwrap();
+        }
+
+        /// What a reader may never change: every file of acme and globex, their pins, and every blob.
+        fn everything_kept(&self) -> AllKept {
+            let mut files = Vec::new();
+            for ws in [acme(), GLOBEX] {
+                for key in [FileKey::KeyRef(ws), FileKey::Wrap(ws), FileKey::Manifest(ws), FileKey::NextManifest(ws), FileKey::Policy(ws), FileKey::Log(ws)] {
+                    files.push(self.file(&key));
+                }
+            }
+            let pins = [acme(), GLOBEX].map(|ws| self.anchor.read(ws).unwrap()).to_vec();
+            let blobs = [acme(), GLOBEX].map(|ws| self.keystore.list(ws).unwrap()).to_vec();
+            (files, pins, blobs)
+        }
+    }
+
+    #[test]
+    fn opening_gives_values_approvals_and_box_keys() {
+        let world = World::new().made();
+        world.set(&world.acme, "acme", &key("github", "token"), "acme github token", 1);
+        world.approve(&world.acme, "acme", "github", POLICY_TEXT.as_bytes(), 2);
+        world.make_box(&world.acme, "acme", "dev", box_key_bytes(), 3);
+        let asked = world.acme.asked().len();
+        let reader = world.open(&world.acme, "acme").unwrap();
+        assert_eq!(world.acme.asked().len(), asked + 1, "one ask");
+        assert_eq!(world.acme.asked().last().unwrap().2, Change::Open);
+        assert_eq!((reader.id(), reader.seen()), (acme(), 4));
+        assert_eq!(reader.items().collect::<Vec<_>>(), [&key("github", "token")]);
+        assert_eq!(read(&reader, &world, &key("github", "token")), Ok(Some("acme github token".to_string())));
+        assert_eq!(read(&reader, &world, &key("github", "user")), Ok(None), "not listed");
+        assert!(reader.approval(Kind::Resource, "github").unwrap().approves(POLICY_TEXT.as_bytes()));
+        assert!(reader.approval(Kind::Box, "dev").unwrap().approves(BOX_TEXT));
+        assert!(reader.approval(Kind::Box, "github").is_none() && reader.approval(Kind::Resource, "dev").is_none());
+        assert_eq!(reader.box_key(&world.keystore, "dev").unwrap().unwrap().hex().as_str(), "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f");
+        assert!(reader.box_key(&world.keystore, "test").unwrap().is_none());
+        // Listed, and its blob gone or changed: unreadable, not missing.
+        let token = reader.manifest().items[0].name;
+        let blob = world.keystore.get(acme(), &token).unwrap().unwrap();
+        world.keystore.delete(acme(), &token).unwrap();
+        assert_eq!(read(&reader, &world, &key("github", "token")), Err(Refusal::Unreadable));
+        let mut changed = blob.clone();
+        changed[20] ^= 0x01;
+        world.keystore.put(acme(), &token, &changed).unwrap();
+        assert_eq!(read(&reader, &world, &key("github", "token")), Err(Refusal::Unreadable));
+        world.keystore.put(acme(), &token, &blob).unwrap();
+        let dev = box_name(inner().open_keys().item_names(), "dev");
+        world.keystore.delete(acme(), &dev).unwrap();
+        assert_eq!(refused(reader.box_key(&world.keystore, "dev")), Refusal::Unreadable);
+        // It prints nothing of itself, and can be shared between threads.
+        assert_eq!((format!("{reader:?}"), format!("{reader:#?}")), ("Reader(..)".to_string(), "Reader(..)".to_string()));
+        fn shared<T: Send + Sync>() {}
+        shared::<Reader>();
+    }
+
+    #[test]
+    fn the_audit_key_is_unchanged() {
+        let world = World::new().made();
+        let reader = world.open(&world.acme, "acme").unwrap();
+        assert_eq!(reader.audit_key().as_slice(), hex(KAT_AUDIT_KEY));
+        assert_ne!(reader.audit_key().as_slice(), hex(KAT_KEY_LOGS), "not the logs key itself");
+        // Another workspace's is another.
+        world.make(&world.globex, "globex", globex_fresh()).unwrap();
+        assert_ne!(world.open(&world.globex, "globex").unwrap().audit_key(), reader.audit_key());
+    }
+
+    #[test]
+    fn a_reread_sees_a_value_stored_since() {
+        let world = World::new().made();
+        world.set(&world.acme, "acme", &key("github", "token"), "one", 1);
+        let mut reader = world.open(&world.acme, "acme").unwrap();
+        assert!(!reader.reread(&world.files, &world.anchor, &ws_name("acme")).unwrap(), "nothing moved");
+        world.set(&world.acme, "acme", &key("github", "token"), "two", 2);
+        world.set(&world.acme, "acme", &key("linear", "token"), "three", 3);
+        // Until it reads again, the value stored over the one it listed is of another version, and the new one isn't listed.
+        assert_eq!(read(&reader, &world, &key("github", "token")), Err(Refusal::Unreadable));
+        assert_eq!(read(&reader, &world, &key("linear", "token")), Ok(None));
+        let asked = world.acme.asked().len();
+        assert!(reader.reread(&world.files, &world.anchor, &ws_name("acme")).unwrap());
+        assert_eq!(world.acme.asked().len(), asked, "reading again asks nothing");
+        assert_eq!(reader.seen(), 4);
+        assert_eq!(read(&reader, &world, &key("github", "token")), Ok(Some("two".to_string())));
+        assert_eq!(read(&reader, &world, &key("linear", "token")), Ok(Some("three".to_string())));
+        // A removal is seen the same way.
+        ws_remove(&world.machine(&world.acme, Build::Dev), &ws_name("acme"), &Which::Field(key("linear", "token")), [0x99; 12]).unwrap();
+        assert!(reader.reread(&world.files, &world.anchor, &ws_name("acme")).unwrap());
+        assert_eq!(read(&reader, &world, &key("linear", "token")), Ok(None));
+        assert!(!reader.reread(&world.files, &world.anchor, &ws_name("acme")).unwrap());
+    }
+
+    #[test]
+    fn a_reread_sees_an_approval_given_since() {
+        let world = World::new().made();
+        let mut reader = world.open(&world.acme, "acme").unwrap();
+        world.approve(&world.acme, "acme", "github", POLICY_TEXT.as_bytes(), 1);
+        world.make_box(&world.acme, "acme", "dev", [0x41; 32], 2);
+        assert!(reader.approval(Kind::Resource, "github").is_none() && reader.box_key(&world.keystore, "dev").unwrap().is_none());
+        assert!(reader.reread(&world.files, &world.anchor, &ws_name("acme")).unwrap());
+        assert!(reader.approval(Kind::Resource, "github").unwrap().approves(POLICY_TEXT.as_bytes()));
+        assert!(reader.approval(Kind::Box, "dev").unwrap().approves(BOX_TEXT));
+        assert_eq!(reader.box_key(&world.keystore, "dev").unwrap().unwrap().hex().as_str(), "41".repeat(32));
+    }
+
+    #[test]
+    fn a_reread_refuses_a_lower_pin() {
+        let world = World::new().made();
+        world.set(&world.acme, "acme", &key("github", "token"), "one", 1);
+        let (old_pin, old_manifest) = (world.anchor.read(acme()).unwrap().unwrap(), world.file(&FileKey::Manifest(acme())).unwrap());
+        world.set(&world.acme, "acme", &key("github", "token"), "two", 2);
+        let mut reader = world.open(&world.acme, "acme").unwrap();
+        let (new_pin, new_manifest) = (world.anchor.read(acme()).unwrap().unwrap(), world.file(&FileKey::Manifest(acme())).unwrap());
+        let reread = |reader: &mut Reader| refused(reader.reread(&world.files, &world.anchor, &ws_name("acme")));
+        // The manifest and pin of before put back, as a program can where the pin is a file.
+        world.anchor.forget(acme()).unwrap();
+        world.anchor.advance(acme(), &old_pin).unwrap();
+        world.files.write_atomic(&FileKey::Manifest(acme()), &old_manifest).unwrap();
+        assert_eq!(reread(&mut reader), Refusal::Tampered);
+        // Another pin at the version it saw, and no pin at all.
+        world.anchor.forget(acme()).unwrap();
+        world.anchor.advance(acme(), &Pin { state: old_pin.state, ..new_pin }).unwrap();
+        assert_eq!(reread(&mut reader), Refusal::Tampered);
+        world.anchor.forget(acme()).unwrap();
+        assert_eq!(reread(&mut reader), Refusal::Tampered);
+        // A higher pin over files it doesn't cover.
+        world.anchor.advance(acme(), &Pin { version: 9, state: [0; 48], ..old_pin }).unwrap();
+        assert_eq!(reread(&mut reader), Refusal::Tampered);
+        // Through all of it, the reader kept what it had read.
+        assert_eq!(reader.seen(), new_pin.version);
+        assert_eq!(read(&reader, &world, &key("github", "token")), Ok(Some("two".to_string())));
+        // Put back as it was, nothing moved.
+        world.anchor.forget(acme()).unwrap();
+        world.anchor.advance(acme(), &new_pin).unwrap();
+        world.files.write_atomic(&FileKey::Manifest(acme()), &new_manifest).unwrap();
+        assert!(!reader.reread(&world.files, &world.anchor, &ws_name("acme")).unwrap());
+        // Not prevented while the pin is a file: the manifest of before, under a pin rehashed over it at a higher version, is
+        // read as it was then.
+        world.files.write_atomic(&FileKey::Manifest(acme()), &old_manifest).unwrap();
+        world.anchor.advance(acme(), &Pin { version: 9, ..old_pin }).unwrap();
+        assert!(reader.reread(&world.files, &world.anchor, &ws_name("acme")).unwrap());
+        assert_eq!(reader.seen(), 9);
+    }
+
+    #[test]
+    fn a_reread_writes_nothing() {
+        let world = World::new().made();
+        let mut reader = world.open(&world.acme, "acme").unwrap();
+        world.set(&world.acme, "acme", &key("github", "token"), "one", 1);
+        let first = world.file(&FileKey::Manifest(acme())).unwrap();
+        world.set(&world.acme, "acme", &key("github", "token"), "two", 2);
+        // A change cut short after its pin moved: the new manifest beside the old, which is still in place.
+        let second = world.file(&FileKey::Manifest(acme())).unwrap();
+        world.files.write_atomic(&FileKey::NextManifest(acme()), &second).unwrap();
+        world.files.write_atomic(&FileKey::Manifest(acme()), &first).unwrap();
+        let kept = world.everything_kept();
+        // Read while another halti holds the lock: it takes none, and reads the manifest the pin covers.
+        let held = world.files.lock(acme()).unwrap();
+        let (calls, reads, keystore) = (world.files.calls(), world.files.reads().len(), world.keystore.calls().len());
+        assert!(reader.reread(&world.files, &world.anchor, &ws_name("acme")).unwrap());
+        drop(held);
+        assert_eq!(world.files.calls() - calls, world.files.reads().len() - reads, "every call to the files was a read");
+        assert_eq!(world.keystore.calls().len(), keystore, "nor was the keystore touched");
+        assert_eq!(read(&reader, &world, &key("github", "token")), Ok(Some("two".to_string())));
+        assert!(world.everything_kept() == kept, "no file, pin or blob was written");
+        // The next unlock finishes the change, as ever.
+        assert_eq!(ws_items(&world.machine(&world.acme, Build::Dev), &ws_name("acme")).unwrap().len(), 1);
+        assert_eq!((world.file(&FileKey::Manifest(acme())), world.file(&FileKey::NextManifest(acme()))), (Some(second), None));
+    }
+
+    /// Files in memory where a change finishes as soon as either manifest file is first read: `next` is put in place of the
+    /// manifest and the one beside it removed, as the last two steps of a replacement do.
+    struct Finishing<'a> {
+        files: &'a MemFiles,
+        next: std::cell::RefCell<Option<Vec<u8>>>,
+    }
+
+    impl Adapter for Finishing<'_> {
+        fn label(&self) -> Label {
+            self.files.label()
+        }
+    }
+
+    impl Files for Finishing<'_> {
+        fn read(&self, k: &FileKey) -> Result<Option<Vec<u8>>> {
+            let read = self.files.read(k)?;
+            if matches!(k, FileKey::Manifest(_) | FileKey::NextManifest(_))
+                && let Some(next) = self.next.take()
+            {
+                self.files.write_atomic(&FileKey::Manifest(acme()), &next)?;
+                self.files.remove(&FileKey::NextManifest(acme()))?;
+            }
+            Ok(read)
+        }
+
+        fn write_atomic(&self, k: &FileKey, bytes: &[u8]) -> Result<()> {
+            self.files.write_atomic(k, bytes)
+        }
+
+        fn create_new(&self, k: &FileKey, bytes: &[u8]) -> Result<bool> {
+            self.files.create_new(k, bytes)
+        }
+
+        fn append(&self, k: &FileKey, line: &[u8]) -> Result<()> {
+            self.files.append(k, line)
+        }
+
+        fn remove(&self, k: &FileKey) -> Result<()> {
+            self.files.remove(k)
+        }
+
+        fn names(&self) -> Result<Vec<WsName>> {
+            self.files.names()
+        }
+
+        fn lock(&self, ws: WsId) -> Result<Box<dyn crate::store::Held>> {
+            self.files.lock(ws)
+        }
+    }
+
+    #[test]
+    fn a_reread_while_a_change_finishes_sees_it() {
+        let world = World::new().made();
+        let mut reader = world.open(&world.acme, "acme").unwrap();
+        world.set(&world.acme, "acme", &key("github", "token"), "one", 1);
+        let first = world.file(&FileKey::Manifest(acme())).unwrap();
+        world.set(&world.acme, "acme", &key("github", "token"), "two", 2);
+        // The pin moved and the new manifest beside the old, which is still in place; the change finishes between the
+        // reader's two reads of the manifest files.
+        let second = world.file(&FileKey::Manifest(acme())).unwrap();
+        world.files.write_atomic(&FileKey::NextManifest(acme()), &second).unwrap();
+        world.files.write_atomic(&FileKey::Manifest(acme()), &first).unwrap();
+        let finishing = Finishing { files: &world.files, next: std::cell::RefCell::new(Some(second.clone())) };
+        assert!(reader.reread(&finishing, &world.anchor, &ws_name("acme")).unwrap());
+        assert!(finishing.next.borrow().is_none(), "it finished while read");
+        assert_eq!((world.file(&FileKey::Manifest(acme())), world.file(&FileKey::NextManifest(acme()))), (Some(second), None));
+        assert_eq!(reader.seen(), 3);
+        assert_eq!(read(&reader, &world, &key("github", "token")), Ok(Some("two".to_string())));
+    }
+
+    #[test]
+    fn a_reread_makes_the_checks_of_the_open() {
+        let world = World::new().made();
+        let mut reader = world.open(&world.acme, "acme").unwrap();
+        let (seen, first) = (reader.seen(), reader.manifest().clone());
+        // Each sealed under the inner key and pinned at a higher version, as a program holding that key could.
+        let lacking_nothing = first.adapters.iter().map(|recorded| Recorded { lacks: Lacks::NONE, ..recorded.clone() }).collect();
+        let cases = [
+            (Manifest { keystore: KeystoreKind::Files, ..first.clone() }, Refusal::Tampered),
+            (Manifest { key: KeyKind::Passphrase, ..first.clone() }, Refusal::Tampered),
+            (Manifest { built_by: Build::Release, ..first.clone() }, Refusal::OtherBuild(Build::Release)),
+            (Manifest { adapters: lacking_nothing, ..first.clone() }, Refusal::Downgraded(Lacks::of(&Property::ALL))),
+        ];
+        for (manifest, refusal) in cases {
+            world.plant(&manifest, acme(), "acme");
+            assert_eq!(refused(reader.reread(&world.files, &world.anchor, &ws_name("acme"))), refusal, "{manifest:?}");
+            assert_eq!((reader.seen(), reader.manifest()), (seen, &first), "it kept what it had read");
+        }
+        // The same manifest planted again is read.
+        world.plant(&first, acme(), "acme");
+        assert!(reader.reread(&world.files, &world.anchor, &ws_name("acme")).unwrap());
+    }
+
+    #[test]
+    fn a_list_whose_box_names_disagree_is_tampered() {
+        let world = World::new().made();
+        world.make_box(&world.acme, "acme", "dev", [0x41; 32], 1);
+        let mut reader = world.open(&world.acme, "acme").unwrap();
+        // dev listed under box test's name, sealed and pinned as a program holding the inner key could.
+        let mut manifest = reader.manifest().clone();
+        manifest.boxes[0].item = box_name(inner().open_keys().item_names(), "test");
+        world.plant(&manifest, acme(), "acme");
+        let kept = world.everything_kept();
+        let machine = world.machine(&world.acme, Build::Dev);
+        assert_eq!(refused(ws_open(&machine, &ws_name("acme"))), Refusal::Tampered);
+        assert_eq!(refused(ws_items(&machine, &ws_name("acme"))), Refusal::Tampered);
+        let proposal = Proposal { kind: Kind::Box, name: "test", text: BOX_TEXT, base: Base::New };
+        let made = std::cell::Cell::new(false);
+        assert_eq!(
+            refused(ws_box_new(
+                &machine,
+                &ws_name("acme"),
+                None,
+                &proposal,
+                || {
+                    made.set(true);
+                    Ok(())
+                },
+                BoxNonces { key: [9; 12], manifest: [10; 12] }
+            )),
+            Refusal::Tampered
+        );
+        assert!(!made.get(), "the store is not made");
+        assert_eq!(refused(reader.reread(&world.files, &world.anchor, &ws_name("acme"))), Refusal::Tampered);
+        assert!(world.everything_kept() == kept);
+        // A secret's name used as a box's is no box's either.
+        manifest.boxes[0].item = crate::item::item_name(inner().open_keys().item_names(), &key("dev", "name"));
+        world.plant(&manifest, acme(), "acme");
+        assert_eq!(refused(ws_open(&machine, &ws_name("acme"))), Refusal::Tampered);
+    }
+
+    #[test]
+    fn a_reader_of_one_workspace_reads_nothing_of_another() {
+        let world = World::new().made();
+        world.make(&world.globex, "globex", globex_fresh()).unwrap();
+        for (text, holder) in [("acme", &world.acme), ("globex", &world.globex)] {
+            world.set(holder, text, &key("github", "token"), &format!("{text} github token"), 1);
+            world.make_box(holder, text, "dev", if text == "acme" { [0x41; 32] } else { [0x42; 32] }, 2);
+        }
+        let mut reader = world.open(&world.acme, "acme").unwrap();
+        assert_eq!(read(&reader, &world, &key("github", "token")), Ok(Some("acme github token".to_string())));
+        assert_eq!(reader.box_key(&world.keystore, "dev").unwrap().unwrap().hex().as_str(), "41".repeat(32));
+        // globex's blobs copied over acme's: neither opens.
+        let theirs = world.open(&world.globex, "globex").unwrap();
+        let (their_token, their_box) = (theirs.manifest().items[0].name, theirs.manifest().boxes[0].item);
+        let (our_token, our_box) = (reader.manifest().items[0].name, reader.manifest().boxes[0].item);
+        assert!(their_token != our_token && their_box != our_box, "named apart");
+        world.keystore.put(acme(), &our_token, &world.keystore.get(GLOBEX, &their_token).unwrap().unwrap()).unwrap();
+        world.keystore.put(acme(), &our_box, &world.keystore.get(GLOBEX, &their_box).unwrap().unwrap()).unwrap();
+        assert_eq!(read(&reader, &world, &key("github", "token")), Err(Refusal::Unreadable));
+        assert_eq!(refused(reader.box_key(&world.keystore, "dev")), Refusal::Unreadable);
+        // Its reads name only acme's keystore.
+        let calls = world.keystore.calls().len();
+        let _ = reader.value(&world.keystore, &key("github", "token"));
+        let _ = reader.box_key(&world.keystore, "dev");
+        assert!(world.keystore.calls()[calls..].iter().all(|ws| *ws == acme()));
+        // globex's manifest and pin put in acme's place, or acme's read under globex's name: nothing is read.
+        world.set(&world.acme, "acme", &key("linear", "token"), "acme linear token", 3);
+        assert_eq!(refused(reader.reread(&world.files, &world.anchor, &ws_name("globex"))), Refusal::Tampered);
+        let globex_manifest = world.file(&FileKey::Manifest(GLOBEX)).unwrap();
+        world.files.write_atomic(&FileKey::Manifest(acme()), &globex_manifest).unwrap();
+        world.repin(acme(), "acme", &world.acme);
+        assert_eq!(refused(reader.reread(&world.files, &world.anchor, &ws_name("acme"))), Refusal::Tampered);
+        assert_eq!(reader.box_key(&world.keystore, "test").unwrap().map(|_| ()), None);
+        assert_eq!(reader.manifest().items.len(), 1, "it kept acme's list as it was read");
     }
 }

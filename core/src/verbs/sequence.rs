@@ -96,6 +96,11 @@ pub(crate) struct Unlocked<'u> {
 }
 
 impl Unlocked<'_> {
+    /// The pin the files were checked against.
+    pub(crate) fn pin(&self) -> Pin {
+        self.pin
+    }
+
     /// The version the pin will have once this change is made: what a value stored in it is sealed
     /// for.
     pub(crate) fn next(&self) -> Result<u64> {

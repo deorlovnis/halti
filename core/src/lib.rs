@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod anchor;
+pub mod boxkey;
 pub mod contract;
 pub mod crypto;
 pub mod directory;

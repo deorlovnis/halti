@@ -17,6 +17,7 @@ use anyhow::Result;
 
 use super::sequence::{Unlocked, unlock};
 use super::ws::{Machine, kinds_match, opened_manifest, read_record};
+use crate::boxkey::box_name;
 use crate::holder::Change;
 use crate::ids::{WsId, WsName};
 use crate::item::{ItemKey, Secret, item_name, open_value, seal_value};
@@ -167,8 +168,8 @@ pub fn ws_remove(machine: &Machine<'_>, name: &WsName, which: &Which, manifest_n
 }
 
 /// Opens the workspace for `change` as `ws_open` does, checks every listed name against its
-/// secret, and hands `then` the workspace's id, the unlock, the manifest and the working keys,
-/// which are wiped when it returns.
+/// secret or box, and hands `then` the workspace's id, the unlock, the manifest and the working
+/// keys, which are wiped when it returns.
 pub(super) fn with_list<T>(machine: &Machine<'_>, name: &WsName, change: Change, then: impl FnOnce(WsId, &Unlocked<'_>, Manifest, &OpenKeys) -> Result<T>) -> Result<T> {
     machine.admit()?;
     let record = read_record(machine.host.files, name)?;
@@ -176,11 +177,17 @@ pub(super) fn with_list<T>(machine: &Machine<'_>, name: &WsName, change: Change,
     unlock(&machine.host, record.id, name, machine.build, change, |unlocked| {
         let manifest = opened_manifest(machine, &record, name, unlocked)?;
         let keys = unlocked.inner.open_keys();
-        if manifest.items.iter().any(|entry| item_name(keys.item_names(), &entry.key) != entry.name) {
+        if !names_hold(&manifest, keys.item_names()) {
             return Err(Refusal::Tampered.into());
         }
         then(record.id, unlocked, manifest, &keys)
     })
+}
+
+/// Whether every item and box the manifest lists is kept under the name its text gives under the
+/// workspace's names key `names`. A list where one isn't was changed.
+pub(super) fn names_hold(manifest: &Manifest, names: &[u8; 32]) -> bool {
+    manifest.items.iter().all(|entry| item_name(names, &entry.key) == entry.name) && manifest.boxes.iter().all(|entry| box_name(names, &entry.name) == entry.item)
 }
 
 #[cfg(test)]
@@ -271,6 +278,7 @@ mod tests {
             keystore_ref: Vec::new(),
             items: Vec::new(),
             approvals: Vec::new(),
+            boxes: Vec::new(),
         }
     }
 
