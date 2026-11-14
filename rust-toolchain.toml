@@ -1,0 +1,5 @@
+# The Rust that check.sh passes with. A newer one brings new lints, and install-linux.sh installs
+# only what check.sh passed.
+[toolchain]
+channel = "1.92.0"
+components = ["clippy", "rustfmt"]

@@ -722,6 +722,8 @@ const WS_BOX_ITEMS: &[&str] = &[
     "store::is_mounted(",
     "store::detach(",
     "run::sweep(",
+    "keep::Keep",
+    "keep::Checked",
 ];
 
 /// The box items the workspace's box commands name by type: the parse under a rule, the rule, and
@@ -781,4 +783,186 @@ fn ws_names_only_source_free_box_items() {
     }
     assert!(named >= WS_BOX_ITEMS.len(), "the workspace's box commands use the boxes module: {named}");
     assert!(found.is_empty(), "src/ws reaches no source through the boxes module; name only {WS_BOX_ITEMS:?}:\n{}", found.join("\n"));
+}
+
+/// The paths a `use` statement imports, its groups flattened, each by the name it has where it
+/// comes from: `use crate::{a, b::{self, c as d}}` imports `crate::a`, `crate::b` and `crate::b::c`.
+fn imported(statement: &str) -> Vec<String> {
+    let tree = statement.split_once("use ").map_or("", |(_, tree)| tree);
+    let (mut found, mut prefixes, mut name) = (Vec::new(), vec![String::new()], String::new());
+    for c in tree.chars().chain([',']) {
+        match c {
+            '{' => {
+                prefixes.push(format!("{}{}", prefixes.last().unwrap(), name.trim()));
+                name.clear();
+            }
+            ',' | '}' => {
+                let flat = name.split_whitespace().collect::<Vec<_>>().join(" ");
+                let path: String = flat.split(" as ").next().unwrap_or_default().split_whitespace().collect();
+                if !path.is_empty() {
+                    let full = format!("{}{path}", prefixes.last().unwrap());
+                    found.push(full.strip_suffix("::self").unwrap_or(&full).to_string());
+                }
+                name.clear();
+                if c == '}' {
+                    prefixes.pop();
+                }
+            }
+            _ => name.push(c),
+        }
+    }
+    found
+}
+
+/// `path` as file `file` (under src/) names it, from the crate's root: `super::` and `self::`
+/// resolved. A path from another crate is as written.
+fn from_root(file: &str, path: &str) -> String {
+    let mut module: Vec<&str> = file.trim_start_matches("src/").trim_end_matches(".rs").split('/').collect();
+    let mut rest = path;
+    let mut moved = false;
+    while let Some(after) = rest.strip_prefix("super::") {
+        module.pop();
+        rest = after;
+        moved = true;
+    }
+    if let Some(after) = rest.strip_prefix("self::") {
+        rest = after;
+        moved = true;
+    }
+    if !moved {
+        return path.to_string();
+    }
+    ["crate"].into_iter().chain(module).chain([rest]).collect::<Vec<_>>().join("::")
+}
+
+/// What file `file` names of the crate, from its root: what its `use` statements import, and the
+/// paths from `crate::` or `super::` in the rest of its code, comments aside.
+fn crate_paths(file: &str, code: &str) -> Vec<String> {
+    let mut found: Vec<String> = uses(code).iter().flat_map(|statement| imported(statement)).map(|path| from_root(file, &path)).collect();
+    let part = |c: char| c.is_alphanumeric() || c == '_' || c == ':';
+    for line in code.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || !uses(trimmed).is_empty() {
+            continue;
+        }
+        for start in ["crate::", "super::"] {
+            for (at, _) in line.match_indices(start) {
+                if !line[..at].ends_with(part) {
+                    found.push(from_root(file, &line[at..].chars().take_while(|&c| part(c)).collect::<String>()));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Whether one of `paths` is `module`, or in it.
+fn in_module(paths: &[String], module: &str) -> bool {
+    paths.iter().any(|path| path == module || path.starts_with(&format!("{module}::")))
+}
+
+#[test]
+fn what_a_file_names_is_read_from_the_crate_s_root() {
+    let named = |file: &str, code: &str| crate_paths(file, code);
+    assert_eq!(named("src/boxes/keep.rs", "use crate::{util, ws};"), ["crate::util", "crate::ws"]);
+    assert_eq!(named("src/boxes/keep.rs", "use super::super::ws::boxes::{self, Kept as K};"), ["crate::ws::boxes", "crate::ws::boxes::Kept"]);
+    let grouped = "use crate::{\n    boxes,\n    source::{current, Source},\n};";
+    assert_eq!(named("src/keep.rs", grouped), ["crate::boxes", "crate::source::current", "crate::source::Source"]);
+    assert_eq!(named("src/ws/keep.rs", "use super::boxes::{self, Kept};"), ["crate::ws::boxes", "crate::ws::boxes::Kept"]);
+    assert_eq!(named("src/keep.rs", "use std::io::{Read, Write};\n// crate::boxes\nfn f() { super::boxes::run(); }"), ["std::io::Read", "std::io::Write", "crate::boxes::run"]);
+    assert!(in_module(&named("src/keep.rs", grouped), "crate::boxes") && !in_module(&named("src/keep.rs", "use crate::boxes_of;"), "crate::boxes"));
+}
+
+/// The two ends of an open workspace's socket that other commands use, the wire and the client,
+/// look nothing up and reach no box: what they send and read is names. Imported or written out,
+/// alone or in a group.
+#[test]
+fn the_keeper_s_client_names_no_lookup() {
+    let mut found = Vec::new();
+    for path in ["src/keep.rs", "src/ws/keep.rs"] {
+        let code = release_code(path, &fs::read_to_string(root().join(path)).unwrap()).unwrap();
+        let named = crate_paths(path, &code);
+        for module in ["crate::boxes", "crate::source::current"] {
+            if in_module(&named, module) {
+                found.push(format!("{path}: {module}"));
+            }
+        }
+        for word in ["source::current", "choose("] {
+            if code.contains(word) {
+                found.push(format!("{path}: {word}"));
+            }
+        }
+    }
+    assert!(found.is_empty(), "the socket's client looks nothing up:\n{}", found.join("\n"));
+}
+
+/// What keeps a workspace open starts its boxes through lookups, and names no workspace command,
+/// imported or written out, alone or in a group: the checks of a box's files, and what stops the
+/// boxes other terminals run, are handed to it.
+#[test]
+fn the_keeper_names_no_workspace_command() {
+    const KEEPER: &str = "src/boxes/keep.rs";
+    let code = release_code(KEEPER, &fs::read_to_string(root().join(KEEPER)).unwrap()).unwrap();
+    assert!(code.contains("pub fn serve("), "{KEEPER} is the keeper");
+    assert!(!in_module(&crate_paths(KEEPER, &code), "crate::ws") && !code.contains("choose("), "{KEEPER} names a workspace command, or chooses");
+}
+
+/// The name of the function of `code` that the text at `at` is in: the last `fn` before it that
+/// starts a line.
+fn enclosing_fn(code: &str, at: usize) -> &str {
+    let header = code[..at]
+        .lines()
+        .rev()
+        .map(|line| line.trim_start().trim_start_matches("pub(crate) ").trim_start_matches("pub "))
+        .find_map(|line| line.strip_prefix("fn "))
+        .expect("in a function");
+    &header[..header.find(['(', '<']).unwrap_or(header.len())]
+}
+
+#[test]
+fn a_function_is_found_by_what_is_in_it() {
+    let code = "fn one() {\n    a();\n}\n\npub fn two<T>() {\n    b();\n}\n\nimpl X {\n    pub(crate) fn three(&self) {\n        c();\n    }\n}\n";
+    let at = |call: &str| enclosing_fn(code, code.find(call).unwrap());
+    assert_eq!((at("a()"), at("b()"), at("c()")), ("one", "two", "three"));
+}
+
+/// Ctrl-C and a closed terminal reach every process of the terminal's group. Only the agent's own
+/// `container exec` and the image builds share it; every other `container` command and every
+/// `hdiutil` starts in a process group of its own, so a second Ctrl-C can't cut a VM's stop, a
+/// store's detach or a browser runner off half way.
+#[test]
+fn only_the_agent_and_the_builds_share_the_terminal() {
+    const ON_TERMINAL: &[&str] = &["exec_command", "build_agent_image", "build_browser_image"];
+    let mut found = Vec::new();
+    let mut hdiutil = 0;
+    for (path, text) in sources(&["src", "core/src"]) {
+        let Some(code) = release_code(&path, &text) else { continue };
+        for (at, _) in code.match_indices("Command::new(\"container\")") {
+            if path != "src/engine.rs" || enclosing_fn(&code, at) != "container_on_terminal" {
+                found.push(format!("{path}: Command::new(\"container\") in {}", enclosing_fn(&code, at)));
+            }
+        }
+        for (at, _) in code.match_indices("container_on_terminal()") {
+            let caller = enclosing_fn(&code, at);
+            if !code[..at].ends_with("fn ") && !ON_TERMINAL.contains(&caller) {
+                found.push(format!("{path}: container_on_terminal() in {caller}"));
+            }
+        }
+        for (at, _) in code.match_indices("Command::new(\"hdiutil\")") {
+            hdiutil += 1;
+            let statement = &code[at..at + code[at..].find(';').unwrap()];
+            if !statement.contains(".process_group(0)") {
+                found.push(format!("{path}: Command::new(\"hdiutil\") in {} has no process group of its own", enclosing_fn(&code, at)));
+            }
+        }
+    }
+    let engine = release_code("src/engine.rs", &fs::read_to_string(root().join("src/engine.rs")).unwrap()).unwrap();
+    let body = |header: &str| {
+        let start = engine.find(header).unwrap_or_else(|| panic!("no `{header}`"));
+        &engine[start..start + engine[start..].find("\n}\n").unwrap()]
+    };
+    assert!(body("fn container() -> Command {").contains("apart(\"container\")"), "src/engine.rs: container() starts its command apart");
+    assert!(body("fn apart(program: &str) -> Command {").contains(".process_group(0)"), "src/engine.rs: apart gives a process group of its own");
+    assert_eq!(hdiutil, 1, "hdiutil is started in one place, store::hdiutil");
+    assert!(found.is_empty(), "a child that needs no terminal starts apart:\n{}", found.join("\n"));
 }

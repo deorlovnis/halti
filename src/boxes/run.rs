@@ -1,11 +1,12 @@
 //! `halti box run`: open the box, start its VM and door, work in it, and put everything away.
 //!
-//! The order is the point. Opening needs a lock (one halti per open box), the person's yes (as
-//! `[box.approval] run` says), the key and the store; then the folders are set up while no VM has
-//! them mounted, then the VM and the door start. Ending runs the other way round: the VM stops
-//! first, then the door, then the store is detached (and deleted, for a box that isn't kept). Each
-//! step is held by a guard object, so an error, a panic or a signal (see `catch_signals`) unwinds
-//! the same way.
+//! A run is `start`, then `work` (or `wait`), then `stop`. The order is the point. Opening needs a
+//! lock (one halti per open box), the person's yes (as `[box.approval] run` says), the key and the
+//! store; then the folders are set up while no VM has them mounted, then the VM and the door start.
+//! Ending runs the other way round, in one order whatever ended the box: the VMs stop, then the
+//! door, then the store is detached (and deleted, for a box that isn't kept), and the lock goes
+//! last (`Running::put_away`). A started box is one value that is put away when it is dropped, so
+//! an error, a panic or a signal (see `catch_signals`) unwinds the same way.
 //!
 //! Everything outside halti (the approval, the engine, the door) is reached through `World`, so the
 //! sequence can be tested with fakes while the store is real.
@@ -20,12 +21,13 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
 use super::browser_vm::BrowserVm;
+use super::nofollow;
 use super::sessions::{InBox, Launch, Sessions};
 use super::store::{self, Layout};
 use super::{BoxPolicy, KeyStore, MountPolicy, MountRule, mount_problem_in};
@@ -34,6 +36,7 @@ use crate::chain::{self, Chain};
 use crate::config::Settings;
 use crate::engine::{self, Vms};
 use crate::index::Index;
+use crate::keep::{No, Refused};
 use crate::source::{self, BoxItem};
 use crate::{door, names, policy, seal};
 
@@ -46,6 +49,8 @@ const GUEST_MOUNTS: &str = "/mnt";
 const SETTLE: Duration = Duration::from_secs(30);
 /// How often a stop request (a signal) is looked for while the agent works.
 const WATCH_EVERY: Duration = Duration::from_millis(100);
+/// How often a box that waits looks whether its VM still runs.
+const LOOK_EVERY: Duration = Duration::from_secs(2);
 
 /// What a run needs from outside halti.
 pub trait World: Sync {
@@ -106,7 +111,7 @@ impl World for Real<'_> {
 
     fn stop_vm(&self, vm: &str) {
         if let Err(e) = self.vms.stop(vm) {
-            eprintln!("halti: stopping {vm}: {e:#}");
+            crate::util::warn(&format!("stopping {vm}: {e:#}"));
         }
     }
 
@@ -211,187 +216,360 @@ fn agent_env(policy: &BoxPolicy, bearer: bool) -> Vec<(String, String)> {
 
 /// Run the box. Returns the exit code of the command inside.
 pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
-    layout.prepare()?;
+    let running = match start(layout, world, req).map_err(|refused| refused.why)? {
+        Begun::Here(running) => *running,
+        Begun::Elsewhere => return join_open(layout, world, req),
+    };
+    let status = running.work(req.command.as_deref().unwrap_or(&req.policy.run), req.tty);
+    running.stop();
+    exit_code(status?)
+}
+
+/// Another halti has the box open: work in the same VM, through the same door.
+fn join_open(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     let vm = layout.vm(&req.id);
-    let policy = req.policy;
-    let bearer = || -> Result<bool> { Ok(policy.model.as_deref().map(|m| world.model_uses_bearer(m)).transpose()?.unwrap_or(false)) };
-    let command = guest_command(req.command.as_deref().unwrap_or(&policy.run));
+    if !world.running(&vm) {
+        bail!("box {} is being opened or closed by another halti: try again in a moment", req.shown);
+    }
+    // The door of the open box keeps the rules it started with, so joining under a policy
+    // approved since would promise rules nothing enforces.
+    if fs::read_to_string(layout.opened_with(&req.id)).ok().as_deref() != Some(req.policy_sha.as_str()) {
+        bail!("box {} runs with the policy it was opened with, not the one approved since: stop it ({}) and run it again", req.shown, req.stop_with);
+    }
+    let bearer = req.policy.model.as_deref().map(|m| world.model_uses_bearer(m)).transpose()?.unwrap_or(false);
+    let command = guest_command(req.command.as_deref().unwrap_or(&req.policy.run));
+    exit_code(world.exec(&vm, &agent_env(req.policy, bearer), &command, req.tty)?)
+}
 
-    // Another halti has the box open: work in the same VM, through the same door.
-    let Some(lock) = store::lock(&layout.lock(&req.id))? else {
-        if !world.running(&vm) {
-            bail!("box {} is being opened or closed by another halti: try again in a moment", req.shown);
-        }
-        // The door of the open box keeps the rules it started with, so joining under a policy
-        // approved since would promise rules nothing enforces.
-        if fs::read_to_string(layout.opened_with(&req.id)).ok().as_deref() != Some(req.policy_sha.as_str()) {
-            bail!("box {} runs with the policy it was opened with, not the one approved since: stop it ({}) and run it again", req.shown, req.stop_with);
-        }
-        return exit_code(world.exec(&vm, &agent_env(policy, bearer()?), &command, req.tty)?);
+/// What `start` found.
+pub enum Begun<'a> {
+    /// Another halti has the box open: join it, or say so.
+    Elsewhere,
+    Here(Box<Running<'a>>),
+}
+
+/// A box that is started, or being started: its lock, store, door and VMs, and the names they go
+/// by. It is put away (`put_away`) when it is dropped, so `stop`, a start that fails half way, a
+/// panic and a signal all end it in the same order.
+pub struct Running<'a> {
+    world: &'a dyn World,
+    req: &'a Request<'a>,
+    vm: String,
+    socket: PathBuf,
+    mnt: PathBuf,
+    log_key: [u8; 32],
+    /// The agent's environment.
+    env: Vec<(String, String)>,
+    /// From just before the agent's VM is started: it may run, and is stopped when the box ends.
+    vm_armed: bool,
+    /// Set by whoever stopped the agent's VM: the watch in `work`, or `put_away`.
+    vm_stopped: AtomicBool,
+    /// The start finished: the box ran, so its end is logged and what it kept is noted.
+    started: bool,
+    browser: Option<Arc<BrowserVm>>,
+    door: Option<Box<dyn Any>>,
+    /// The box's sealed sessions, read as the box ends.
+    sealed: Option<Sessions>,
+    store: Option<store::Open>,
+    lock: Option<store::Lock>,
+    lock_file: PathBuf,
+}
+
+/// Open the box: take its lock, clear what a crashed run left, check what it needs, ask (if
+/// `req.confirm`), open its store, start its VM and door. A refusal says its kind; whatever was
+/// opened by then is put away.
+pub fn start<'a>(layout: &'a Layout, world: &'a dyn World, req: &'a Request<'a>) -> Result<Begun<'a>, Refused> {
+    layout.prepare()?;
+    let Some(lock) = store::lock(&layout.lock(&req.id))? else { return Ok(Begun::Elsewhere) };
+    let mut running = Running {
+        world,
+        req,
+        vm: layout.vm(&req.id),
+        socket: layout.socket(&req.id),
+        mnt: layout.mount_point(&req.id),
+        log_key: [0; 32],
+        env: Vec::new(),
+        vm_armed: false,
+        vm_stopped: AtomicBool::new(false),
+        started: false,
+        browser: None,
+        door: None,
+        sealed: None,
+        store: None,
+        lock: Some(lock),
+        lock_file: layout.lock(&req.id),
     };
-    fs::write(layout.opened_with(&req.id), &req.policy_sha).with_context(|| format!("noting the policy box {} opens with", req.name))?;
+    running.open(layout)?;
+    Ok(Begun::Here(Box::new(running)))
+}
 
-    // Holding the lock, whatever a crashed run left is ours to clear: its VMs too.
-    sweep_temp(layout)?;
-    sweep(layout, &req.id)?;
-    for leftover in [vm.clone(), layout.browser_vm(&req.id)] {
-        if world.running(&leftover) {
-            world.stop_vm(&leftover);
+impl Running<'_> {
+    fn open(&mut self, layout: &Layout) -> Result<(), Refused> {
+        let (world, req) = (self.world, self.req);
+        let vm = self.vm.clone();
+        let policy = req.policy;
+        fs::write(layout.opened_with(&req.id), &req.policy_sha).with_context(|| format!("noting the policy box {} opens with", req.name))?;
+
+        // Holding the lock, whatever a crashed run left is ours to clear: its VMs too.
+        sweep_temp(layout)?;
+        sweep(layout, &req.id)?;
+        for leftover in [vm.clone(), layout.browser_vm(&req.id)] {
+            if world.running(&leftover) {
+                world.stop_vm(&leftover);
+            }
         }
-    }
 
-    world.available()?;
-    let image =
-        policy.image.as_deref().ok_or_else(|| anyhow!("the policy of box {} names no image (set image = \"{}@sha256:...\" and approve it)", req.shown, names::AGENT_IMAGE))?;
-    // A workspace's box names itself in what its model's lookup says; today's keep their words.
-    let uses_bearer = match &policy.model {
-        Some(model) if layout.in_workspace() => bearer().with_context(|| format!("box {} uses {model}", req.shown))?,
-        _ => bearer()?,
-    };
-    let env = agent_env(policy, uses_bearer);
-    for site in policy.model.iter().chain(&policy.sites) {
-        world.site_ready(site).with_context(|| format!("box {} uses {site}", req.shown))?;
-    }
-    let folders = resolve_mounts(&policy.mounts, &req.mounts)?;
-    layout.sockets_fit(&req.id)?;
-
-    if req.confirm {
-        let sites = if policy.sites.is_empty() { String::new() } else { format!(" and let it use {}", policy.sites.join(", ")) };
-        world.confirm(&format!("open box {}{sites}", req.name))?;
-    }
-    // What a second terminal needs to join a workspace's box, which reads no approval.
-    if layout.in_workspace() {
-        fs::write(layout.bearer(&req.id), if uses_bearer { "1" } else { "0" }).with_context(|| format!("noting how box {} reaches its model", req.shown))?;
-    }
-
-    let mnt = layout.mount_point(&req.id);
-    let (bundle, key) = if req.persistent {
-        (layout.bundle(req.name), world.key(req.name)?)
-    } else {
-        let (bundle, key) = (layout.ephemeral_bundle(&req.id), store::new_key()?);
-        store::create(layout, &bundle, &key)?;
-        (bundle, key)
-    };
-    let log_key = super::log_key(&key);
-    let mut store = store::open(&bundle, &mnt, &key, false).inspect_err(|_| {
-        if !req.persistent {
-            let _ = store::shred(&bundle);
+        world.available().map_err(|why| Refused::new(No::Engine, why))?;
+        let image =
+            policy.image.as_deref().ok_or_else(|| anyhow!("the policy of box {} names no image (set image = \"{}@sha256:...\" and approve it)", req.shown, names::AGENT_IMAGE))?;
+        // A workspace's box names itself in what its model's lookup says; today's keep their words.
+        // A model that can't be looked up isn't ready, as a site that isn't.
+        let bearer = || -> Result<bool> { Ok(policy.model.as_deref().map(|m| world.model_uses_bearer(m)).transpose()?.unwrap_or(false)) };
+        let uses_bearer = match &policy.model {
+            Some(model) if layout.in_workspace() => bearer().with_context(|| format!("box {} uses {model}", req.shown)).map_err(not_ready(model))?,
+            Some(model) => bearer().map_err(not_ready(model))?,
+            None => false,
+        };
+        self.env = agent_env(policy, uses_bearer);
+        for site in policy.model.iter().chain(&policy.sites) {
+            world.site_ready(site).with_context(|| format!("box {} uses {site}", req.shown)).map_err(not_ready(site))?;
         }
-    })?;
-    if !req.persistent {
-        store.shred_on_close();
-    }
-    let ca = Arc::new(box_ca(&mnt, req.name, &key, req.persistent)?);
-    let sessions = Sessions::new(&mnt, &key, policy.browser.keep_sessions);
-    let sealed_sites = Sessions::new(&mnt, &key, true);
-    let _ = store::log_event(&mnt, &log_key, "box", &req.id, 0, "started");
+        let folders = resolve_mounts(&policy.mounts, &req.mounts)?;
+        layout.sockets_fit(&req.id)?;
 
-    // The folders are changed here, while no VM has them.
-    prepare_home(&mnt.join("home"), policy.docker)?;
-    let mut mounts = vec![
-        engine::Mount { host: mnt.join("home"), guest: GUEST_HOME.into(), readonly: false },
-        engine::Mount { host: mnt.join("work"), guest: GUEST_WORK.into(), readonly: false },
-        engine::Mount { host: mnt.join("downloads"), guest: GUEST_DOWNLOADS.into(), readonly: false },
-    ];
-    for (mount, host) in &folders {
-        if mount.readonly() {
-            mounts.push(engine::Mount { host: host.clone(), guest: format!("{GUEST_MOUNTS}/{}", mount.name()), readonly: true });
+        if req.confirm {
+            let sites = if policy.sites.is_empty() { String::new() } else { format!(" and let it use {}", policy.sites.join(", ")) };
+            world.confirm(&format!("open box {}{sites}", req.name))?;
+            self.unless_stopped()?;
+        }
+        // What a second terminal needs to join a workspace's box, which reads no approval.
+        if layout.in_workspace() {
+            fs::write(layout.bearer(&req.id), if uses_bearer { "1" } else { "0" }).with_context(|| format!("noting how box {} reaches its model", req.shown))?;
+        }
+
+        let mnt = self.mnt.clone();
+        let (bundle, key) = if req.persistent {
+            (layout.bundle(req.name), world.key(req.name)?)
         } else {
-            clone_into(&mnt.join("work"), &mount.name(), host)?;
+            let (bundle, key) = (layout.ephemeral_bundle(&req.id), store::new_key()?);
+            store::create(layout, &bundle, &key)?;
+            (bundle, key)
+        };
+        self.log_key = super::log_key(&key);
+        let mut store = store::open(&bundle, &mnt, &key, false).inspect_err(|_| {
+            if !req.persistent {
+                let _ = store::shred(&bundle);
+            }
+        })?;
+        if !req.persistent {
+            store.shred_on_close();
         }
+        self.store = Some(store);
+        self.unless_stopped()?;
+        let ca = Arc::new(box_ca(&mnt, req.name, &key, req.persistent)?);
+        let sessions = Sessions::new(&mnt, &key, policy.browser.keep_sessions);
+        self.sealed = Some(Sessions::new(&mnt, &key, true));
+        let _ = store::log_event(&mnt, &self.log_key, "box", &req.id, 0, "started");
+
+        // The folders are changed here, while no VM has them.
+        for replaced in prepare_home(&mnt, policy.docker).with_context(|| format!("box {}", req.shown))? {
+            crate::util::warn(&format!("box {}: {} was a link or a special file, so halti replaced it and followed nothing", req.shown, replaced.display()));
+        }
+        let mut mounts = vec![
+            engine::Mount { host: mnt.join("home"), guest: GUEST_HOME.into(), readonly: false },
+            engine::Mount { host: mnt.join("work"), guest: GUEST_WORK.into(), readonly: false },
+            engine::Mount { host: mnt.join("downloads"), guest: GUEST_DOWNLOADS.into(), readonly: false },
+        ];
+        for (mount, host) in &folders {
+            if mount.readonly() {
+                mounts.push(engine::Mount { host: host.clone(), guest: format!("{GUEST_MOUNTS}/{}", mount.name()), readonly: true });
+            } else {
+                clone_into(&mnt.join("work"), &mount.name(), host)?;
+            }
+        }
+
+        let socket = self.socket.clone();
+        let _ = fs::remove_file(&socket);
+
+        // The browser VM is made for the box's sites but started by the first runner that asks.
+        let browser_socket = layout.browser_socket(&req.id);
+        let _ = fs::remove_file(&browser_socket);
+        let tokens = door::Tokens::default();
+        let (browser_vm, launch): (Option<Arc<BrowserVm>>, Launch) = match (!policy.sites.is_empty()).then(|| world.browser_image()) {
+            Some(Ok(image)) => {
+                let downloads = policy.browser.downloads.then(|| layout.downloads(req.name));
+                let vm = Arc::new(BrowserVm::new(&layout.browser_vm(&req.id), &image, browser_socket.clone(), downloads, ca.cert_pem(), tokens.clone()));
+                let runners = vm.clone();
+                (Some(vm), Box::new(move |site| runners.runner(site)))
+            }
+            Some(Err(e)) => {
+                let why = format!("{e:#}");
+                (None, Box::new(move |_| bail!("the browser VM isn't available: {why}")))
+            }
+            None => (None, Box::new(|_| bail!("this box has no sites to browse"))),
+        };
+        let spec = engine::VmSpec {
+            name: vm.clone(),
+            image: image.to_string(),
+            cpus: policy.cpus,
+            memory: policy.memory.clone(),
+            socket: socket.clone(),
+            mounts,
+            docker: policy.docker,
+            rosetta: policy.rosetta,
+        };
+        let config = door::Config {
+            // A workspace's box is named with its workspace, in the door's answers and the audit log.
+            name: if layout.in_workspace() { req.shown.clone() } else { req.id.clone() },
+            socket,
+            allow: policy.allow(),
+            model: policy.model.clone(),
+            sites: policy.sites.clone(),
+            net: door::inspect::Net { writes: policy.net.writes, allow_writes: policy.net.allow_writes.clone(), ask: req.write },
+            log: store::door_log(&mnt),
+            ca: Some(ca.clone()),
+            log_key: self.log_key,
+            browser: Some(Arc::new(InBox::new(sessions, launch, policy.browser.downloads))),
+            browser_socket: browser_vm.as_ref().map(|_| browser_socket),
+            browser_tokens: tokens,
+        };
+
+        self.browser = browser_vm;
+        self.vm_armed = true;
+        world.start_vm(&spec)?;
+        self.unless_stopped()?;
+        self.door = Some(world.start_door(config)?);
+        world.install_ca(&vm, &ca.cert_pem())?;
+        self.unless_stopped()?;
+        if policy.docker {
+            world.start_docker(&vm)?;
+            self.unless_stopped()?;
+        }
+        self.started = true;
+        Ok(())
     }
 
-    let socket = layout.socket(&req.id);
-    let _ = fs::remove_file(&socket);
-
-    // The browser VM is made for the box's sites but started by the first runner that asks.
-    let browser_socket = layout.browser_socket(&req.id);
-    let _ = fs::remove_file(&browser_socket);
-    let tokens = door::Tokens::default();
-    let (browser_vm, launch): (Option<Arc<BrowserVm>>, Launch) = match (!policy.sites.is_empty()).then(|| world.browser_image()) {
-        Some(Ok(image)) => {
-            let downloads = policy.browser.downloads.then(|| layout.downloads(req.name));
-            let vm = Arc::new(BrowserVm::new(&layout.browser_vm(&req.id), &image, browser_socket.clone(), downloads, ca.cert_pem(), tokens.clone()));
-            let runners = vm.clone();
-            (Some(vm), Box::new(move |site| runners.runner(site)))
+    /// A stop asked while the box starts (Ctrl-C or a closed terminal, which no longer reach the
+    /// steps that wait on a child) ends the start: the agent's command never runs.
+    fn unless_stopped(&self) -> Result<(), Refused> {
+        if self.req.stop.load(Ordering::SeqCst) {
+            return Err(Refused::new(No::Failed, stopped_before_the_agent(&self.req.shown)));
         }
-        Some(Err(e)) => {
-            let why = format!("{e:#}");
-            (None, Box::new(move |_| bail!("the browser VM isn't available: {why}")))
-        }
-        None => (None, Box::new(|_| bail!("this box has no sites to browse"))),
-    };
-    let spec = engine::VmSpec {
-        name: vm.clone(),
-        image: image.to_string(),
-        cpus: policy.cpus,
-        memory: policy.memory.clone(),
-        socket: socket.clone(),
-        mounts,
-        docker: policy.docker,
-        rosetta: policy.rosetta,
-    };
-    let config = door::Config {
-        // A workspace's box is named with its workspace, in the door's answers and the audit log.
-        name: if layout.in_workspace() { req.shown.clone() } else { req.id.clone() },
-        socket: socket.clone(),
-        allow: policy.allow(),
-        model: policy.model.clone(),
-        sites: policy.sites.clone(),
-        net: door::inspect::Net { writes: policy.net.writes, allow_writes: policy.net.allow_writes.clone(), ask: req.write },
-        log: store::door_log(&mnt),
-        ca: Some(ca.clone()),
-        log_key,
-        browser: Some(Arc::new(InBox::new(sessions, launch, policy.browser.downloads))),
-        browser_socket: browser_vm.as_ref().map(|_| browser_socket),
-        browser_tokens: tokens,
-    };
-
-    // Declared in the order they start, so they drop in the order they must end: VM, door, store.
-    let door: Box<dyn Any>;
-    let vm_guard = VmGuard { world, vm: &vm, socket: &socket };
-    // Dropped first of the three: the browser VM and its runners go before the agent's VM.
-    let _browser_guard = BrowserGuard(browser_vm.clone());
-    world.start_vm(&spec)?;
-    door = world.start_door(config)?;
-    world.install_ca(&vm, &ca.cert_pem())?;
-    if policy.docker {
-        world.start_docker(&vm)?;
+        Ok(())
     }
 
-    let done = AtomicBool::new(false);
-    let status = thread::scope(|scope| {
-        scope.spawn(|| {
-            while !done.load(Ordering::SeqCst) {
-                if req.stop.load(Ordering::SeqCst) {
-                    world.stop_vm(&vm);
+    /// Run `command` in the box as the agent, with the terminal if `tty`, until it ends. A stop
+    /// (`req.stop`) stops the agent's VM, which ends it; one asked already runs nothing.
+    pub fn work(&self, command: &[String], tty: bool) -> Result<ExitStatus> {
+        let (world, vm, stopped, stop) = (self.world, self.vm.as_str(), &self.vm_stopped, self.req.stop);
+        if stop.load(Ordering::SeqCst) {
+            return Err(stopped_before_the_agent(&self.req.shown));
+        }
+        let command = guest_command(command);
+        let done = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::SeqCst) {
+                    if stop.load(Ordering::SeqCst) {
+                        if !stopped.swap(true, Ordering::SeqCst) {
+                            world.stop_vm(vm);
+                        }
+                        return;
+                    }
+                    thread::sleep(WATCH_EVERY);
+                }
+            });
+            let status = world.exec(vm, &self.env, &command, tty);
+            done.store(true, Ordering::SeqCst);
+            status
+        })
+    }
+
+    /// Keep the box until a stop is asked (`req.stop`), `leave` says to, or its VM is gone (stopped
+    /// by hand, say): a box whose agents come and go by other ways in.
+    pub fn wait(&self, leave: &dyn Fn() -> bool) {
+        let mut looked = Instant::now();
+        while !self.req.stop.load(Ordering::SeqCst) && !leave() {
+            if looked.elapsed() >= LOOK_EVERY {
+                if !self.world.running(&self.vm) {
                     return;
                 }
-                thread::sleep(WATCH_EVERY);
+                looked = Instant::now();
             }
-        });
-        let status = world.exec(&vm, &env, &command, req.tty);
-        done.store(true, Ordering::SeqCst);
-        status
-    });
-    // Browsers the agent left open close now, sealing their sessions, while the VMs they use still run.
-    world.settle(door.as_ref());
-
-    let _ = store::log_event(&mnt, &log_key, "box", &req.id, 0, "stopped");
-    drop(vm_guard);
-    drop(door);
-    if req.persistent {
-        if let Err(e) = world.record_sessions(req.name, &sealed_sites.sites()) {
-            eprintln!("halti: keeping which sites of box {} have a session: {e:#}", req.shown);
+            thread::sleep(WATCH_EVERY);
         }
-        record_head(world, req.name, &req.shown, &mnt, log_key);
     }
-    drop(store);
-    if req.unique {
-        let _ = fs::remove_file(layout.lock(&req.id));
+
+    /// Put the box away (see `put_away`).
+    pub fn stop(self) {
+        drop(self);
     }
-    drop(lock);
-    exit_code(status?)
+
+    /// Stop the agent's VM, unless that was done.
+    fn stop_vm(&self) {
+        if !self.vm_stopped.swap(true, Ordering::SeqCst) {
+            self.world.stop_vm(&self.vm);
+        }
+    }
+
+    /// Everything the box has, in the order it must end. If a stop was asked, the agent is still
+    /// connected: its VM stops first, so the browsers its connections kept open close now, rather
+    /// than settling waiting for it. Otherwise the agent left by itself, and the door settles first,
+    /// with both VMs still up. Then the agent's VM (if it still runs), the browser VM and its
+    /// runners, the door, what is kept outside the store, the store, and the lock last.
+    fn put_away(&mut self) {
+        let (world, req) = (self.world, self.req);
+        if self.vm_armed && req.stop.load(Ordering::SeqCst) {
+            self.stop_vm();
+        }
+        if self.started {
+            // Browsers the agent left open close now, sealing their sessions, while the VMs they use still run.
+            if let Some(door) = &self.door {
+                world.settle(door.as_ref());
+            }
+            let _ = store::log_event(&self.mnt, &self.log_key, "box", &req.id, 0, "stopped");
+        }
+        if self.vm_armed {
+            if !self.vm_stopped.swap(true, Ordering::SeqCst) || world.running(&self.vm) {
+                world.stop_vm(&self.vm);
+            }
+            let _ = fs::remove_file(&self.socket);
+        }
+        if let Some(browser) = self.browser.take() {
+            browser.stop();
+        }
+        drop(self.door.take());
+        if self.started && req.persistent {
+            if let Some(sealed) = &self.sealed
+                && let Err(e) = world.record_sessions(req.name, &sealed.sites())
+            {
+                crate::util::warn(&format!("keeping which sites of box {} have a session: {e:#}", req.shown));
+            }
+            record_head(world, req.name, &req.shown, &self.mnt, self.log_key);
+        }
+        drop(self.store.take());
+        if let Some(lock) = self.lock.take() {
+            if req.unique {
+                let _ = fs::remove_file(&self.lock_file);
+            }
+            drop(lock);
+        }
+    }
+}
+
+fn stopped_before_the_agent(shown: &str) -> anyhow::Error {
+    anyhow!("box {shown} was stopped before its agent started")
+}
+
+/// A refusal for a site (or the model) that isn't ready.
+fn not_ready(site: &str) -> impl FnOnce(anyhow::Error) -> Refused + '_ {
+    move |why| Refused::new(No::Site(site.to_string()), why)
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.put_away();
+    }
 }
 
 /// Note where the log's chain stands, so `halti box log --verify` can tell a log whose chain was
@@ -403,10 +581,10 @@ fn record_head(world: &dyn World, name: &str, shown: &str, mnt: &Path, log_key: 
             if let Some(head) = found.head()
                 && let Err(e) = world.record_log_head(name, &head)
             {
-                eprintln!("halti: keeping where the log of box {shown} stands: {e:#}");
+                crate::util::warn(&format!("keeping where the log of box {shown} stands: {e:#}"));
             }
         }
-        Err(e) => eprintln!("halti: the log of box {shown}: {e:#}"),
+        Err(e) => crate::util::warn(&format!("the log of box {shown}: {e:#}")),
     }
 }
 
@@ -435,31 +613,6 @@ pub fn join(layout: &Layout, vms: &dyn Vms, box_name: &str, shown: &str, mounts:
     // `container exec` shares the terminal and may leave it non-blocking.
     crate::util::blocking_stdio();
     exit_code(status?)
-}
-
-/// The browser VM (if it was started) stops when this is dropped.
-struct BrowserGuard(Option<Arc<BrowserVm>>);
-
-impl Drop for BrowserGuard {
-    fn drop(&mut self) {
-        if let Some(vm) = &self.0 {
-            vm.stop();
-        }
-    }
-}
-
-/// The VM stops when this is dropped, and its socket goes.
-struct VmGuard<'a> {
-    world: &'a dyn World,
-    vm: &'a str,
-    socket: &'a Path,
-}
-
-impl Drop for VmGuard<'_> {
-    fn drop(&mut self) {
-        self.world.stop_vm(self.vm);
-        let _ = fs::remove_file(self.socket);
-    }
 }
 
 /// The box's CA, which only its VM trusts. A kept box has it sealed in its store (with a key
@@ -515,16 +668,17 @@ fn resolve_mounts<'a>(mounts: &'a [MountPolicy], rule: &MountRule) -> Result<Vec
         .collect()
 }
 
-/// Copy a folder into work/<name> the first time. Later runs keep the agent's own copy.
+/// Copy a folder into work/<name> the first time. Later runs keep the agent's own copy, even a link
+/// in its place, which isn't followed.
 fn clone_into(work: &Path, name: &str, host: &Path) -> Result<()> {
     let dst = work.join(name);
-    if dst.exists() {
+    if fs::symlink_metadata(&dst).is_ok() {
         return Ok(());
     }
     match store::copy_tree(host, &dst) {
         Ok(copied) => {
             if copied.skipped > 0 {
-                eprintln!("halti: {} links and special files in {} weren't copied", copied.skipped, host.display());
+                crate::util::warn(&format!("{} links and special files in {} weren't copied", copied.skipped, host.display()));
             }
             Ok(())
         }
@@ -537,34 +691,40 @@ fn clone_into(work: &Path, name: &str, host: &Path) -> Result<()> {
 
 /// What the agent needs in its home: Claude Code skips its web-fetch check (the door's rules take
 /// its place), knows halti's tools, and doesn't stop at first-run screens. Merged into what is
-/// there, so what the agent keeps in these files stays.
-fn prepare_home(home: &Path, docker: bool) -> Result<()> {
+/// there, so what the agent keeps in these files stays. `mnt` is the open store; nothing in its
+/// home is reached through a link the agent left there. Returns what was replaced for being a link
+/// or a special file.
+fn prepare_home(mnt: &Path, docker: bool) -> Result<Vec<PathBuf>> {
+    let mut replaced = Vec::new();
     // The Docker CLI hands containers the door's proxy (they can't reach the agent's 127.0.0.1).
     if docker {
-        merge_json(&home.join(".docker/config.json"), |o| {
+        replaced.extend(merge_json(mnt, "home/.docker/config.json", |o| {
             o.insert("proxies".into(), engine::docker_proxies());
-        })?;
+        })?);
     }
-    merge_json(&home.join(".claude/settings.json"), |o| {
+    replaced.extend(merge_json(mnt, "home/.claude/settings.json", |o| {
         o.insert("skipWebFetchPreflight".into(), json!(true));
-    })?;
+    })?);
     // User-scope MCP servers live in ~/.claude.json.
-    merge_json(&home.join(".claude.json"), |o| {
+    replaced.extend(merge_json(mnt, "home/.claude.json", |o| {
         o.insert("hasCompletedOnboarding".into(), json!(true));
         let servers = o.entry("mcpServers").or_insert_with(|| json!({}));
         if let Some(servers) = servers.as_object_mut() {
             servers.insert(names::MCP_SERVER_KEY.into(), json!({ "type": "stdio", "command": names::SHIM, "args": ["mcp"], "env": {} }));
         }
-    })
+    })?);
+    Ok(replaced)
 }
 
-fn merge_json(path: &Path, change: impl FnOnce(&mut Map<String, Value>)) -> Result<()> {
-    let mut value = fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}));
+/// Changes the JSON object in the file `rel` of the store `mnt`; one that isn't there, isn't a plain
+/// file or holds no JSON object is made anew. One that can't be read is left alone, and the start
+/// fails.
+fn merge_json(mnt: &Path, rel: &str, change: impl FnOnce(&mut Map<String, Value>)) -> Result<Vec<PathBuf>> {
+    let rel = Path::new(rel);
+    let found = nofollow::read(mnt, rel)?;
+    let mut value = found.and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}));
     change(value.as_object_mut().expect("an object"));
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_string_pretty(&value)? + "\n").with_context(|| format!("writing {}", path.display()))
+    nofollow::write(mnt, rel, (serde_json::to_string_pretty(&value)? + "\n").as_bytes())
 }
 
 /// Clear what a crashed run left for an id: a mounted store, and a store made for one run.
@@ -608,8 +768,10 @@ unsafe extern "C" {
 }
 
 /// Have the signals that end a terminal session set a flag instead of killing halti, so the
-/// box is put away properly. (A child gets the default again when it starts: a handler isn't
-/// inherited across exec, so Ctrl-C still reaches a command that isn't on a terminal.)
+/// box is put away properly. A child gets the default again when it starts (a handler isn't
+/// inherited across exec), so the ones that need no terminal start in a process group of their
+/// own (`engine`, `store`): Ctrl-C and a closed terminal don't end a VM's stop or a store's detach
+/// half way.
 pub fn catch_signals() {
     const SIGHUP: i32 = 1;
     const SIGINT: i32 = 2;
@@ -639,6 +801,8 @@ mod tests {
     type NetSeen = (policy::Mode, Vec<String>, [u8; 32], Option<Means>);
     type ExecSeen = (Vec<(String, String)>, Vec<String>, bool);
     type Hook = Box<dyn Fn(&Path) + Sync + Send>;
+    /// Runs when what the box kept is noted, as it ends.
+    type Check = Box<dyn Fn() + Sync + Send>;
     /// Runs in exec with the door's browser and the store's mount point.
     type BrowserHook = Box<dyn Fn(&dyn BoxBrowser, &Path) + Sync + Send>;
 
@@ -680,12 +844,19 @@ mod tests {
         deny: bool,
         unavailable: bool,
         door_fails: bool,
+        /// A site (or model) that isn't ready.
+        unready: Option<&'static str>,
+        /// Note `settle` among the calls.
+        settles: bool,
         /// Block in exec until the VM is stopped (a signal's doing).
         block: bool,
+        /// Set the flag (as a signal would) during the call that starts with this.
+        stop_at: Option<(&'static str, Arc<AtomicBool>)>,
         key: String,
         /// Runs in exec with the box's work folder.
         hook: Option<Hook>,
         browser_hook: Option<BrowserHook>,
+        recording: Option<Check>,
     }
 
     impl Fake {
@@ -694,7 +865,13 @@ mod tests {
         }
 
         fn note(&self, call: impl Into<String>) {
-            self.seen.lock().unwrap().calls.push(call.into());
+            let call = call.into();
+            if let Some((at, stop)) = &self.stop_at
+                && call.starts_with(at)
+            {
+                stop.store(true, Ordering::SeqCst);
+            }
+            self.seen.lock().unwrap().calls.push(call);
         }
     }
 
@@ -742,6 +919,12 @@ mod tests {
             Ok(Box::new(()))
         }
 
+        fn settle(&self, _door: &dyn Any) {
+            if self.settles {
+                self.note("settle");
+            }
+        }
+
         fn browser_image(&self) -> Result<String> {
             Ok("browser@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into())
         }
@@ -759,11 +942,17 @@ mod tests {
 
         fn model_uses_bearer(&self, model: &str) -> Result<bool> {
             self.note(format!("bearer: {model}"));
+            if self.unready == Some(model) {
+                bail!("{model} has no approved policy");
+            }
             Ok(true)
         }
 
         fn site_ready(&self, site: &str) -> Result<()> {
             self.note(format!("site: {site}"));
+            if self.unready == Some(site) {
+                bail!("{site} has no approved policy");
+            }
             Ok(())
         }
 
@@ -772,6 +961,9 @@ mod tests {
         }
 
         fn record_sessions(&self, _name: &str, sites: &[String]) -> Result<()> {
+            if let Some(check) = &self.recording {
+                check();
+            }
             self.seen.lock().unwrap().sessions = Some(sites.to_vec());
             Ok(())
         }
@@ -1125,8 +1317,11 @@ mod tests {
         let p = policy(&s, "");
         let fake = Fake { block: true, ..Fake::default() };
         let code = thread::scope(|scope| {
+            // While the agent runs: a stop before that runs no agent at all.
             scope.spawn(|| {
-                thread::sleep(Duration::from_millis(1500));
+                while !fake.calls().iter().any(|c| c == "exec") {
+                    thread::sleep(Duration::from_millis(20));
+                }
                 s.stop.store(true, Ordering::SeqCst);
             });
             run(&s.layout, &fake, &request(&s, &p, false)).unwrap()
@@ -1134,6 +1329,236 @@ mod tests {
         assert_eq!(code, 143, "killed by SIGTERM");
         assert!(fake.calls().iter().filter(|c| *c == "stop_vm").count() >= 1);
         assert_put_away(&s);
+    }
+
+    /// Starts the box for `req`, which no other halti has open.
+    fn started<'a>(s: &'a Setup, fake: &'a Fake, req: &'a Request<'a>) -> Running<'a> {
+        match start(&s.layout, fake, req).unwrap() {
+            Begun::Here(running) => *running,
+            Begun::Elsewhere => panic!("another halti has the box open"),
+        }
+    }
+
+    /// The calls after the box was started.
+    fn after_start(fake: &Fake) -> Vec<String> {
+        let calls = fake.calls();
+        let at = calls.iter().position(|c| c == "install_ca").expect("the box started");
+        calls[at + 1..].to_vec()
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn start_then_stop_is_today_s_run() {
+        let s = setup();
+        let p = policy(&s, "");
+        let key = store::new_key().unwrap();
+        store::create(&s.layout, &s.layout.bundle("r"), &key).unwrap();
+        let order = [
+            "available",
+            "bearer: anthropic",
+            "site: anthropic",
+            "site: github",
+            "confirm: open box r and let it use github",
+            "start_vm",
+            "start_door",
+            "install_ca",
+            "exec",
+            "settle",
+            "stop_vm",
+        ];
+        let today = Fake { key: key.clone(), settles: true, ..Fake::default() };
+        assert_eq!(run(&s.layout, &today, &request(&s, &p, true)).unwrap(), 0);
+        assert_eq!(today.calls(), order);
+
+        let split = Fake { key, settles: true, ..Fake::default() };
+        let req = request(&s, &p, true);
+        let running = started(&s, &split, &req);
+        assert!(running.work(&p.run, false).unwrap().success());
+        running.stop();
+        assert_eq!(split.calls(), order);
+        assert!(s.layout.bundle("r").exists() && !store::is_mounted(&s.layout.mount_point("r")));
+        assert!(store::lock(&s.layout.lock("r")).unwrap().is_some(), "the lock is released");
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn a_stop_while_the_box_starts_lets_no_agent_in() {
+        let s = setup();
+        let mut p = policy(&s, "");
+        p.docker = true;
+        // Where the start waits: the person's yes, the VM, the CA, Docker. What was opened is put away.
+        for (step, last) in [
+            ("confirm", &["confirm: open box r and let it use github"][..]),
+            ("start_vm", &["start_vm", "stop_vm"]),
+            ("install_ca", &["install_ca", "stop_vm"]),
+            ("start_docker", &["start_docker", "stop_vm"]),
+        ] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let fake = Fake { settles: true, stop_at: Some((step, stop.clone())), ..Fake::default() };
+            let req = Request { stop: &stop, ..request(&s, &p, false) };
+            let e = run(&s.layout, &fake, &req).unwrap_err();
+            assert_eq!(e.to_string(), "box r was stopped before its agent started");
+            let calls = fake.calls();
+            assert!(calls[calls.len() - last.len()..] == *last && !calls.iter().any(|c| c == "exec" || c == "settle"), "{step}: {calls:?}");
+            assert_put_away(&s);
+            assert!(store::lock(&s.layout.lock("r")).unwrap().is_some(), "the lock is released");
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let fake = Fake { stop_at: Some(("start_vm", stop.clone())), ..Fake::default() };
+        let req = Request { stop: &stop, ..request(&s, &p, false) };
+        let Err(refused) = start(&s.layout, &fake, &req) else { panic!("started though stopped") };
+        assert_eq!(refused.no, No::Failed);
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn a_box_stopped_before_its_agent_starts_runs_nothing() {
+        let s = setup();
+        let p = policy(&s, "");
+        let fake = Fake::default();
+        let req = request(&s, &p, false);
+        let running = started(&s, &fake, &req);
+        s.stop.store(true, Ordering::SeqCst);
+        assert_eq!(running.work(&p.run, false).unwrap_err().to_string(), "box r was stopped before its agent started");
+        running.stop();
+        assert_eq!(after_start(&fake), ["stop_vm"]);
+        assert_put_away(&s);
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn a_started_box_waits_until_told() {
+        let s = setup();
+        let p = policy(&s, "");
+        let fake = Fake::default();
+        let req = request(&s, &p, false);
+        let running = started(&s, &fake, &req);
+        let told = AtomicBool::new(false);
+        let waited = thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(300));
+                told.store(true, Ordering::SeqCst);
+            });
+            let began = Instant::now();
+            running.wait(&|| told.load(Ordering::SeqCst));
+            began.elapsed()
+        });
+        assert!(waited >= Duration::from_millis(300), "{waited:?}");
+        assert!(fake.running("halti-box-r") && after_start(&fake).is_empty(), "it runs, and nothing ran in it: {:?}", fake.calls());
+        assert!(store::is_mounted(&s.layout.mount_point("r")));
+        running.stop();
+        assert_put_away(&s);
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn a_box_whose_vm_is_gone_is_put_away() {
+        let s = setup();
+        let p = policy(&s, "");
+        let fake = Fake { settles: true, ..Fake::default() };
+        let req = request(&s, &p, false);
+        let running = started(&s, &fake, &req);
+        thread::scope(|scope| {
+            // Stopped by hand, outside halti.
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(200));
+                *fake.running.lock().unwrap() = false;
+            });
+            running.wait(&|| false);
+        });
+        running.stop();
+        assert_eq!(after_start(&fake), ["settle", "stop_vm"]);
+        assert_put_away(&s);
+        assert!(store::lock(&s.layout.lock("r")).unwrap().is_some(), "the lock is released");
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn the_browser_vm_stops_before_the_lock_goes() {
+        let s = setup();
+        let p = policy(&s, "");
+        let key = store::new_key().unwrap();
+        store::create(&s.layout, &s.layout.bundle("r"), &key).unwrap();
+        let (socket, lock) = (s.layout.browser_socket("r"), s.layout.lock("r"));
+        let published = socket.clone();
+        // Where the browser VM publishes its door's socket while it runs.
+        let hook: Hook = Box::new(move |_| fs::write(&published, "").unwrap());
+        let recording: Check = Box::new(move || {
+            assert!(!socket.exists(), "the browser VM is stopped");
+            assert!(store::is_held(&lock), "before the lock goes");
+        });
+        let fake = Fake { key, hook: Some(hook), recording: Some(recording), ..Fake::default() };
+        run(&s.layout, &fake, &request(&s, &p, true)).unwrap();
+        assert_eq!(fake.seen.lock().unwrap().sessions.as_deref(), Some(&[][..]), "what the box kept was noted");
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn a_stop_while_the_agent_runs_stops_its_vm_before_settling() {
+        let s = setup();
+        let p = policy(&s, "");
+        let fake = Fake { settles: true, ..Fake::default() };
+        let req = request(&s, &p, false);
+        let running = started(&s, &fake, &req);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(200));
+                s.stop.store(true, Ordering::SeqCst);
+            });
+            running.wait(&|| false);
+        });
+        running.stop();
+        // The agent is still connected: its VM goes first, so settling waits for nothing.
+        assert_eq!(after_start(&fake), ["stop_vm", "settle"]);
+        assert_put_away(&s);
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn a_box_left_by_its_last_session_settles_first() {
+        let s = setup();
+        let p = policy(&s, "");
+        let fake = Fake { settles: true, ..Fake::default() };
+        let req = request(&s, &p, false);
+        let running = started(&s, &fake, &req);
+        running.wait(&|| true);
+        running.stop();
+        // Browsers close and seal their sessions while both VMs still run.
+        assert_eq!(after_start(&fake), ["settle", "stop_vm"]);
+        assert_put_away(&s);
+
+        // The same when the agent's command ends by itself.
+        let fake = Fake { settles: true, ..Fake::default() };
+        run(&s.layout, &fake, &request(&s, &p, false)).unwrap();
+        assert_eq!(after_start(&fake), ["exec", "settle", "stop_vm"]);
+    }
+
+    #[test]
+    fn a_site_that_isn_t_ready_is_no_site() {
+        let s = setup();
+        let p = policy(&s, "");
+        // The model too, which today's box doesn't name itself for.
+        for (site, calls, said) in [("github", 4, "box r uses github: github has no approved policy"), ("anthropic", 2, "anthropic has no approved policy")] {
+            let fake = Fake { unready: Some(site), ..Fake::default() };
+            let req = request(&s, &p, false);
+            let Err(refused) = start(&s.layout, &fake, &req) else { panic!("{site} isn't ready") };
+            assert_eq!(refused.no, No::Site(site.to_string()));
+            assert_eq!(format!("{:#}", refused.why), said);
+            assert_eq!(fake.calls().len(), calls, "nothing asked or opened: {:?}", fake.calls());
+            assert_put_away(&s);
+            // Today's run says the same.
+            let today = Fake { unready: Some(site), ..Fake::default() };
+            assert_eq!(format!("{:#}", run(&s.layout, &today, &req).unwrap_err()), said);
+        }
+        let missing = Fake { unavailable: true, ..Fake::default() };
+        let req = request(&s, &p, false);
+        let Err(refused) = start(&s.layout, &missing, &req) else { panic!("there is no engine") };
+        assert_eq!(refused.no, No::Engine);
+        let no_image = BoxPolicy::parse("").unwrap();
+        let req = request(&s, &no_image, false);
+        let Err(refused) = start(&s.layout, &Fake::default(), &req) else { panic!("there is no image") };
+        assert_eq!(refused.no, No::Failed);
+        assert!(store::lock(&s.layout.lock("r")).unwrap().is_some(), "the lock is released");
     }
 
     #[test]
@@ -1488,7 +1913,7 @@ mod tests {
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::write(home.join(".claude/settings.json"), r#"{"theme":"dark","skipWebFetchPreflight":false}"#).unwrap();
         fs::write(home.join(".claude.json"), r#"{"mcpServers":{"mine":{"command":"x"}},"halti":1}"#).unwrap();
-        prepare_home(&home, false).unwrap();
+        assert!(prepare_home(&dir.0, false).unwrap().is_empty());
         let settings: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude/settings.json")).unwrap()).unwrap();
         assert_eq!((settings["theme"].clone(), settings["skipWebFetchPreflight"].clone()), (json!("dark"), json!(true)));
         let claude: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
@@ -1496,14 +1921,93 @@ mod tests {
         assert_eq!(claude["mcpServers"][names::MCP_SERVER_KEY]["command"], json!(names::SHIM));
 
         fs::write(home.join(".claude.json"), "not json").unwrap();
-        prepare_home(&home, false).unwrap();
+        assert!(prepare_home(&dir.0, false).unwrap().is_empty());
         assert!(fs::read_to_string(home.join(".claude.json")).unwrap().contains(names::SHIM), "a broken file is replaced");
 
         assert!(!home.join(".docker").exists());
         fs::create_dir_all(home.join(".docker")).unwrap();
         fs::write(home.join(".docker/config.json"), r#"{"auths":{"x":{}}}"#).unwrap();
-        prepare_home(&home, true).unwrap();
+        assert!(prepare_home(&dir.0, true).unwrap().is_empty());
         let docker: Value = serde_json::from_str(&fs::read_to_string(home.join(".docker/config.json")).unwrap()).unwrap();
         assert_eq!((docker["auths"]["x"].clone(), docker["proxies"]["default"]["noProxy"].clone()), (json!({}), json!("localhost,127.0.0.1")));
+
+        // However large: Claude Code keeps its history of projects in this file.
+        let projects = "x".repeat(65 << 20);
+        fs::write(home.join(".claude.json"), format!(r#"{{"projects":"{projects}"}}"#)).unwrap();
+        assert!(prepare_home(&dir.0, false).unwrap().is_empty());
+        let claude: Value = serde_json::from_slice(&fs::read(home.join(".claude.json")).unwrap()).unwrap();
+        assert!(claude["projects"] == json!(projects), "a large file is kept");
+        assert_eq!(claude["mcpServers"][names::MCP_SERVER_KEY]["command"], json!(names::SHIM));
+    }
+
+    #[test]
+    fn a_settings_file_that_cant_be_read_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads it anyway
+        }
+        let dir = TempDir::new("halti-home").unwrap();
+        let file = dir.0.join("home/.claude.json");
+        fs::create_dir_all(dir.0.join("home")).unwrap();
+        fs::write(&file, r#"{"mine":1}"#).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o200)).unwrap();
+        let error = format!("{:#}", prepare_home(&dir.0, false).unwrap_err());
+        assert!(error.contains("reading home/.claude.json"), "{error}");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), r#"{"mine":1}"#);
+    }
+
+    #[test]
+    fn a_link_in_the_home_is_not_written_through() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new("halti-home-links").unwrap();
+        let (home, outside) = (dir.0.join("home"), dir.0.join("outside"));
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(outside.join("claude")).unwrap();
+        fs::write(outside.join("notes.txt"), "the person's own").unwrap();
+        fs::write(outside.join("claude/settings.json"), r#"{"theirs":1}"#).unwrap();
+        symlink(outside.join("notes.txt"), home.join(".claude.json")).unwrap();
+        symlink(outside.join("claude"), home.join(".claude")).unwrap();
+        symlink(outside.join("docker"), home.join(".docker")).unwrap();
+
+        let replaced = prepare_home(&dir.0, true).unwrap();
+        assert_eq!(replaced, [".docker", ".claude", ".claude.json"].map(|name| Path::new("home").join(name)), "named as the box sees them");
+        assert_eq!(fs::read_to_string(outside.join("notes.txt")).unwrap(), "the person's own");
+        assert_eq!(fs::read_to_string(outside.join("claude/settings.json")).unwrap(), r#"{"theirs":1}"#);
+        assert!(!outside.join("docker").exists(), "nothing was made outside");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(outside.join("claude")).unwrap().count(), 1);
+
+        // In their place, plain files of halti's, as in a home with no links.
+        for file in [".docker/config.json", ".claude/settings.json", ".claude.json"] {
+            assert!(!fs::symlink_metadata(home.join(file)).unwrap().file_type().is_symlink(), "{file}");
+            assert!(!fs::symlink_metadata(home.join(file).parent().unwrap()).unwrap().file_type().is_symlink(), "{file}");
+        }
+        assert!(fs::read_to_string(home.join(".claude.json")).unwrap().contains(names::SHIM));
+        assert!(prepare_home(&dir.0, true).unwrap().is_empty(), "the next start finds nothing to replace");
+    }
+
+    #[test]
+    fn a_link_in_place_of_a_copy_is_kept_and_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new("halti-clone-links").unwrap();
+        let (work, outside, host) = (dir.0.join("work"), dir.0.join("outside"), dir.0.join("proj"));
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&host).unwrap();
+        fs::write(host.join("README"), "original").unwrap();
+        symlink(&outside, work.join("proj")).unwrap();
+        symlink(dir.0.join("gone"), work.join("other")).unwrap();
+
+        clone_into(&work, "proj", &host).unwrap();
+        clone_into(&work, "other", &host).unwrap();
+        assert!(fs::read_dir(&outside).unwrap().next().is_none() && !dir.0.join("gone").exists(), "nothing was copied through a link");
+        assert!(fs::symlink_metadata(work.join("other")).unwrap().file_type().is_symlink(), "the agent's link stays");
+
+        clone_into(&work, "new", &host).unwrap();
+        assert_eq!(fs::read_to_string(work.join("new/README")).unwrap(), "original");
     }
 }

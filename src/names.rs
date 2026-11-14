@@ -114,6 +114,14 @@ pub const WS_BROWSER_VM_PREFIX: &str = "halti-wsbrowser-";
 /// The folder of a workspace's boxes' sockets, inside the sockets folder (`/tmp/halti-<uid>/ws`).
 pub const WS_SOCKETS: &str = "ws";
 
+/// The end of the name of an open workspace's socket in that folder, `<tag>.keep.sock`. No box name
+/// has a dot, so it is never a box's socket.
+pub const KEEP_SOCKET: &str = ".keep.sock";
+
+/// The lock that `halti open` holds in a workspace's boxes folder for as long as it keeps the
+/// workspace open.
+pub const KEEPER_LOCK: &str = "keeper.lock";
+
 /// Where the box CA is installed in the agent's VM, which NODE_EXTRA_CA_CERTS names.
 pub const CA_CERT: &str = "/usr/local/share/ca-certificates/halti-box.crt";
 
@@ -136,6 +144,7 @@ mod tests {
         assert_eq!((STANDIN, MCP_SERVER_KEY), ("halti-managed", "halti"));
         assert_eq!((BOX_VM_PREFIX, BROWSER_VM_PREFIX), ("halti-box-", "halti-browser-"));
         assert_eq!((WS_BOX_VM_PREFIX, WS_BROWSER_VM_PREFIX, WS_SOCKETS), ("halti-wsbox-", "halti-wsbrowser-", "ws"));
+        assert_eq!((KEEP_SOCKET, KEEPER_LOCK), (".keep.sock", "keeper.lock"));
         let today = [BOX_VM_PREFIX, BROWSER_VM_PREFIX, crate::legacy::BOX_VM_PREFIX, crate::legacy::BROWSER_VM_PREFIX];
         for new in [WS_BOX_VM_PREFIX, WS_BROWSER_VM_PREFIX] {
             for old in today {

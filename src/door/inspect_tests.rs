@@ -161,7 +161,9 @@ struct Rig {
     connects: Arc<AtomicUsize>,
     /// While set, the door can't connect to the site.
     unreachable: Arc<AtomicBool>,
-    serving: JoinHandle<(u64, u64)>,
+    /// What `serve` counted, and the answers to what the door asked: they are kept on the thread
+    /// that asked.
+    serving: JoinHandle<((u64, u64), Vec<bool>)>,
 }
 
 impl Rig {
@@ -195,7 +197,7 @@ impl Rig {
             Ok(door_upstream)
         };
         let (shared, host) = (shared.clone(), host.to_string());
-        let serving = thread::spawn(move || serve(door_guest, connect, &Ctx { shared: &shared, host: &host, caller: &Caller::Agent }));
+        let serving = thread::spawn(move || (serve(door_guest, connect, &Ctx { shared: &shared, host: &host, caller: &Caller::Agent }), approve::take_answers()));
         guest.set_read_timeout(Some(WAIT)).unwrap();
         Self { guest: Conn { reader: BufReader::new(guest.try_clone().unwrap()), stream: guest, seen: Vec::new() }, seen, release, connects, unreachable, serving }
     }
@@ -210,6 +212,15 @@ impl Rig {
 
     /// End the guest's side and wait for the door to finish: the log is complete after this.
     fn finish(self) -> (u64, u64) {
+        self.end().0
+    }
+
+    /// `finish`, and how each question the door asked on this connection was answered.
+    fn finish_asked(self) -> Vec<bool> {
+        self.end().1
+    }
+
+    fn end(self) -> ((u64, u64), Vec<bool>) {
         let _ = self.guest.stream.shutdown(Shutdown::Write);
         drop(self.guest);
         self.serving.join().unwrap()
@@ -604,8 +615,7 @@ fn site_hosts(sh: &Arc<Shared>, yes: bool) {
     assert_eq!(rig.guest.post(pending, "/submit", &[], "x").0.status, 403);
     let (_, body) = rig.guest.get(pending, "/echo", &[]);
     assert!(body.contains(SECRET), "nothing is masked for it: the agent's own values are its own");
-    rig.finish();
-    assert!(approve::take_answers().is_empty());
+    assert!(rig.finish_asked().is_empty());
 
     // A site approved a moment ago and revoked since covers nothing (policies are read per request).
     policy::revoke("readonly").unwrap();
@@ -630,9 +640,7 @@ fn site_asks(sh: &Arc<Shared>, yes: bool) {
         assert!(rig.reached().is_empty());
         assert_eq!(rig.guest.get(ask, "/plain", &[]).0.status, 200, "the connection goes on");
     }
-    rig.finish();
-    let answers = approve::take_answers();
-    assert_eq!(answers, [yes], "one prompt for the one write, none for reads");
+    assert_eq!(rig.finish_asked(), [yes], "one prompt for the one write, none for reads");
 }
 
 /// The site closes connections the door keeps for it; the door makes a new one, once, and only
@@ -696,40 +704,34 @@ fn the_site_closes_idle_connections(sh: &Arc<Shared>) {
 
 /// `[net] writes = "ask"` on a host no site covers.
 fn net_asks(sh: &Arc<Shared>, yes: bool) {
-    approve::take_answers();
     let host = "web.example.com";
     let mut rig = Rig::new(sh, host);
     let (reply, body) = rig.guest.post(host, "/submit?token=sekrit&q=1", &[], "data");
     assert_eq!(reply.status, if yes { 200 } else { 403 }, "{body}");
     assert_eq!(rig.reached().len(), usize::from(yes));
     assert_eq!(rig.guest.get(host, "/plain", &[]).0.status, 200);
-    rig.finish();
-    assert_eq!(approve::take_answers(), [yes]);
+    assert_eq!(rig.finish_asked(), [yes]);
 }
 
 /// `[net] writes = "ask"` with `[box.approval] write = "none"`: the write passes and nothing is asked.
 fn net_asks_nothing(sh: &Arc<Shared>) {
-    approve::take_answers();
     let host = "web.example.com";
     let mut rig = Rig::new(sh, host);
     let (reply, body) = rig.guest.post(host, "/submit", &[], "data");
     assert_eq!(reply.status, 200, "{body}");
     assert_eq!(rig.reached().len(), 1);
-    rig.finish();
-    assert!(approve::take_answers().is_empty(), "nothing was asked");
+    assert!(rig.finish_asked().is_empty(), "nothing was asked");
 }
 
 /// With nothing on this system that can approve it, a write `[net]` asks about is refused, saying so.
 fn net_cannot_ask(sh: &Arc<Shared>) {
-    approve::take_answers();
     let host = "web.example.com";
     let mut rig = Rig::new(sh, host);
     let (reply, body) = rig.guest.post(host, "/submit", &[], "data");
     assert_eq!(reply.status, 403, "{body}");
     assert!(body.contains("wasn't approved: a write the box's policy says to ask about needs an approval this system can't give"), "{body}");
     assert!(rig.reached().is_empty());
-    rig.finish();
-    assert!(approve::take_answers().is_empty(), "nothing was asked");
+    assert!(rig.finish_asked().is_empty(), "nothing was asked");
 }
 
 /// `[net] writes = "allow"`: everything passes, and the log says so.
@@ -742,9 +744,9 @@ fn net_allows(sh: &Arc<Shared>) {
     // A WebSocket can't be carried, even where writes are allowed.
     let (reply, body) = rig.guest.get(host, "/socket", &[("Connection", "Upgrade"), ("Upgrade", "websocket")]);
     assert_eq!(reply.status, 501, "{body}");
-    let (up, down) = rig.finish();
+    let ((up, down), asked) = rig.end();
     assert_eq!((up, down), (4, 8));
-    assert!(approve::take_answers().is_empty());
+    assert!(asked.is_empty());
 }
 
 /// One line per request, chained, with the URL masked; an edit or a deletion shows.

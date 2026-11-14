@@ -16,9 +16,14 @@
 //! environment variables hold the stand-in for a site's credential. `[browser]` says whether a
 //! site's browser session is kept between runs: sealed in the store's `browser/` folder, which no
 //! VM mounts (see `sessions`; `halti box login` signs in by hand, see `login`).
+//!
+//! A workspace's boxes are started by `ws run` in its own process, or, while the workspace is
+//! open, by the `halti open` that keeps it (see `keep`).
 
 pub mod browser_vm;
+pub(crate) mod keep;
 mod login;
+mod nofollow;
 pub(crate) mod run;
 pub(crate) mod sessions;
 pub(crate) mod store;
@@ -41,6 +46,7 @@ use crate::chain::{self, Chain};
 use crate::config::{Engine, Settings};
 use crate::door::inspect::parse_prefix;
 use crate::engine::Vms;
+use crate::keep::{No, Refused};
 use crate::policy::{self, Approval, Mode, Site, Status};
 use crate::source::{self, BoxItem, Hint};
 use crate::util::{config_dir, expand_home, home, store_root};
@@ -225,6 +231,7 @@ fn mount_problem_among(path: &Path, own: &[PathBuf]) -> Option<String> {
 }
 
 /// Which folders a box may mount, with halti's own folders (`own`) kept out of it either way.
+#[derive(Clone)]
 pub enum MountRule {
     /// Today's boxes: any folder but halti's own and everything.
     Guarded(Vec<PathBuf>),
@@ -771,15 +778,7 @@ pub struct Join {
 /// through the place. Then today's run, with no question: opening the workspace was the approval.
 pub fn run_in(start: Start) -> Result<u8> {
     let Start { settings, vms, layout, name, shown, text, policy, mounts, command } = start;
-    let approve = format!("halti ws box approve {shown}");
-    match policy::status_of_text(&key(&name), &text) {
-        Status::Approved => {}
-        Status::Changed => bail!("the policy of box {shown} changed since it was approved. approve it with: {approve}"),
-        Status::Unapproved | Status::Missing => bail!("box {shown} isn't approved. approve it with: {approve}"),
-    }
-    if policy.keep && !KeyStore::of(&settings).exists(&name) {
-        bail!("box {shown} has a store but no key. remove it with: {}", source::current().hint(Hint::RemoveBox(&name)));
-    }
+    ready(&name, &shown, &text, policy.keep, &settings).map_err(|refused| refused.why)?;
     run::catch_signals();
     let request = run::Request {
         name: &name,
@@ -798,6 +797,32 @@ pub fn run_in(start: Start) -> Result<u8> {
         confirm: false,
     };
     run_request(&layout, vms, &settings, &request)
+}
+
+/// What the workspace's box `name` (`shown`, as messages name it) needs of the place, which is
+/// chosen, before it starts: see `ready_in`. `text` is its policy file's bytes as read, and `keep`
+/// whether that policy keeps a store.
+fn ready(name: &str, shown: &str, text: &[u8], keep: bool, settings: &Settings) -> Result<(), Refused> {
+    let keys = KeyStore::of(settings);
+    let approval = policy::status_of_text(&key(name), text);
+    ready_in(shown, approval, keep, || keys.exists(name), &source::current().hint(Hint::RemoveBox(name)))
+}
+
+/// What a workspace's box (`shown`, as messages name it) needs of the place before it starts: an
+/// approval of the policy file's bytes as read (`approval`, what the place says of them), and for a
+/// box that keeps a store, its key (`has_key`, asked only then). `remove` is the place's command
+/// that removes the box.
+fn ready_in(shown: &str, approval: Status, keep: bool, has_key: impl FnOnce() -> bool, remove: &str) -> Result<(), Refused> {
+    let approve = format!("halti ws box approve {shown}");
+    match approval {
+        Status::Approved => {}
+        Status::Changed => return Err(Refused::new(No::Changed, anyhow!("the policy of box {shown} changed since it was approved. approve it with: {approve}"))),
+        Status::Unapproved | Status::Missing => return Err(Refused::new(No::Unapproved, anyhow!("box {shown} isn't approved. approve it with: {approve}"))),
+    }
+    if keep && !has_key() {
+        return Err(Refused::new(No::Key, anyhow!("box {shown} has a store but no key. remove it with: {remove}")));
+    }
+    Ok(())
 }
 
 /// Joins a workspace's box that runs: no place, no question (`run::join`).
@@ -918,14 +943,14 @@ fn box_path(rel: &str) -> Result<PathBuf> {
     Ok(rel.to_path_buf())
 }
 
-/// Copy `rel` out of the open store into `to`. A path that resolves outside the store (a link the
-/// agent made) is refused, and links inside a folder are skipped.
+/// Copy `rel` out of the open store into `to`. A link on the way (one the agent made) is refused,
+/// wherever it leads, and links inside a folder are skipped.
 fn export_from(mnt: &Path, rel: &str, to: &Path) -> Result<(Vec<Exported>, usize)> {
     let rel = box_path(rel)?;
+    nofollow::no_link(mnt, &rel)?;
     let src = mnt.join(&rel);
-    let real = fs::canonicalize(&src).map_err(|_| anyhow!("{} isn't in the box", rel.display()))?;
-    if !real.starts_with(fs::canonicalize(mnt)?) {
-        bail!("{} leads out of the box", rel.display());
+    if fs::symlink_metadata(&src).is_err() {
+        bail!("{} isn't in the box", rel.display());
     }
     let to = fs::canonicalize(to).with_context(|| format!("{} isn't a folder", to.display()))?;
     if !to.is_dir() {
@@ -1298,6 +1323,22 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_s_box_that_isn_t_ready_says_its_kind() {
+        let remove = "halti ws box rm acme/dev";
+        let refused = |approval, keep, has_key: bool| ready_in("acme/dev", approval, keep, || has_key, remove).err().map(|refused| (refused.no, refused.why.to_string()));
+        let unapproved = Some((No::Unapproved, "box acme/dev isn't approved. approve it with: halti ws box approve acme/dev".to_string()));
+        assert_eq!(refused(Status::Unapproved, true, true), unapproved);
+        assert_eq!(refused(Status::Missing, false, true), unapproved);
+        let changed = "the policy of box acme/dev changed since it was approved. approve it with: halti ws box approve acme/dev";
+        assert_eq!(refused(Status::Changed, true, true), Some((No::Changed, changed.to_string())));
+        let keyless = "box acme/dev has a store but no key. remove it with: halti ws box rm acme/dev";
+        assert_eq!(refused(Status::Approved, true, false), Some((No::Key, keyless.to_string())));
+        assert_eq!(refused(Status::Approved, true, true), None);
+        // A box that keeps no store needs no key, and the place isn't asked for one.
+        assert!(ready_in("acme/dev", Status::Approved, false, || panic!("asked for a key"), remove).is_ok());
+    }
+
+    #[test]
     fn the_templates_are_valid_policies() {
         assert!(BoxPolicy::parse(&template("research", None)).is_ok());
         let open = BoxPolicy::parse(&template("research", None)).unwrap();
@@ -1409,10 +1450,28 @@ mod tests {
         fs::write(dir.0.join("secret.txt"), "not in the box").unwrap();
         std::os::unix::fs::symlink(&dir.0, mnt.join("work/escape")).unwrap();
         std::os::unix::fs::symlink(dir.0.join("secret.txt"), mnt.join("work/file-link")).unwrap();
+        // A link that stays in the store is refused too: it could lead to halti's own folders.
+        fs::create_dir_all(mnt.join("door")).unwrap();
+        fs::write(mnt.join("door/ca.sealed"), "halti's").unwrap();
+        std::os::unix::fs::symlink("../door", mnt.join("work/inside")).unwrap();
 
-        for rel in ["../secret.txt", "/etc/passwd", "work/../../secret.txt", "", ".", "work/escape/secret.txt", "work/escape", "work/file-link", "work/missing"] {
+        for rel in [
+            "../secret.txt",
+            "/etc/passwd",
+            "work/../../secret.txt",
+            "",
+            ".",
+            "work/escape/secret.txt",
+            "work/escape",
+            "work/file-link",
+            "work/missing",
+            "work/inside",
+            "work/inside/ca.sealed",
+        ] {
             assert!(export_from(&mnt, rel, &to).is_err(), "exported {rel:?}");
         }
+        let error = export_from(&mnt, "work/escape/secret.txt", &to).err().unwrap().to_string();
+        assert_eq!(error, "work/escape is a link; links aren't followed");
         assert!(fs::read_dir(&to).unwrap().next().is_none(), "nothing was written");
         assert!(export_from(&mnt, "work", &dir.0.join("nowhere")).is_err());
     }

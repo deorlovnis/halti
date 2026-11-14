@@ -169,3 +169,34 @@ fn the_hints_name_the_workspace_s_commands() {
     assert_eq!(Source::keychain().no_policy("github"), "github has no policy (write one with: halti policy edit github)");
     assert_eq!(Source::keychain().unapproved("github"), "the policy for github isn't approved (halti policy approve github)");
 }
+
+#[test]
+fn a_closed_place_answers_nothing() {
+    let (_bench, acme) = acme_and_globex("halti-place-closed");
+    assert_eq!(acme.value("github", "token").as_deref(), Some("acme's token"));
+    acme.lock_keys();
+    acme.close();
+    assert_eq!((acme.value("github", "token"), acme.record(Record::Resource("github")), acme.box_item("dev", BoxItem::Key)), (None, None, None));
+    assert!(acme.index().is_err() && acme.audit_key(true).is_err() && !acme.has_box_item("dev", BoxItem::Key));
+    assert!(!acme.refused_reread(), "closed is not a refusal");
+    // Closing again, or a place that holds no key, does nothing.
+    acme.close();
+    Source::keychain().close();
+}
+
+#[test]
+fn a_refused_reread_is_reported_once() {
+    let (bench, acme) = acme_and_globex("halti-place-refused-once");
+    let pin = bench.root().join("pins").join(acme_dir(&bench, &acme).file_name().unwrap());
+    let opened_under = fs::read(&pin).unwrap();
+    bench.set("acme", ACME, "github", "token", "acme's new token");
+    assert_eq!(acme.value("github", "token").as_deref(), Some("acme's new token"));
+    assert!(!acme.refused_reread());
+    // The pin put back: each lookup fails, and that is said once.
+    fs::write(&pin, &opened_under).unwrap();
+    assert_eq!(acme.value("github", "token"), None);
+    assert_eq!(acme.value("github", "token"), None);
+    assert!(acme.refused_reread());
+    assert!(!acme.refused_reread());
+    assert!(!Source::keychain().refused_reread());
+}
