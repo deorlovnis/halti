@@ -30,6 +30,7 @@ use std::path::{Component, Path, PathBuf};
 use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
+use halti_core::ids::WsName;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde::Deserialize;
@@ -37,11 +38,11 @@ use sha2::{Digest, Sha256};
 
 use crate::approval::{self, Action};
 use crate::chain::{self, Chain};
-use crate::config::{Engine, Keys, Settings};
+use crate::config::{Engine, Settings};
 use crate::door::inspect::parse_prefix;
 use crate::engine::Vms;
 use crate::policy::{self, Approval, Mode, Site, Status};
-use crate::source::{self, BoxItem};
+use crate::source::{self, BoxItem, Hint};
 use crate::util::{config_dir, expand_home, home, store_root};
 use crate::{approve, config, engine, legacy, names, parse_env, parse_resource};
 pub use login::login;
@@ -223,10 +224,87 @@ fn mount_problem_among(path: &Path, own: &[PathBuf]) -> Option<String> {
     all.any(|dir| path.starts_with(&dir) || dir.starts_with(path)).then(|| "holds halti's own files".into())
 }
 
+/// Which folders a box may mount, with halti's own folders (`own`) kept out of it either way.
+pub enum MountRule {
+    /// Today's boxes: any folder but halti's own and everything.
+    Guarded(Vec<PathBuf>),
+    /// A workspace's boxes: only a folder in the home folder, not the home folder itself, with no
+    /// hidden folder on its way and not in ~/Library, as written and as its real path. Hidden
+    /// folders hold other clients' credentials (~/.ssh, ~/.claude, ~/.config), ~/Library the stores
+    /// of running boxes and the Keychains, and outside the home folder are other users' sockets and
+    /// mounted disks: a rule that allows names them all, where a list that refuses would miss the
+    /// next one.
+    #[allow(dead_code)] // for a workspace's boxes
+    Workspace(Vec<PathBuf>),
+}
+
+impl MountRule {
+    /// Today's rule with halti's folders as the settings say: the config folder, the store root and
+    /// the workspaces folder.
+    pub fn guarded(settings: &Settings) -> MountRule {
+        MountRule::Guarded(own_folders(settings))
+    }
+
+    /// A workspace's rule, with the same folders of halti's kept out.
+    #[allow(dead_code)] // for a workspace's boxes
+    pub fn workspace(settings: &Settings) -> MountRule {
+        MountRule::Workspace(own_folders(settings))
+    }
+
+    fn in_workspace(&self) -> bool {
+        matches!(self, MountRule::Workspace(_))
+    }
+}
+
+fn own_folders(settings: &Settings) -> Vec<PathBuf> {
+    vec![config_dir(), store_root(), settings.workspaces.path.clone()]
+}
+
+/// Why a folder can't be handed to a box under `rule`, if it can't.
+pub fn mount_problem_in(path: &Path, rule: &MountRule) -> Option<String> {
+    match rule {
+        MountRule::Guarded(own) => mount_problem_among(path, own),
+        MountRule::Workspace(own) => outside_plain_home(path, &home()).or_else(|| mount_problem_among(path, own)),
+    }
+}
+
+/// Why `path` isn't a plain folder in `home` (one with no hidden folder on its way and not in
+/// Library, nor `home` itself), as written or as its real path, if it isn't. A path that isn't
+/// there is checked as written only; a run checks its real path once it is.
+fn outside_plain_home(path: &Path, home: &Path) -> Option<String> {
+    let plain = |path: &Path, home: &Path| {
+        let Ok(rest) = path.strip_prefix(home) else { return false };
+        let mut parts = rest.components().peekable();
+        let library = matches!(parts.peek(), Some(Component::Normal(first)) if first.to_string_lossy().eq_ignore_ascii_case("Library"));
+        !library && parts.peek().is_some() && parts.all(|part| matches!(part, Component::Normal(name) if !name.to_string_lossy().starts_with('.')))
+    };
+    let real = match fs::canonicalize(path) {
+        Ok(real) => plain(&real, &fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf())),
+        Err(_) => true,
+    };
+    (!(plain(path, home) && real)).then(|| "a box in a workspace mounts only folders in your home that aren't hidden and aren't in ~/Library".into())
+}
+
+/// The rule a policy's mounts are checked against.
+enum Mounts<'a> {
+    /// Today's, with the workspaces folder in effect read when a mount is checked.
+    Today,
+    Under(&'a MountRule),
+}
+
 impl BoxPolicy {
     pub fn parse(text: &str) -> Result<Self> {
+        Self::parse_with(text, Mounts::Today)
+    }
+
+    /// As `parse`, with the mounts checked against `rule`.
+    pub fn parse_in(text: &str, rule: &MountRule) -> Result<Self> {
+        Self::parse_with(text, Mounts::Under(rule))
+    }
+
+    fn parse_with(text: &str, mounts: Mounts<'_>) -> Result<Self> {
         let policy: BoxPolicy = toml::from_str(text)?;
-        policy.validate()?;
+        policy.validate(mounts)?;
         Ok(policy)
     }
 
@@ -235,7 +313,7 @@ impl BoxPolicy {
         self.net.allow.iter().filter_map(|e| Site::parse(e).ok()).map(|s| s.text()).collect()
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, rule: Mounts<'_>) -> Result<()> {
         if self.run.is_empty() || self.run.iter().any(|a| a.is_empty()) {
             bail!("run must be a command, e.g. [\"claude\"]");
         }
@@ -290,9 +368,12 @@ impl BoxPolicy {
             parse_prefix(entry).map_err(|e| anyhow!("[net] allow_writes '{entry}': {e}"))?;
         }
         let mut names = BTreeSet::new();
+        let in_workspace = matches!(rule, Mounts::Under(rule) if rule.in_workspace());
         for m in &self.mounts {
             match m.mode.as_str() {
                 "clone" | "ro" => {}
+                // A workspace's box has no export yet.
+                "rw" if in_workspace => bail!("[[mount]] {}: rw isn't available, a box can't change your files; use clone", m.path),
                 "rw" => bail!("[[mount]] {}: rw isn't available, a box can't change your files; use clone and `halti box export`", m.path),
                 other => bail!("[[mount]] {}: mode '{other}' isn't clone or ro", m.path),
             }
@@ -300,8 +381,22 @@ impl BoxPolicy {
             if !host.is_absolute() || host.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
                 bail!("[[mount]] path '{}' must be absolute or start with ~/, without . or ..", m.path);
             }
-            if let Some(why) = mount_problem(&host) {
-                bail!("[[mount]] path '{}' {why}", m.path);
+            match &rule {
+                Mounts::Today => {
+                    if let Some(why) = mount_problem(&host) {
+                        bail!("[[mount]] path '{}' {why}", m.path);
+                    }
+                }
+                Mounts::Under(rule @ MountRule::Guarded(_)) => {
+                    if let Some(why) = mount_problem_in(&host, rule) {
+                        bail!("[[mount]] path '{}' {why}", m.path);
+                    }
+                }
+                Mounts::Under(rule @ MountRule::Workspace(_)) => {
+                    if let Some(why) = mount_problem_in(&host, rule) {
+                        bail!("[[mount]] {}: {why}", m.path);
+                    }
+                }
             }
             let name = m.name();
             if name.is_empty() || name.starts_with('.') || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
@@ -344,6 +439,45 @@ writes = "deny"                         # anything but a read (GET, HEAD, OPTION
 # allow_writes = ["https://api.example.com/search"]   # URL prefixes that may receive writes anyway
 
 # [[mount]]                             # holes in the box: none unless listed
+# path = "~/Git/project"
+# mode = "clone"                        # clone: the agent works on its own copy in work/ | ro: read-only
+"#,
+        standin = names::STANDIN
+    )
+}
+
+/// The box template for a workspace: today's fields, with hints naming `halti ws …`, and no lines
+/// for signing in, importing or exporting, which a workspace's boxes don't have yet.
+#[allow(dead_code)] // for a workspace's boxes
+pub fn workspace_template(ws: &WsName, name: &str, image: Option<&str>) -> String {
+    let image = image.map_or_else(
+        || format!("# image = \"{}@sha256:...\"       # the system inside, pinned: build it with install.sh, then paste its digest", names::AGENT_IMAGE),
+        |digest| format!("image = \"{digest}\"                  # the system inside, pinned: a new image is a policy change"),
+    );
+    format!(
+        r#"# The policy of box {name} in workspace {ws}. It takes effect only once approved: halti ws box approve {ws}/{name}
+about = ""
+run = ["claude"]                        # what `halti ws run {ws}/{name}` starts
+{image}
+model = "anthropic"                     # resource of {ws} whose key halti adds to the agent's model calls
+sites = []                              # resources of {ws} the agent may use through halti; their policies apply
+# standins = ["GH_TOKEN"]               # variables set to "{standin}" for tools that insist on a token; halti adds the real credential on the hosts of `sites`
+keep = true                            # false: the box is shredded when it stops
+# docker = true                         # Docker Engine in the VM; it makes the agent root in the VM, which stays the boundary
+# rosetta = true                        # Rosetta in the VM, for x86-64 images with no arm64 build
+cpus = 4
+memory = "8G"
+
+[browser]                               # the sandboxed browser, for `sites` whose own policy has a [browse] section
+# keep_sessions = true                  # seal each site's session when its browser closes, so the next one starts signed in
+# downloads = false                     # true: pages may download files, kept on the Mac outside the box
+
+[net]                                   # where the agent's own requests may go; nothing else is reachable
+allow = ["*"]                           # any public https site, reads only (see writes); or a list like ["https://*.wikipedia.org"], or [] for nowhere
+writes = "deny"                         # anything but a read (GET, HEAD, OPTIONS, a fetch or clone) to a host no `sites` entry covers: deny | ask (Touch ID each) | allow
+# allow_writes = ["https://api.example.com/search"]   # URL prefixes that may receive writes anyway
+
+# [[mount]]                             # holes in the box: none unless listed; only folders in your home that aren't hidden and aren't in ~/Library
 # path = "~/Git/project"
 # mode = "clone"                        # clone: the agent works on its own copy in work/ | ro: read-only
 "#,
@@ -411,55 +545,69 @@ fn vms(settings: &Settings) -> Result<&'static dyn Vms> {
     }
 }
 
-/// Where box keys are kept, as `[box] keys` says: the one place a box's store key is read, written
-/// and deleted. Another place is one more variant of `config::Keys` and one more arm in each.
+/// Where box keys are kept (see `Keys`): the one place a box's store key is read, written and
+/// deleted. Another keeper `[box] keys` can name is one more variant of `config::Keys`, and another
+/// place that keeps its own is one more `Keys` variant; each is one more arm in each method.
 #[derive(Clone, Copy)]
-struct KeyStore(Option<Keys>);
+struct KeyStore(Keys);
+
+/// Where a box's key is: where `[box] keys` says, or the chosen place's when it keeps box keys
+/// itself, as a workspace does, whatever the settings say.
+#[derive(Clone, Copy)]
+enum Keys {
+    Settings(Option<config::Keys>),
+    Place,
+}
 
 impl KeyStore {
     fn of(settings: &Settings) -> KeyStore {
-        KeyStore(settings.keys)
+        if source::current().keeps_box_keys() {
+            return KeyStore(Keys::Place);
+        }
+        KeyStore(Keys::Settings(settings.keys))
     }
 
     fn get(self, name: &str) -> Option<String> {
-        match self.0? {
-            Keys::Keychain => source::current().box_item(name, BoxItem::Key),
+        match self.0 {
+            Keys::Settings(Some(config::Keys::Keychain)) | Keys::Place => source::current().box_item(name, BoxItem::Key),
+            Keys::Settings(None) => None,
         }
     }
 
     /// Whether there is one, without reading it.
     fn exists(self, name: &str) -> bool {
         match self.0 {
-            Some(Keys::Keychain) => source::current().has_box_item(name, BoxItem::Key),
-            None => false,
+            Keys::Settings(Some(config::Keys::Keychain)) | Keys::Place => source::current().has_box_item(name, BoxItem::Key),
+            Keys::Settings(None) => false,
         }
     }
 
     fn set(self, name: &str, value: &str) -> Result<()> {
         match self.0 {
-            Some(Keys::Keychain) => source::current().set_box_item(name, BoxItem::Key, value),
-            None => bail!("a box's key can't be kept on this system"),
+            Keys::Settings(Some(config::Keys::Keychain)) | Keys::Place => source::current().set_box_item(name, BoxItem::Key, value),
+            Keys::Settings(None) => bail!("a box's key can't be kept on this system"),
         }
     }
 
     fn delete(self, name: &str) -> bool {
         match self.0 {
-            Some(Keys::Keychain) => source::current().remove_box_item(name, BoxItem::Key),
-            None => false,
+            Keys::Settings(Some(config::Keys::Keychain)) | Keys::Place => source::current().remove_box_item(name, BoxItem::Key),
+            Keys::Settings(None) => false,
         }
     }
 
     /// Where a key is, as halti says it.
     fn place(self) -> &'static str {
         match self.0 {
-            Some(Keys::Keychain) => "in the Keychain",
-            None => "anywhere on this system",
+            Keys::Settings(Some(config::Keys::Keychain)) => "in the Keychain",
+            Keys::Settings(None) => "anywhere on this system",
+            Keys::Place => "in its workspace",
         }
     }
 
     /// The box's store key, or why its store can't be opened.
     fn open_key(self, name: &str) -> Result<String> {
-        self.get(name).ok_or_else(|| anyhow!("the key of box {name} isn't {}, so its store can't be opened (halti box rm {name})", self.place()))
+        self.get(name).ok_or_else(|| anyhow!("the key of box {name} isn't {}, so its store can't be opened ({})", self.place(), source::current().hint(Hint::RemoveBox(name))))
     }
 }
 
@@ -572,6 +720,10 @@ pub fn run(name: &str, temp: bool, command: Vec<String>) -> Result<u8> {
         tty: crate::interactive(),
         stop: run::signalled(),
         write: settings.means(Action::BoxWrite),
+        shown: name.to_string(),
+        stop_with: format!("halti box stop {name}"),
+        mounts: MountRule::guarded(&settings),
+        confirm: true,
     };
     run::run(&layout, &run::Real { vms, keys: KeyStore::of(&settings), settings: &settings }, &request)
 }
@@ -768,7 +920,7 @@ pub fn rm(name: &str) -> Result<()> {
     keys.delete(name);
     source::current().remove_box_item(name, BoxItem::LogHead);
     source::current().remove_box_item(name, BoxItem::Sessions);
-    policy::revoke(&k);
+    policy::revoke(&k)?;
     store::shred(&bundle)?;
     run::sweep(&layout, name)?;
     println!("deleted box {name}: its key and its store");
@@ -976,6 +1128,96 @@ mod tests {
         }
         assert_eq!(mount_problem_among(&home().join("work/project"), &own), None);
         assert!(mount_problem(&config::workspaces_in_effect()).is_some(), "wherever it is");
+    }
+
+    #[test]
+    fn a_workspace_box_mounts_only_plain_home_folders() {
+        let rule = MountRule::Workspace(vec![config_dir(), store_root()]);
+        let refused = [
+            home().join(".claude"),
+            home().join(".ssh/x"),
+            home().join("Git/.env-folder"),
+            home(),
+            home().join("Library/Keychains"),
+            home().join(legacy::STORE_ROOT).join("box/open/crewpoint"),
+            home().join("library/Keychains"),
+            PathBuf::from("/Volumes/x"),
+            PathBuf::from("/tmp/cred-501"),
+            PathBuf::from("/"),
+            config_dir(),
+            store_root().join("box"),
+        ];
+        for path in &refused {
+            let why = mount_problem_in(path, &rule);
+            assert_eq!(why.as_deref(), Some("a box in a workspace mounts only folders in your home that aren't hidden and aren't in ~/Library"), "{}", path.display());
+        }
+        assert_eq!(mount_problem_in(&home().join("Git/project"), &rule), None);
+        // Today's guarded folders hold even where they are plain home folders.
+        let own = MountRule::Workspace(vec![home().join("work/ws")]);
+        assert_eq!(mount_problem_in(&home().join("work/ws/acme"), &own).as_deref(), Some("holds halti's own files"));
+        assert_eq!(mount_problem_in(&home().join("work"), &own).as_deref(), Some("holds halti's own files"));
+
+        // A link to a hidden folder is refused by its real path, as written and when a run resolves it.
+        let dir = TempDir::new("halti-plain-home").unwrap();
+        let home = dir.0.join("home");
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::create_dir_all(home.join("Git/project")).unwrap();
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join("Git/keys")).unwrap();
+        assert!(outside_plain_home(&home.join("Git/keys"), &home).is_some());
+        assert!(outside_plain_home(&fs::canonicalize(home.join("Git/keys")).unwrap(), &home).is_some());
+        assert_eq!(outside_plain_home(&home.join("Git/project"), &home), None);
+        assert_eq!(outside_plain_home(&home.join("Git/not-yet"), &home), None, "checked by its real path once it is there");
+
+        // In a policy, as the error names it.
+        let text = |path: &str| format!("[[mount]]\npath = \"{path}\"");
+        let error = format!("{:#}", BoxPolicy::parse_in(&text("~/.claude"), &rule).err().unwrap());
+        assert_eq!(error, "[[mount]] ~/.claude: a box in a workspace mounts only folders in your home that aren't hidden and aren't in ~/Library");
+        assert!(BoxPolicy::parse_in(&text("~/Git/project"), &rule).is_ok());
+        let error = format!("{:#}", BoxPolicy::parse_in(&format!("{}\nmode = \"rw\"", text("~/Git/project")), &rule).err().unwrap());
+        assert_eq!(error, "[[mount]] ~/Git/project: rw isn't available, a box can't change your files; use clone");
+    }
+
+    #[test]
+    fn the_mount_guard_takes_its_folders() {
+        let dir = TempDir::new("halti-guard").unwrap();
+        let own = [dir.0.join("config"), dir.0.join("ws")];
+        let rule = MountRule::Guarded(own.to_vec());
+        for path in [dir.0.join("config/policy"), dir.0.join("ws"), dir.0.clone(), home(), PathBuf::from("/")] {
+            assert!(mount_problem_in(&path, &rule).is_some(), "{}", path.display());
+        }
+        assert_eq!(mount_problem_in(&dir.0.join("project"), &rule), None);
+        // Today's rule and today's guard agree: halti's folders as the settings say.
+        let mac = config::Settings::builtin(Os::Macos);
+        let MountRule::Guarded(today) = MountRule::guarded(&mac) else { panic!("today's rule") };
+        assert_eq!(today, [config_dir(), store_root(), mac.workspaces.path.clone()]);
+        let MountRule::Workspace(theirs) = MountRule::workspace(&mac) else { panic!("a workspace's rule") };
+        assert_eq!(theirs, today);
+        assert_eq!(mount_problem_in(&home().join("Git/project"), &MountRule::guarded(&mac)), mount_problem(&home().join("Git/project")));
+        assert_eq!(mount_problem_in(&config_dir(), &MountRule::guarded(&mac)), mount_problem(&config_dir()));
+        // A policy checked under a rule keeps today's words.
+        let text = format!("[[mount]]\npath = \"{}\"", dir.0.join("ws/acme").display());
+        let error = format!("{:#}", BoxPolicy::parse_in(&text, &rule).err().unwrap());
+        assert_eq!(error, format!("[[mount]] path '{}' holds halti's own files", dir.0.join("ws/acme").display()));
+    }
+
+    #[test]
+    fn the_workspace_template_is_a_valid_policy_and_names_only_ws_commands() {
+        let acme = WsName::parse("acme").unwrap();
+        let rule = MountRule::Workspace(vec![config_dir(), store_root()]);
+        for image in [None, Some(DIGEST)] {
+            let text = workspace_template(&acme, "dev", image);
+            let p = BoxPolicy::parse_in(&text, &rule).unwrap();
+            assert_eq!((p.image.as_deref(), p.model.as_deref(), p.keep, p.allow(), p.net.writes), (image, Some("anthropic"), true, vec!["*".to_string()], Mode::Deny));
+            assert!(text.contains("halti ws box approve acme/dev") && text.contains("halti ws run acme/dev"), "{text}");
+            assert!(!text.contains("halti box") && !text.contains("box login") && !text.contains("import") && !text.contains("export"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_workspace_s_box_keys_are_its_own() {
+        // Today's place keeps them where `[box] keys` says, and says so as before.
+        assert_eq!(KeyStore::of(&config::Settings::builtin(Os::Macos)).place(), "in the Keychain");
+        assert_eq!(KeyStore(Keys::Place).place(), "in its workspace");
     }
 
     #[test]

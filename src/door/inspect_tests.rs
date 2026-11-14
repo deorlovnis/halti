@@ -608,7 +608,7 @@ fn site_hosts(sh: &Arc<Shared>, yes: bool) {
     assert!(approve::take_answers().is_empty());
 
     // A site approved a moment ago and revoked since covers nothing (policies are read per request).
-    policy::revoke("readonly");
+    policy::revoke("readonly").unwrap();
     let mut rig = Rig::new(sh, ro);
     rig.guest.get(ro, "/plain", &[]);
     assert_eq!(rig.reached()[0].header("authorization"), None);

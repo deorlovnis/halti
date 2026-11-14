@@ -21,6 +21,7 @@ use url::{Host, Url};
 
 use crate::approval::{self, Action, Means, World};
 use crate::config::{self, Settings};
+use crate::source::Hint;
 use crate::util::{expand_home, sha256_hex};
 use crate::ws::OS;
 use crate::{ask, boxes, browser, interactive, names, parse_env, parse_field, parse_resource, source};
@@ -571,6 +572,11 @@ impl Approval {
         Self { policy: sha256_hex(text.as_bytes()), scripts: BTreeMap::new(), text: Some(text.to_string()) }
     }
 
+    /// An approval a workspace keeps sealed: the policy's sha256 (64 hex characters) alone.
+    pub fn sealed(sha256: &str) -> Self {
+        Self { policy: sha256.to_string(), scripts: BTreeMap::new(), text: None }
+    }
+
     /// The first characters of the file's sha256, for showing.
     pub fn short(&self) -> &str {
         &self.policy[..12]
@@ -661,12 +667,15 @@ pub fn approved_at(key: &str, file: &Path) -> Result<String, Status> {
     }
 }
 
+/// The approved policy of `res`, read and checked where the chosen place keeps it, or why there is
+/// none: said in that place's words, since the door hands it to the agent.
 pub fn load(res: &str) -> Result<Approved> {
-    let p = path(res);
-    let text = fs::read(&p).map_err(|_| anyhow!("{res} has no policy (write one with: halti policy edit {res})"))?;
-    let record = record(res).ok_or_else(|| anyhow!("the policy for {res} isn't approved (halti policy approve {res})"))?;
+    let (source, p) = (source::current(), path(res));
+    let named = source.named(res);
+    let Some(text) = source.policy_text(res)? else { bail!(source.no_policy(res)) };
+    let record = record(res).ok_or_else(|| anyhow!(source.unapproved(res)))?;
     if record.policy != sha256_hex(&text) {
-        bail!("the policy for {res} changed since it was approved (halti policy approve {res})");
+        bail!("the policy for {named} changed since it was approved ({})", source.hint(Hint::ApprovePolicy(res)));
     }
     let text = String::from_utf8(text).with_context(|| format!("{} isn't UTF-8", p.display()))?;
     let policy = Policy::parse(&text).with_context(|| p.display().to_string())?;
@@ -693,8 +702,8 @@ fn approved_text(key: &str) -> Option<String> {
 
 /// Forget an approval (a resource's, or a box's under its Keychain name); the file has no
 /// effect until approved again.
-pub fn revoke(key: &str) {
-    source::remove_record(key);
+pub fn revoke(key: &str) -> Result<()> {
+    source::remove_record(key)
 }
 
 /// Whether an approval's Keychain name is a box's.

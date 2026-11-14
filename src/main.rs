@@ -722,7 +722,7 @@ fn cmd_rm(res: &str, field: Option<String>) -> Result<()> {
         }
         None => {
             idx.map.remove(res);
-            policy::revoke(res);
+            policy::revoke(res)?;
             println!("removed {res}");
         }
     }

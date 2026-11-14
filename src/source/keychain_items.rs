@@ -94,6 +94,8 @@ pub(super) struct Items {
     /// Boxes' policies.
     boxes: PathBuf,
     audit_log: PathBuf,
+    /// Where pages' blocked writes are noted.
+    blocked: PathBuf,
     /// A key tests give the audit log instead of the Keychain's.
     #[cfg(halti_dev)]
     audit_key: Option<OsString>,
@@ -107,6 +109,7 @@ impl Items {
             policies: config.join("policy"),
             boxes: config.join("box"),
             audit_log: config.join("audit.log"),
+            blocked: config.join("blocked-writes"),
             #[cfg(halti_dev)]
             audit_key: None,
         };
@@ -199,6 +202,10 @@ impl Items {
 
     pub(super) fn box_dir(&self) -> &Path {
         &self.boxes
+    }
+
+    pub(super) fn blocked_dir(&self) -> PathBuf {
+        self.blocked.clone()
     }
 
     pub(super) fn box_item(&self, name: &str, item: BoxItem) -> Option<String> {

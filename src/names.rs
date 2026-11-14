@@ -104,6 +104,16 @@ pub const MCP_SERVER_KEY: &str = "halti";
 pub const BOX_VM_PREFIX: &str = "halti-box-";
 pub const BROWSER_VM_PREFIX: &str = "halti-browser-";
 
+/// The VM name prefixes of a workspace's boxes, `halti-wsbox-<tag>-<box>` and
+/// `halti-wsbrowser-<tag>-<box>`, where the tag is the first 12 hex characters of the workspace's
+/// id. Neither is a prefix of the names above or of cred's, nor the other way round, so stopping one
+/// box's VMs by name never stops another's.
+pub const WS_BOX_VM_PREFIX: &str = "halti-wsbox-";
+pub const WS_BROWSER_VM_PREFIX: &str = "halti-wsbrowser-";
+
+/// The folder of a workspace's boxes' sockets, inside the sockets folder (`/tmp/halti-<uid>/ws`).
+pub const WS_SOCKETS: &str = "ws";
+
 /// Where the box CA is installed in the agent's VM, which NODE_EXTRA_CA_CERTS names.
 pub const CA_CERT: &str = "/usr/local/share/ca-certificates/halti-box.crt";
 
@@ -125,6 +135,14 @@ mod tests {
         assert_eq!((DOOR_SOCKET, LOCAL_SOCKET, DOOR_KIND), ("/run/halti/door.sock", "/run/halti/local.sock", "halti"));
         assert_eq!((STANDIN, MCP_SERVER_KEY), ("halti-managed", "halti"));
         assert_eq!((BOX_VM_PREFIX, BROWSER_VM_PREFIX), ("halti-box-", "halti-browser-"));
+        assert_eq!((WS_BOX_VM_PREFIX, WS_BROWSER_VM_PREFIX, WS_SOCKETS), ("halti-wsbox-", "halti-wsbrowser-", "ws"));
+        let today = [BOX_VM_PREFIX, BROWSER_VM_PREFIX, crate::legacy::BOX_VM_PREFIX, crate::legacy::BROWSER_VM_PREFIX];
+        for new in [WS_BOX_VM_PREFIX, WS_BROWSER_VM_PREFIX] {
+            for old in today {
+                assert!(!new.starts_with(old) && !old.starts_with(new), "{new} and {old} name each other's VMs");
+            }
+        }
+        assert!(!WS_BOX_VM_PREFIX.starts_with(WS_BROWSER_VM_PREFIX) && !WS_BROWSER_VM_PREFIX.starts_with(WS_BOX_VM_PREFIX));
         assert_eq!(CA_CERT, "/usr/local/share/ca-certificates/halti-box.crt");
     }
 }

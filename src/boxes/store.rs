@@ -18,11 +18,13 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
+use halti_core::ids::WsId;
 use jiff::Timestamp;
 use serde_json::json;
 
 use crate::chain::Chain;
 use crate::util::store_root;
+use crate::{engine, names};
 
 /// The most a store can hold; the bundle grows as needed and starts small.
 const SIZE: &str = "100g";
@@ -32,14 +34,31 @@ pub const FOLDERS: [&str; 6] = ["home", "work", "downloads", "log", "door", "bro
 const DOOR_LOG: &str = "log/door.log";
 const CA_FILE: &str = "door/ca.sealed";
 
-/// Where a box's files live on the Mac. `real()` is the user's; tests build their own.
+/// The longest Unix socket path macOS accepts (104 bytes, with the terminating NUL), as
+/// `engine::run` checks it.
+const SOCKET_PATH_MAX: usize = 103;
+
+/// Where a box's files live on the Mac. `real()` is the user's; `workspace()` a workspace's boxes';
+/// tests build their own.
 pub struct Layout {
-    /// Stores, mount points and locks: box/ under the store root (`util::store_root`)
+    /// Stores, mount points and locks: box/ under the store root (`util::store_root`), or a
+    /// workspace's boxes/ folder
     pub root: PathBuf,
     /// The sockets the VMs publish, in a short path (104-byte limit): /tmp/halti-<uid>
-    /// (/tmp/halti-dev-<uid> for debug builds)
+    /// (/tmp/halti-dev-<uid> for debug builds), and its ws/ folder for a workspace's boxes
     pub sockets: PathBuf,
+    /// Where browser VMs save downloads, one folder per box
+    downloads: PathBuf,
     uid: u32,
+    names: Names,
+}
+
+/// How a layout names its VMs and sockets.
+enum Names {
+    /// `halti-box-ID`, `ID.sock`: today's boxes.
+    Keychain,
+    /// `halti-wsbox-TAG-ID`, `TAG-ID.sock`: the boxes of the workspace whose id starts with the tag.
+    Workspace { tag: String },
 }
 
 impl Layout {
@@ -49,15 +68,62 @@ impl Layout {
             bail!("no home folder");
         }
         let uid = uid()?;
-        // Debug builds' VMs publish their sockets apart from an installed halti's.
-        let sockets = PathBuf::from(format!("/tmp/{}-{uid}", if cfg!(halti_dev) { "halti-dev" } else { "halti" }));
-        Ok(Self { root: root.join("box"), sockets, uid })
+        Ok(Self { root: root.join("box"), sockets: sockets(uid), downloads: root.join("downloads"), uid, names: Names::Keychain })
+    }
+
+    /// The boxes of the workspace `ws`, whose boxes folder is `boxes` (WSDIR/boxes): stores, locks,
+    /// mount points and downloads in it, sockets in the ws/ folder of the sockets folder, and VMs
+    /// named with the first 12 hex characters of its id.
+    #[allow(dead_code)] // for running a workspace's boxes
+    pub fn workspace(boxes: &Path, ws: WsId) -> Result<Self> {
+        let uid = uid()?;
+        Ok(Self::of_workspace(boxes, sockets(uid).join(names::WS_SOCKETS), uid, ws))
+    }
+
+    fn of_workspace(boxes: &Path, sockets: PathBuf, uid: u32, ws: WsId) -> Self {
+        let tag = ws.to_string()[..12].to_string();
+        Self { root: boxes.to_path_buf(), sockets, downloads: boxes.join("downloads"), uid, names: Names::Workspace { tag } }
     }
 
     #[cfg(test)]
     pub fn under(dir: &Path) -> Result<Self> {
         // No `id` here: a child process forked while another test holds a lock would keep it.
-        Ok(Self { root: dir.join("box"), sockets: dir.join("sock"), uid: fs::metadata(dir)?.uid() })
+        Ok(Self { root: dir.join("box"), sockets: dir.join("sock"), downloads: dir.join("downloads"), uid: fs::metadata(dir)?.uid(), names: Names::Keychain })
+    }
+
+    /// A workspace's layout in a test folder: its boxes folder `boxes`, its sockets in `sock/ws`.
+    #[cfg(test)]
+    pub fn under_workspace(dir: &Path, ws: WsId) -> Result<Self> {
+        Ok(Self::of_workspace(&dir.join("boxes"), dir.join("sock").join(names::WS_SOCKETS), fs::metadata(dir)?.uid(), ws))
+    }
+
+    /// Whether these are a workspace's boxes.
+    pub fn in_workspace(&self) -> bool {
+        matches!(self.names, Names::Workspace { .. })
+    }
+
+    /// What names the box's VMs and sockets: its id, after the workspace's tag in a workspace.
+    fn named(&self, id: &str) -> String {
+        match &self.names {
+            Names::Keychain => id.to_string(),
+            Names::Workspace { tag } => format!("{tag}-{id}"),
+        }
+    }
+
+    /// The agent's VM: `halti-box-ID`, or `halti-wsbox-TAG-ID` in a workspace.
+    pub fn vm(&self, id: &str) -> String {
+        match &self.names {
+            Names::Keychain => format!("{}{id}", names::BOX_VM_PREFIX),
+            Names::Workspace { .. } => format!("{}{}", names::WS_BOX_VM_PREFIX, self.named(id)),
+        }
+    }
+
+    /// The browser VM: `halti-browser-ID`, or `halti-wsbrowser-TAG-ID` in a workspace.
+    pub fn browser_vm(&self, id: &str) -> String {
+        match &self.names {
+            Names::Keychain => engine::browser_vm_name(id),
+            Names::Workspace { .. } => format!("{}{}", names::WS_BROWSER_VM_PREFIX, self.named(id)),
+        }
     }
 
     pub fn bundle(&self, name: &str) -> PathBuf {
@@ -86,30 +152,66 @@ impl Layout {
         self.open_dir().join(format!("{id}.policy"))
     }
 
-    pub fn socket(&self, id: &str) -> PathBuf {
-        self.sockets.join(format!("{id}.sock"))
+    /// Whether the open box's model takes a bearer token ("1") or a key ("0"), written by the halti
+    /// that opened a workspace's box, so a second terminal joins it without reading an approval.
+    pub fn bearer(&self, id: &str) -> PathBuf {
+        self.open_dir().join(format!("{id}.bearer"))
     }
 
-    /// The socket of the box's browser VM, next to the agent's.
+    pub fn socket(&self, id: &str) -> PathBuf {
+        self.sockets.join(format!("{}.sock", self.named(id)))
+    }
+
+    /// The socket of the box's browser VM, next to the agent's. In a workspace its name has a dot,
+    /// which no box name has, so it is never another box's agent socket.
     #[allow(dead_code)] // for the browser VM of box runs
     pub fn browser_socket(&self, id: &str) -> PathBuf {
-        self.sockets.join(format!("{id}-browser.sock"))
+        match &self.names {
+            Names::Keychain => self.sockets.join(format!("{id}-browser.sock")),
+            Names::Workspace { .. } => self.sockets.join(format!("{}.browser.sock", self.named(id))),
+        }
     }
 
     /// Where the box's browser VM saves downloads, one folder per site: outside every store, and
-    /// mounted into the browser VM only (downloads/<box> under the store root).
+    /// mounted into the browser VM only (downloads/<box> under the store root, or the workspace's
+    /// boxes folder).
     #[allow(dead_code)] // for the browser VM of box runs
     pub fn downloads(&self, name: &str) -> PathBuf {
-        self.root.parent().unwrap_or(&self.root).join("downloads").join(name)
+        self.downloads.join(name)
     }
 
-    /// Create the folders a run needs, private to the user.
+    /// Fails unless both of the box's sockets fit the system's limit: checked before anything opens.
+    pub fn sockets_fit(&self, id: &str) -> Result<()> {
+        for socket in [self.socket(id), self.browser_socket(id)] {
+            let length = socket.as_os_str().len();
+            if length > SOCKET_PATH_MAX {
+                bail!("socket path {} is too long ({length} bytes, macOS allows {SOCKET_PATH_MAX})", socket.display());
+            }
+        }
+        Ok(())
+    }
+
+    /// Create the folders a run needs, private to the user. A workspace's sockets folder is in a
+    /// folder of its own, made private first.
     pub fn prepare(&self) -> Result<()> {
-        for dir in [&self.root, &self.open_dir(), &self.root.join("temp"), &self.sockets] {
+        let mut dirs = vec![self.root.clone(), self.open_dir(), self.root.join("temp")];
+        if self.in_workspace()
+            && let Some(parent) = self.sockets.parent()
+        {
+            dirs.push(parent.to_path_buf());
+        }
+        dirs.push(self.sockets.clone());
+        for dir in &dirs {
             private_dir(dir, self.uid)?;
         }
         Ok(())
     }
+}
+
+/// The sockets folder of this build: /tmp/halti-<uid>, /tmp/halti-dev-<uid> for debug builds.
+fn sockets(uid: u32) -> PathBuf {
+    // Debug builds' VMs publish their sockets apart from an installed halti's.
+    PathBuf::from(format!("/tmp/{}-{uid}", if cfg!(halti_dev) { "halti-dev" } else { "halti" }))
 }
 
 fn uid() -> Result<u32> {
@@ -481,6 +583,79 @@ mod tests {
         fs::remove_dir(layout.root.join("temp")).unwrap();
         symlink(&dir.0, layout.root.join("temp")).unwrap();
         assert!(layout.prepare().is_err(), "a link where a private folder belongs");
+    }
+
+    const ACME: [u8; 16] = [0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0x0a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78];
+
+    #[test]
+    fn a_workspace_layout_is_named_apart() {
+        let dir = TempDir::new("halti-layout").unwrap();
+        // Today's layout gives today's names, byte for byte.
+        let today = Layout::under(&dir.0).unwrap();
+        assert!(!today.in_workspace());
+        assert_eq!((today.vm("dev"), today.browser_vm("dev")), ("halti-box-dev".to_string(), "halti-browser-dev".to_string()));
+        assert_eq!((today.vm("dev"), today.browser_vm("dev")), (super::super::run::vm_name("dev"), engine::browser_vm_name("dev")));
+        assert_eq!((today.socket("dev"), today.browser_socket("dev")), (dir.0.join("sock/dev.sock"), dir.0.join("sock/dev-browser.sock")));
+        assert_eq!((today.downloads("dev"), today.bundle("dev")), (dir.0.join("downloads/dev"), dir.0.join("box/dev.sparsebundle")));
+        assert_eq!((today.lock("dev"), today.opened_with("dev")), (dir.0.join("box/open/dev.lock"), dir.0.join("box/open/dev.policy")));
+        let real = Layout::real().unwrap();
+        assert_eq!((real.root.clone(), real.downloads("dev")), (store_root().join("box"), store_root().join("downloads/dev")));
+        assert_eq!(real.downloads("dev"), real.root.parent().unwrap().join("downloads").join("dev"), "where downloads always were");
+        assert_eq!(real.sockets, PathBuf::from(format!("/tmp/halti-dev-{}", real.uid)));
+        assert_eq!(real.vm("dev"), "halti-box-dev");
+
+        // A workspace's: its tag in the VMs' and sockets' names, everything else in its boxes folder.
+        let acme = Layout::under_workspace(&dir.0, WsId::from_bytes(ACME)).unwrap();
+        assert!(acme.in_workspace());
+        assert_eq!((acme.vm("dev"), acme.browser_vm("dev")), ("halti-wsbox-abcdef012345-dev".to_string(), "halti-wsbrowser-abcdef012345-dev".to_string()));
+        assert_eq!((acme.socket("dev"), acme.browser_socket("dev")), (dir.0.join("sock/ws/abcdef012345-dev.sock"), dir.0.join("sock/ws/abcdef012345-dev.browser.sock")));
+        let boxes = dir.0.join("boxes");
+        assert_eq!((acme.bundle("dev"), acme.ephemeral_bundle("dev")), (boxes.join("dev.sparsebundle"), boxes.join("temp/dev.sparsebundle")));
+        assert_eq!((acme.mount_point("dev"), acme.lock("dev"), acme.opened_with("dev")), (boxes.join("open/dev"), boxes.join("open/dev.lock"), boxes.join("open/dev.policy")));
+        assert_eq!((acme.bearer("dev"), acme.downloads("dev")), (boxes.join("open/dev.bearer"), boxes.join("downloads/dev")));
+        // Box x's browser socket is never box x-browser's agent socket, as today's are.
+        assert_eq!(today.browser_socket("x"), today.socket("x-browser"));
+        assert_ne!(acme.browser_socket("x"), acme.socket("x-browser"));
+        // Another workspace's box of the same name meets nothing of acme's.
+        let globex = Layout::under_workspace(&dir.0, WsId::from_bytes([0x02; 16])).unwrap();
+        assert_ne!((globex.vm("dev"), globex.browser_vm("dev"), globex.socket("dev")), (acme.vm("dev"), acme.browser_vm("dev"), acme.socket("dev")));
+        let real = Layout::workspace(&boxes, WsId::from_bytes(ACME)).unwrap();
+        assert_eq!(real.sockets, PathBuf::from(format!("/tmp/halti-dev-{}/ws", real.uid)));
+        assert_eq!(real.socket("dev"), PathBuf::from(format!("/tmp/halti-dev-{}/ws/abcdef012345-dev.sock", real.uid)));
+
+        // Its sockets' folder is private, and so is the folder it is in.
+        acme.prepare().unwrap();
+        for d in [&boxes, &boxes.join("open"), &boxes.join("temp"), &dir.0.join("sock"), &dir.0.join("sock/ws")] {
+            assert_eq!(fs::metadata(d).unwrap().mode() & 0o777, 0o700, "{}", d.display());
+        }
+    }
+
+    #[test]
+    fn the_longest_sockets_fit() {
+        let longest = Layout::of_workspace(Path::new("/x/boxes"), PathBuf::from("/tmp/halti-dev-4294967295/ws"), 4294967295, WsId::from_bytes([0xff; 16]));
+        let name = "a".repeat(32);
+        assert_eq!((longest.socket(&name).as_os_str().len(), longest.browser_socket(&name).as_os_str().len()), (79, 87));
+        longest.sockets_fit(&name).unwrap();
+        assert_eq!(longest.vm(&name).len(), 57);
+        assert_eq!(longest.browser_vm(&name).len(), 61);
+    }
+
+    #[test]
+    fn sockets_fit_refuses_104_bytes() {
+        // 103 bytes is the most: 104 with the NUL.
+        let at = |length: usize| {
+            let sockets = PathBuf::from(format!("/{}", "s".repeat(length - "/".len() - "/".len() - "-dev.browser.sock".len() - 12)));
+            Layout::of_workspace(Path::new("/x/boxes"), sockets, 501, WsId::from_bytes([0x10; 16]))
+        };
+        assert_eq!(at(103).browser_socket("dev").as_os_str().len(), 103);
+        at(103).sockets_fit("dev").unwrap();
+        let error = at(104).sockets_fit("dev").unwrap_err().to_string();
+        assert!(error.starts_with("socket path /sss") && error.ends_with(".browser.sock is too long (104 bytes, macOS allows 103)"), "{error}");
+        // Today's are checked the same way.
+        let dir = TempDir::new("halti-long").unwrap();
+        let mut today = Layout::under(&dir.0).unwrap();
+        today.sockets = PathBuf::from(format!("/{}", "s".repeat(87)));
+        assert!(today.sockets_fit("dev").is_err() && today.sockets_fit("d").is_ok());
     }
 
     /// The real thing: hdiutil, in a temp folder, with a random key.

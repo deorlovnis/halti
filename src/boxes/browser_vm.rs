@@ -28,11 +28,11 @@ pub struct BrowserVm {
 }
 
 impl BrowserVm {
-    /// A browser VM for the box `box_id`, not started yet. `image` is a pinned
+    /// A browser VM named `vm` (the box's layout names it), not started yet. `image` is a pinned
     /// "name@sha256:..."; `downloads` the Mac folder for downloads, or `None` when the
     /// policy doesn't allow them; `tokens` the list the box's door checks.
-    pub fn new(box_id: &str, image: &str, socket: PathBuf, downloads: Option<PathBuf>, ca_pem: String, tokens: door::Tokens) -> Self {
-        let spec = engine::BrowserSpec { name: engine::browser_vm_name(box_id), image: image.to_string(), socket, downloads };
+    pub fn new(vm: &str, image: &str, socket: PathBuf, downloads: Option<PathBuf>, ca_pem: String, tokens: door::Tokens) -> Self {
+        let spec = engine::BrowserSpec { name: vm.to_string(), image: image.to_string(), socket, downloads };
         Self {
             spec,
             ca_pem,

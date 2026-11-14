@@ -611,6 +611,28 @@ fn a_use_statement_is_read_to_its_end() {
     assert_eq!(uses(code), ["use std::fs", "use crate::{\n    approve, keychain,\n}", "pub(crate) use super::keychain as k"]);
 }
 
+/// The workspace place, whose file names nothing of the Keychain's: a lookup it can't answer is a
+/// miss, never a read of the Keychain's item of the same name.
+const WORKSPACE_PLACE: &str = "src/source/workspace.rs";
+
+#[test]
+fn the_workspace_place_names_no_keychain() {
+    let code = release_code(WORKSPACE_PLACE, &fs::read_to_string(root().join(WORKSPACE_PLACE)).unwrap()).unwrap();
+    let mut found = Vec::new();
+    for (n, line) in code.lines().enumerate() {
+        if line.to_lowercase().contains("keychain") {
+            found.push(format!("{WORKSPACE_PLACE}:{}: {}", n + 1, line.trim()));
+        }
+    }
+    for statement in uses(&code) {
+        if statement.contains("super::*") || statement.contains("source::*") {
+            found.push(format!("{WORKSPACE_PLACE}: {}", statement.trim()));
+        }
+    }
+    assert!(code.contains("pub(super) struct Opened"), "{WORKSPACE_PLACE} is the workspace place");
+    assert!(found.is_empty(), "the workspace place falls back to nothing:\n{}", found.join("\n"));
+}
+
 /// Lookup code never chooses where lookups go.
 #[test]
 fn lookup_code_never_chooses() {

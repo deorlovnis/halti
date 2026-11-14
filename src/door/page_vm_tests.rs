@@ -263,7 +263,7 @@ fn scenario() {
         net,
     )
     .unwrap();
-    let vm = BrowserVm::new(&id, &image, short.join("browser.sock"), Some(downloads.clone()), box_ca.cert_pem(), tokens);
+    let vm = BrowserVm::new(&crate::engine::browser_vm_name(&id), &image, short.join("browser.sock"), Some(downloads.clone()), box_ca.cert_pem(), tokens);
 
     // The VM starts with the first runner and trusts the box CA: a real page over TLS the door ended.
     let started = Instant::now();
@@ -514,7 +514,7 @@ fn session_scenario() {
     fs::create_dir_all(short.join("store/browser")).unwrap();
     let _cleanup = Cleanup(short.clone());
     let tokens = Tokens::default();
-    let vm = Arc::new(BrowserVm::new(&id, &image, short.join("browser.sock"), None, box_ca.cert_pem(), tokens.clone()));
+    let vm = Arc::new(BrowserVm::new(&crate::engine::browser_vm_name(&id), &image, short.join("browser.sock"), None, box_ca.cert_pem(), tokens.clone()));
     // The box: its store folder (sessions are sealed in it), and a browser that starts runners in the VM.
     let browser = |keep: bool| -> Arc<dyn crate::browse::BoxBrowser> {
         let vm = vm.clone();

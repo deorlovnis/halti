@@ -300,7 +300,7 @@ impl World for Real {
     }
 
     fn unpin(&self, key: &str) {
-        policy::revoke(key);
+        let _ = policy::revoke(key);
     }
 }
 

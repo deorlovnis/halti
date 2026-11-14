@@ -47,6 +47,7 @@ use zeroize::Zeroizing;
 use crate::approval::{Action, Declined, Means, Real, World};
 use crate::config::{self, Manager, PassphraseMode, Settings};
 use crate::names;
+pub use files::Reading;
 use files::{DirFiles, FileAnchor, FileKeystore, PolicyFiles, orphan_policies};
 use saved::{Copies, KeychainPassphrase};
 use tty::TtyPassphrase;
@@ -534,6 +535,9 @@ fn listing(name: &WsName, stored: &[Stored]) -> Said {
 
 #[cfg(all(test, halti_dev))]
 mod saved_tests;
+
+#[cfg(all(test, halti_dev))]
+pub mod bench_tests;
 
 #[cfg(test)]
 mod tests {

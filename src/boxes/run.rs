@@ -28,7 +28,7 @@ use serde_json::{Map, Value, json};
 use super::browser_vm::BrowserVm;
 use super::sessions::{InBox, Launch, Sessions};
 use super::store::{self, Layout};
-use super::{BoxPolicy, KeyStore, MountPolicy, mount_problem};
+use super::{BoxPolicy, KeyStore, MountPolicy, MountRule, mount_problem_in};
 use crate::approval::{self, Action, Means};
 use crate::chain::{self, Chain};
 use crate::config::Settings;
@@ -184,44 +184,57 @@ pub struct Request<'a> {
     /// How the door approves a write the box's policy says to ask about (`[box.approval] write`):
     /// read as the box opens, and kept while it runs. None: this system has no means for it.
     pub write: Option<Means>,
+    /// The box as messages name it, and the door in a workspace: `dev` today, `acme/dev` in a
+    /// workspace.
+    pub shown: String,
+    /// The command that stops it: `halti box stop dev`, or `halti ws stop acme/dev`.
+    pub stop_with: String,
+    /// Which folders it may mount: today's guarded folders, or a workspace's rule.
+    pub mounts: MountRule,
+    /// Whether the person is asked as `[box.approval] run` says: not where opening the workspace
+    /// was the approval.
+    pub confirm: bool,
 }
 
 pub fn vm_name(id: &str) -> String {
     format!("{}{id}", names::BOX_VM_PREFIX)
 }
 
+/// The agent's environment: the model's stand-in where it takes a bearer token (`bearer`) or a
+/// key, and the policy's stand-ins.
+fn agent_env(policy: &BoxPolicy, bearer: bool) -> Vec<(String, String)> {
+    let mut env = engine::agent_env(bearer);
+    // For tools that won't start without a token; the door adds the real one on the sites' hosts.
+    env.extend(policy.standins.iter().map(|name| (name.clone(), door::STANDIN.to_string())));
+    env
+}
+
 /// Run the box. Returns the exit code of the command inside.
 pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     layout.prepare()?;
-    let vm = vm_name(&req.id);
+    let vm = layout.vm(&req.id);
     let policy = req.policy;
-    let agent_env = || -> Result<Vec<(String, String)>> {
-        let bearer = policy.model.as_deref().map(|m| world.model_uses_bearer(m)).transpose()?.unwrap_or(false);
-        let mut env = engine::agent_env(bearer);
-        // For tools that won't start without a token; the door adds the real one on the sites' hosts.
-        env.extend(policy.standins.iter().map(|name| (name.clone(), door::STANDIN.to_string())));
-        Ok(env)
-    };
+    let bearer = || -> Result<bool> { Ok(policy.model.as_deref().map(|m| world.model_uses_bearer(m)).transpose()?.unwrap_or(false)) };
     let command = guest_command(req.command.as_deref().unwrap_or(&policy.run));
 
     // Another halti has the box open: work in the same VM, through the same door.
     let Some(lock) = store::lock(&layout.lock(&req.id))? else {
         if !world.running(&vm) {
-            bail!("box {} is being opened or closed by another halti: try again in a moment", req.name);
+            bail!("box {} is being opened or closed by another halti: try again in a moment", req.shown);
         }
         // The door of the open box keeps the rules it started with, so joining under a policy
         // approved since would promise rules nothing enforces.
         if fs::read_to_string(layout.opened_with(&req.id)).ok().as_deref() != Some(req.policy_sha.as_str()) {
-            bail!("box {} runs with the policy it was opened with, not the one approved since: stop it (halti box stop {}) and run it again", req.name, req.name);
+            bail!("box {} runs with the policy it was opened with, not the one approved since: stop it ({}) and run it again", req.shown, req.stop_with);
         }
-        return exit_code(world.exec(&vm, &agent_env()?, &command, req.tty)?);
+        return exit_code(world.exec(&vm, &agent_env(policy, bearer()?), &command, req.tty)?);
     };
     fs::write(layout.opened_with(&req.id), &req.policy_sha).with_context(|| format!("noting the policy box {} opens with", req.name))?;
 
     // Holding the lock, whatever a crashed run left is ours to clear: its VMs too.
     sweep_temp(layout)?;
     sweep(layout, &req.id)?;
-    for leftover in [vm.clone(), engine::browser_vm_name(&req.id)] {
+    for leftover in [vm.clone(), layout.browser_vm(&req.id)] {
         if world.running(&leftover) {
             world.stop_vm(&leftover);
         }
@@ -229,15 +242,23 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
 
     world.available()?;
     let image =
-        policy.image.as_deref().ok_or_else(|| anyhow!("the policy of box {} names no image (set image = \"{}@sha256:...\" and approve it)", req.name, names::AGENT_IMAGE))?;
-    let env = agent_env()?;
+        policy.image.as_deref().ok_or_else(|| anyhow!("the policy of box {} names no image (set image = \"{}@sha256:...\" and approve it)", req.shown, names::AGENT_IMAGE))?;
+    let uses_bearer = bearer()?;
+    let env = agent_env(policy, uses_bearer);
     for site in policy.model.iter().chain(&policy.sites) {
-        world.site_ready(site).with_context(|| format!("box {} uses {site}", req.name))?;
+        world.site_ready(site).with_context(|| format!("box {} uses {site}", req.shown))?;
     }
-    let folders = resolve_mounts(&policy.mounts)?;
+    let folders = resolve_mounts(&policy.mounts, &req.mounts)?;
+    layout.sockets_fit(&req.id)?;
 
-    let sites = if policy.sites.is_empty() { String::new() } else { format!(" and let it use {}", policy.sites.join(", ")) };
-    world.confirm(&format!("open box {}{sites}", req.name))?;
+    if req.confirm {
+        let sites = if policy.sites.is_empty() { String::new() } else { format!(" and let it use {}", policy.sites.join(", ")) };
+        world.confirm(&format!("open box {}{sites}", req.name))?;
+    }
+    // What a second terminal needs to join a workspace's box, which reads no approval.
+    if layout.in_workspace() {
+        fs::write(layout.bearer(&req.id), if uses_bearer { "1" } else { "0" }).with_context(|| format!("noting how box {} reaches its model", req.shown))?;
+    }
 
     let mnt = layout.mount_point(&req.id);
     let (bundle, key) = if req.persistent {
@@ -286,7 +307,7 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     let (browser_vm, launch): (Option<Arc<BrowserVm>>, Launch) = match (!policy.sites.is_empty()).then(|| world.browser_image()) {
         Some(Ok(image)) => {
             let downloads = policy.browser.downloads.then(|| layout.downloads(req.name));
-            let vm = Arc::new(BrowserVm::new(&req.id, &image, browser_socket.clone(), downloads, ca.cert_pem(), tokens.clone()));
+            let vm = Arc::new(BrowserVm::new(&layout.browser_vm(&req.id), &image, browser_socket.clone(), downloads, ca.cert_pem(), tokens.clone()));
             let runners = vm.clone();
             (Some(vm), Box::new(move |site| runners.runner(site)))
         }
@@ -307,7 +328,8 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
         rosetta: policy.rosetta,
     };
     let config = door::Config {
-        name: req.id.clone(),
+        // A workspace's box is named with its workspace, in the door's answers and the audit log.
+        name: if layout.in_workspace() { req.shown.clone() } else { req.id.clone() },
         socket: socket.clone(),
         allow: policy.allow(),
         model: policy.model.clone(),
@@ -356,9 +378,9 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     drop(door);
     if req.persistent {
         if let Err(e) = world.record_sessions(req.name, &sealed_sites.sites()) {
-            eprintln!("halti: keeping which sites of box {} have a session: {e:#}", req.name);
+            eprintln!("halti: keeping which sites of box {} have a session: {e:#}", req.shown);
         }
-        record_head(world, req.name, &mnt, log_key);
+        record_head(world, req.name, &req.shown, &mnt, log_key);
     }
     drop(store);
     if req.unique {
@@ -370,17 +392,45 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
 
 /// Note where the log's chain stands, so `halti box log --verify` can tell a log whose chain was
 /// stripped or whose end was cut off. A log whose chain is already broken keeps the head it had.
-fn record_head(world: &dyn World, name: &str, mnt: &Path, log_key: [u8; 32]) {
+/// `shown` is the box as messages name it.
+fn record_head(world: &dyn World, name: &str, shown: &str, mnt: &Path, log_key: [u8; 32]) {
     match Chain::new(&store::door_log(mnt), log_key).verify() {
         Ok(found) => {
             if let Some(head) = found.head()
                 && let Err(e) = world.record_log_head(name, &head)
             {
-                eprintln!("halti: keeping where the log of box {name} stands: {e:#}");
+                eprintln!("halti: keeping where the log of box {shown} stands: {e:#}");
             }
         }
-        Err(e) => eprintln!("halti: the log of box {name}: {e:#}"),
+        Err(e) => eprintln!("halti: the log of box {shown}: {e:#}"),
     }
+}
+
+/// Join a workspace's box that another halti has open, from a second terminal: the engine only.
+/// Nothing is asked and nothing is looked up: the policy file must be the one the box opened with
+/// (`policy` is its bytes, read once), and how the model is reached is what the opener noted.
+#[allow(dead_code, clippy::too_many_arguments)] // for a workspace's boxes
+pub fn join(layout: &Layout, vms: &dyn Vms, box_name: &str, shown: &str, mounts: &MountRule, policy: &[u8], command: Option<&[String]>, tty: bool) -> Result<u8> {
+    let vm = layout.vm(box_name);
+    let busy = || anyhow!("box {shown} is being opened or closed by another halti: try again in a moment");
+    if !vms.running(&vm) {
+        return Err(busy());
+    }
+    if fs::read_to_string(layout.opened_with(box_name)).ok().as_deref() != Some(crate::util::sha256_hex(policy).as_str()) {
+        bail!("box {shown} runs with the policy it was opened with, and its file has changed since: stop it (halti ws stop {shown}) and run it again");
+    }
+    let text = std::str::from_utf8(policy).map_err(|_| anyhow!("the policy of box {shown} isn't text"))?;
+    let policy = BoxPolicy::parse_in(text, mounts)?;
+    let bearer = match fs::read_to_string(layout.bearer(box_name)).ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => return Err(busy()),
+    };
+    let command = guest_command(command.unwrap_or(&policy.run));
+    let status = vms.exec(&vm, &agent_env(&policy, bearer), &command, tty);
+    // `container exec` shares the terminal and may leave it non-blocking.
+    crate::util::blocking_stdio();
+    exit_code(status?)
 }
 
 /// The browser VM (if it was started) stops when this is dropped.
@@ -443,9 +493,9 @@ fn guest_command(cmd: &[String]) -> Vec<String> {
     full
 }
 
-/// The mounts of the policy, checked to be folders that exist and can be shared, with their
-/// real paths (a link is followed once, here, and the target is what gets checked and mounted).
-fn resolve_mounts(mounts: &[MountPolicy]) -> Result<Vec<(&MountPolicy, PathBuf)>> {
+/// The mounts of the policy, checked to be folders that exist and can be shared under `rule`, with
+/// their real paths (a link is followed once, here, and the target is what gets checked and mounted).
+fn resolve_mounts<'a>(mounts: &'a [MountPolicy], rule: &MountRule) -> Result<Vec<(&'a MountPolicy, PathBuf)>> {
     mounts
         .iter()
         .map(|m| {
@@ -453,7 +503,7 @@ fn resolve_mounts(mounts: &[MountPolicy]) -> Result<Vec<(&MountPolicy, PathBuf)>
             if !real.is_dir() {
                 bail!("[[mount]] {} isn't a folder", m.path);
             }
-            if let Some(why) = mount_problem(&real) {
+            if let Some(why) = mount_problem_in(&real, rule) {
                 bail!("[[mount]] {} ({}) {why}", m.path, real.display());
             }
             Ok((m, real))
@@ -571,10 +621,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Condvar, Mutex};
 
+    use halti_core::ids::WsId;
+
     use super::*;
     use crate::browse::BoxBrowser;
     use crate::legacy;
-    use crate::util::TempDir;
+    use crate::util::{TempDir, config_dir, sha256_hex, store_root};
 
     const DIGEST: &str = "agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -607,6 +659,8 @@ mod tests {
         /// Files of the box as the agent would find them, read when it starts.
         files: BTreeMap<String, String>,
         stopped: bool,
+        /// The VMs stopped, by name.
+        stopped_vms: Vec<String>,
     }
 
     /// Records what a run does; `exec` can change files the way the agent would.
@@ -617,6 +671,8 @@ mod tests {
         running: Mutex<bool>,
         /// The name of the one VM that runs (when `running`); `None`: any name.
         only: Option<String>,
+        /// VMs that run whatever else does: other boxes'.
+        others: Vec<String>,
         deny: bool,
         unavailable: bool,
         door_fails: bool,
@@ -650,7 +706,7 @@ mod tests {
         }
 
         fn running(&self, vm: &str) -> bool {
-            *self.running.lock().unwrap() && self.only.as_ref().is_none_or(|only| only == vm)
+            (*self.running.lock().unwrap() && self.only.as_ref().is_none_or(|only| only == vm)) || self.others.iter().any(|other| other == vm)
         }
 
         fn start_vm(&self, spec: &engine::VmSpec) -> Result<()> {
@@ -661,10 +717,11 @@ mod tests {
             Ok(())
         }
 
-        fn stop_vm(&self, _vm: &str) {
+        fn stop_vm(&self, vm: &str) {
             self.note("stop_vm");
             *self.running.lock().unwrap() = false;
             self.seen.lock().unwrap().stopped = true;
+            self.seen.lock().unwrap().stopped_vms.push(vm.to_string());
             self.wake.notify_all();
         }
 
@@ -771,7 +828,22 @@ mod tests {
     }
 
     fn request<'a>(s: &'a Setup, policy: &'a BoxPolicy, persistent: bool) -> Request<'a> {
-        Request { name: "r", id: "r".into(), policy, policy_sha: "sha-1".into(), persistent, unique: false, command: None, tty: false, stop: &s.stop, write: Some(Means::None) }
+        Request {
+            name: "r",
+            id: "r".into(),
+            policy,
+            policy_sha: "sha-1".into(),
+            persistent,
+            unique: false,
+            command: None,
+            tty: false,
+            stop: &s.stop,
+            write: Some(Means::None),
+            shown: "r".into(),
+            stop_with: "halti box stop r".into(),
+            mounts: MountRule::Guarded(vec![config_dir(), store_root(), crate::config::workspaces_in_effect()]),
+            confirm: true,
+        }
     }
 
     fn policy(s: &Setup, extra: &str) -> BoxPolicy {
@@ -1189,6 +1261,220 @@ mod tests {
         let fake = Fake { key, browser_hook: Some(hook), ..Fake::default() };
         run(&s.layout, &fake, &request(&s, &p, true)).unwrap();
         assert_eq!(fake.seen.lock().unwrap().sessions.as_deref(), Some(&[][..]));
+    }
+
+    /// A folder with a short path, removed when dropped.
+    struct Short(PathBuf);
+
+    impl Drop for Short {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A workspace's box `dev`, as `ws run acme/dev` asks for it once the workspace is open.
+    fn in_workspace<'a>(s: &'a Setup, policy: &'a BoxPolicy) -> Request<'a> {
+        Request {
+            name: "dev",
+            id: "dev".into(),
+            shown: "acme/dev".into(),
+            stop_with: "halti ws stop acme/dev".into(),
+            mounts: MountRule::Workspace(vec![config_dir(), store_root()]),
+            confirm: false,
+            ..request(s, policy, false)
+        }
+    }
+
+    const ACME: [u8; 16] = [0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0x0a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78];
+
+    /// A policy a workspace's box may have: no mounts outside a plain home folder.
+    fn plain_policy() -> BoxPolicy {
+        BoxPolicy::parse(&format!("image = \"{DIGEST}\"\nmodel = \"anthropic\"\nsites = [\"github\"]\nstandins = [\"GH_TOKEN\"]\n")).unwrap()
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn a_workspace_box_runs_in_order_without_a_confirm() {
+        let s = setup();
+        let mut layout = Layout::under_workspace(&s.dir.0, WsId::from_bytes(ACME)).unwrap();
+        // A test folder's path is too long for a workspace's browser socket on a Mac.
+        let short = Short(PathBuf::from(format!("/tmp/halti-ws-test-{}", std::process::id())));
+        layout.sockets = short.0.join("ws");
+        let p = plain_policy();
+        let bearer = layout.bearer("dev");
+        let hook: Hook = Box::new(move |_| assert_eq!(fs::read_to_string(&bearer).unwrap(), "1", "a second terminal can join"));
+        let fake = Fake { hook: Some(hook), ..Fake::default() };
+        assert_eq!(run(&layout, &fake, &in_workspace(&s, &p)).unwrap(), 0);
+        // The workspace's open was the approval: nothing else is asked.
+        assert_eq!(fake.calls(), ["available", "bearer: anthropic", "site: anthropic", "site: github", "start_vm", "start_door", "install_ca", "exec", "stop_vm"]);
+        let seen = fake.seen.lock().unwrap();
+        let (name, _, _, _, socket, mounts, _) = seen.spec.clone().unwrap();
+        assert_eq!((name.as_str(), socket), ("halti-wsbox-abcdef012345-dev", short.0.join("ws/abcdef012345-dev.sock")));
+        assert!(mounts.iter().all(|m| m.0.starts_with(s.dir.0.join("boxes/open/dev"))), "the store is in the workspace's boxes folder: {mounts:?}");
+        assert!(seen.files.contains_key(".claude.json"));
+        assert_eq!(seen.exec_vm.as_deref(), Some("halti-wsbox-abcdef012345-dev"));
+        assert!(!store::is_mounted(&layout.mount_point("dev")) && !layout.ephemeral_bundle("dev").exists() && !layout.socket("dev").exists());
+        assert!(!s.dir.0.join("box").exists(), "nothing of today's boxes' folders");
+    }
+
+    #[test]
+    fn a_workspace_run_never_stops_a_keychain_or_cred_box_of_the_same_name() {
+        let s = setup();
+        let layout = Layout::under_workspace(&s.dir.0, WsId::from_bytes(ACME)).unwrap();
+        let p = plain_policy();
+        let others = vec![vm_name("dev"), crate::engine::browser_vm_name("dev"), format!("{}dev", legacy::BOX_VM_PREFIX), format!("{}dev", legacy::BROWSER_VM_PREFIX)];
+        // They run: only the workspace's own leftovers would be stopped, and none is there.
+        let fake = Fake { others: others.clone(), unavailable: true, ..Fake::default() };
+        assert!(run(&layout, &fake, &in_workspace(&s, &p)).is_err());
+        assert_eq!(fake.calls(), ["available"], "nothing stopped");
+        assert!(others.iter().all(|vm| fake.running(vm)));
+        // A leftover of the workspace's own box is stopped, and only that.
+        let fake = Fake { others: [others.clone(), vec![layout.vm("dev"), layout.browser_vm("dev")]].concat(), unavailable: true, ..Fake::default() };
+        assert!(run(&layout, &fake, &in_workspace(&s, &p)).is_err());
+        assert_eq!(fake.seen.lock().unwrap().stopped_vms, ["halti-wsbox-abcdef012345-dev", "halti-wsbrowser-abcdef012345-dev"]);
+    }
+
+    /// The VM, environment and command a join ran.
+    type Joined = (String, Vec<(String, String)>, Vec<String>);
+
+    /// An engine that notes each call: a join reaches nothing else.
+    #[derive(Default)]
+    struct Engine {
+        calls: Mutex<Vec<String>>,
+        exec: Mutex<Option<Joined>>,
+    }
+
+    impl Vms for Engine {
+        fn available(&self) -> Result<()> {
+            self.calls.lock().unwrap().push("available".into());
+            Ok(())
+        }
+
+        fn running(&self, _name: &str) -> bool {
+            self.calls.lock().unwrap().push("running".into());
+            true
+        }
+
+        fn run(&self, _spec: &engine::VmSpec) -> Result<()> {
+            self.calls.lock().unwrap().push("run".into());
+            Ok(())
+        }
+
+        fn stop(&self, _name: &str) -> Result<()> {
+            self.calls.lock().unwrap().push("stop".into());
+            Ok(())
+        }
+
+        fn exec(&self, name: &str, env: &[(String, String)], cmd: &[String], _tty: bool) -> Result<ExitStatus> {
+            self.calls.lock().unwrap().push("exec".into());
+            *self.exec.lock().unwrap() = Some((name.to_string(), env.to_vec(), cmd.to_vec()));
+            Ok(ExitStatus::from_raw(0))
+        }
+
+        fn install_ca(&self, _name: &str, _pem: &str) -> Result<()> {
+            self.calls.lock().unwrap().push("install_ca".into());
+            Ok(())
+        }
+
+        fn start_docker(&self, _name: &str) -> Result<()> {
+            self.calls.lock().unwrap().push("start_docker".into());
+            Ok(())
+        }
+
+        fn image_digest(&self, _reference: &str) -> Result<String> {
+            self.calls.lock().unwrap().push("image_digest".into());
+            Ok(DIGEST.into())
+        }
+    }
+
+    /// A workspace's box `dev` as its opener leaves it: the lock held, the policy's hash and the
+    /// model's answer noted. Returns the lock and the policy's bytes.
+    fn opened(layout: &Layout, bearer: &str) -> (store::Lock, Vec<u8>) {
+        layout.prepare().unwrap();
+        let text = format!("image = \"{DIGEST}\"\nmodel = \"anthropic\"\nrun = [\"claude\", \"-c\"]\nstandins = [\"GH_TOKEN\"]\n").into_bytes();
+        let held = store::lock(&layout.lock("dev")).unwrap().unwrap();
+        fs::write(layout.opened_with("dev"), sha256_hex(&text)).unwrap();
+        fs::write(layout.bearer("dev"), bearer).unwrap();
+        (held, text)
+    }
+
+    #[test]
+    fn a_join_asks_nothing_and_looks_nothing_up() {
+        let s = setup();
+        let layout = Layout::under_workspace(&s.dir.0, WsId::from_bytes(ACME)).unwrap();
+        let (_held, text) = opened(&layout, "1");
+        let rule = MountRule::Workspace(vec![]);
+        let vms = Engine::default();
+        assert_eq!(join(&layout, &vms, "dev", "acme/dev", &rule, &text, None, true).unwrap(), 0);
+        assert_eq!(*vms.calls.lock().unwrap(), ["running", "exec"]);
+        let (vm, env, cmd) = vms.exec.lock().unwrap().clone().unwrap();
+        assert_eq!(vm, "halti-wsbox-abcdef012345-dev");
+        assert!(env.contains(&("CLAUDE_CODE_OAUTH_TOKEN".into(), names::STANDIN.into())) && env.contains(&("GH_TOKEN".into(), names::STANDIN.into())), "{env:?}");
+        assert_eq!(&cmd[3..], ["claude", "-c"], "the policy's run");
+        // The model's other answer, and a command of the person's own.
+        fs::write(layout.bearer("dev"), "0").unwrap();
+        let vms = Engine::default();
+        join(&layout, &vms, "dev", "acme/dev", &rule, &text, Some(&["bash".to_string()][..]), false).unwrap();
+        let (_, env, cmd) = vms.exec.lock().unwrap().clone().unwrap();
+        assert!(env.contains(&("ANTHROPIC_API_KEY".into(), names::STANDIN.into())), "{env:?}");
+        assert_eq!(&cmd[3..], ["bash"]);
+        // With no answer noted, the box is still being opened.
+        fs::remove_file(layout.bearer("dev")).unwrap();
+        let vms = Engine::default();
+        let error = join(&layout, &vms, "dev", "acme/dev", &rule, &text, None, false).unwrap_err().to_string();
+        assert_eq!(error, "box acme/dev is being opened or closed by another halti: try again in a moment");
+        assert_eq!(*vms.calls.lock().unwrap(), ["running"]);
+    }
+
+    #[test]
+    fn a_join_refuses_a_policy_file_changed_since_the_open() {
+        let s = setup();
+        let layout = Layout::under_workspace(&s.dir.0, WsId::from_bytes(ACME)).unwrap();
+        let (_held, text) = opened(&layout, "1");
+        let rule = MountRule::Workspace(vec![]);
+        let changed = [text.as_slice(), b"cpus = 2\n"].concat();
+        let vms = Engine::default();
+        let error = join(&layout, &vms, "dev", "acme/dev", &rule, &changed, None, false).unwrap_err().to_string();
+        assert_eq!(error, "box acme/dev runs with the policy it was opened with, and its file has changed since: stop it (halti ws stop acme/dev) and run it again");
+        assert_eq!(*vms.calls.lock().unwrap(), ["running"], "nothing runs");
+        // Changed the same way as the hash noted, it is still checked by the workspace's rule.
+        let hidden = [text.as_slice(), b"[[mount]]\npath = \"~/.ssh\"\n"].concat();
+        fs::write(layout.opened_with("dev"), sha256_hex(&hidden)).unwrap();
+        let error = format!("{:#}", join(&layout, &vms, "dev", "acme/dev", &rule, &hidden, None, false).unwrap_err());
+        assert!(error.contains("[[mount]] ~/.ssh: a box in a workspace mounts only folders"), "{error}");
+        assert_eq!(*vms.calls.lock().unwrap(), ["running", "running"]);
+    }
+
+    #[test]
+    fn long_sockets_are_refused_before_the_box_opens() {
+        let s = setup();
+        let mut layout = Layout::under_workspace(&s.dir.0, WsId::from_bytes(ACME)).unwrap();
+        layout.sockets = s.dir.0.join("s".repeat(104));
+        let p = plain_policy();
+        for confirm in [true, false] {
+            let fake = Fake::default();
+            let error = run(&layout, &fake, &Request { confirm, ..in_workspace(&s, &p) }).unwrap_err().to_string();
+            assert!(error.contains("is too long"), "{error}");
+            assert_eq!(fake.calls(), ["available", "bearer: anthropic", "site: anthropic", "site: github"], "nothing asked or opened");
+            assert!(!layout.bearer("dev").exists() && !layout.root.join("temp/dev.sparsebundle").exists());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+    fn today_s_layout_writes_no_bearer_file() {
+        let s = setup();
+        let p = policy(&s, "");
+        let hook: Hook = Box::new(|work| {
+            let open = work.parent().unwrap().parent().unwrap();
+            let mut found: Vec<String> = fs::read_dir(open).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            found.sort();
+            assert_eq!(found, ["r", "r.lock", "r.policy"], "no .bearer");
+        });
+        let fake = Fake { hook: Some(hook), ..Fake::default() };
+        run(&s.layout, &fake, &request(&s, &p, false)).unwrap();
+        assert!(fake.calls().contains(&"exec".to_string()));
+        assert!(!s.layout.bearer("r").exists());
     }
 
     #[test]
