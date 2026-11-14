@@ -1,6 +1,6 @@
 //! Workspaces on this machine: where their files are, how a passphrase and a secret's value are
 //! read, and what `ws new`, `ws ls`, `ws set`, `ws rm`, `ws delete`, `ws policy` (`policies`),
-//! `ws box`, `ws run` and `ws stop` (`boxes`), `open` and `close` print. What
+//! `ws box`, `ws run` and `ws stop` (`boxes`), `open` and `close` (`keep`) print. What
 //! a workspace is, every check on it, and how its secrets are sealed are core's
 //! (`halti_core::verbs`); nothing here decides whether one opens, and no key of a workspace's
 //! reaches this side.
@@ -17,11 +17,12 @@
 //! A secret's value is read only after the approval and the checks (`tty::read_value`), once, and
 //! is never printed. Only `open` saves a typed passphrase again.
 //!
-//! Workspaces can't stay open yet: `open` checks the passphrase and the files and wipes the keys as
-//! it ends, and `close` has nothing to do and says so.
+//! `open` keeps a workspace open in its terminal until `close`, Ctrl-C or a closed terminal ends
+//! it (`keep`).
 
 pub mod boxes;
 mod files;
+pub mod keep;
 mod memory;
 pub mod policies;
 mod saved;
@@ -42,7 +43,7 @@ use halti_core::manifest::Manifest;
 use halti_core::platform::{Build, Os, Role};
 use halti_core::refusal::Refusal;
 use halti_core::store::{FileKey, Files};
-use halti_core::verbs::{Deleted, Draws, Fresh, Host, Machine, Nonces, Put, State, Stored, Which, resolve_name, ws_delete, ws_items, ws_list, ws_new, ws_open, ws_remove, ws_set};
+use halti_core::verbs::{Deleted, Draws, Fresh, Host, Machine, Nonces, Put, Reader, State, Stored, Which, ws_delete, ws_items, ws_list, ws_new, ws_open, ws_remove, ws_set};
 use zeroize::Zeroizing;
 
 use crate::approval::{Action, Declined, Means, Real, World};
@@ -50,6 +51,7 @@ use crate::config::{self, Manager, PassphraseMode, Settings};
 use crate::names;
 pub use files::Reading;
 use files::{DirFiles, FileAnchor, FileKeystore, PolicyFiles, orphan_policies};
+pub use memory::lock_pages;
 use saved::{Copies, KeychainPassphrase};
 use tty::TtyPassphrase;
 
@@ -225,18 +227,6 @@ fn forget_drawn_lock(here: &Here, drawn: WsId) -> Result<()> {
     here.files.forget_lock(drawn)
 }
 
-/// `halti open [NAME] [--type]`: checks the passphrase and the files. Workspaces can't stay open
-/// yet: the keys are wiped before anything is printed.
-pub fn open(typed: Option<&str>, type_it: bool) -> Result<()> {
-    let settings = config::settings();
-    memory::harden();
-    let here = Here::at(&settings.workspaces.path);
-    let name = resolve_name(&here.files, typed)?;
-    let way = Way { world: &Real, copies: &saved::Keychain, means: saved_means(&settings, Action::WsOpen, type_it), detail: None };
-    open_with(&here, &name, &way, &|| TtyPassphrase::new(false))?.print();
-    Ok(())
-}
-
 /// Runs `verb` on `name` with the key holder `way` says, approved as `action` asks. With no means,
 /// the passphrase is typed (`typing`). Through the saved copy: if there is one, the approval, then
 /// the copy. Declined, nothing more happens, and the error is `declined`. A copy that can't be used,
@@ -281,9 +271,9 @@ fn declined(what: &str, command: &str) -> String {
 
 /// Opens `name` the way `way` says (`approved`), with `typing` making the holder that has it typed.
 /// Typed after a means was tried, a workspace made with a saved copy has it saved again, and one
-/// made to be typed loses any copy found for it.
-fn open_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
-    let closed = format!("workspaces can't stay open yet, so {name} was closed again");
+/// made to be typed loses any copy found for it. Returns what opened it, and what to say about the
+/// saved copy.
+fn open_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<(Reader, Said)> {
     // Kept only where it may be saved again.
     let keeping = || typing().keeping();
     let typing: &dyn Fn() -> TtyPassphrase = if way.means.is_some() { &keeping } else { typing };
@@ -293,12 +283,8 @@ fn open_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> Tty
     let way = &Way { world: way.world, copies: way.copies, means: way.means, detail: None };
     let (reader, typed) = approved(here, name, way, Action::WsOpen, &declined, typing, &open)?;
     let (id, made_with_a_copy) = (reader.id(), made_saved(reader.manifest()));
-    drop(reader);
-    let mut said = Said { out: vec!["passphrase correct".to_string()], notes: Vec::new() };
-    let Some(holder) = typed else {
-        said.out.push(closed);
-        return Ok(said);
-    };
+    let mut said = Said::default();
+    let Some(holder) = typed else { return Ok((reader, said)) };
     if made_with_a_copy {
         if let Some(passphrase) = holder.take() {
             match way.copies.add(id, &passphrase) {
@@ -312,16 +298,7 @@ fn open_with(here: &Here, name: &WsName, way: &Way<'_>, typing: &dyn Fn() -> Tty
         }
         said.out.push(format!("{name} was made without a saved passphrase, so it is typed each time"));
     }
-    said.out.push(closed);
-    Ok(said)
-}
-
-/// `halti close [NAME]`: workspaces can't stay open yet, so there is nothing to close. It says so,
-/// and asks nothing.
-pub fn close(typed: Option<&str>) -> Result<()> {
-    let name = resolve_name(&DirFiles::at(&config::settings().workspaces.path), typed)?;
-    println!("{name} isn't open");
-    Ok(())
+    Ok((reader, said))
 }
 
 /// `halti ws ls [WS] [--type]`: with a name, the secrets of that workspace, approved as opening it
@@ -347,7 +324,14 @@ pub fn ls(typed: Option<&str>, type_it: bool) -> Result<()> {
     for entry in &listed {
         let name = entry.name.as_str();
         match entry.record {
-            Some(record) => println!("{name:<16} {:<10} {:<10} {}", if entry.pinned { "closed" } else { "unfinished" }, key_name(record.key), record.id),
+            Some(record) => {
+                let state = match entry.pinned {
+                    true if keep::answers(&here, &entry.name, record.id) => "open",
+                    true => "closed",
+                    false => "unfinished",
+                };
+                println!("{name:<16} {state:<10} {:<10} {}", key_name(record.key), record.id);
+            }
             None => println!("{name:<16} {:<10} {:<10} -", "unreadable", "-"),
         }
     }

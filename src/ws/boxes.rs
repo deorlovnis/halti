@@ -9,6 +9,10 @@
 //! `main` chooses. A second terminal joins a box that runs and is asked nothing: it reads only what
 //! the opener noted beside the store (`boxes::join_in`). Listing and stopping ask nothing.
 //!
+//! A workspace that `halti open` keeps open (`ws::keep`) starts its boxes after the same checks of
+//! their files, which are made here and handed to it (`keep`); `Kept` is where other commands find
+//! it: its lock and its socket.
+//!
 //! What is shown before an approval is what is sealed: a policy's file is read once, checked
 //! against the workspace's mount rule and plain text, and those bytes are shown and sent to core.
 //! Nothing here looks anything up through a place: of `boxes` only what reaches none is used.
@@ -37,9 +41,9 @@ use crate::boxes::{self, BoxPolicy, MountRule};
 use crate::config::{self, Settings};
 use crate::engine::{self, Vms};
 use crate::keep::{No, Refused};
-use crate::policy;
 use crate::source::Source;
 use crate::util::sha256_hex;
+use crate::{names, policy};
 
 /// `acme/dev`: a workspace's name, then after the first `/` a box, each as core checks it.
 pub fn target(text: &str) -> Result<(WsName, &str)> {
@@ -64,8 +68,13 @@ struct Found {
 /// Box `box_name` of `name`. There is no workspace without a record.
 fn find(here: &Here, name: &WsName, box_name: &str) -> Result<Found> {
     let id = here.id_of(name).ok_or_else(|| Refusal::Unknown(name.clone()))?;
-    let layout = Layout::workspace(&boxes_dir(&here.root, id), id)?;
-    Ok(Found { name: name.clone(), id, box_name: box_name.to_string(), shown: format!("{name}/{box_name}"), files: PolicyFiles::boxes(&here.root, id), layout })
+    found_in(&here.root, name, id, box_name)
+}
+
+/// Box `box_name` of workspace `name`, whose id is `id`, in the workspaces folder `root`.
+fn found_in(root: &Path, name: &WsName, id: WsId, box_name: &str) -> Result<Found> {
+    let layout = Layout::workspace(&boxes_dir(root, id), id)?;
+    Ok(Found { name: name.clone(), id, box_name: box_name.to_string(), shown: format!("{name}/{box_name}"), files: PolicyFiles::boxes(root, id), layout })
 }
 
 fn no_box(shown: &str) -> anyhow::Error {
@@ -538,10 +547,13 @@ fn log_with(here: &Here, found: &Found, way: &Way<'_>, typing: &dyn Fn() -> TtyP
 
 // --- deleting a workspace ---
 
-/// Refuses to delete workspace `name` (id `id`) while one of its boxes runs or has a store: checked
-/// before anything is asked.
+/// Refuses to delete workspace `name` (id `id`) while it is open, or one of its boxes runs or has a
+/// store: checked before anything is asked.
 pub(super) fn refuse_delete(here: &Here, name: &WsName, id: WsId) -> Result<()> {
     let folder = boxes_dir(&here.root, id);
+    if boxes::store::is_held(&folder.join(names::KEEPER_LOCK)) {
+        bail!("{name} is open: close it first (halti close {name})");
+    }
     for entry in fs::read_dir(folder.join("open")).into_iter().flatten().flatten() {
         let file = entry.file_name().to_string_lossy().into_owned();
         if let Some(box_name) = file.strip_suffix(".lock")
@@ -597,6 +609,90 @@ impl Leftovers {
             }
         }
     }
+}
+
+// --- an open workspace ---
+
+/// What keeps a workspace open, as `halti open` hands it on.
+pub type Keep = boxes::keep::Keep;
+
+/// An open workspace as other commands find it, by the id its record names: the lock that
+/// `halti open` holds while it keeps the workspace open, its socket, and its boxes.
+pub(super) struct Kept {
+    layout: Layout,
+    files: PolicyFiles,
+}
+
+impl Kept {
+    pub(super) fn of(here: &Here, id: WsId) -> Result<Kept> {
+        Ok(Kept { layout: Layout::workspace(&boxes_dir(&here.root, id), id)?, files: PolicyFiles::boxes(&here.root, id) })
+    }
+
+    /// Whether some process holds the lock: a hint that the workspace is open, not proof. A program
+    /// running as you can hold it.
+    pub(super) fn held(&self) -> bool {
+        boxes::store::is_held(&self.layout.keeper_lock())
+    }
+
+    /// The lock, unless another process holds it. Its folder is made first: a workspace that never
+    /// had a box has none.
+    pub(super) fn take(&self) -> Result<Option<boxes::store::Lock>> {
+        self.layout.prepare()?;
+        boxes::store::lock(&self.layout.keeper_lock())
+    }
+
+    /// Waits a while for the lock to be let go of; false if it is still held.
+    pub(super) fn let_go(&self) -> bool {
+        (0..40).any(|_| {
+            let free = !self.held();
+            if !free {
+                thread::sleep(Duration::from_millis(250));
+            }
+            free
+        })
+    }
+
+    pub(super) fn socket(&self) -> std::path::PathBuf {
+        self.layout.keeper_socket().expect("a workspace's boxes")
+    }
+
+    /// Puts away what a `halti open` or a `ws run` that ended without cleaning up left: the boxes
+    /// with something left. Nothing where there is no engine.
+    pub(super) fn left(&self, settings: &Settings) -> Result<Vec<String>> {
+        let Ok(vms) = boxes::vms(settings) else { return Ok(Vec::new()) };
+        Ok(boxes::keep::put_away_left(&self.layout, vms, &self.files.names()?))
+    }
+
+    /// Stops the boxes that other terminals run, names only: the boxes stopped, and those whose
+    /// halti held on.
+    pub(super) fn others(&self, settings: &Settings) -> (Vec<String>, Vec<String>) {
+        let Ok(vms) = boxes::vms(settings) else { return (Vec::new(), Vec::new()) };
+        boxes::keep::stop_others(&self.layout, vms)
+    }
+}
+
+/// What keeps workspace `name` (id `id`) open, once it is opened and chosen: `lock`, which
+/// `halti open` took, its boxes as `kept` found them, the settings read once, and the checks of a
+/// box's files before it starts, which are `ws run`'s (`start_check`).
+pub(super) fn keep(here: &Here, name: &WsName, id: WsId, kept: Kept, lock: boxes::store::Lock, settings: &Settings) -> Result<Keep> {
+    let rule = MountRule::workspace(settings);
+    let (root, ws, checked_under) = (here.root.clone(), name.clone(), rule.clone());
+    let check = move |box_name: &str| -> Result<boxes::keep::Checked, Refused> {
+        let found = found_in(&root, &ws, id, box_name)?;
+        let (text, policy) = start_check(&found, &checked_under)?;
+        Ok(boxes::keep::Checked { text, policy })
+    };
+    let boxes_named = kept.files.names()?;
+    Ok(boxes::keep::Keep {
+        name: name.clone(),
+        lock,
+        layout: kept.layout,
+        mounts: rule,
+        vms: boxes::vms(settings).ok(),
+        settings: settings.clone(),
+        boxes: boxes_named,
+        check: Box::new(check),
+    })
 }
 
 #[cfg(all(test, halti_dev))]

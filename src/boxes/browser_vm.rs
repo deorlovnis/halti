@@ -87,7 +87,7 @@ impl BrowserVm {
         if std::mem::take(&mut *up)
             && let Err(e) = engine::stop(&self.spec.name)
         {
-            eprintln!("halti: stopping {}: {e:#}", self.spec.name);
+            crate::util::warn(&format!("stopping {}: {e:#}", self.spec.name));
         }
         let _ = std::fs::remove_file(&self.spec.socket);
     }

@@ -111,7 +111,7 @@ impl World for Real<'_> {
 
     fn stop_vm(&self, vm: &str) {
         if let Err(e) = self.vms.stop(vm) {
-            eprintln!("halti: stopping {vm}: {e:#}");
+            crate::util::warn(&format!("stopping {vm}: {e:#}"));
         }
     }
 
@@ -373,7 +373,7 @@ impl Running<'_> {
 
         // The folders are changed here, while no VM has them.
         for replaced in prepare_home(&mnt, policy.docker).with_context(|| format!("box {}", req.shown))? {
-            eprintln!("halti: box {}: {} was a link or a special file, so halti replaced it and followed nothing", req.shown, replaced.display());
+            crate::util::warn(&format!("box {}: {} was a link or a special file, so halti replaced it and followed nothing", req.shown, replaced.display()));
         }
         let mut mounts = vec![
             engine::Mount { host: mnt.join("home"), guest: GUEST_HOME.into(), readonly: false },
@@ -487,7 +487,6 @@ impl Running<'_> {
 
     /// Keep the box until a stop is asked (`req.stop`), `leave` says to, or its VM is gone (stopped
     /// by hand, say): a box whose agents come and go by other ways in.
-    #[allow(dead_code)] // nothing keeps a box without a command of its own yet
     pub fn wait(&self, leave: &dyn Fn() -> bool) {
         let mut looked = Instant::now();
         while !self.req.stop.load(Ordering::SeqCst) && !leave() {
@@ -544,7 +543,7 @@ impl Running<'_> {
             if let Some(sealed) = &self.sealed
                 && let Err(e) = world.record_sessions(req.name, &sealed.sites())
             {
-                eprintln!("halti: keeping which sites of box {} have a session: {e:#}", req.shown);
+                crate::util::warn(&format!("keeping which sites of box {} have a session: {e:#}", req.shown));
             }
             record_head(world, req.name, &req.shown, &self.mnt, self.log_key);
         }
@@ -582,10 +581,10 @@ fn record_head(world: &dyn World, name: &str, shown: &str, mnt: &Path, log_key: 
             if let Some(head) = found.head()
                 && let Err(e) = world.record_log_head(name, &head)
             {
-                eprintln!("halti: keeping where the log of box {shown} stands: {e:#}");
+                crate::util::warn(&format!("keeping where the log of box {shown} stands: {e:#}"));
             }
         }
-        Err(e) => eprintln!("halti: the log of box {shown}: {e:#}"),
+        Err(e) => crate::util::warn(&format!("the log of box {shown}: {e:#}")),
     }
 }
 
@@ -679,7 +678,7 @@ fn clone_into(work: &Path, name: &str, host: &Path) -> Result<()> {
     match store::copy_tree(host, &dst) {
         Ok(copied) => {
             if copied.skipped > 0 {
-                eprintln!("halti: {} links and special files in {} weren't copied", copied.skipped, host.display());
+                crate::util::warn(&format!("{} links and special files in {} weren't copied", copied.skipped, host.display()));
             }
             Ok(())
         }

@@ -16,8 +16,12 @@
 //! environment variables hold the stand-in for a site's credential. `[browser]` says whether a
 //! site's browser session is kept between runs: sealed in the store's `browser/` folder, which no
 //! VM mounts (see `sessions`; `halti box login` signs in by hand, see `login`).
+//!
+//! A workspace's boxes are started by `ws run` in its own process, or, while the workspace is
+//! open, by the `halti open` that keeps it (see `keep`).
 
 pub mod browser_vm;
+pub(crate) mod keep;
 mod login;
 mod nofollow;
 pub(crate) mod run;
@@ -227,6 +231,7 @@ fn mount_problem_among(path: &Path, own: &[PathBuf]) -> Option<String> {
 }
 
 /// Which folders a box may mount, with halti's own folders (`own`) kept out of it either way.
+#[derive(Clone)]
 pub enum MountRule {
     /// Today's boxes: any folder but halti's own and everything.
     Guarded(Vec<PathBuf>),
@@ -773,9 +778,7 @@ pub struct Join {
 /// through the place. Then today's run, with no question: opening the workspace was the approval.
 pub fn run_in(start: Start) -> Result<u8> {
     let Start { settings, vms, layout, name, shown, text, policy, mounts, command } = start;
-    let keys = KeyStore::of(&settings);
-    let approval = policy::status_of_text(&key(&name), &text);
-    ready_in(&shown, approval, policy.keep, || keys.exists(&name), &source::current().hint(Hint::RemoveBox(&name))).map_err(|refused| refused.why)?;
+    ready(&name, &shown, &text, policy.keep, &settings).map_err(|refused| refused.why)?;
     run::catch_signals();
     let request = run::Request {
         name: &name,
@@ -794,6 +797,15 @@ pub fn run_in(start: Start) -> Result<u8> {
         confirm: false,
     };
     run_request(&layout, vms, &settings, &request)
+}
+
+/// What the workspace's box `name` (`shown`, as messages name it) needs of the place, which is
+/// chosen, before it starts: see `ready_in`. `text` is its policy file's bytes as read, and `keep`
+/// whether that policy keeps a store.
+fn ready(name: &str, shown: &str, text: &[u8], keep: bool, settings: &Settings) -> Result<(), Refused> {
+    let keys = KeyStore::of(settings);
+    let approval = policy::status_of_text(&key(name), text);
+    ready_in(shown, approval, keep, || keys.exists(name), &source::current().hint(Hint::RemoveBox(name)))
 }
 
 /// What a workspace's box (`shown`, as messages name it) needs of the place before it starts: an

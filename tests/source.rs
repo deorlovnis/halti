@@ -721,7 +721,12 @@ const WS_BOX_ITEMS: &[&str] = &[
     "store::door_log(",
     "store::is_mounted(",
     "store::detach(",
+    "store::Lock",
     "run::sweep(",
+    "keep::Keep",
+    "keep::Checked",
+    "keep::put_away_left(",
+    "keep::stop_others(",
 ];
 
 /// The box items the workspace's box commands name by type: the parse under a rule, the rule, and
@@ -781,6 +786,32 @@ fn ws_names_only_source_free_box_items() {
     }
     assert!(named >= WS_BOX_ITEMS.len(), "the workspace's box commands use the boxes module: {named}");
     assert!(found.is_empty(), "src/ws reaches no source through the boxes module; name only {WS_BOX_ITEMS:?}:\n{}", found.join("\n"));
+}
+
+/// The two ends of an open workspace's socket that other commands use, the wire and the client,
+/// look nothing up and reach no box: what they send and read is names.
+#[test]
+fn the_keeper_s_client_names_no_lookup() {
+    let mut found = Vec::new();
+    for path in ["src/keep.rs", "src/ws/keep.rs"] {
+        let code = release_code(path, &fs::read_to_string(root().join(path)).unwrap()).unwrap();
+        for word in ["source::current", "crate::boxes", "choose("] {
+            if code.contains(word) {
+                found.push(format!("{path}: {word}"));
+            }
+        }
+    }
+    assert!(found.is_empty(), "the socket's client looks nothing up:\n{}", found.join("\n"));
+}
+
+/// What keeps a workspace open starts its boxes through lookups, and names no workspace command:
+/// the checks of a box's files are handed to it.
+#[test]
+fn the_keeper_names_no_workspace_command() {
+    const KEEPER: &str = "src/boxes/keep.rs";
+    let code = release_code(KEEPER, &fs::read_to_string(root().join(KEEPER)).unwrap()).unwrap();
+    assert!(code.contains("pub fn serve("), "{KEEPER} is the keeper");
+    assert!(!code.contains("crate::ws") && !code.contains("choose("), "{KEEPER} names a workspace command, or chooses");
 }
 
 /// The name of the function of `code` that the text at `at` is in: the last `fn` before it that

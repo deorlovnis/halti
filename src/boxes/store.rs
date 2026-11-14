@@ -180,6 +180,20 @@ impl Layout {
         self.downloads.join(name)
     }
 
+    /// The lock `halti open` holds while it keeps the workspace open, in its boxes folder.
+    pub fn keeper_lock(&self) -> PathBuf {
+        self.root.join(names::KEEPER_LOCK)
+    }
+
+    /// The socket of the `halti open` that keeps the workspace open: `TAG.keep.sock`, beside its
+    /// boxes' sockets. Today's boxes have none.
+    pub fn keeper_socket(&self) -> Option<PathBuf> {
+        match &self.names {
+            Names::Keychain => None,
+            Names::Workspace { tag } => Some(self.sockets.join(format!("{tag}{}", names::KEEP_SOCKET))),
+        }
+    }
+
     /// Fails unless both of the box's sockets fit the system's limit: checked before anything opens.
     pub fn sockets_fit(&self, id: &str) -> Result<()> {
         for socket in [self.socket(id), self.browser_socket(id)] {
@@ -362,7 +376,7 @@ impl Drop for Open {
                 let _ = shred(&self.bundle);
             }
             Ok(()) => {}
-            Err(e) => eprintln!("halti: {e:#} (detach it with: hdiutil detach -force '{}')", self.mnt.display()),
+            Err(e) => crate::util::warn(&format!("{e:#} (detach it with: hdiutil detach -force '{}')", self.mnt.display())),
         }
     }
 }
@@ -625,6 +639,9 @@ mod tests {
         let real = Layout::workspace(&boxes, WsId::from_bytes(ACME)).unwrap();
         assert_eq!(real.sockets, PathBuf::from(format!("/tmp/halti-dev-{}/ws", real.uid)));
         assert_eq!(real.socket("dev"), PathBuf::from(format!("/tmp/halti-dev-{}/ws/abcdef012345-dev.sock", real.uid)));
+        // The socket of the halti that keeps the workspace open is never a box's: no box name has a dot.
+        assert_eq!(real.keeper_socket(), Some(PathBuf::from(format!("/tmp/halti-dev-{}/ws/abcdef012345.keep.sock", real.uid))));
+        assert_eq!((acme.keeper_lock(), today.keeper_socket()), (boxes.join("keeper.lock"), None));
 
         // Its sockets' folder is private, and so is the folder it is in.
         acme.prepare().unwrap();
@@ -641,6 +658,7 @@ mod tests {
         longest.sockets_fit(&name).unwrap();
         assert_eq!(longest.vm(&name).len(), 57);
         assert_eq!(longest.browser_vm(&name).len(), 61);
+        assert_eq!(longest.keeper_socket().unwrap().as_os_str().len(), 51);
     }
 
     #[test]

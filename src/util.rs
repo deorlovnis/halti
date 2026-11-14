@@ -1,6 +1,7 @@
 //! Small helpers shared by several commands.
 
 use std::ffi::OsString;
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,6 +15,18 @@ use crate::names;
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A line on stdout that may go nowhere: once the terminal is closed, a write fails, and
+/// `println!` would panic where a box is being put away.
+pub fn say(line: &str) {
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out, "{line}").and_then(|_| out.flush());
+}
+
+/// `halti: LINE` on stderr, as `say` writes stdout.
+pub fn warn(line: &str) {
+    let _ = writeln!(io::stderr().lock(), "halti: {line}");
 }
 
 /// Debug builds keep their files apart from an installed halti's, so a test build never reads or

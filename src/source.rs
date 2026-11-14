@@ -202,6 +202,30 @@ impl Source {
         }
     }
 
+    /// Closes a workspace: its keys are wiped, and every lookup fails from then on. The Keychain
+    /// place holds no key.
+    pub fn close(&self) {
+        if let Place::Workspace(w) = &self.place {
+            w.close();
+        }
+    }
+
+    /// True once, after the workspace refused to read its files again because they went back to
+    /// an older state.
+    pub fn refused_reread(&self) -> bool {
+        match &self.place {
+            Place::Keychain(_) => false,
+            Place::Workspace(w) => w.refused_reread(),
+        }
+    }
+
+    /// Keeps a workspace's keys out of swap, where this system allows it.
+    pub fn lock_keys(&self) {
+        if let Place::Workspace(w) = &self.place {
+            w.lock_keys();
+        }
+    }
+
     /// Whether this place keeps box keys itself, whatever `[box] keys` says.
     pub fn keeps_box_keys(&self) -> bool {
         matches!(self.place, Place::Workspace(_))
