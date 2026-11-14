@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build halti and install it as /usr/local/bin/halti on Linux, owned by root so nothing running as
-# you can replace it. Run ./check.sh on this machine first, and install only where it passes.
-# `./install-linux.sh --dry-run` only says what it would do.
+# you can replace it. It installs only a commit ./check.sh has passed at on this machine, with no
+# changes to the files. `./install-linux.sh --dry-run` only says what it would do.
 #
 # It ends with a warning for each of two things that undo what root ownership gives: sudo that
 # asks no password, and swap that isn't encrypted. Neither stops the install. See README "On a
@@ -15,10 +15,17 @@ store="$HOME/Library/Application Support/halti"
 approved=/etc/halti/approved
 dest=/usr/local/bin/halti
 
+# Where cargo builds, as check.sh has it. check.sh writes the stamp last, naming the commit it
+# passed at, and only when the files had no changes.
+target="${CARGO_TARGET_DIR:-target}"
+bin="$target/release/halti"
+stamp="$target/check-passed"
+
 case "${1:-}" in
   --dry-run)
     cat <<DRY
-would build target/release/halti and install it only if it has no test hooks
+would build $bin and install it only if ./check.sh passed at this commit on this machine
+  (with no changes to the files) and the build has no test hooks
 would write, owned by root:
   $dest
 would build no box image: boxes don't run on Linux yet
@@ -83,26 +90,36 @@ clear_swap() {
   done
 }
 
+head=$(git rev-parse HEAD)
+if [ -n "$(git status --porcelain)" ]; then
+  echo "install-linux.sh: the files have changes since the last commit; commit or undo them, then run ./check.sh" >&2
+  exit 1
+fi
+if [ "$(cat "$stamp" 2>/dev/null)" != "$head" ]; then
+  echo "install-linux.sh: ./check.sh hasn't passed at this commit on this machine; run it, then install" >&2
+  exit 1
+fi
+
 cargo build --release
-info=$(target/release/halti build-info)
+info=$("$bin" build-info)
 if ! printf '%s\n' "$info" | grep -qx 'debug_assertions=false halti_dev=false'; then
-  echo "install-linux.sh: target/release/halti has the test hooks; not installing it" >&2
+  echo "install-linux.sh: $bin has the test hooks; not installing it" >&2
   exit 1
 fi
-if ! printf '%s\n' "$info" | grep -qx "verified: linux-$(uname -m)"; then
-  echo "install-linux.sh: check.sh doesn't build and test halti on $(uname -m) Linux; not installing it" >&2
-  exit 1
+if [ "$sudo_asks" = yes ]; then
+  echo "Installing $dest (sudo may ask for your password)."
+else
+  echo "Installing $dest."
 fi
-echo "Installing $dest (sudo asks for your password)."
 sudo install -d -o root -g root -m 755 "$(dirname "$dest")"
-sudo install -o root -g root -m 755 target/release/halti "$dest"
+sudo install -o root -g root -m 755 "$bin" "$dest"
 echo "installed $dest"
 echo "note: boxes don't run on Linux yet; workspaces do" >&2
 
 if [ "$sudo_asks" = no ]; then
-  echo "warning: $user can use sudo without a password. a program running as $user, or an agent that breaks out of a box, is then root on this server. see the README: sudo" >&2
+  echo "warning: $user can use sudo without a password, so any program running as $user is root here; see README \"On a Linux server\"" >&2
 fi
 swap=$(clear_swap | paste -sd, - | sed 's/,/, /g')
 if [ -n "$swap" ]; then
-  echo "warning: this server has swap that is not encrypted ($swap). tokens and workspace keys can be written to it. turn it off with: sudo swapoff -a, and remove it from /etc/fstab" >&2
+  echo "warning: swap that isn't encrypted is on ($swap): tokens and workspace keys can reach it; turn it off with sudo swapoff -a and remove it from /etc/fstab" >&2
 fi

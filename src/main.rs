@@ -58,9 +58,10 @@ use refresh::{auto_resources, refresh_due};
 
 const MASK: &[u8] = b"********";
 
-/// The Linux target check.sh builds and tests this source on, for this build's processor: halti is
-/// installed on a server only where check.sh passes. Other processors have none, and macOS isn't
-/// one, until there is a machine to run it on.
+/// The Linux target check.sh builds and tests this source for, on this build's processor. It
+/// doesn't say check.sh has passed anywhere: install-linux.sh asks for the record check.sh writes
+/// when it passes on that machine. Other processors have none, and macOS isn't one, until there is
+/// a machine to run it on.
 const VERIFIED: &str = if cfg!(target_arch = "x86_64") {
     "linux-x86_64"
 } else if cfg!(target_arch = "aarch64") {

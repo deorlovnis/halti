@@ -2,7 +2,8 @@
 # Everything a change must pass that needs no human: formatting, lints, the tests, a release build
 # and what its build-info says, the shim, and the syntax of the runner, install.sh,
 # install-linux.sh (and its dry run) and macos-check.sh. Run before pushing (`mise run check` runs
-# this). On Linux it must pass before install-linux.sh installs halti there.
+# this). When every step passes with no changes to the files, it writes the commit it passed at to
+# check-passed in the target folder: install-linux.sh installs only that commit.
 #
 # CARGO_BUILD_JOBS defaults to 3. A set CARGO_TARGET_DIR is used for halti; the shim builds in
 # SHIM_TARGET_DIR if that is set, else in its own target/.
@@ -77,6 +78,14 @@ export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-3}"
 target="${CARGO_TARGET_DIR:-target}"
 # Absolute, since the release tests run the binary from other folders.
 case "$target" in /*) ;; *) target="$PWD/$target" ;; esac
+stamp="$target/check-passed"
+rm -f "$stamp"
+
+# The commit checked out, if the files have no changes since it; else nothing.
+clean_head() {
+  if [ -z "$(git status --porcelain)" ]; then git rev-parse HEAD; fi
+}
+head="$(clean_head)"
 
 step() { printf '\n== %s\n' "$*"; }
 
@@ -134,4 +143,7 @@ bash -n install-linux.sh
 ./install-linux.sh --dry-run >/dev/null
 bash -n macos-check.sh
 
+if [ -n "$head" ] && [ "$(clean_head)" = "$head" ]; then
+  echo "$head" >"$stamp"
+fi
 step "all checks passed"
