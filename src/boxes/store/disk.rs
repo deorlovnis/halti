@@ -181,8 +181,9 @@ pub fn usage(disk: &Path) -> (u64, Option<SystemTime>) {
 /// The notes of `ws box new` and `halti open` about what `what` names (`box acme/dev keeps`), kept
 /// in the workspace's folder `wsdir`, which halti doesn't encrypt: whether the disk that holds
 /// `wsdir` is a dm-crypt one, and swap that isn't. halti can't tell a disk its owner unlocks from
-/// one that unlocks itself at boot, so the first says only what was checked.
-pub fn at_rest_notes(what: &str, wsdir: &Path) -> Vec<String> {
+/// one that unlocks itself at boot, so the first says only what was checked. With no `what`, the
+/// swap alone.
+pub fn at_rest_notes(what: Option<&str>, wsdir: &Path) -> Vec<String> {
     let sys = Path::new("/sys");
     let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     let swaps = fs::read_to_string("/proc/swaps").unwrap_or_default();
@@ -191,14 +192,17 @@ pub fn at_rest_notes(what: &str, wsdir: &Path) -> Vec<String> {
     notes(what, wsdir, encrypted, clear_swap(sys, &swaps))
 }
 
-fn notes(what: &str, wsdir: &Path, encrypted: bool, clear_swap: bool) -> Vec<String> {
-    let mut said = vec![match encrypted {
-        true => format!(
-            "note: what {what} is not encrypted by halti here. {} is on a dm-crypt disk. this protects it only if you unlock that disk yourself after each boot",
-            wsdir.display()
-        ),
-        false => format!("note: what {what} is not encrypted. anyone with a copy of this server's disk can read it. see the README: an encrypted data disk"),
-    }];
+fn notes(what: Option<&str>, wsdir: &Path, encrypted: bool, clear_swap: bool) -> Vec<String> {
+    let mut said: Vec<String> = what
+        .map(|what| match encrypted {
+            true => format!(
+                "note: what {what} is not encrypted by halti here. {} is on a dm-crypt disk. this protects it only if you unlock that disk yourself after each boot",
+                wsdir.display()
+            ),
+            false => format!("note: what {what} is not encrypted. anyone with a copy of this server's disk can read it. see the README: an encrypted data disk"),
+        })
+        .into_iter()
+        .collect();
     if clear_swap {
         said.push("note: this server has swap that is not encrypted. tokens and workspace keys can be written to it".to_string());
     }
@@ -345,21 +349,25 @@ mod tests {
 
         let wsdir = Path::new("/data/halti-ws/0123");
         assert_eq!(
-            notes("box acme/dev keeps", wsdir, true, false),
+            notes(Some("box acme/dev keeps"), wsdir, true, false),
             [
                 "note: what box acme/dev keeps is not encrypted by halti here. /data/halti-ws/0123 is on a dm-crypt disk. this protects it only if you unlock that disk yourself after each boot"
             ]
         );
         assert_eq!(
-            notes("box acme/dev keeps", wsdir, false, true),
+            notes(Some("box acme/dev keeps"), wsdir, false, true),
             [
                 "note: what box acme/dev keeps is not encrypted. anyone with a copy of this server's disk can read it. see the README: an encrypted data disk",
                 "note: this server has swap that is not encrypted. tokens and workspace keys can be written to it"
             ]
         );
+        // With nothing named, swap alone: what an open workspace with no box is told.
+        assert_eq!(notes(None, wsdir, true, false), Vec::<String>::new());
+        assert_eq!(notes(None, wsdir, false, true), ["note: this server has swap that is not encrypted. tokens and workspace keys can be written to it"]);
         // This machine's own answer has the one line or the other, and names the box.
-        let said = at_rest_notes("box acme/dev keeps", &dir.0);
+        let said = at_rest_notes(Some("box acme/dev keeps"), &dir.0);
         assert!(said[0].starts_with("note: what box acme/dev keeps is not encrypted") && (1..=2).contains(&said.len()), "{said:?}");
+        assert!(at_rest_notes(None, &dir.0).len() <= 1);
     }
 
     #[test]

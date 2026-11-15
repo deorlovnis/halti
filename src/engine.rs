@@ -147,6 +147,11 @@ pub trait Vms: Sync {
     fn run(&self, spec: &VmSpec) -> Result<()>;
     /// Stop a VM; fine if it is gone already.
     fn stop(&self, name: &str) -> Result<()>;
+    /// Whether a stop of the VM was asked since it started, so a start or a command it cut short
+    /// ended as stopped. Apple's tool says how a stopped command ended itself.
+    fn stop_asked(&self, _name: &str) -> bool {
+        false
+    }
     /// Run a command in the VM as the agent. The environment holds no secrets (see `agent_env`).
     fn exec(&self, name: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus>;
     fn install_ca(&self, name: &str, pem: &str) -> Result<()>;

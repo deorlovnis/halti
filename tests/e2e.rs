@@ -1216,7 +1216,7 @@ fn a_workspace_is_made_listed_opened_closed_and_deleted_with_one_passphrase_each
     assert!(!labels.status.success() && stdout(&labels).is_empty(), "{}", stderr(&labels));
     for args in [&["open", "acme"][..], &["open"]] {
         let opened = open_then_close(&env, env.command().env("HALTI_TEST_PASSPHRASE", PASSPHRASE).args(args), "acme");
-        let said = stdout(&opened);
+        let said = self::opened(&opened);
         assert!(opened.status.success() && said == format!("{}closed acme\n", is_open("acme")), "{said}{}", stderr(&opened));
         assert_eq!((prompted(&opened), asked(&opened)), (1, 1), "{args:?}");
         assert!(stderr(&opened).contains("halti: [test] asked: passphrase for workspace acme: \n"), "{}", stderr(&opened));
@@ -1312,6 +1312,15 @@ fn names_are_checked_never_swapped_and_an_unfinished_workspace_is_cleared() {
 /// The line `halti open NAME` says once NAME is open, and stays.
 fn is_open(name: &str) -> String {
     format!("{name} is open in this terminal. close it with Ctrl-C, or from another terminal: halti close {name}\n")
+}
+
+/// What `halti open` said on stdout, without the line a Linux server with swap that isn't
+/// encrypted adds, which depends on the machine the tests run on.
+fn opened(out: &Output) -> String {
+    let said = stdout(out);
+    let swap = "note: this server has swap that is not encrypted. tokens and workspace keys can be written to it\n";
+    assert!(!said.contains(swap) || cfg!(target_os = "linux"), "{said}");
+    said.replacen(swap, "", 1)
 }
 
 /// A `halti open` that stays: what it says as it says it, until it ends.
@@ -1447,7 +1456,7 @@ fn open_stays_until_close_and_a_second_open_is_refused_before_asking() {
     let closed = env.ws_box(PASSPHRASE, "true", &["close", "acme"]);
     assert!(closed.status.success() && stdout(&closed) == "closed acme\n" && prompted(&closed) == 0, "{}", stderr(&closed));
     let opened = open.wait();
-    assert!(opened.status.success() && stdout(&opened) == format!("{}closed acme\n", is_open("acme")), "{}", stderr(&opened));
+    assert!(opened.status.success() && self::opened(&opened) == format!("{}closed acme\n", is_open("acme")), "{}", stderr(&opened));
     assert_eq!(asked(&opened), 1);
     assert!(!keeper_socket(&env, "acme").exists(), "its socket is gone");
     let listed = stdout(&ws(&env, PASSPHRASE, &["ws", "ls"]));
@@ -1464,7 +1473,7 @@ fn sigint_and_sighup_close_it() {
         assert!(open.is_open(), "{sig}: {}", open.err.lock().unwrap());
         signal(open.pid(), sig);
         let opened = open.wait();
-        assert!(opened.status.success() && stdout(&opened) == format!("{}closed acme\n", is_open("acme")), "{sig}: {}", stderr(&opened));
+        assert!(opened.status.success() && self::opened(&opened) == format!("{}closed acme\n", is_open("acme")), "{sig}: {}", stderr(&opened));
         assert!(!keeper_socket(&env, "acme").exists(), "{sig}: its socket is gone");
     }
     // Nothing is left: it opens again.
@@ -1501,7 +1510,12 @@ fn a_killed_keeper_is_cleaned_up_by_the_next_open() {
     fs::create_dir_all(boxes.join(format!("temp/dev{}", names::STORE))).unwrap();
     let opened = open_then_close(&env, env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["open", "acme"]), "acme");
     let put_away = "put away what the last open of acme left: dev\n";
-    assert!(opened.status.success() && stdout(&opened) == format!("{put_away}{}closed acme\n", is_open("acme")), "{}{}", stdout(&opened), stderr(&opened));
+    // On Linux, where halti doesn't encrypt a box's disk, a workspace with boxes says so as it opens.
+    let said = stdout(&opened);
+    let (notes, rest): (Vec<&str>, Vec<&str>) = said.lines().partition(|line| line.starts_with("note: "));
+    let rest: String = rest.iter().map(|line| format!("{line}\n")).collect();
+    assert!(opened.status.success() && rest == format!("{put_away}{}closed acme\n", is_open("acme")), "{said}{}", stderr(&opened));
+    assert_eq!(notes.first().is_some_and(|note| note.starts_with("note: what acme's boxes write is not encrypted")), cfg!(target_os = "linux"), "{said}");
 }
 
 #[test]
@@ -1568,13 +1582,12 @@ fn a_held_lock_nobody_answers_at_is_being_opened_and_listed_closed() {
     let closed = env.ws_box(PASSPHRASE, "true", &["close", "acme"]);
     assert!(!closed.status.success() && asked(&closed) == 0, "{}", stderr(&closed));
     assert_eq!(stderr(&closed), "halti: acme is being opened or closed: try again in a moment\n");
-    // A run and a stop never fall back to asking. Where boxes can't run, they stop before that.
+    // A run and a stop never fall back to asking, on a server without KVM too: neither needs it to
+    // reach an open workspace.
     for args in [["ws", "run", "acme/dev"], ["ws", "stop", "acme/dev"]] {
         let out = env.ws_box(PASSPHRASE, "true", &args);
         assert!(!out.status.success() && asked(&out) == 0, "{args:?}: {}", stderr(&out));
-        if cfg!(target_os = "macos") {
-            assert_eq!(stderr(&out), "halti: acme is being opened or closed: try again in a moment\n", "{args:?}");
-        }
+        assert_eq!(stderr(&out), "halti: acme is being opened or closed: try again in a moment\n", "{args:?}");
     }
     let listed = stdout(&ws(&env, PASSPHRASE, &["ws", "ls"]));
     assert!(listed.lines().any(|line| line.starts_with("acme ") && line.contains(" closed ")), "{listed}");
@@ -3165,7 +3178,7 @@ fn a_workspace_line_that_needs_a_password_manager_is_refused_without_one() {
     // Nothing changed: a workspace is made, opened and deleted with its passphrase, as before.
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
     let out = open_then_close(&env, env.command().env("HALTI_TEST_PASSPHRASE", PASSPHRASE).args(["open", "acme"]), "acme");
-    assert!(out.status.success() && asked(&out) == 1 && stdout(&out).starts_with(&is_open("acme")), "{}", stderr(&out));
+    assert!(out.status.success() && asked(&out) == 1 && opened(&out).starts_with(&is_open("acme")), "{}", stderr(&out));
 }
 
 #[test]
@@ -3348,13 +3361,21 @@ fn wsdir(env: &Env, name: &str) -> PathBuf {
 fn ws_box_needs_kvm() {
     let env = Env::new();
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
-    let boxes = [&["ws", "box", "new", "acme/dev"][..], &["ws", "run", "acme/dev"], &["ws", "stop", "acme/dev"]];
+    let boxes = [&["ws", "box", "new", "acme/dev"][..], &["ws", "run", "acme/dev"]];
+    // Stopping needs neither KVM nor the VM program: with none running, that is what is said.
+    let stop = |kvm: &Path| {
+        let out = env.ws_box_command(PASSPHRASE, "true").env("HALTI_TEST_KVM", kvm).args(["ws", "stop", "acme/dev"]).output().unwrap();
+        assert!(!out.status.success() && stderr(&out) == "halti: box acme/dev isn't running\n" && asked(&out) == 0, "ws stop: {}", stderr(&out));
+    };
+    // A server halti pins no VM program for says that, whatever KVM is there.
+    let arm = (!cfg!(target_arch = "x86_64")).then_some("halti: boxes can't run on this server: halti pins a VM program for x86-64 servers only\n");
     // No KVM: each is refused before anything is asked or made.
     let refused = format!("halti: boxes can't run on this server: it has no {}\n", env.dir.join("no-kvm").display());
     for args in boxes {
         let out = env.ws_box(PASSPHRASE, "true", args);
-        assert!(!out.status.success() && stderr(&out) == refused && asked(&out) == 0, "{args:?}: {}", stderr(&out));
+        assert!(!out.status.success() && stderr(&out) == arm.unwrap_or(&refused) && asked(&out) == 0, "{args:?}: {}", stderr(&out));
     }
+    stop(&env.dir.join("no-kvm"));
     assert!(!wsdir(&env, "acme").join("boxes").exists(), "nothing was made");
     // KVM this user may not use: the same, with what to do.
     let closed = env.dir.join("kvm");
@@ -3366,9 +3387,14 @@ fn ws_box_needs_kvm() {
             let out = env.ws_box_command(PASSPHRASE, "true").env("HALTI_TEST_KVM", &closed).args(args).output().unwrap();
             let said = stderr(&out);
             let refused = format!("halti: boxes can't run on this server: you may not use {} (sudo usermod -aG kvm ", closed.display());
-            assert!(!out.status.success() && said.starts_with(&refused) && said.ends_with(", then log in again)\n") && asked(&out) == 0, "{args:?}: {said}");
+            let told = match arm {
+                Some(arm) => said == arm,
+                None => said.starts_with(&refused) && said.ends_with(", then log in again)\n"),
+            };
+            assert!(!out.status.success() && told && asked(&out) == 0, "{args:?}: {said}");
         }
     }
+    stop(&closed);
     assert!(!wsdir(&env, "acme").join("boxes").exists(), "nothing was made");
     // Listing and removing need none: no store can be there.
     assert_eq!(stdout(&env.ws_box(PASSPHRASE, "true", &["ws", "box", "ls", "acme"])), "acme has no boxes. make one with: halti ws box new acme/NAME\n");

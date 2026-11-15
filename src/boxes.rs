@@ -352,7 +352,7 @@ impl BoxPolicy {
         }
         let on_disk = matches!(rule, Mounts::Under(MountRule::WorkspaceDisk(_)));
         if on_disk && self.rosetta {
-            bail!("rosetta is only on a mac");
+            bail!("rosetta = true: rosetta is only on a mac. set rosetta = false");
         }
         if on_disk && self.docker {
             bail!("docker = true: Docker doesn't run in a box on linux yet. set docker = false");
@@ -1448,7 +1448,7 @@ mod tests {
         let own = vec![config_dir(), store_root()];
         let (disk, mac) = (MountRule::WorkspaceDisk(own.clone()), MountRule::Workspace(own));
         let refused = |text: &str| format!("{:#}", BoxPolicy::parse_in(text, &disk).err().unwrap_or_else(|| panic!("accepted: {text}")));
-        assert_eq!(refused("rosetta = true\n"), "rosetta is only on a mac");
+        assert_eq!(refused("rosetta = true\n"), "rosetta = true: rosetta is only on a mac. set rosetta = false");
         assert_eq!(refused("docker = true\n"), "docker = true: Docker doesn't run in a box on linux yet. set docker = false");
         let ro = "[[mount]]\npath = \"~/src\"\nmode = \"ro\"\n";
         assert_eq!(refused(ro), "[[mount]] ~/src: a box on linux can't mount a folder read-only yet. use mode = \"clone\"");

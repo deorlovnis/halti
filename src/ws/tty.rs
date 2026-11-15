@@ -210,9 +210,7 @@ impl Terminal {
                 return Ok(answer.clone());
             }
         };
-        // Typeahead meant for something else must not answer this.
-        unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) };
-        let typed = match crate::util::sigint_ignored(|| rpassword::prompt_password(question)) {
+        let typed = match unechoed(tty, || crate::util::sigint_ignored(|| rpassword::prompt_password(question))) {
             Ok(typed) => Zeroizing::new(typed),
             Err(e) if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::Interrupted) => return Err(Refusal::Declined.into()),
             Err(e) => return Err(anyhow::Error::from(e).context("reading the passphrase")),
@@ -308,8 +306,7 @@ pub fn read_value(key: &ItemKey) -> Result<Secret> {
 /// thrown away: left there, the shell would read them, shown and run, once halti ends.
 fn typed_value(key: &ItemKey) -> Result<Zeroizing<Vec<u8>>> {
     let tty = OpenOptions::new().read(true).write(true).open("/dev/tty").map_err(|_| anyhow!("there is no terminal to type the value in. pipe it in instead"))?;
-    unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) };
-    let read = crate::util::sigint_ignored(|| rpassword::prompt_password(format!("value for {key}: ")));
+    let read = unechoed(&tty, || crate::util::sigint_ignored(|| rpassword::prompt_password(format!("value for {key}: "))));
     let more = flushed(&tty);
     let typed = match read {
         Ok(typed) => Zeroizing::new(typed),
@@ -320,6 +317,33 @@ fn typed_value(key: &ItemKey) -> Result<Zeroizing<Vec<u8>>> {
         bail!("a value of more than one line can't be typed, so nothing was stored. pipe it in instead");
     }
     typed_text(typed)
+}
+
+/// Runs `ask`, which shows a question and reads the answer unseen, with the terminal's echo turned
+/// off before the question is shown and typeahead meant for something else thrown away: what is
+/// typed as soon as the question shows is never echoed, as it would be in the moment between a
+/// question and the echo turned off after it. The terminal is put back as it was after.
+fn unechoed<T>(tty: &File, ask: impl FnOnce() -> T) -> T {
+    let fd = tty.as_raw_fd();
+    // SAFETY: termios is plain data that tcgetattr(3) fills.
+    let mut was: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: tcgetattr(3), tcsetattr(3) and tcflush(3) on an open terminal, with a termios that
+    // lives through each call.
+    let got = unsafe { libc::tcgetattr(fd, &mut was) } == 0;
+    if got {
+        let mut quiet = was;
+        quiet.c_lflag &= !libc::ECHO;
+        // SAFETY: as above.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+    }
+    // SAFETY: as above.
+    unsafe { libc::tcflush(fd, libc::TCIFLUSH) };
+    let asked = ask();
+    if got {
+        // SAFETY: as above.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &was) };
+    }
+    asked
 }
 
 /// Throws away whatever is waiting to be read at the terminal, and says whether anything was. It
@@ -449,6 +473,38 @@ fn grouped(bytes: &[u8]) -> Zeroizing<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::FromRawFd;
+
+    /// While a question is shown and answered, the terminal echoes nothing, and what was typed
+    /// before it is gone; after, the terminal is as it was.
+    #[test]
+    fn a_question_is_shown_with_the_echo_already_off() {
+        let (mut person, mut terminal) = (0, 0);
+        // SAFETY: openpty(3) fills the two descriptors, each owned by one File below.
+        let made = unsafe { libc::openpty(&mut person, &mut terminal, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+        assert_eq!(made, 0, "openpty: {}", io::Error::last_os_error());
+        // SAFETY: as above.
+        let (mut person, terminal) = unsafe { (File::from_raw_fd(person), File::from_raw_fd(terminal)) };
+        let echo = |tty: &File| {
+            // SAFETY: termios is plain data that tcgetattr(3) fills, from an open terminal.
+            let mut now: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut now) }, 0);
+            now.c_lflag & libc::ECHO != 0
+        };
+        assert!(echo(&terminal), "a terminal echoes to begin with");
+        person.write_all(b"typed too early\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let waiting = |tty: &File| {
+            let mut waiting: libc::c_int = 0;
+            // SAFETY: FIONREAD writes one int, which lives through the call.
+            unsafe { libc::ioctl(tty.as_raw_fd(), libc::FIONREAD, &mut waiting) };
+            waiting
+        };
+        let (silent, flushed) = unechoed(&terminal, || (!echo(&terminal), waiting(&terminal) == 0));
+        assert!(silent, "the echo was off when the question was shown");
+        assert!(flushed, "typeahead was thrown away first");
+        assert!(echo(&terminal), "and put back after");
+    }
 
     #[test]
     fn a_made_passphrase_is_twenty_characters_of_base32_in_groups_of_four() {

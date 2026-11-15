@@ -202,6 +202,12 @@ impl Layout {
         self.open_dir().join(format!("{id}.console"))
     }
 
+    /// For such a box, written once its start is done, so a second terminal joins only a box
+    /// whose home is written: the halti that opened it removes it as it puts the box away.
+    pub fn ready(&self, id: &str) -> PathBuf {
+        self.open_dir().join(format!("{id}.ready"))
+    }
+
     /// The socket of the box's browser VM, next to the agent's. In a workspace its name has a dot,
     /// which no box name has, so it is never another box's agent socket.
     #[allow(dead_code)] // for the browser VM of box runs
@@ -339,9 +345,10 @@ fn hdiutil(args: &[&std::ffi::OsStr], key: Option<&str>) -> Result<String> {
 pub use disk::{Open, create, open, shred, usage};
 
 /// What is said, each line a note, about how what `what` names (`box acme/dev keeps`) is kept at
-/// rest in the workspace's folder `wsdir`, where halti doesn't encrypt it: nothing on a Mac, whose
-/// stores are encrypted.
-pub fn at_rest_notes(what: &str, wsdir: &Path) -> Vec<String> {
+/// rest in the workspace's folder `wsdir`, where halti doesn't encrypt it, and swap that isn't
+/// encrypted; with no `what`, the swap alone. Nothing on a Mac, whose stores and swap are
+/// encrypted.
+pub fn at_rest_notes(what: Option<&str>, wsdir: &Path) -> Vec<String> {
     #[cfg(target_os = "linux")]
     return disk::at_rest_notes(what, wsdir);
     #[cfg(not(target_os = "linux"))]

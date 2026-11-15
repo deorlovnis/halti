@@ -507,9 +507,12 @@ fn word<W: Word>(key: &str, value: &DeValue<'_>, allowed: &[W], os: Os) -> Resul
     if allowed.contains(&named) {
         return Ok(named);
     }
+    // A word of a Mac's is said to be one; any other this system hasn't is not named.
+    if !named.on(os) && named.on(Os::Macos) {
+        return Err(format!("{} is only on a mac", named.name()));
+    }
     if !named.on(os) {
-        let there = if os == Os::Macos { "linux" } else { "a mac" };
-        return Err(format!("{} is only on {there}", named.name()));
+        return Err(format!("{key} can {}", choices(allowed)));
     }
     Err(format!("{key} can't be {}. it can {}", named.name(), choices(allowed)))
 }
@@ -1004,7 +1007,7 @@ mod tests {
             ("[workspace]\npassphrase = \"typed\"\n", Os::Macos, 2, "passphrase can be own or generate"),
             ("[box]\nengine = \"tart\"\n", Os::Macos, 2, "engine can only be container"),
             ("[box]\nengine = \"container\"\n", Os::Linux, 2, "container is only on a mac"),
-            ("[box]\nengine = \"cloud-hypervisor\"\n", Os::Macos, 2, "cloud-hypervisor is only on linux"),
+            ("[box]\nengine = \"cloud-hypervisor\"\n", Os::Macos, 2, "engine can only be container"),
             ("[box]\nengine = \"tart\"\n", Os::Linux, 2, "engine can only be cloud-hypervisor"),
             ("[box]\nkeys = \"files\"\n", Os::Macos, 2, "keys can only be keychain"),
             ("[box]\nkeys = \"keychain\"\n", Os::Linux, 2, "keys can't be set on this system"),
@@ -1123,7 +1126,8 @@ mod tests {
         assert_eq!(Engine::CloudHypervisor.name(), "cloud-hypervisor");
         let linux = parse("[box]\nengine = \"cloud-hypervisor\"\n", Os::Linux).unwrap();
         assert_eq!(linux, Settings::builtin(Os::Linux), "the line says what the template does");
-        assert_eq!(parse("[box]\nengine = \"cloud-hypervisor\"\n", Os::Macos).unwrap_err().why, "cloud-hypervisor is only on linux");
+        // A Mac says what it said before Linux had the word.
+        assert_eq!(parse("[box]\nengine = \"cloud-hypervisor\"\n", Os::Macos).unwrap_err().why, "engine can only be container");
         // A Mac keeps its own, and `container` is still refused on Linux.
         assert_eq!(Settings::builtin(Os::Macos).engine, Some(Engine::Container));
         assert_eq!(parse("[box]\nengine = \"container\"\n", Os::Linux).unwrap_err().why, "container is only on a mac");

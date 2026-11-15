@@ -67,6 +67,10 @@ pub trait World: Sync {
     fn start_vm(&self, spec: &engine::VmSpec) -> Result<()>;
     /// Stop a VM; fine if it is gone already.
     fn stop_vm(&self, vm: &str);
+    /// Whether a stop of the VM was asked since it started (`Vms::stop_asked`).
+    fn stop_asked(&self, _vm: &str) -> bool {
+        false
+    }
     /// Start the door. It stops when the returned value is dropped.
     fn start_door(&self, cfg: door::Config) -> Result<Box<dyn Any>>;
     /// After the agent's command ended and before any VM stops: let the door finish what the end
@@ -123,6 +127,10 @@ impl World for Real<'_> {
         if let Err(e) = self.vms.stop(vm) {
             crate::util::warn(&format!("stopping {vm}: {e:#}"));
         }
+    }
+
+    fn stop_asked(&self, vm: &str) -> bool {
+        self.vms.stop_asked(vm)
     }
 
     fn start_door(&self, cfg: door::Config) -> Result<Box<dyn Any>> {
@@ -246,7 +254,9 @@ pub fn run(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
 /// Another halti has the box open: work in the same VM, through the same door.
 fn join_open(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     let vm = layout.vm(&req.id);
-    if !world.running(&vm) {
+    // On a disk only the box reads, its home and its clones are written once its VM runs: until
+    // the start is done, the box isn't ready to join.
+    if !world.running(&vm) || (world.takes_disk() && !layout.ready(&req.id).exists()) {
         bail!("box {} is being opened or closed by another halti: try again in a moment", req.shown);
     }
     // The door of the open box keeps the rules it started with, so joining under a policy
@@ -256,7 +266,8 @@ fn join_open(layout: &Layout, world: &dyn World, req: &Request) -> Result<u8> {
     }
     let bearer = req.policy.model.as_deref().map(|m| world.model_uses_bearer(m)).transpose()?.unwrap_or(false);
     let command = guest_command(req.command.as_deref().unwrap_or(&req.policy.run));
-    exit_code(world.exec(&vm, &agent_env(req.policy, bearer), &command, req.tty)?)
+    let status = world.exec(&vm, &agent_env(req.policy, bearer), &command, req.tty);
+    exit_code(status.map_err(|e| ended(e, world.takes_disk() && !world.running(&vm), &req.shown, &layout.console(&req.id)))?)
 }
 
 /// What `start` found.
@@ -291,6 +302,10 @@ pub struct Running<'a> {
     store: Option<store::Open>,
     lock: Option<store::Lock>,
     lock_file: PathBuf,
+    /// For an engine given the box's disk: the file that says the box is ready to join, and the
+    /// VM's console.
+    ready: Option<PathBuf>,
+    console: Option<PathBuf>,
 }
 
 /// Open the box: take its lock, clear what a crashed run left, check what it needs, ask (if
@@ -317,6 +332,8 @@ pub fn start<'a>(layout: &'a Layout, world: &'a dyn World, req: &'a Request<'a>)
         store: None,
         lock: Some(lock),
         lock_file: layout.lock(&req.id),
+        ready: world.takes_disk().then(|| layout.ready(&req.id)),
+        console: world.takes_disk().then(|| layout.console(&req.id)),
     };
     running.open(layout)?;
     Ok(Begun::Here(Box::new(running)))
@@ -329,7 +346,11 @@ impl Running<'_> {
         let policy = req.policy;
         fs::write(layout.opened_with(&req.id), &req.policy_sha).with_context(|| format!("noting the policy box {} opens with", req.name))?;
 
-        // Holding the lock, whatever a crashed run left is ours to clear: its VMs too.
+        // Holding the lock, whatever a crashed run left is ours to clear: its VMs too, and its word
+        // that the box was ready to join.
+        if let Some(ready) = &self.ready {
+            let _ = fs::remove_file(ready);
+        }
         sweep_temp(layout)?;
         sweep(layout, &req.id)?;
         for leftover in [vm.clone(), layout.browser_vm(&req.id)] {
@@ -472,24 +493,36 @@ impl Running<'_> {
 
         self.browser = browser_vm;
         self.vm_armed = true;
-        world.start_vm(&spec)?;
+        world.start_vm(&spec).map_err(|e| self.cut_short(e))?;
         self.unless_stopped()?;
         if on_disk {
-            prepare_home_in(world, &vm, policy.docker).with_context(|| format!("box {}", req.shown))?;
+            prepare_home_in(world, &vm, policy.docker).with_context(|| format!("box {}", req.shown)).map_err(|e| self.cut_short(e))?;
             for (mount, host) in &folders {
-                clone_through(world, &vm, &mount.name(), host)?;
+                clone_through(world, &vm, &mount.name(), host).map_err(|e| self.cut_short(e))?;
             }
             self.unless_stopped()?;
         }
         self.door = Some(world.start_door(config)?);
-        world.install_ca(&vm, &ca.cert_pem())?;
+        world.install_ca(&vm, &ca.cert_pem()).map_err(|e| self.cut_short(e))?;
         self.unless_stopped()?;
         if policy.docker {
-            world.start_docker(&vm)?;
+            world.start_docker(&vm).map_err(|e| self.cut_short(e))?;
             self.unless_stopped()?;
         }
         self.started = true;
+        if let Some(ready) = &self.ready {
+            fs::write(ready, "").with_context(|| format!("noting that box {} is ready", req.shown))?;
+        }
         Ok(())
+    }
+
+    /// A step of the start that failed because the box was stopped meanwhile (`ws stop` from
+    /// another terminal) says so, as a Ctrl-C does; any other failure is said as it is.
+    fn cut_short(&self, error: anyhow::Error) -> Refused {
+        match self.world.stop_asked(&self.vm) {
+            true => Refused::new(No::Failed, stopped_before_the_agent(&self.req.shown)),
+            false => error.into(),
+        }
     }
 
     /// A stop asked while the box starts (Ctrl-C or a closed terminal, which no longer reach the
@@ -524,7 +557,10 @@ impl Running<'_> {
             });
             let status = world.exec(vm, &self.env, &command, tty);
             done.store(true, Ordering::SeqCst);
-            status
+            match &self.console {
+                Some(console) => status.map_err(|e| ended(e, !world.running(vm), &self.req.shown, console)),
+                None => status,
+            }
         })
     }
 
@@ -562,6 +598,9 @@ impl Running<'_> {
     /// runners, the door, what is kept outside the store, the store, and the lock last.
     fn put_away(&mut self) {
         let (world, req) = (self.world, self.req);
+        if let Some(ready) = &self.ready {
+            let _ = fs::remove_file(ready);
+        }
         if self.vm_armed && req.stop.load(Ordering::SeqCst) {
             self.stop_vm();
         }
@@ -604,6 +643,16 @@ fn stopped_before_the_agent(shown: &str) -> anyhow::Error {
     anyhow!("box {shown} was stopped before its agent started")
 }
 
+/// What a command in box `shown` failed with: where its VM is `gone` with no stop asked (an engine
+/// given the box's disk says a stop's end as the stop's SIGTERM), that the box ended, and where
+/// what its VM printed is.
+fn ended(error: anyhow::Error, gone: bool, shown: &str, console: &Path) -> anyhow::Error {
+    match gone {
+        true => anyhow!("box {shown} ended unexpectedly. what its VM printed is in {}", console.display()),
+        false => error,
+    }
+}
+
 /// A refusal for a site (or the model) that isn't ready.
 fn not_ready(site: &str) -> impl FnOnce(anyhow::Error) -> Refused + '_ {
     move |why| Refused::new(No::Site(site.to_string()), why)
@@ -638,7 +687,9 @@ fn record_head(world: &dyn World, name: &str, shown: &str, mnt: &Path, log_key: 
 pub fn join(layout: &Layout, vms: &dyn Vms, box_name: &str, shown: &str, mounts: &MountRule, policy: &[u8], command: Option<&[String]>, tty: bool) -> Result<u8> {
     let vm = layout.vm(box_name);
     let busy = || anyhow!("box {shown} is being opened or closed by another halti: try again in a moment");
-    if !vms.running(&vm) {
+    // On a disk only the box reads, its home and its clones are written once its VM runs: until
+    // the start is done, the box isn't ready to join.
+    if !vms.running(&vm) || (vms.takes_disk() && !layout.ready(box_name).exists()) {
         return Err(busy());
     }
     if fs::read_to_string(layout.opened_with(box_name)).ok().as_deref() != Some(crate::util::sha256_hex(policy).as_str()) {
@@ -655,7 +706,7 @@ pub fn join(layout: &Layout, vms: &dyn Vms, box_name: &str, shown: &str, mounts:
     let status = vms.exec(&vm, &agent_env(&policy, bearer), &command, tty);
     // `container exec` shares the terminal and may leave it non-blocking.
     crate::util::blocking_stdio();
-    exit_code(status?)
+    exit_code(status.map_err(|e| ended(e, vms.takes_disk() && !vms.running(&vm), shown, &layout.console(box_name)))?)
 }
 
 /// The box's CA, which only its VM trusts. A kept box has it sealed in its store (with a key
@@ -771,8 +822,15 @@ fn home_changes(docker: bool) -> Vec<(&'static str, Change)> {
     changes
 }
 
-/// Reads a file of the agent's (`$1`): a plain file only, never what a link points at.
-const READ_FILE: &str = "if [ -f \"$1\" ] && [ ! -L \"$1\" ]; then cat \"$1\"; fi";
+/// The largest file of the agent's home that `prepare_home_in` reads back: what the box sends is
+/// capped, and a start must not depend on the size of a file the agent can grow.
+const MOST_HOME_FILE: u64 = 32 << 20;
+/// Reads a file of the agent's (`$1`): a plain file only, never what a link points at. One larger
+/// than `MOST_HOME_FILE` is moved aside to `$1.halti-too-big`, and `TOO_BIG` is said instead.
+const READ_FILE: &str = "if [ -f \"$1\" ] && [ ! -L \"$1\" ]; then \
+                         if [ $(wc -c < \"$1\") -gt 33554432 ]; then mv -f \"$1\" \"$1.halti-too-big\" && echo halti-too-big; else cat \"$1\"; fi; fi";
+/// What `READ_FILE` says of a file it moved aside: no JSON.
+const TOO_BIG: &[u8] = b"halti-too-big\n";
 /// Writes a file of the agent's (`$1`) from the input: a new file, then renamed in its place, so a
 /// link there is replaced, not written through.
 const WRITE_FILE: &str = "mkdir -p \"$(dirname \"$1\")\" && rm -rf \"$1.halti-new\" && cat > \"$1.halti-new\" && mv -f \"$1.halti-new\" \"$1\"";
@@ -788,11 +846,15 @@ fn script(script: &str, path: &str) -> Vec<String> {
 
 /// `prepare_home`, for a box whose home is on a disk only the box reads, once its VM runs: each file
 /// read through the box as the agent, changed here, and written back the same way. What the box
-/// sends is taken only as a JSON object; anything else is made anew, as on a Mac.
+/// sends is taken only as a JSON object; anything else is made anew, as on a Mac, and so is a file
+/// too large to read back, which is kept aside.
 fn prepare_home_in(world: &dyn World, vm: &str, docker: bool) -> Result<()> {
     for (file, change) in home_changes(docker) {
         let path = format!("{GUEST_HOME}/{file}");
         let found = world.pipe(vm, &script(READ_FILE, &path), b"").with_context(|| format!("reading {path}"))?;
+        if found == TOO_BIG {
+            crate::util::warn(&format!("{path} was over {} MiB, so halti moved it to {path}.halti-too-big and made it anew", MOST_HOME_FILE >> 20));
+        }
         let mut value = serde_json::from_slice::<Value>(&found).ok().filter(Value::is_object).unwrap_or_else(|| json!({}));
         change(value.as_object_mut().expect("an object"));
         let text = serde_json::to_string_pretty(&value)? + "\n";
@@ -965,6 +1027,14 @@ mod tests {
         /// An engine given the box's disk: what the box keeps on it is in this folder, which
         /// `pipe` runs its commands against.
         disk: Option<PathBuf>,
+        /// The box is stopped from another terminal during the call that starts with this, which
+        /// then fails, as a call to a VM that is gone does.
+        cut_at: Option<&'static str>,
+        cut: AtomicBool,
+        /// The VM ends under the agent's command, with no stop asked: exec fails.
+        breaks: bool,
+        /// Where the box notes it is ready to join: whether it is there is noted at each call.
+        ready_at: Option<PathBuf>,
     }
 
     impl Fake {
@@ -979,7 +1049,22 @@ mod tests {
             {
                 stop.store(true, Ordering::SeqCst);
             }
+            if self.cut_at.is_some_and(|at| call.starts_with(at)) {
+                self.cut.store(true, Ordering::SeqCst);
+                *self.running.lock().unwrap() = false;
+            }
+            if let Some(ready) = &self.ready_at {
+                self.seen.lock().unwrap().files.insert(format!("ready at {call}"), ready.exists().to_string());
+            }
             self.seen.lock().unwrap().calls.push(call);
+        }
+
+        /// Fails if the box was stopped from another terminal.
+        fn unless_cut(&self) -> Result<()> {
+            if self.cut.load(Ordering::SeqCst) {
+                bail!("dialing the box: connection refused");
+            }
+            Ok(())
         }
     }
 
@@ -1000,6 +1085,9 @@ mod tests {
 
         fn start_vm(&self, spec: &engine::VmSpec) -> Result<()> {
             self.note("start_vm");
+            if self.cut_at == Some("start_vm") {
+                return self.unless_cut();
+            }
             let mounts = spec.mounts.iter().map(|m| (m.host.clone(), m.guest.clone(), m.readonly)).collect();
             let mut seen = self.seen.lock().unwrap();
             seen.spec = Some((spec.name.clone(), spec.image.clone(), spec.cpus, spec.memory.clone(), spec.socket.clone(), mounts, spec.docker));
@@ -1015,6 +1103,10 @@ mod tests {
             self.seen.lock().unwrap().stopped = true;
             self.seen.lock().unwrap().stopped_vms.push(vm.to_string());
             self.wake.notify_all();
+        }
+
+        fn stop_asked(&self, _vm: &str) -> bool {
+            self.cut.load(Ordering::SeqCst)
         }
 
         fn start_door(&self, cfg: door::Config) -> Result<Box<dyn Any>> {
@@ -1043,6 +1135,7 @@ mod tests {
 
         fn install_ca(&self, _vm: &str, pem: &str) -> Result<()> {
             self.note("install_ca");
+            self.unless_cut()?;
             self.seen.lock().unwrap().ca = Some(pem.to_string());
             Ok(())
         }
@@ -1087,6 +1180,10 @@ mod tests {
 
         fn exec(&self, vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus> {
             self.note("exec");
+            if self.breaks {
+                *self.running.lock().unwrap() = false;
+                bail!("the box closed the command's connection");
+            }
             let mut seen = self.seen.lock().unwrap();
             seen.exec = Some((env.to_vec(), cmd.to_vec(), tty));
             seen.exec_vm = Some(vm.to_string());
@@ -1134,6 +1231,7 @@ mod tests {
             let kind =
                 [(READ_FILE, "read"), (WRITE_FILE, "write"), (THERE, "there"), (UNPACK, "unpack")].iter().find(|(text, _)| *text == cmd[2]).map_or("other", |(_, kind)| kind);
             self.note(format!("pipe: {kind} {}", cmd[4]));
+            self.unless_cut()?;
             assert_eq!((&cmd[..2], cmd[3].as_str()), (&["sh".to_string(), "-c".to_string()][..], "sh"));
             let mut child = Command::new("sh")
                 .args(["-c", &cmd[2], "sh"])
@@ -1914,6 +2012,11 @@ mod tests {
     struct Engine {
         calls: Mutex<Vec<String>>,
         exec: Mutex<Option<Joined>>,
+        /// It is given the box's disk.
+        disk: bool,
+        /// The VM ends under the command, with no stop asked.
+        breaks: bool,
+        gone: AtomicBool,
     }
 
     impl Vms for Engine {
@@ -1924,7 +2027,7 @@ mod tests {
 
         fn running(&self, _name: &str) -> bool {
             self.calls.lock().unwrap().push("running".into());
-            true
+            !self.gone.load(Ordering::SeqCst)
         }
 
         fn run(&self, _spec: &engine::VmSpec) -> Result<()> {
@@ -1940,6 +2043,10 @@ mod tests {
         fn exec(&self, name: &str, env: &[(String, String)], cmd: &[String], _tty: bool) -> Result<ExitStatus> {
             self.calls.lock().unwrap().push("exec".into());
             *self.exec.lock().unwrap() = Some((name.to_string(), env.to_vec(), cmd.to_vec()));
+            if self.breaks {
+                self.gone.store(true, Ordering::SeqCst);
+                bail!("the box closed the command's connection");
+            }
             Ok(ExitStatus::from_raw(0))
         }
 
@@ -1959,7 +2066,7 @@ mod tests {
         }
 
         fn takes_disk(&self) -> bool {
-            false
+            self.disk
         }
 
         fn pipe(&self, _name: &str, _cmd: &[String], _input: &[u8]) -> Result<Vec<u8>> {
@@ -2206,6 +2313,111 @@ mod tests {
         let third = Fake { disk: Some(root), ..Fake::default() };
         run(&s.layout, &third, &request(&s, &p, false)).unwrap();
         assert!(!third.calls().iter().any(|c| c.starts_with("pipe: unpack")) && !s.dir.0.join("gone").exists());
+    }
+
+    /// A file of the agent's home too large to read back through the box is moved aside and made
+    /// anew, so the box still starts, whatever size the agent made it.
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "a Linux store")]
+    fn a_home_file_too_large_to_read_back_is_moved_aside() {
+        assert_eq!(MOST_HOME_FILE, 33554432, "the size READ_FILE names");
+        assert!(READ_FILE.contains(&format!(" -gt {MOST_HOME_FILE} ")));
+        let s = setup();
+        let (root, p) = on_disk(&s);
+        let home = root.join("home/agent");
+        let big = fs::File::create(home.join(".claude.json")).unwrap();
+        big.set_len(MOST_HOME_FILE + 1).unwrap();
+        drop(big);
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(home.join(".claude/settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        let fake = Fake { disk: Some(root.clone()), ..Fake::default() };
+        assert_eq!(run(&s.layout, &fake, &request(&s, &p, false)).unwrap(), 0);
+        assert!(fake.calls().contains(&"exec".to_string()), "the box started: {:?}", fake.calls());
+        assert_eq!(fs::metadata(home.join(".claude.json.halti-too-big")).unwrap().len(), MOST_HOME_FILE + 1, "kept aside, as it was");
+        let claude: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(claude["mcpServers"][names::MCP_SERVER_KEY]["command"], json!(names::SHIM));
+        let settings: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude/settings.json")).unwrap()).unwrap();
+        assert_eq!(settings["theme"], json!("dark"), "a file within the limit is merged as before");
+    }
+
+    /// A box stopped from another terminal while it starts (`ws stop`) ends the start as a Ctrl-C
+    /// does: whichever step the stop cut short, it says the box was stopped, not what that step
+    /// failed with.
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "a Linux store")]
+    fn a_disk_box_stopped_while_it_starts_says_so() {
+        let s = setup();
+        let (root, p) = on_disk(&s);
+        for at in ["start_vm", "pipe: read", "pipe: there", "install_ca"] {
+            let fake = Fake { disk: Some(root.clone()), cut_at: Some(at), ..Fake::default() };
+            let error = format!("{:#}", run(&s.layout, &fake, &request(&s, &p, false)).unwrap_err());
+            assert_eq!(error, "box r was stopped before its agent started", "{at}");
+            assert!(!fake.calls().contains(&"exec".to_string()), "{at}: {:?}", fake.calls());
+            assert_put_away(&s);
+        }
+        // A step that fails with no stop asked says what it failed with.
+        let fake = Fake { disk: Some(root), door_fails: true, ..Fake::default() };
+        assert_eq!(format!("{:#}", run(&s.layout, &fake, &request(&s, &p, false)).unwrap_err()), "the door can't start");
+    }
+
+    /// The VM of a box given its disk ends under the agent's command, with no stop asked (killed,
+    /// or out of memory): said, with where its console is, not as a stop.
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "a Linux store")]
+    fn a_disk_box_whose_vm_ends_under_its_command_says_so() {
+        let s = setup();
+        let (root, p) = on_disk(&s);
+        let fake = Fake { disk: Some(root), breaks: true, ..Fake::default() };
+        let error = run(&s.layout, &fake, &request(&s, &p, false)).unwrap_err().to_string();
+        assert_eq!(error, format!("box r ended unexpectedly. what its VM printed is in {}", s.layout.console("r").display()));
+        assert_put_away(&s);
+        // A join says the same.
+        let layout = Layout::under_workspace(&s.dir.0, WsId::from_bytes(ACME)).unwrap();
+        let (_held, text) = opened(&layout, "1");
+        fs::write(layout.ready("dev"), "").unwrap();
+        let vms = Engine { disk: true, breaks: true, ..Engine::default() };
+        let error = join(&layout, &vms, "dev", "acme/dev", &MountRule::Workspace(vec![]), &text, None, false).unwrap_err().to_string();
+        assert_eq!(error, format!("box acme/dev ended unexpectedly. what its VM printed is in {}", layout.console("dev").display()));
+        // On a Mac's engine, the error is said as it was.
+        let vms = Engine { breaks: true, ..Engine::default() };
+        let error = join(&layout, &vms, "dev", "acme/dev", &MountRule::Workspace(vec![]), &text, None, false).unwrap_err().to_string();
+        assert_eq!(error, "the box closed the command's connection");
+    }
+
+    /// A box given its disk is joined only once its start is done: its home and its clones are
+    /// written, its door is up. Until then, and once it is put away, a second terminal is told to
+    /// try again.
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "a Linux store")]
+    fn a_disk_box_is_joined_only_once_it_is_ready() {
+        let s = setup();
+        let (root, p) = on_disk(&s);
+        let ready = s.layout.ready("r");
+        // A word left by a run that was killed is cleared as the box opens.
+        s.layout.prepare().unwrap();
+        fs::write(&ready, "").unwrap();
+        let fake = Fake { disk: Some(root), ready_at: Some(ready.clone()), ..Fake::default() };
+        run(&s.layout, &fake, &request(&s, &p, false)).unwrap();
+        let files = fake.seen.lock().unwrap().files.clone();
+        for call in ["start_vm", "pipe: read /home/agent/.claude.json", "start_door", "install_ca"] {
+            assert_eq!(files[&format!("ready at {call}")], "false", "{call}");
+        }
+        assert_eq!(files["ready at exec"], "true");
+        assert!(!ready.exists(), "removed as the box is put away");
+
+        // A join: the box runs, its policy and its model are noted, but it isn't ready.
+        let layout = Layout::under_workspace(&s.dir.0, WsId::from_bytes(ACME)).unwrap();
+        let (_held, text) = opened(&layout, "1");
+        let rule = MountRule::Workspace(vec![]);
+        let vms = Engine { disk: true, ..Engine::default() };
+        let error = join(&layout, &vms, "dev", "acme/dev", &rule, &text, None, false).unwrap_err().to_string();
+        assert_eq!(error, "box acme/dev is being opened or closed by another halti: try again in a moment");
+        assert_eq!(*vms.calls.lock().unwrap(), ["running"], "nothing runs");
+        fs::write(layout.ready("dev"), "").unwrap();
+        assert_eq!(join(&layout, &vms, "dev", "acme/dev", &rule, &text, None, false).unwrap(), 0);
+        // A Mac's engine has its home before its VM starts, and needs no word.
+        fs::remove_file(layout.ready("dev")).unwrap();
+        assert_eq!(join(&layout, &Engine::default(), "dev", "acme/dev", &rule, &text, None, false).unwrap(), 0);
     }
 
     #[test]
