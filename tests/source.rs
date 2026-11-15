@@ -66,8 +66,9 @@ const NOT_READ: &[&str] = &[
     "HALTI_RUNNER_DEBUG_NO_ROUTING",
     // Read by install.sh.
     "HALTI_SIGN_IDENTITY",
-    // Read by install-linux.sh: KVM's device, which its tests name.
+    // Read by install-linux.sh: KVM's device, and where what boxes run on goes, which its tests name.
     "HALTI_KVM_DEVICE",
+    "HALTI_LIB_DIR",
     // A refresh script's field (`HALTI_<FIELD>`), in a test's script.
     "HALTI_LOGIN",
 ];
