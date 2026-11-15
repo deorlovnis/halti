@@ -5,6 +5,11 @@
 # this). When every step passes with no changes to the files, it writes the commit it passed at to
 # check-passed in the target folder: install-linux.sh installs only that commit.
 #
+# The release build's run with every test hook set and the escape tests need user namespaces. Where
+# the system restricts them (Ubuntu 24.04 does, through AppArmor), they are not run: check.sh ends
+# by listing what it could not run here and why, and writes those lines into check-passed after the
+# commit, for install-linux.sh to name.
+#
 # CARGO_BUILD_JOBS defaults to 3. A set CARGO_TARGET_DIR is used for halti; the shim builds in
 # SHIM_TARGET_DIR if that is set, else in its own target/.
 #
@@ -12,6 +17,9 @@
 # (issue tracker IDs, milestone and plan codes, local design notes, decision records), and with a
 # RANGE (`A..B`, or `B --not --remotes`) no commit message in it does either. The repo is public;
 # those stay in the tracker. `./check.sh install-hook` makes git run it before every push.
+# `./check.sh userns` says why the release tests' `unshare -Urm` can't make a user namespace here,
+# and `./check.sh userns box` why the debug halti (built first) can't make a box; each says nothing
+# when it can.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -44,9 +52,51 @@ refs() {
   fi
 }
 
+# Whether AppArmor restricts unprivileged user namespaces here: 1 if it does, else 0 or nothing.
+apparmor_userns() {
+  sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null ||
+    cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || true
+}
+
+# Why CMD fails here, or nothing when it works: the last line it said. AppArmor is named only where
+# it restricts user namespaces and CMD failed as that makes it fail: unshare(1) can't write its uid
+# map, halti can't write its setgroups.
+userns_blocked() {
+  local said
+  if said="$("$@" 2>&1)"; then return 0; fi
+  said="${said##*$'\n'}"
+  case "$said" in
+    */proc/self/uid_map*"Operation not permitted"* | */proc/self/setgroups*"Permission denied"*)
+      if [ "$(apparmor_userns)" = 1 ]; then
+        echo "AppArmor restricts unprivileged user namespaces here"
+        return 0
+      fi
+      ;;
+  esac
+  echo "${said:-$1 fails here}"
+}
+
+# Why the debug halti can't make a box here, or nothing when it can or fails some other way (the
+# escape tests then run and say how). It asks halti, not unshare(1): the sandbox makes its
+# namespaces with its own unshare(2), and AppArmor's limit is per program.
+box_blocked() {
+  local why
+  why="$(userns_blocked "$target/debug/halti" box sh --engine sandbox -- true)"
+  case "$why" in AppArmor* | *"making the box's namespaces"* | *"writing /proc/self/"*) echo "$why" ;; esac
+}
+
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-3}"
+target="${CARGO_TARGET_DIR:-target}"
+# Absolute, since the release tests run the binary from other folders.
+case "$target" in /*) ;; *) target="$PWD/$target" ;; esac
+
 case "${1:-}" in
   refs)
     refs "${2:-}"
+    exit
+    ;;
+  userns)
+    if [ "${2:-}" = box ]; then box_blocked; else userns_blocked unshare -Urm true; fi
     exit
     ;;
   install-hook)
@@ -70,16 +120,39 @@ HOOK
     ;;
   "") ;;
   *)
-    echo "usage: ./check.sh [refs [RANGE] | install-hook]" >&2
+    echo "usage: ./check.sh [refs [RANGE] | install-hook | userns [box]]" >&2
     exit 2
     ;;
 esac
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-3}"
-target="${CARGO_TARGET_DIR:-target}"
-# Absolute, since the release tests run the binary from other folders.
-case "$target" in /*) ;; *) target="$PWD/$target" ;; esac
 stamp="$target/check-passed"
 rm -f "$stamp"
+# What could not run here, with why: one line each.
+not_run=()
+# The tests of tests/release.rs that run the release build in a user namespace, in their order
+# there; tests/install_linux.rs keeps this list true.
+release_userns_tests=(
+  the_home_folder_is_the_passwd_one
+  no_variable_answers_an_approval
+  no_variable_moves_the_index_the_policies_the_boxes_or_the_keychain
+  without_a_passwd_home_nothing_runs
+  no_variable_answers_a_passphrase
+  no_variable_answers_sudo
+)
+# The escape tests of tests/sandbox.rs, in their order there; tests/install_linux.rs keeps this list
+# true. Where no box can be made, the tests step leaves them out.
+escape_tests=(
+  bash_and_claude_run_inside
+  the_network_is_only_lo
+  tcp_to_the_host_fails
+  a_file_outside_the_bind_set_is_missing
+  the_callers_folder_is_out_of_reach
+  the_callers_environment_stays_out
+  the_callers_fds_stay_out
+  no_host_root_in_mountinfo
+  every_proc_mount_is_read_only
+  nothing_is_left_after_exit
+  a_missing_or_unrunnable_command_says_so
+)
 
 # The commit checked out, if the files have no changes since it; else nothing.
 clean_head() {
@@ -100,11 +173,32 @@ step clippy
 cargo clippy --workspace --all-targets -- -D warnings
 
 step tests
-cargo test --workspace
+# On Linux the escape tests run only where the debug halti can make a box.
+box_why=""
+if [ "$(uname -s)" = Linux ]; then
+  cargo build --bin halti
+  box_why="$(box_blocked)"
+fi
+if [ -z "$box_why" ]; then
+  cargo test --workspace
+else
+  skip=()
+  for name in "${escape_tests[@]}"; do skip+=(--skip "$name"); done
+  cargo test --workspace -- --exact "${skip[@]}"
+fi
 
-# Again with their output, to show which escape tests ran here and which were skipped.
+# Again with their output, to show which escape tests ran here and which parts were skipped.
 step "escape tests"
-cargo test --test sandbox -- --nocapture --test-threads=1 2>&1 | grep -oE 'escape test (ran|skipped): .*|test result: .*'
+if [ -n "$box_why" ]; then
+  echo "not run: $box_why"
+  not_run+=("the escape tests of the sandbox engine, which only debug builds have ($box_why)")
+else
+  if ! said="$(cargo test --test sandbox -- --nocapture --test-threads=1 2>&1)"; then
+    printf '%s\n' "$said"
+    exit 1
+  fi
+  grep -oE 'escape test (ran|skipped): .*|test result: .*' <<<"$said"
+fi
 
 step "release check"
 cargo check --release
@@ -119,9 +213,18 @@ if ! grep -qx 'debug_assertions=false halti_dev=false' <<<"$info"; then
   echo "check.sh: the ci-release build has the test hooks" >&2
   exit 1
 fi
-# Runs it with every test hook set (in a user namespace, so Linux only).
+# Runs it with every test hook set, in a user namespace, so Linux only. Where none can be made,
+# only the release tests that need none run.
 if [ "$(uname -s)" = Linux ]; then
-  HALTI_RELEASE_BIN="$bin" cargo test --test release -- --ignored
+  why="$(userns_blocked unshare -Urm true)"
+  if [ -z "$why" ]; then
+    HALTI_RELEASE_BIN="$bin" cargo test --test release -- --ignored
+  else
+    skip=()
+    for name in "${release_userns_tests[@]}"; do skip+=(--skip "$name"); done
+    HALTI_RELEASE_BIN="$bin" cargo test --test release -- --ignored --exact "${skip[@]}"
+    not_run+=("the ${#release_userns_tests[@]} release tests that run the release build in a user namespace: that no test hook answers an approval, a passphrase or sudo for it (without a terminal it refuses) or moves its files, that it ignores HOME and XDG_* and takes its home from passwd, and that without a passwd home it runs nothing ($why)")
+  fi
 fi
 
 step shim
@@ -144,6 +247,11 @@ bash -n install-linux.sh
 bash -n macos-check.sh
 
 if [ -n "$head" ] && [ "$(clean_head)" = "$head" ]; then
-  echo "$head" >"$stamp"
+  { echo "$head"; for line in ${not_run[@]+"${not_run[@]}"}; do echo "$line"; done; } >"$stamp"
 fi
-step "all checks passed"
+if [ ${#not_run[@]} = 0 ]; then
+  step "all checks passed"
+else
+  step "all checks that ran passed; not run here:"
+  printf '%s\n' "${not_run[@]}"
+fi

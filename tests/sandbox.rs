@@ -2,8 +2,8 @@
 //! `halti box sh --engine sandbox` (the debug binary) and checks, from both sides, what the box
 //! can't see or reach, and that nothing of it is left after.
 //!
-//! Linux only, and only where the kernel lets a user make namespaces: each test prints whether it
-//! ran or was skipped, and check.sh shows those lines.
+//! Linux only. Where halti can't make a box's namespaces, each fails saying it cannot run here, so
+//! none counts as passed; check.sh leaves them out there and lists them as not run.
 
 #![cfg(target_os = "linux")]
 
@@ -15,13 +15,16 @@ use std::{fs, process};
 
 const HALTI: &str = env!("CARGO_BIN_EXE_halti");
 
-/// Whether a box can be made here; says so if not.
-fn can_sandbox(test: &str) -> bool {
-    let ok = Command::new("unshare").args(["-Urnm", "--pid", "--fork", "true"]).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
-    if !ok {
-        println!("escape test skipped: {test} (no user namespaces here)");
+/// Fails the test, saying why, where halti can't make a box's namespaces here. It asks halti, not
+/// unshare(1), as AppArmor's limit on user namespaces is per program. Any other failure is left
+/// to the test.
+fn can_sandbox() {
+    let out = in_box(&["true"]).output().unwrap();
+    let said = text(&out.stderr);
+    let why = said.lines().last().unwrap_or_default();
+    if !out.status.success() && (why.contains("making the box's namespaces") || why.contains("writing /proc/self/")) {
+        panic!("cannot run here: {why}");
     }
-    ok
 }
 
 fn ran(test: &str) {
@@ -78,9 +81,7 @@ fn mounts(mountinfo: &str) -> Vec<[String; 4]> {
 
 #[test]
 fn bash_and_claude_run_inside() {
-    if !can_sandbox("bash and claude run") {
-        return;
-    }
+    can_sandbox();
     let out = in_box(&["bash", "-c", "true"]).output().unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
     let out = in_box(&["bash", "-c", "exit 7"]).output().unwrap();
@@ -96,9 +97,7 @@ fn bash_and_claude_run_inside() {
 
 #[test]
 fn the_network_is_only_lo() {
-    if !can_sandbox("only lo") {
-        return;
-    }
+    can_sandbox();
     let said = bash("readlink /proc/self/ns/net; echo ---; sed 1,2d /proc/net/dev | cut -d: -f1 | tr -d ' '; echo ---; ls /sys/class/net 2>/dev/null; true");
     let parts: Vec<&str> = said.split("---\n").collect();
     assert_eq!(parts.len(), 3, "{said}");
@@ -115,9 +114,7 @@ fn the_network_is_only_lo() {
 
 #[test]
 fn tcp_to_the_host_fails() {
-    if !can_sandbox("no TCP to the host") {
-        return;
-    }
+    can_sandbox();
     // A listener of the host's own, which the host reaches, so the test can't pass by reaching nothing.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -130,9 +127,7 @@ fn tcp_to_the_host_fails() {
 
 #[test]
 fn a_file_outside_the_bind_set_is_missing() {
-    if !can_sandbox("planted file missing") {
-        return;
-    }
+    can_sandbox();
     let fixture = Fixture::new("fixture");
     let (dir, secret) = (fixture.0.display(), fixture.0.join("secret"));
     let said = bash(&format!("test -e '{}' && echo visible; test -e '{dir}' && echo dir visible; test -x /usr/bin/env && echo usr; echo done", secret.display()));
@@ -142,9 +137,7 @@ fn a_file_outside_the_bind_set_is_missing() {
 
 #[test]
 fn the_callers_folder_is_out_of_reach() {
-    if !can_sandbox("caller's folder out of reach") {
-        return;
-    }
+    can_sandbox();
     // Started from a folder outside the bind set, no process the box can see has it as its folder.
     let fixture = Fixture::new("cwd");
     let script = "for p in /proc/[0-9]*; do cat $p/cwd/secret 2>/dev/null && echo \" in $p\"; done; echo done";
@@ -156,9 +149,7 @@ fn the_callers_folder_is_out_of_reach() {
 
 #[test]
 fn the_callers_environment_stays_out() {
-    if !can_sandbox("caller's environment out") {
-        return;
-    }
+    can_sandbox();
     let marker = format!("planted-{}", process::id());
     let out = in_box(&["bash", "-c", &format!("grep -l '{marker}' /proc/[0-9]*/environ 2>/dev/null; echo done")]).env("SANDBOX_TEST_MARKER", &marker).output().unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -168,9 +159,7 @@ fn the_callers_environment_stays_out() {
 
 #[test]
 fn the_callers_fds_stay_out() {
-    if !can_sandbox("caller's fds out") {
-        return;
-    }
+    can_sandbox();
     // bash opens fd 7 on a folder outside the bind set and runs the box with it.
     let fixture = Fixture::new("fd");
     let inside = "ls /proc/self/fd/7/ 2>/dev/null; test -e /proc/self/fd/7 && echo fd 7; echo done";
@@ -188,9 +177,7 @@ fn the_callers_fds_stay_out() {
 
 #[test]
 fn no_host_root_in_mountinfo() {
-    if !can_sandbox("no host root in mountinfo") {
-        return;
-    }
+    can_sandbox();
     let host = mounts(&fs::read_to_string("/proc/self/mountinfo").unwrap());
     let [root_dev, root_root, ..] = host.iter().find(|[.., at, _]| at == "/").unwrap().clone();
     let inside = mounts(&bash("cat /proc/self/mountinfo"));
@@ -204,9 +191,7 @@ fn no_host_root_in_mountinfo() {
 
 #[test]
 fn every_proc_mount_is_read_only() {
-    if !can_sandbox("/proc read-only") {
-        return;
-    }
+    can_sandbox();
     let out = in_box(&["cat", "/proc/self/mountinfo"]).output().unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
     let proc: Vec<_> = mounts(&text(&out.stdout)).into_iter().filter(|[.., at, _]| at == "/proc" || at.starts_with("/proc/")).collect();
@@ -219,9 +204,7 @@ fn every_proc_mount_is_read_only() {
 
 #[test]
 fn nothing_is_left_after_exit() {
-    if !can_sandbox("nothing left after exit") {
-        return;
-    }
+    can_sandbox();
     let marker = format!("600.{}", process::id());
     let running = || fs::read_dir("/proc").unwrap().flatten().any(|e| fs::read(e.path().join("cmdline")).is_ok_and(|c| c.split(|b| *b == 0).any(|a| a == marker.as_bytes())));
     let mounts_before = fs::read_to_string("/proc/self/mountinfo").unwrap();
@@ -244,9 +227,7 @@ fn nothing_is_left_after_exit() {
 
 #[test]
 fn a_missing_or_unrunnable_command_says_so() {
-    if !can_sandbox("missing command") {
-        return;
-    }
+    can_sandbox();
     let out = in_box(&["no-such-command"]).output().unwrap();
     assert_eq!(out.status.code(), Some(127));
     assert!(text(&out.stderr).contains("halti: no-such-command:"), "{}", text(&out.stderr));

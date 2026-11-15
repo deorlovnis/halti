@@ -4,7 +4,8 @@
 //!
 //! The release binary takes its home from the passwd entry, so it runs in a user and mount
 //! namespace (`unshare -Urm`) where it is root, with a test folder mounted over /root: it never
-//! sees your real files. Linux only.
+//! sees your real files. Linux only. Where no user namespace can be made, a test that needs one
+//! fails saying so, never passes; check.sh leaves those out there and lists them as not run.
 
 #![cfg(target_os = "linux")]
 
@@ -43,6 +44,7 @@ struct Dirs {
 
 impl Dirs {
     fn new() -> Self {
+        user_namespace();
         static COUNT: AtomicUsize = AtomicUsize::new(0);
         let dir = env::temp_dir().join(format!("halti-release-{}-{}", std::process::id(), COUNT.fetch_add(1, Ordering::Relaxed)));
         let _ = fs::remove_dir_all(&dir);
@@ -98,6 +100,16 @@ impl Drop for Dirs {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Fails the test, saying why, where a user namespace can't be made here.
+fn user_namespace() {
+    let why = match Command::new("unshare").args(["-Urm", "true"]).stdin(Stdio::null()).output() {
+        Ok(out) if out.status.success() => return,
+        Ok(out) => text(&out.stderr).trim().to_string(),
+        Err(e) => e.to_string(),
+    };
+    panic!("cannot run here: unshare -Urm fails ({why})");
 }
 
 fn text(bytes: &[u8]) -> String {
