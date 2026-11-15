@@ -8,10 +8,9 @@
 //!     HALTI_KVM_IMAGES=/usr/local/lib/halti/images \
 //!     cargo test --bin halti vmm::kvm_tests -- --ignored --nocapture
 //!
-//! It makes the box's disk itself with mkfs.ext4.
+//! It makes the box's disk as a box's store makes it (mkfs.ext4 in a sparse file).
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use std::{env, fs};
@@ -68,14 +67,6 @@ fn sh(engine: &CloudHypervisor, name: &str, root: bool, script: &str) -> String 
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A fresh ext4 file system in a sparse file, as the box's disk.
-fn new_disk(path: &Path) {
-    let file = fs::File::create(path).unwrap();
-    file.set_len(1 << 30).unwrap();
-    let out = Command::new("mkfs.ext4").args(["-q", "-F"]).arg(path).output().expect("mkfs.ext4");
-    assert!(out.status.success(), "mkfs.ext4: {}", String::from_utf8_lossy(&out.stderr));
-}
-
 #[test]
 #[ignore = "needs Linux with /dev/kvm, Cloud Hypervisor, its kernel and an agent image disk: see the top of this file"]
 fn a_box_boots_runs_as_the_agent_and_as_root_and_keeps_its_disk_across_a_stop() {
@@ -92,8 +83,9 @@ fn a_box_boots_runs_as_the_agent_and_as_root_and_keeps_its_disk_across_a_stop() 
     println!("image: {image}");
     let name = format!("{}0123456789ab-kvm", names::WS_BOX_VM_PREFIX);
     let paths = engine.paths(&name).unwrap();
-    let disk = dir.join("kvm.img");
-    new_disk(&disk);
+    let layout = store::Layout::under(&dir).unwrap();
+    let disk = layout.bundle("kvm");
+    store::create(&layout, &disk, "").unwrap();
     let console = dir.join("open/kvm.console");
     let spec = VmSpec {
         name: name.clone(),
@@ -155,6 +147,10 @@ fn a_box_boots_runs_as_the_agent_and_as_root_and_keeps_its_disk_across_a_stop() 
     let mounts = sh(&engine, &name, false, "for d in /home/agent /work /downloads; do stat -c '%n %u' $d; done; ls /sys/class/net");
     println!("folders and network devices: {}", mounts.trim().replace('\n', " | "));
     assert_eq!(mounts, "/home/agent 1000\n/work 1000\n/downloads 1000\nlo\n");
+    // The programs the image unpacked from others' archives are root's, as the image's own are.
+    let owners = sh(&engine, &name, false, "stat -c '%n %u:%g' /usr/local/bin/dockerd /usr/local/bin/gh /usr/local/bin/uv /usr/local/bin/halti-shim");
+    println!("owners in the image: {}", owners.trim().replace('\n', " | "));
+    assert_eq!(owners, "/usr/local/bin/dockerd 0:0\n/usr/local/bin/gh 0:0\n/usr/local/bin/uv 0:0\n/usr/local/bin/halti-shim 0:0\n");
 
     // The CA, as a run installs it, and a request through the door over vsock: a host the box
     // may not reach is refused by the door, which logs it.
@@ -195,6 +191,7 @@ fn a_box_boots_runs_as_the_agent_and_as_root_and_keeps_its_disk_across_a_stop() 
     let kept = sh(&engine, &name, false, "cat /home/agent/kept.txt /work/kept.txt");
     println!("after the stop and a new start, the box disk holds: {}", kept.trim().replace('\n', " | "));
     assert_eq!(kept, "kept\nkept\n");
+    println!("the box's disk takes {} MB of the server's", store::usage(&disk).0 >> 20);
     // and the door, which went on dialing, reaches the new VM
     assert_eq!(sh(&engine, &name, false, refused), "403");
 

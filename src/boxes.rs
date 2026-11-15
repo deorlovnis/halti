@@ -1053,7 +1053,7 @@ pub fn ls() -> Result<()> {
     // Stores whose policy file is gone.
     for entry in fs::read_dir(&layout.root).into_iter().flatten().flatten() {
         let file = entry.file_name().to_string_lossy().into_owned();
-        if let Some(name) = file.strip_suffix(".sparsebundle").filter(|n| !shown.iter().any(|s| s == n)) {
+        if let Some(name) = file.strip_suffix(names::STORE).filter(|n| !shown.iter().any(|s| s == n)) {
             shown.push(name.to_string());
         }
     }

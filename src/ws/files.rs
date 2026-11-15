@@ -54,6 +54,8 @@ use halti_core::platform::{Adapter, Grade, Label, Lacks, Property};
 use halti_core::policy::Approval;
 use halti_core::store::{FileKey, Files, Held, ItemName, KeystoreBackend, KeystoreKind};
 
+use crate::names;
+
 /// What `DirFiles` says of itself.
 pub const FILES: Label = Label {
     adapter: "dir-files",
@@ -601,11 +603,11 @@ pub fn boxes_dir(root: &Path, ws: WsId) -> PathBuf {
     root.join(ws.to_string()).join("boxes")
 }
 
-/// The stores in a boxes folder: `BOX.sparsebundle` in it, and in its temp/ folder those of runs
-/// that keep nothing, by their boxes' names, sorted and each once. A folder that isn't there holds
-/// none.
+/// The stores in a boxes folder: `BOX.sparsebundle` or `BOX.img` in it, made here or on the other
+/// system (`names::STORES`), and in its temp/ folder those of runs that keep nothing, by their
+/// boxes' names, sorted and each once. A folder that isn't there holds none.
 pub fn stores_in(boxes: &Path) -> Result<Vec<String>> {
-    let mut names = Vec::new();
+    let mut stores = Vec::new();
     for dir in [boxes.to_path_buf(), boxes.join("temp")] {
         let found = match fs::read_dir(&dir) {
             Ok(found) => found,
@@ -615,14 +617,14 @@ pub fn stores_in(boxes: &Path) -> Result<Vec<String>> {
         for entry in found {
             let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(stem) = name.strip_suffix(".sparsebundle").filter(|_| !name.starts_with('.')) {
-                names.push(stem.to_string());
+            if let Some(stem) = names::STORES.iter().find_map(|end| name.strip_suffix(end)).filter(|_| !name.starts_with('.')) {
+                stores.push(stem.to_string());
             }
         }
     }
-    names.sort();
-    names.dedup();
-    Ok(names)
+    stores.sort();
+    stores.dedup();
+    Ok(stores)
 }
 
 /// Removes a workspace's boxes folder and all in it, then the workspace's folder if nothing else
@@ -1182,8 +1184,8 @@ mod tests {
         fs::write(acme_boxes.join("open/dev.lock"), b"").unwrap();
         fs::write(root.join(acme.to_string()).join(".DS_Store"), b"finder's").unwrap();
         // globex: only a boxes folder, with a store in it. initech: a store of a run that keeps nothing.
-        fs::create_dir_all(boxes_dir(&root, globex).join("dev.sparsebundle")).unwrap();
-        fs::create_dir_all(boxes_dir(&root, initech).join("temp/scratch.sparsebundle")).unwrap();
+        fs::create_dir_all(boxes_dir(&root, globex).join(format!("dev{}", names::STORE))).unwrap();
+        fs::create_dir_all(boxes_dir(&root, initech).join(format!("temp/scratch{}", names::STORE))).unwrap();
         assert_eq!(stores_in(&boxes_dir(&root, initech)).unwrap(), ["scratch"]);
         assert_eq!(stores_in(&boxes_dir(&root, globex)).unwrap(), ["dev"]);
         assert_eq!(orphan_policies(&root).unwrap(), [acme], "a folder with a store is never an orphan");
@@ -1194,8 +1196,39 @@ mod tests {
         assert!(!root.join(acme.to_string()).exists());
         // One with a store is refused, and left as it is.
         assert!(remove_boxes(&root, globex).unwrap_err().to_string().ends_with("holds a box's store"));
-        assert!(boxes_dir(&root, globex).join("dev.sparsebundle").exists());
+        assert!(boxes_dir(&root, globex).join(format!("dev{}", names::STORE)).exists());
         assert_eq!(orphan_policies(&root).unwrap(), []);
+    }
+
+    /// On Linux a store is a disk, `BOX.img`, a plain file, with halti's folder `BOX.d` beside it.
+    /// Either system finds both systems' stores, so a folder copied from the other one keeps them.
+    #[test]
+    fn stores_in_finds_either_system_s_stores() {
+        let dir = TempDir::new("halti-ws-image-stores").unwrap();
+        let boxes = dir.0.join("boxes");
+        fs::create_dir_all(boxes.join("temp")).unwrap();
+        fs::write(boxes.join("dev.img"), b"a disk").unwrap();
+        fs::create_dir_all(boxes.join("dev.d/log")).unwrap();
+        fs::write(boxes.join("temp/scratch.img"), b"a run's disk").unwrap();
+        fs::create_dir_all(boxes.join("half.d")).unwrap();
+        fs::create_dir_all(boxes.join("mac.sparsebundle")).unwrap();
+        fs::write(boxes.join(".hidden.img"), b"").unwrap();
+        assert_eq!(stores_in(&boxes).unwrap(), ["dev", "mac", "scratch"]);
+        // Gone with its disk, a store is no longer found: the disk goes last.
+        fs::remove_file(boxes.join("dev.img")).unwrap();
+        fs::remove_file(boxes.join("temp/scratch.img")).unwrap();
+        fs::remove_dir_all(boxes.join("mac.sparsebundle")).unwrap();
+        assert!(stores_in(&boxes).unwrap().is_empty());
+
+        // A workspace folder with only the other system's store is no orphan, and isn't removed.
+        let root = dir.0.join("ws");
+        let acme = WsId::from_bytes([0x10; 16]);
+        let other = if names::STORE == ".img" { ".sparsebundle" } else { ".img" };
+        let store = boxes_dir(&root, acme).join(format!("dev{other}"));
+        fs::create_dir_all(&store).unwrap();
+        assert_eq!(orphan_policies(&root).unwrap(), []);
+        assert!(remove_boxes(&root, acme).unwrap_err().to_string().ends_with("holds a box's store"));
+        assert!(store.exists());
     }
 
     #[test]

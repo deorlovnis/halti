@@ -955,6 +955,50 @@ mod tests {
         assert_eq!(found.files.approved_copy("dev").unwrap(), None);
     }
 
+    /// On Linux a box's store is its disk and halti's folder beside it. A workspace that holds one,
+    /// or the disk of one half removed, or a run's in temp/, is refused before anything is asked,
+    /// and clearing its boxes folder removes none of it. Once the box is removed, it goes.
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "needs mkfs.ext4")]
+    fn ws_delete_refuses_a_workspace_with_an_image_store() {
+        let dir = TempDir::new("halti-ws-image-store").unwrap();
+        let here = Here::at(&dir.0.join("ws"));
+        let acme = WsName::parse("acme").unwrap();
+        let copies = OneCopy(Cell::new(None));
+        new_with(&here, &acme, &TtyPassphrase::new(false).answering(ACME).saving(), &copies).unwrap();
+        let found = find(&here, &acme, "dev").unwrap();
+        let world = Fake::answering(true, true);
+        let way = Way { world: &world, copies: &copies, means: Some(Means::TouchId), detail: None };
+        make_with(&here, &found, b"run = [\"claude\"]\nkeep = true\n", None, true, &way, &not_typed, &boxes::store::create).unwrap();
+        let (disk, folder) = (found.layout.bundle("dev"), found.layout.root.join("dev.d"));
+        assert!(disk.is_file() && folder.join("log").is_dir() && folder.join("door").is_dir());
+        world.calls();
+
+        let refused = "acme has boxes with stores: dev. remove them first: halti ws box rm acme/dev";
+        let delete = || super::super::delete_with(&here, &acme, &way, &not_typed);
+        assert_eq!(delete().unwrap_err().to_string(), refused);
+        assert!(world.calls().is_empty(), "nothing is asked");
+        assert!(clear(&here, found.id).is_err());
+        assert!(disk.is_file() && folder.join("log").is_dir() && here.id_of(&acme).is_some());
+        // Its folder gone, as a removal cut short leaves it: the disk is still a store.
+        fs::remove_dir_all(&folder).unwrap();
+        assert_eq!(delete().unwrap_err().to_string(), refused);
+        assert!(clear(&here, found.id).is_err() && disk.is_file());
+
+        // Removed with the box, it no longer stands in the way; a run's store in temp/ does.
+        rm_with(&here, &found, None, &way, &not_typed).unwrap();
+        assert!(!disk.exists() && !folder.exists());
+        world.calls();
+        let scratch = found.layout.ephemeral_bundle("scratch");
+        fs::write(&scratch, b"a run's disk").unwrap();
+        let error = delete().unwrap_err().to_string();
+        assert_eq!(error, "acme has boxes with stores: scratch. remove them first: halti ws box rm acme/scratch");
+        assert!(world.calls().is_empty() && scratch.exists());
+        fs::remove_file(&scratch).unwrap();
+        assert_eq!(delete().unwrap().out, ["deleted workspace acme"]);
+        assert!(!here.root.join(found.id.to_string()).exists() && here.id_of(&acme).is_none());
+    }
+
     #[test]
     fn a_start_s_checks_say_their_kind() {
         let dir = TempDir::new("halti-ws-box-checks").unwrap();
