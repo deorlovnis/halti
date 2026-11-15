@@ -34,8 +34,10 @@ pub const GRACE: SignedDuration = SignedDuration::from_secs(60);
 /// again.
 const EXPIRED_KEPT: SignedDuration = SignedDuration::from_secs(600);
 /// The most workspaces, trust entries and request ids one report names.
-const REPORT_MAX: usize = 64;
-const REPORT_IDS_MAX: usize = 256;
+pub const REPORT_MAX: usize = 64;
+pub const REPORT_IDS_MAX: usize = 256;
+/// The most of what one phone sent one machine that the phone is shown.
+const SENT_MAX: usize = 64;
 
 /// What a machine reported last.
 #[derive(Clone, Debug)]
@@ -256,12 +258,7 @@ pub fn done_body(body: &[u8]) -> Result<Vec<(u64, String)>, Refused> {
     if body.done.len() > ITEMS_MAX {
         return Err(Refused::Malformed);
     }
-    body.done.into_iter().map(|said| if said_ok(&said.said) { Ok((said.n, said.said)) } else { Err(Refused::Malformed) }).collect()
-}
-
-/// A word a machine says came of an item: 1 to 16 of a-z and `-`.
-fn said_ok(word: &str) -> bool {
-    (1..=16).contains(&word.len()) && word.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+    body.done.into_iter().map(|said| if wire::is_word(&said.said) { Ok((said.n, said.said)) } else { Err(Refused::Malformed) }).collect()
 }
 
 #[derive(Deserialize)]
@@ -340,8 +337,17 @@ impl Relay {
         mailbox
     }
 
+    /// The mailbox of `machine` if the hub holds one: a phone's call that names a machine makes
+    /// none.
+    fn held(&mut self, machine: &str, now: Timestamp) -> Option<&mut Mailbox> {
+        let mailbox = self.machines.get_mut(machine)?;
+        mailbox.purge(now);
+        Some(mailbox)
+    }
+
     /// A machine's report: kept as its state, and the requests it no longer lists dropped. The ids
-    /// it lists that the hub lacks come back: the machine posts those again.
+    /// it lists that the hub lacks come back, as many as it has room for: the machine posts those
+    /// again.
     pub fn report(&mut self, machine: &str, reported: Reported, now: Timestamp) -> Vec<[u8; 16]> {
         let Reported { link, workspaces, trusted, ids } = reported;
         let mailbox = self.mailbox(machine, now);
@@ -351,7 +357,8 @@ impl Relay {
         };
         mailbox.report = Some(Report { at: now, since, link, workspaces, trusted });
         mailbox.requests.retain(|id, _| ids.contains(id));
-        ids.iter().filter(|id| !mailbox.requests.contains_key(*id) && !mailbox.expired.contains_key(*id)).copied().collect()
+        let room = REQUESTS_MAX.saturating_sub(mailbox.requests.len());
+        ids.iter().filter(|id| !mailbox.requests.contains_key(*id) && !mailbox.expired.contains_key(*id)).take(room).copied().collect()
     }
 
     /// A request a machine posts. One the hub holds already is left as it is.
@@ -377,7 +384,7 @@ impl Relay {
     pub fn requests(&mut self, scope: &[WsName], machines: &[String], now: Timestamp) -> Vec<(String, Vec<u8>)> {
         let mut out = Vec::new();
         for machine in machines {
-            let mailbox = self.mailbox(machine, now);
+            let Some(mailbox) = self.held(machine, now) else { continue };
             for held in mailbox.requests.values().filter(|held| !held.hidden && in_scope(scope, &held.record.ws)) {
                 out.push((machine.clone(), held.bytes.clone()));
             }
@@ -387,14 +394,15 @@ impl Relay {
 
     /// The record of request `id` on `machine`, if a phone of `scope` may answer it.
     pub fn record(&mut self, machine: &str, id: Id, scope: &[WsName], now: Timestamp) -> Option<(Record, Vec<u8>)> {
-        let held = self.mailbox(machine, now).requests.get(&id.0)?;
+        let held = self.held(machine, now)?.requests.get(&id.0)?;
         (!held.hidden && in_scope(scope, &held.record.ws)).then(|| (held.record.clone(), held.bytes.clone()))
     }
 
     /// Closes the remote copy of request `id` on `machine` for every phone. Nothing reaches the
     /// machine: its own prompt and `halti requests` go on.
     pub fn hide(&mut self, machine: &str, id: Id, scope: &[WsName], now: Timestamp) -> Result<(), Refused> {
-        let held = self.mailbox(machine, now).requests.get_mut(&id.0).filter(|held| !held.hidden && in_scope(scope, &held.record.ws)).ok_or(Refused::Gone)?;
+        let held =
+            self.held(machine, now).and_then(|mailbox| mailbox.requests.get_mut(&id.0)).filter(|held| !held.hidden && in_scope(scope, &held.record.ws)).ok_or(Refused::Gone)?;
         held.hidden = true;
         Ok(())
     }
@@ -430,6 +438,12 @@ impl Relay {
         mailbox.items.clone()
     }
 
+    /// How many machines the hub holds a mailbox for.
+    #[cfg(test)]
+    pub fn mailboxes(&self) -> usize {
+        self.machines.len()
+    }
+
     /// Whether `machine` has items queued.
     pub fn waiting(&self, machine: &str) -> bool {
         self.machines.get(machine).is_some_and(|mailbox| !mailbox.items.is_empty())
@@ -458,7 +472,8 @@ impl Relay {
     }
 
     /// What phone `device`, which sees `scope`, is shown: each machine that reported trusting it,
-    /// with that machine's key and conflict mark as `row` gives them, and what it sent.
+    /// with that machine's key and conflict mark as `row` gives them, and the last `SENT_MAX` it
+    /// sent each machine.
     pub fn view(&mut self, device: &str, scope: &[WsName], row: &dyn Fn(&str) -> Option<MachineRow>, now: Timestamp) -> Value {
         let mut machines = Vec::new();
         let mut sent = Vec::new();
@@ -466,7 +481,9 @@ impl Relay {
         for name in names {
             let Some((key, conflict)) = row(&name) else { continue };
             let mailbox = self.mailbox(&name, now);
-            for item in mailbox.items.iter().chain(mailbox.done.iter()).filter(|item| item.from == device) {
+            let mut mine: Vec<&Item> = mailbox.items.iter().chain(mailbox.done.iter()).filter(|item| item.from == device).collect();
+            mine.sort_by_key(|item| item.n);
+            for item in mine.iter().skip(mine.len().saturating_sub(SENT_MAX)) {
                 let state = match (&item.said, item.taken) {
                     (Some(said), _) => said.clone(),
                     (None, true) => "taken".to_string(),

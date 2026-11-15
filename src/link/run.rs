@@ -3,13 +3,16 @@
 //!
 //! - **Report.** Every second it asks this machine's open workspaces, on their sockets, which
 //!   requests wait and which boxes run, for the workspaces a trusted device may see. When that
-//!   changed, and at least every 20 seconds, it reports the whole state to the hub; the reply names
-//!   the requests the hub lacks, which it then posts one by one (a hub that restarted has none),
-//!   and lists the phones not revoked, from which the trust list is kept: a device not on a
-//!   complete list is no longer trusted. Adding trust takes `halti devices trust`, never a list.
+//!   changed, and at least every 20 seconds, it reports the whole state to the hub, cut to what the
+//!   hub takes in a report; the reply names the requests the hub lacks and has room for, which it
+//!   then posts one by one (a hub that restarted has none), and lists the phones not revoked, from
+//!   which the trust list is kept: a device not on a complete list is no longer trusted. Adding
+//!   trust takes `halti devices trust`, never a list.
 //! - **Inbox.** It holds one call to the hub that waits for what phones sent this machine: signed
 //!   answers and stops. Each goes to the open workspace it names, which checks it, and what came of
-//!   it is said to the hub with the next call.
+//!   it is said to the hub with the next call. A stop waits until its boxes are put away, so each
+//!   is handed over on a thread of its own and answers go on meanwhile. An item of a kind this link
+//!   doesn't know is said `unknown`.
 //! - **Socket.** `link.sock` in its folder, 0600, for `halti devices trust` as the same user: lines
 //!   of printable ASCII, at most 4 KiB with their newline.
 //!
@@ -23,12 +26,14 @@
 //! WORD is the hub's word for a refusal, or `unreachable` or `not-joined`.
 //!
 //! It renews its own token from day 10 of its life, by the hub's clock: it draws a new token, writes
-//! it down as the next one, then asks the hub. If no reply comes, the next one is tried before
-//! anything else is done, so a renewal the hub made and whose reply was lost costs nothing; one
-//! the hub refuses is dropped. While it renews no other call is under way, so the old token is never
-//! sent after the new one was used. A token the hub refuses for good (`unknown`, `expired`,
-//! `conflict`) is noted in the folder, and `halti open`, `halti ws run` and `halti requests` then
-//! say so.
+//! it down as the next one, then asks the hub. If no reply comes, every call first tries the next
+//! one, and none is sent with the old one until the hub has answered that try: the new token from
+//! then on if the hub knows it, the old one again if it doesn't. So a renewal the hub made and
+//! whose reply was lost costs nothing, nor does a lost reply to that try, and the old token is
+//! never sent after the new one was used. While it renews or tries no other call is under way. It
+//! writes `link.json` only over what it read there, so a leave or a join meanwhile stands. A token
+//! the hub refuses for good (`unknown`, `expired`, `conflict`) is noted in the folder, and
+//! `halti open`, `halti ws run` and `halti requests` then say so.
 //!
 //! When the hub can't be reached it tries again, waiting longer each time, up to a minute. Nothing
 //! on the machine waits for it: requests are answered at the machine as before.
@@ -46,8 +51,8 @@ use halti_core::ids::WsName;
 use serde_json::{Value, json};
 
 use super::files::{Entry, Folder, Joined};
-use crate::hub::{pin, wire};
-use crate::keep::{self, Records, Told};
+use crate::hub::{ITEMS_MAX, REPORT_IDS_MAX, REPORT_MAX, STATE_BODY_MAX, pin, wire};
+use crate::keep::{self, Records, STOP_RUNS_MAX, Told};
 use crate::requests::{Id, Record, RunId};
 use crate::util::{self, hex, say};
 
@@ -141,6 +146,23 @@ impl Listed {
     }
 }
 
+/// What a phone sent this machine, read whole from what the hub handed over.
+enum Inbound {
+    Answer { ws: WsName, device: String, id: Id, yes: bool, signature: Vec<u8> },
+    Stop { ws: WsName, device: String, runs: Vec<RunId>, signature: Vec<u8> },
+}
+
+/// What came of the items the hub handed over, each known by its number and signature: a hub
+/// that restarted numbers its items from 1 again.
+#[derive(Default)]
+struct Handled {
+    /// Handled, and to be said to the hub with the next call: the number, the signature and the
+    /// word.
+    said: Vec<(u64, String, &'static str)>,
+    /// Being handled on a thread of its own.
+    under_way: Vec<(u64, String)>,
+}
+
 /// What the link saw at one look.
 struct Look {
     /// The body of its report.
@@ -169,6 +191,10 @@ pub struct Link<'a> {
     reported: Condvar,
     /// The last thing said about the hub, so each is said once.
     said: Mutex<String>,
+    /// What was said about this machine's own state, each once while the link runs.
+    noted: Mutex<Vec<String>>,
+    /// What came of the items the hub handed over, until the hub is told.
+    handled: Mutex<Handled>,
 }
 
 /// Runs the link in `folder` for this machine's workspaces until `stop` is set.
@@ -187,10 +213,12 @@ pub fn run(folder: &Folder, local: &dyn Local, timing: Timing, stop: &AtomicBool
         reports: Mutex::new((0, 0, None)),
         reported: Condvar::new(),
         said: Mutex::default(),
+        noted: Mutex::default(),
+        handled: Mutex::default(),
     };
     thread::scope(|scope| {
         let link = &link;
-        scope.spawn(move || link.inbox());
+        scope.spawn(move || link.inbox(scope));
         scope.spawn(move || link.serve(&listener));
         link.report_loop();
     });
@@ -224,6 +252,15 @@ impl Link<'_> {
         }
     }
 
+    /// Says `line` if it wasn't said before while the link runs.
+    fn note_once(&self, line: String) {
+        let mut noted = locked(&self.noted);
+        if !noted.contains(&line) {
+            say(&format!("link: {line}"));
+            noted.push(line);
+        }
+    }
+
     fn joined(&self) -> Option<Joined> {
         self.joined.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
@@ -242,12 +279,19 @@ impl Link<'_> {
         }
     }
 
-    /// One call to the hub with the token, held for reading while it is under way.
+    /// One call to the hub with the token, held for reading while it is under way. A next token
+    /// written down is tried first, and until the hub has answered that, nothing is sent.
     fn call(&self, method: &str, path: &str, body: Option<&Value>, wait: Duration) -> Result<Value, Failed> {
-        let guard = self.joined.read().unwrap_or_else(PoisonError::into_inner);
-        let Some(joined) = guard.as_ref() else { return Err(Failed::Refused(401, "not-joined".into())) };
-        let token = joined.token.clone();
-        self.call_with(joined, &token, method, path, body, wait)
+        loop {
+            let guard = self.joined.read().unwrap_or_else(PoisonError::into_inner);
+            let Some(joined) = guard.as_ref() else { return Err(Failed::Refused(401, "not-joined".into())) };
+            if joined.next.is_none() {
+                let token = joined.token.clone();
+                return self.call_with(joined, &token, method, path, body, wait);
+            }
+            drop(guard);
+            self.try_next()?;
+        }
     }
 
     /// One call with `token`, whatever holds it. A refusal for good is noted.
@@ -338,10 +382,14 @@ impl Link<'_> {
     /// The state to report, the requests that wait, each with its bytes, and the trust list it was
     /// made from: of the workspaces a trusted device may see, those open asked on their sockets.
     fn look(&self) -> Look {
-        let trust = self.folder.trust().unwrap_or_else(|e| {
+        let mut trust = self.folder.trust().unwrap_or_else(|e| {
             self.say_once(&format!("{e:#}"));
             Vec::new()
         });
+        if trust.len() > REPORT_MAX {
+            self.note_once(format!("this machine trusts more than {REPORT_MAX} devices: the hub is told of the first {REPORT_MAX}"));
+            trust.truncate(REPORT_MAX);
+        }
         let name = self.joined().map(|joined| joined.name).unwrap_or_default();
         let mut trusted_ws: Vec<WsName> = Vec::new();
         for entry in &trust {
@@ -358,6 +406,10 @@ impl Link<'_> {
             if !trusted_ws.contains(&ws) {
                 continue;
             }
+            if workspaces.len() == REPORT_MAX {
+                self.note_once(format!("more than {REPORT_MAX} workspaces have a trusted device: the hub is told of {REPORT_MAX}"));
+                break;
+            }
             let mut runs = Vec::new();
             let mut open = false;
             if let Some(socket) = socket {
@@ -366,8 +418,12 @@ impl Link<'_> {
                     for bytes in listed {
                         let Some(record) = Record::decode(&bytes).filter(|record| record.ws == ws.as_str()) else { continue };
                         if record.machine != name {
-                            self.say_once(&format!("{ws} was opened before this machine joined as {name}: its requests name {}. close it and open it again", record.machine));
+                            self.note_once(format!("{ws} has requests raised before this machine joined as {name}: they name {}, and are answered here", record.machine));
                             continue;
+                        }
+                        if records.len() == REPORT_IDS_MAX {
+                            self.note_once(format!("more than {REPORT_IDS_MAX} requests wait: the hub is told of {REPORT_IDS_MAX}, and the rest are answered here"));
+                            break;
                         }
                         ids.insert(record.id.0, ws.clone());
                         records.push((record, bytes));
@@ -376,14 +432,27 @@ impl Link<'_> {
                 if let Some(Ok(running)) = keep::runs(&socket, &ws, KEEPER_WAIT) {
                     runs = running;
                 }
+                if runs.len() > STOP_RUNS_MAX {
+                    self.note_once(format!("more than {STOP_RUNS_MAX} boxes run in {ws}: the hub is told of {STOP_RUNS_MAX}"));
+                    runs.truncate(STOP_RUNS_MAX);
+                }
             }
             let runs: Vec<Value> = runs.iter().map(|(name, run)| json!({"box": name, "run": run.hex()})).collect();
             workspaces.push(json!({"name": ws, "open": open, "runs": runs}));
         }
-        *locked(&self.ids) = ids;
         let trusted: Vec<Value> = trust.iter().map(|entry| json!({"device": entry.name, "ws": entry.ws})).collect();
-        let requests: Vec<String> = records.iter().map(|(record, _)| record.id.hex()).collect();
-        Look { state: json!({"link": hex(&self.instance), "workspaces": workspaces, "trusted": trusted, "requests": requests}), records, trust }
+        let state = |records: &[(Record, Vec<u8>)]| {
+            let requests: Vec<String> = records.iter().map(|(record, _)| record.id.hex()).collect();
+            json!({"link": hex(&self.instance), "workspaces": workspaces, "trusted": trusted, "requests": requests})
+        };
+        // A report the hub would refuse as too large names fewer requests: the rest are answered here.
+        while !records.is_empty() && state(&records).to_string().len() > STATE_BODY_MAX {
+            let (record, _) = records.pop().expect("not empty");
+            ids.remove(&record.id.0);
+            self.note_once("this machine's report is longer than the hub takes: it names fewer requests, and the rest are answered here".to_string());
+        }
+        *locked(&self.ids) = ids;
+        Look { state: state(&records), records, trust }
     }
 
     /// Reports what `look` saw, posts the requests the hub lacks, and keeps the trust list to the
@@ -402,7 +471,11 @@ impl Link<'_> {
             // A request the hub won't hold (expired, or one more than it holds) waits here as before.
             match self.call("POST", "/v1/machine/request", Some(&json!({"record": hex(bytes)})), self.timing.call_wait) {
                 Ok(_) | Err(Failed::Refused(410, _)) => {}
-                Err(Failed::Refused(429, _)) => self.say_once("the hub holds as many of this machine's requests as it takes: the rest are answered here"),
+                // The rest would be refused too.
+                Err(Failed::Refused(429, _)) => {
+                    self.say_once("the hub holds as many of this machine's requests as it takes: the rest are answered here");
+                    break;
+                }
                 Err(failed) => return Err(failed),
             }
         }
@@ -434,12 +507,9 @@ impl Link<'_> {
 
     // --- renewal ---
 
-    /// Tries the next token if one is written down; otherwise, once `renew_every` has passed, asks
-    /// the hub whether the token is due, and renews it if it is.
+    /// Once `renew_every` has passed, asks the hub whether the token is due, and renews it if it
+    /// is. A next token written down is tried first, as before every call.
     fn renew(&self, renew_at: &mut Instant) {
-        if self.joined().is_some_and(|joined| joined.next.is_some()) {
-            return self.try_next();
-        }
         if Instant::now() < *renew_at {
             return;
         }
@@ -452,24 +522,25 @@ impl Link<'_> {
         }
     }
 
-    /// The next token, tried before anything else is sent: the token from now on if it works,
-    /// dropped if the hub doesn't know it, kept to try again if the hub can't be reached.
-    fn try_next(&self) {
+    /// The next token, tried before anything else is sent: the token from now on if the hub takes
+    /// it, dropped if the hub refuses it (it never took the renewal, or refuses this machine's
+    /// token anyway, which the token held then hears). Kept, and how the try went, if no answer
+    /// came.
+    fn try_next(&self) -> Result<(), Failed> {
         let mut guard = self.joined.write().unwrap_or_else(PoisonError::into_inner);
-        let Some(joined) = guard.clone() else { return };
-        let Some(next) = &joined.next else { return };
-        // The hub may not know it: that is no refusal of the token this machine holds.
-        match send(&joined, next, "GET", "/v1/me", None, self.timing.call_wait) {
+        let Some(joined) = guard.clone() else { return Ok(()) };
+        let Some(next) = joined.next.clone() else { return Ok(()) };
+        match send(&joined, &next, "GET", "/v1/me", None, self.timing.call_wait) {
             Ok(_) => {
-                let renewed = Joined { token: next.clone(), next: None, ..joined };
-                if self.write(&mut guard, renewed) {
-                    say("link: renewed this machine's token");
-                }
+                self.keep(&mut guard, &joined, Joined { token: next, next: None, ..joined.clone() });
+                say("link: renewed this machine's token");
+                Ok(())
             }
-            Err(Failed::Refused(401, word)) if word == "unknown" => {
-                self.write(&mut guard, Joined { next: None, ..joined });
+            Err(Failed::Refused(401, _)) => {
+                self.keep(&mut guard, &joined, Joined { next: None, ..joined.clone() });
+                Ok(())
             }
-            Err(_) => {}
+            Err(failed) => Err(failed),
         }
     }
 
@@ -479,59 +550,98 @@ impl Link<'_> {
         let mut guard = self.joined.write().unwrap_or_else(PoisonError::into_inner);
         let Some(joined) = guard.clone().filter(|joined| joined.next.is_none()) else { return };
         let new = format!("{}{}", wire::Kind::Machine.prefix(), hex(&util::random::<32>()));
+        let pending = Joined { next: Some(new.clone()), ..joined.clone() };
         // Written down before it is sent: a reply lost, or this process ended, still finds it.
-        if !self.write(&mut guard, Joined { next: Some(new.clone()), ..joined.clone() }) {
-            return;
+        match self.folder.change_joined(&joined, &pending) {
+            Ok(true) => *guard = Some(pending.clone()),
+            Ok(false) => {
+                *guard = None;
+                return;
+            }
+            Err(e) => {
+                self.say_once(&format!("{e:#}"));
+                return;
+            }
         }
         let body = json!({"token_hash": hex(&wire::token_hash(&new))});
         match self.call_with(&joined, &joined.token, "POST", "/v1/renew", Some(&body), self.timing.call_wait) {
             Ok(reply) => {
-                if self.write(&mut guard, Joined { token: new, next: None, ..joined }) {
-                    say(&format!("link: renewed this machine's token; it works until {}", reply["expires"].as_str().unwrap_or("?")));
-                }
+                self.keep(&mut guard, &pending, Joined { token: new, next: None, ..joined });
+                let until = reply["expires"].as_str().and_then(|time| time.parse::<jiff::Timestamp>().ok()).map_or("?".to_string(), wire::time);
+                say(&format!("link: renewed this machine's token; it works until {until}"));
             }
-            // No reply: the hub may have taken it, so the new token is tried first next time.
+            // No reply: the hub may have taken it, so the new token is tried first from now on.
             Err(Failed::Down(_)) => {}
             Err(Failed::Refused(status, word)) => {
                 self.say_once(&format!("the hub refused to renew this machine's token: {status} {word}"));
-                self.write(&mut guard, Joined { next: None, ..joined });
+                self.keep(&mut guard, &pending, Joined { next: None, ..joined });
             }
         }
     }
 
-    /// Writes `joined` down, and holds it once it is: whether it was.
-    fn write(&self, held: &mut Option<Joined>, joined: Joined) -> bool {
-        match self.folder.write_joined(&joined) {
-            Ok(()) => {
-                *held = Some(joined);
-                true
-            }
+    /// Holds `to` in place of `from`, which the hub has answered about, and writes it down if
+    /// `link.json` still says `from`. If it says something else (a leave, or a join), that is left
+    /// as it is and read again. If it can't be written, `to` is held anyway: `from` on disk names
+    /// the next token, which is then tried again before anything is sent.
+    fn keep(&self, held: &mut Option<Joined>, from: &Joined, to: Joined) {
+        match self.folder.change_joined(from, &to) {
+            Ok(true) => *held = Some(to),
+            Ok(false) => *held = None,
             Err(e) => {
                 self.say_once(&format!("{e:#}"));
-                false
+                *held = Some(to);
             }
         }
     }
 
     // --- the inbox ---
 
-    fn inbox(&self) {
-        let mut done: Vec<Value> = Vec::new();
+    fn inbox<'s>(&'s self, scope: &'s thread::Scope<'s, '_>) {
         let mut backoff = self.timing.look;
         while !self.stopping() {
             if self.joined().is_none() {
                 self.nap(self.timing.look);
                 continue;
             }
+            // As many words as the hub takes in one call; any more go with the next.
+            let said: Vec<_> = locked(&self.handled).said.iter().take(ITEMS_MAX).cloned().collect();
+            let done: Vec<Value> = said.iter().map(|(n, _, word)| json!({"n": n, "said": word})).collect();
             let wait = crate::hub::INBOX_WAIT + self.timing.call_wait;
             match self.call("POST", "/v1/machine/inbox", Some(&json!({"done": done})), wait) {
                 Ok(reply) => {
                     backoff = self.timing.look;
-                    done.clear();
+                    locked(&self.handled).said.retain(|item| !said.contains(item));
+                    let mut new = false;
                     for item in reply["items"].as_array().map(Vec::as_slice).unwrap_or_default() {
-                        if let Some(n) = item["n"].as_u64() {
-                            done.push(json!({"n": n, "said": self.deliver(item)}));
+                        let Some(n) = item["n"].as_u64() else { continue };
+                        let key = (n, item["signature"].as_str().unwrap_or("").to_string());
+                        let handled = locked(&self.handled);
+                        if handled.under_way.contains(&key) || handled.said.iter().any(|(m, signature, _)| (*m, signature) == (key.0, &key.1)) {
+                            continue;
                         }
+                        drop(handled);
+                        new = true;
+                        match inbound(item) {
+                            Ok(stop @ Inbound::Stop { .. }) => {
+                                locked(&self.handled).under_way.push(key.clone());
+                                scope.spawn(move || {
+                                    let word = self.hand(stop);
+                                    let mut handled = locked(&self.handled);
+                                    handled.said.push((key.0, key.1.clone(), word));
+                                    handled.under_way.retain(|under_way| *under_way != key);
+                                });
+                            }
+                            Ok(answer) => {
+                                let word = self.hand(answer);
+                                locked(&self.handled).said.push((key.0, key.1, word));
+                            }
+                            Err(word) => locked(&self.handled).said.push((key.0, key.1, word)),
+                        }
+                    }
+                    // What is under way stays queued at the hub, which hands it over again at once:
+                    // the next call waits a moment, and says what came of it once it is done.
+                    if !new && !locked(&self.handled).under_way.is_empty() {
+                        self.nap(self.timing.look);
                     }
                 }
                 Err(failed) => {
@@ -547,24 +657,11 @@ impl Link<'_> {
         self.local.workspaces().into_iter().find(|(name, _)| name == ws).and_then(|(_, socket)| socket)
     }
 
-    /// Hands an item to the open workspace it names, and says what came of it: the workspace's
-    /// word, `unreached` if none answered, `malformed` for an item that isn't one.
-    fn deliver(&self, item: &Value) -> &'static str {
-        let text = |field: &str| item[field].as_str();
-        let device = text("device").filter(|name| crate::fields::is_name(name));
-        let ws = text("ws").and_then(|ws| WsName::parse(ws).ok());
-        let signature = text("signature").and_then(util::unhex).filter(|sig| !sig.is_empty() && sig.len() <= halti_core::device::SIGNATURE_MAX);
-        let (Some(device), Some(ws), Some(signature)) = (device, ws, signature) else { return "malformed" };
-        let device = device.to_string();
-        match text("kind") {
-            Some("answer") => {
-                let id = text("id").and_then(wire::unhex::<16>).map(Id);
-                let yes = match text("decision") {
-                    Some("yes") => Some(true),
-                    Some("no") => Some(false),
-                    _ => None,
-                };
-                let (Some(id), Some(yes)) = (id, yes) else { return "malformed" };
+    /// Hands what a phone sent to the open workspace it names, and says what came of it: the
+    /// workspace's word, or `unreached` if none answered.
+    fn hand(&self, inbound: Inbound) -> &'static str {
+        match inbound {
+            Inbound::Answer { ws, device, id, yes, signature } => {
                 // The workspace is the one this machine's own listing gave the id, where it has it.
                 let ws = locked(&self.ids).get(&id.0).cloned().unwrap_or(ws);
                 let Some(socket) = self.keeper(&ws) else { return "unreached" };
@@ -576,9 +673,7 @@ impl Link<'_> {
                     _ => "unreached",
                 }
             }
-            Some("stop") => {
-                let runs = item["runs"].as_array().and_then(|runs| runs.iter().map(|run| run.as_str().and_then(RunId::parse)).collect::<Option<Vec<_>>>());
-                let Some(runs) = runs.filter(|runs| !runs.is_empty() && runs.len() <= keep::STOP_RUNS_MAX) else { return "malformed" };
+            Inbound::Stop { ws, device, runs, signature } => {
                 let Some(socket) = self.keeper(&ws) else { return "unreached" };
                 match keep::tell(&socket, &Records::Stop { ws, device, runs, signature }, STOP_WAIT) {
                     Some(Told::Stopped(0)) => "none",
@@ -587,8 +682,6 @@ impl Link<'_> {
                     _ => "unreached",
                 }
             }
-            // A kind this link doesn't know is said so, and nothing is done with it.
-            _ => "unknown",
         }
     }
 
@@ -648,14 +741,44 @@ impl Link<'_> {
     }
 }
 
-/// One call to the hub `joined` names, with `token`: the reply's body, or how it went wrong.
+/// An item the hub handed over, read whole; or the word it is said with: `unknown` for a kind
+/// this link doesn't know, whatever else it holds, and `malformed` for one of a kind it knows that
+/// isn't one.
+fn inbound(item: &Value) -> Result<Inbound, &'static str> {
+    let text = |field: &str| item[field].as_str();
+    let kind = text("kind");
+    if !matches!(kind, Some("answer" | "stop")) {
+        return Err("unknown");
+    }
+    let device = text("device").filter(|name| crate::fields::is_name(name)).map(str::to_string);
+    let ws = text("ws").and_then(|ws| WsName::parse(ws).ok());
+    let signature = text("signature").and_then(util::unhex).filter(|sig| !sig.is_empty() && sig.len() <= halti_core::device::SIGNATURE_MAX);
+    let (Some(device), Some(ws), Some(signature)) = (device, ws, signature) else { return Err("malformed") };
+    if kind == Some("answer") {
+        let id = text("id").and_then(wire::unhex::<16>).map(Id);
+        let yes = match text("decision") {
+            Some("yes") => Some(true),
+            Some("no") => Some(false),
+            _ => None,
+        };
+        let (Some(id), Some(yes)) = (id, yes) else { return Err("malformed") };
+        return Ok(Inbound::Answer { ws, device, id, yes, signature });
+    }
+    let runs = item["runs"].as_array().and_then(|runs| runs.iter().map(|run| run.as_str().and_then(RunId::parse)).collect::<Option<Vec<_>>>());
+    let Some(runs) = runs.filter(|runs| !runs.is_empty() && runs.len() <= STOP_RUNS_MAX) else { return Err("malformed") };
+    Ok(Inbound::Stop { ws, device, runs, signature })
+}
+
+/// One call to the hub `joined` names, with `token`: the reply's body, or how it went wrong. A
+/// refusal's word is taken only if it is one (`wire::is_word`), and is `?` otherwise: what a hub
+/// says is printed.
 fn send(joined: &Joined, token: &str, method: &str, path: &str, body: Option<&Value>, wait: Duration) -> Result<Value, Failed> {
     let pin = joined.pin().map_err(|e| Failed::Down(format!("{e:#}")))?;
     let (status, reply) = pin::request(&joined.address, pin, method, path, Some(token), body, wait).map_err(|e| Failed::Down(format!("{e:#}")))?;
     if (200..300).contains(&status) {
         return Ok(reply);
     }
-    Err(Failed::Refused(status, reply["error"].as_str().unwrap_or("").to_string()))
+    Err(Failed::Refused(status, reply["error"].as_str().filter(|word| wire::is_word(word)).unwrap_or("?").to_string()))
 }
 
 /// What the link at `socket` answers to `words`: the words after the version, or None if no link

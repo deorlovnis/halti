@@ -5,7 +5,9 @@
 //!   makes it if there is none and keeps one that is there; only `halti hub leave` deletes it. The
 //!   hub and the phones know its public half; the link never reads it.
 //! - `link.json`: the hub's address and pin, the name the hub knows this machine by, the machine
-//!   token, and a new token a renewal was sent for and not yet seen to work.
+//!   token, and a new token a renewal was sent for and not yet seen to work. `halti hub join`,
+//!   `halti hub leave` and the link change it one at a time under `link.lock`, and the link writes
+//!   only over what it read there.
 //! - `trusted.json`: the devices this machine trusts (`halti devices trust`), each with its keys
 //!   and the workspaces it may answer for. Open workspaces read it at each signed answer or stop;
 //!   `devices trust`, `devices untrust` and the link change it, one at a time under `trusted.lock`.
@@ -137,7 +139,20 @@ impl Folder {
 
     pub fn write_joined(&self, joined: &Joined) -> Result<()> {
         self.make()?;
+        let _lock = Locked::take(&self.file("link.lock"))?;
         util::replace_private(&self.file("link.json"), &serde_json::to_vec_pretty(joined)?)
+    }
+
+    /// Writes `to` in place of `from`, if `link.json` still says `from`: whether it did. A leave or
+    /// a join since is left as it is.
+    pub fn change_joined(&self, from: &Joined, to: &Joined) -> Result<bool> {
+        self.make()?;
+        let _lock = Locked::take(&self.file("link.lock"))?;
+        if self.joined()?.as_ref() != Some(from) {
+            return Ok(false);
+        }
+        util::replace_private(&self.file("link.json"), &serde_json::to_vec_pretty(to)?)?;
+        Ok(true)
     }
 
     /// The machine key, if there is one.
@@ -206,6 +221,8 @@ impl Folder {
     /// Forgets the hub: its address and pin, the machine token and the machine key. The devices this
     /// machine trusts are kept. Whether this machine had joined one.
     pub fn leave(&self) -> Result<bool> {
+        self.make()?;
+        let _lock = Locked::take(&self.file("link.lock"))?;
         let mut had = false;
         for name in ["link.json", "machine-key.pem", "refused"] {
             match fs::remove_file(self.file(name)) {

@@ -3,9 +3,10 @@
 //! speaks its wire as the app would.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -37,6 +38,9 @@ struct Proxy {
     address: String,
     target: Arc<Mutex<Option<String>>>,
     open: Arc<Mutex<HashMap<u64, [TcpStream; 2]>>>,
+    /// How each new connection goes: held this long before it is forwarded, and whether the hub's
+    /// reply is lost.
+    how: Arc<Mutex<(Duration, bool)>>,
 }
 
 impl Proxy {
@@ -45,10 +49,12 @@ impl Proxy {
         let address = listener.local_addr().unwrap().to_string();
         let target: Arc<Mutex<Option<String>>> = Arc::default();
         let open: Arc<Mutex<HashMap<u64, [TcpStream; 2]>>> = Arc::default();
-        let (to, held) = (target.clone(), open.clone());
+        let how: Arc<Mutex<(Duration, bool)>> = Arc::default();
+        let (to, held, going) = (target.clone(), open.clone(), how.clone());
         thread::spawn(move || {
             for (n, client) in listener.incoming().flatten().enumerate() {
                 let Some(target) = locked(&to).clone() else { continue };
+                let (wait, lose) = *locked(&going);
                 let Ok(upstream) = TcpStream::connect(&target) else { continue };
                 let (Ok(client_in), Ok(upstream_out), Ok(client_out), Ok(upstream_in)) = (client.try_clone(), upstream.try_clone(), client.try_clone(), upstream.try_clone())
                 else {
@@ -58,14 +64,23 @@ impl Proxy {
                 locked(&held).insert(id, [client, upstream]);
                 let held = held.clone();
                 thread::spawn(move || {
-                    let back = thread::spawn(move || copy(upstream_in, client_out));
-                    copy(client_in, upstream_out);
-                    let _ = back.join();
+                    thread::sleep(wait);
+                    if lose {
+                        let cut = Arc::new(AtomicBool::new(false));
+                        let cutting = cut.clone();
+                        let back = thread::spawn(move || copy_until(upstream_in, client_out, &cut));
+                        copy_cutting(client_in, upstream_out, &cutting);
+                        let _ = back.join();
+                    } else {
+                        let back = thread::spawn(move || copy(upstream_in, client_out));
+                        copy(client_in, upstream_out);
+                        let _ = back.join();
+                    }
                     locked(&held).remove(&id);
                 });
             }
         });
-        Proxy { address, target, open }
+        Proxy { address, target, open, how }
     }
 
     /// Points it at `target`, or nowhere; every connection open through it is cut.
@@ -81,6 +96,46 @@ impl Proxy {
 /// Copies one direction until it ends, then ends it at the other side.
 fn copy(mut from: TcpStream, mut into: TcpStream) {
     let _ = io::copy(&mut from, &mut into);
+    let _ = into.shutdown(Shutdown::Write);
+}
+
+/// Copies the client's side to the hub one TLS record at a time, and sets `cut` just before the
+/// client's second application-data record goes on: the first is its handshake's Finished, the
+/// second its request. The hub reads the whole request.
+fn copy_cutting(mut from: TcpStream, mut into: TcpStream, cut: &AtomicBool) {
+    let (mut pending, mut buf, mut seen) = (Vec::new(), [0u8; 16 * 1024], 0);
+    while let Ok(n @ 1..) = from.read(&mut buf) {
+        pending.extend_from_slice(&buf[..n]);
+        while pending.len() >= 5 {
+            let len = 5 + usize::from(u16::from_be_bytes([pending[3], pending[4]]));
+            if pending.len() < len {
+                break;
+            }
+            if pending[0] == 0x17 {
+                seen += 1;
+                if seen == 2 {
+                    cut.store(true, Ordering::SeqCst);
+                }
+            }
+            if into.write_all(&pending.drain(..len).collect::<Vec<_>>()).is_err() {
+                return;
+            }
+        }
+    }
+    let _ = into.shutdown(Shutdown::Write);
+}
+
+/// Copies the hub's side to the client until `cut`; from then on the client is cut off and what
+/// the hub sends is dropped: its reply is lost.
+fn copy_until(mut from: TcpStream, mut into: TcpStream, cut: &AtomicBool) {
+    let mut buf = [0u8; 16 * 1024];
+    while let Ok(n @ 1..) = from.read(&mut buf) {
+        if cut.load(Ordering::SeqCst) {
+            let _ = into.shutdown(Shutdown::Both);
+        } else if into.write_all(&buf[..n]).is_err() {
+            break;
+        }
+    }
     let _ = into.shutdown(Shutdown::Write);
 }
 
@@ -139,6 +194,17 @@ impl TestHub {
         thread::spawn(move || listen::run(for_listener, listener, config, Limits { request_wait: Duration::from_secs(5), ..Limits::HUB }));
         *locked(&self.target) = Some(target.clone());
         self.proxy.point(Some(target));
+    }
+
+    /// Loses the hub's reply to every call made from now on, once the hub has read the call, or
+    /// stops losing them.
+    pub fn lose_replies(&self, lose: bool) {
+        locked(&self.proxy.how).1 = lose;
+    }
+
+    /// Holds every connection made from now on this long before it is forwarded.
+    pub fn delay(&self, wait: Duration) {
+        locked(&self.proxy.how).0 = wait;
     }
 
     /// Makes the hub unreachable, or the same hub reachable again.
@@ -230,6 +296,10 @@ impl Phone {
         self.signing.subject_public_key_info()
     }
 
+    pub fn agreement_key(&self) -> Vec<u8> {
+        self.agreement.subject_public_key_info()
+    }
+
     pub fn fingerprint(&self) -> String {
         wire::fingerprint(&self.signing_key())
     }
@@ -292,5 +362,58 @@ impl Phone {
         let signature = self.sign(&wire::stop_bytes(machine, ws, runs));
         let body = json!({"machine": machine, "ws": ws, "runs": runs.iter().map(RunId::hex).collect::<Vec<_>>(), "signature": util::hex(&signature)});
         hub.call("POST", "/v1/stop", Some(&self.token), Some(&body))
+    }
+}
+
+/// A hub that answers each path as it is told, whatever is sent, and keeps every body sent: what a
+/// broken hub could do, behind the pin it gave. A path it wasn't told of is `404 not-found`. A
+/// machine's inbox call waits a moment before its answer, as the real one waits.
+pub struct FakeHub {
+    pub address: String,
+    pub pin: [u8; 32],
+    replies: Arc<Mutex<HashMap<String, (u16, String)>>>,
+    sent: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
+impl FakeHub {
+    pub fn start(folder: &Path) -> FakeHub {
+        let key = tls_key(folder).unwrap();
+        let config = server_config(&key).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let hub = FakeHub { address: listener.local_addr().unwrap().to_string(), pin: pin_of(&key), replies: Arc::default(), sent: Arc::default() };
+        let (replies, sent) = (hub.replies.clone(), hub.sent.clone());
+        thread::spawn(move || {
+            for tcp in listener.incoming().flatten() {
+                let (config, replies, sent) = (config.clone(), replies.clone(), sent.clone());
+                thread::spawn(move || {
+                    let mut stream = rustls::StreamOwned::new(rustls::ServerConnection::new(config).unwrap(), tcp);
+                    let mut reader = BufReader::new(&mut stream);
+                    let Ok(Some(head)) = crate::door::http::read_head(&mut reader) else { return };
+                    let Ok(body) = crate::door::http::read_body(&mut reader, &head, 1 << 16) else { return };
+                    let Some((_, path, _)) = head.parts() else { return };
+                    let path = path.to_string();
+                    locked(&sent).push((path.clone(), serde_json::from_slice(&body).unwrap_or(Value::Null)));
+                    let (status, body) = locked(&replies).get(&path).cloned().unwrap_or((404, r#"{"error": "not-found"}"#.to_string()));
+                    if path == "/v1/machine/inbox" {
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    let reply = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(reply.as_bytes());
+                    stream.conn.send_close_notify();
+                    let _ = stream.flush();
+                });
+            }
+        });
+        hub
+    }
+
+    /// Answers `path` with `status` and `body` from now on.
+    pub fn answer(&self, path: &str, status: u16, body: &str) {
+        locked(&self.replies).insert(path.to_string(), (status, body.to_string()));
+    }
+
+    /// The bodies sent to `path` so far, oldest first.
+    pub fn sent(&self, path: &str) -> Vec<Value> {
+        locked(&self.sent).iter().filter(|(to, _)| to == path).map(|(_, body)| body.clone()).collect()
     }
 }

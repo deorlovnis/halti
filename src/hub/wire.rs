@@ -275,12 +275,14 @@
 //!
 //! `link` is drawn as the link starts. `workspaces` are those a trusted phone may see, at most 64,
 //! each with at most 32 runs; `trusted` the phones it trusts, at most 64; `requests` the ids of every
-//! request that waits in those workspaces, at most 256. `200 {"devices": [...], "missing":
-//! ["<16 bytes>", ...]}`. The hub drops each request of this machine's that isn't listed, and
-//! `missing` names those listed that it doesn't hold: the link posts each of them. `devices` lists
-//! every phone not revoked whose workspaces meet those in `trusted`, as `POST /v1/machine/device`
-//! gives one. The link drops its trust in every phone that isn't on that list with the same keys;
-//! a list it can't read whole changes nothing. A phone whose token expired stays on it.
+//! request that waits in those workspaces, at most 256. A machine with more reports that many and
+//! answers the rest itself. `200 {"devices": [...], "missing": ["<16 bytes>", ...]}`. The hub drops
+//! each request of this machine's that isn't listed, and `missing` names those listed that it
+//! doesn't hold, as many as it has room for (50 in all): the link posts each of them. `devices`
+//! lists every phone not revoked whose workspaces meet those in `trusted`, as
+//! `POST /v1/machine/device` gives one. The link drops its trust in every phone that isn't on that
+//! list with the same keys; a list it can't read whole changes nothing. A phone whose token expired
+//! stays on it.
 //!
 //! **Posting a request.** `POST /v1/machine/request`, body `{"record": "<bytes>"}`: `200 {}`, also
 //! for one held already. A record that names another machine is `403 other-machine`; one past its
@@ -310,8 +312,10 @@
 //! with the phone, and checks `key_signature`.
 //!
 //! **Its token.** From day 10 the link draws a new token, writes it down, then renews. If no reply
-//! comes, it calls `GET /v1/me` with the new token before anything else: `200` means the renewal
-//! was made, `401 unknown` that it wasn't, and the old token is used again.
+//! comes, it calls `GET /v1/me` with the new token before anything else, and sends nothing with
+//! the old token until that call is answered: `200` means the renewal was made, `401 unknown` that
+//! it wasn't, and the old token is used again. A call that gets no reply is tried again, with the
+//! new token, since the hub may have seen it: the old token stops once the new one is first used.
 //!
 //! # Errors
 //!
@@ -341,7 +345,8 @@
 //! | 429 | `full` | One request, or one answer or stop, more than the hub holds for that machine |
 //! | 503 | `unavailable` | A renewal the hub could not write down: nothing changed, and the token sent still works. Try again later |
 //!
-//! A client shows these words, never a body as text.
+//! Every word is 1 to 16 of a-z and `-`. A client shows these words, never a body as text, and
+//! shows nothing it got in place of a word that isn't one.
 
 use std::fmt;
 
@@ -603,6 +608,12 @@ pub fn bearer(value: &str) -> Option<(Kind, [u8; 32])> {
 /// Exactly `N` bytes from lowercase hex.
 pub fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
     util::unhex(text)?.try_into().ok()
+}
+
+/// Whether `text` is a word as the wire's replies and a machine's `said` give them: 1 to 16 of a-z
+/// and `-`. A client shows only such words from a hub.
+pub fn is_word(text: &str) -> bool {
+    (1..=16).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
 }
 
 /// A device's or a machine's name: 1 to 32 of a-z, 0-9, `-` and `_`, starting with a letter or a

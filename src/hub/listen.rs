@@ -453,6 +453,9 @@ fn stop(hub: &Hub, caller: &Caller, scope: &[WsName], body: &[u8]) -> Result<(u1
 /// A phone closes the remote copy of a request, with its token alone.
 fn hide(hub: &Hub, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refused> {
     let (machine, id) = relay::hide_body(body)?;
+    if !machine_known(hub, &machine) {
+        return Err(Refused::Gone);
+    }
     locked(&hub.relay).hide(&machine, id, scope, hub.now())?;
     Ok((200, json!({})))
 }

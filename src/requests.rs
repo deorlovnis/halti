@@ -32,7 +32,7 @@
 //! workspace checks it against the trusted key and its own record (`Desk::answer_signed`); the
 //! first answer that counts wins, from here or from a phone.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -53,6 +53,9 @@ pub const ACTION_MAX: usize = 1024;
 const CUT: &str = " (cut)";
 /// How often a request that waits looks whether its box has stopped.
 const LOOK_EVERY: Duration = Duration::from_millis(100);
+/// How many of the signed answers and stops that counted an open workspace remembers what it said
+/// to: as many as wait for one machine at the hub.
+const COUNTED_KEPT: usize = 64;
 
 /// The numbers a desk keeps to.
 #[derive(Clone, Copy, Debug)]
@@ -84,7 +87,12 @@ pub fn check_name(name: &str) -> Result<()> {
 /// the name rule doesn't take made `-`, without the `-` and `_` it would start with, cut at 32
 /// bytes, and `machine` if nothing is left.
 pub fn machine_name() -> String {
-    if let Some(name) = crate::link::joined_name() {
+    machine_name_in(&crate::link::files::Folder::here())
+}
+
+/// As `machine_name`, for the link's folder `folder`.
+pub fn machine_name_in(folder: &crate::link::files::Folder) -> String {
+    if let Some(name) = crate::link::joined_name_in(folder) {
         return name;
     }
     let mut buf = [0u8; 256];
@@ -433,18 +441,66 @@ struct Table {
 
 /// The requests of one open workspace that wait for an answer.
 pub struct Desk {
-    machine: String,
+    /// This machine's name as records give it, asked each time it is needed: a join after the
+    /// workspace opened changes it.
+    machine: Box<dyn Fn() -> String + Send + Sync>,
     ws: String,
     limits: Limits,
     prompt: Arc<dyn Prompt>,
     table: Mutex<Table>,
     /// Told whenever a request is raised, answered or goes.
     changed: Condvar,
+    /// The signed answers and stops that counted or are under way, by the SHA-256 of their line,
+    /// and what was said to each once it was: the same line handed over again, as a link that
+    /// restarted hands it, waits for the first and is said the same, and does nothing.
+    counted: Mutex<VecDeque<([u8; 32], Option<Told>)>>,
+    /// Told whenever one of those is done.
+    counted_done: Condvar,
 }
 
 impl Desk {
+    /// A desk whose records name this machine `machine`.
+    #[cfg(test)]
     pub fn new(machine: String, ws: String, limits: Limits, prompt: Arc<dyn Prompt>) -> Arc<Desk> {
-        Arc::new(Desk { machine, ws, limits, prompt, table: Mutex::default(), changed: Condvar::new() })
+        Desk::following(move || machine.clone(), ws, limits, prompt)
+    }
+
+    /// A desk whose records name this machine as `machine` says at the time: `machine_name`, so
+    /// that a join while the workspace is open counts from then on.
+    pub fn following(machine: impl Fn() -> String + Send + Sync + 'static, ws: String, limits: Limits, prompt: Arc<dyn Prompt>) -> Arc<Desk> {
+        Arc::new(Desk { machine: Box::new(machine), ws, limits, prompt, table: Mutex::default(), changed: Condvar::new(), counted: Mutex::default(), counted_done: Condvar::new() })
+    }
+
+    /// What `records`, a signed answer or stop, comes to: what `work` says the first time, and
+    /// what was said then each time the same line comes again, if it counted. One that comes again
+    /// while the first is under way waits for it.
+    fn once(&self, records: &Records, work: impl FnOnce() -> Told) -> Told {
+        let key: [u8; 32] = Sha256::digest(records.line().as_bytes()).into();
+        let mut counted = self.counted.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            match counted.iter().find(|(line, _)| *line == key) {
+                Some((_, Some(told))) => return told.clone(),
+                Some((_, None)) => counted = self.counted_done.wait(counted).unwrap_or_else(PoisonError::into_inner),
+                None => break,
+            }
+        }
+        counted.push_back((key, None));
+        while counted.len() > COUNTED_KEPT {
+            counted.pop_front();
+        }
+        drop(counted);
+        let told = work();
+        let mut counted = self.counted.lock().unwrap_or_else(PoisonError::into_inner);
+        let counts = matches!(told, Told::Approved | Told::Denied | Told::Stopped(1..));
+        counted.retain_mut(|(line, said)| {
+            if *line == key {
+                *said = Some(told.clone());
+            }
+            *line != key || counts
+        });
+        drop(counted);
+        self.counted_done.notify_all();
+        told
     }
 
     fn table(&self) -> MutexGuard<'_, Table> {
@@ -611,7 +667,7 @@ impl Desk {
             return not(Came::WorkspaceFull);
         }
         let record = Record {
-            machine: self.machine.clone(),
+            machine: (self.machine)(),
             ws: self.ws.clone(),
             box_name: box_name.to_string(),
             run,
@@ -701,7 +757,7 @@ pub trait Runs: Sync {
 /// again stops nothing new.
 pub fn stop_signed(desk: &Desk, trust: Trust, boxes: &dyn Runs, device: &str, runs: &[RunId], signature: &[u8]) -> Option<u32> {
     let trusted = trust(device).filter(|trusted| trusted.ws.contains(&desk.ws))?;
-    trusted.key.verify(&crate::hub::wire::stop_bytes(&desk.machine, &desk.ws, runs), signature).ok()?;
+    trusted.key.verify(&crate::hub::wire::stop_bytes(&(desk.machine)(), &desk.ws, runs), signature).ok()?;
     let count = boxes.stop(runs);
     say(&format!("a stop signed by {} named {} runs of {}: stopped {count}", trusted.name, runs.len(), desk.ws));
     Some(count)
@@ -714,8 +770,8 @@ pub fn told(desk: &Arc<Desk>, trust: Trust, boxes: &dyn Runs, records: &Records)
         Records::List(_) => desk.records().into_iter().map(Told::Request).chain([Told::End]).collect(),
         Records::Runs(_) => boxes.runs().into_iter().map(|(name, run)| Told::Run(name, run)).chain([Told::End]).collect(),
         Records::Answer(_, yes, digest) => vec![told_by(desk.answer_here(*yes, digest))],
-        Records::Signed { device, yes, id, signature, .. } => vec![told_by(desk.answer_signed(trust, device, *yes, *id, signature))],
-        Records::Stop { device, runs, signature, .. } => vec![stop_signed(desk, trust, boxes, device, runs, signature).map_or(Told::Refused, Told::Stopped)],
+        Records::Signed { device, yes, id, signature, .. } => vec![desk.once(records, || told_by(desk.answer_signed(trust, device, *yes, *id, signature)))],
+        Records::Stop { device, runs, signature, .. } => vec![desk.once(records, || stop_signed(desk, trust, boxes, device, runs, signature).map_or(Told::Refused, Told::Stopped))],
     }
 }
 

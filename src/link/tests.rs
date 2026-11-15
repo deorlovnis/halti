@@ -68,9 +68,10 @@ impl Prompt for Nobody {
     }
 }
 
-/// The boxes an open workspace runs here: names and runs, gone once stopped.
+/// The boxes an open workspace runs here: names and runs, gone once stopped, which takes as long as
+/// the second field says.
 #[derive(Default)]
-struct Boxes(Mutex<Vec<(String, RunId)>>);
+struct Boxes(Mutex<Vec<(String, RunId)>>, Mutex<Duration>);
 
 impl Runs for Boxes {
     fn runs(&self) -> Vec<(String, RunId)> {
@@ -78,6 +79,8 @@ impl Runs for Boxes {
     }
 
     fn stop(&self, runs: &[RunId]) -> u32 {
+        let slow = *self.1.lock().unwrap();
+        thread::sleep(slow);
         let mut boxes = self.0.lock().unwrap();
         let before = boxes.len();
         boxes.retain(|(_, run)| !runs.contains(run));
@@ -95,7 +98,10 @@ struct Keeper {
 
 impl Keeper {
     fn start(dir: &Path, folder: &Folder, ws: &str, limits: Limits) -> Keeper {
-        let desk = Desk::new(MACHINE.into(), ws.into(), limits, Arc::new(Nobody));
+        Keeper::start_with(dir, folder, ws, Desk::new(MACHINE.into(), ws.into(), limits, Arc::new(Nobody)))
+    }
+
+    fn start_with(dir: &Path, folder: &Folder, ws: &str, desk: Arc<Desk>) -> Keeper {
         let boxes = Arc::new(Boxes::default());
         let socket = dir.join(format!("{ws}.keep.sock"));
         let listener = keep::bind(&socket).unwrap().unwrap();
@@ -181,6 +187,10 @@ impl World {
     /// Opens workspace `ws` here, with a request's wait as `limits` says.
     fn open(&mut self, ws: &str, limits: Limits) {
         let keeper = Keeper::start(&self.dir.0, &self.folder, ws, limits);
+        self.opened(ws, keeper);
+    }
+
+    fn opened(&mut self, ws: &str, keeper: Keeper) {
         self.locals.0.lock().unwrap().push((WsName::parse(ws).unwrap(), Some(keeper.socket.clone())));
         self.keepers.push((ws.to_string(), keeper));
     }
@@ -445,7 +455,7 @@ fn a_revoked_or_untrusted_device_counts_for_nothing() {
     assert_eq!(keeper.signed("acme", "tablet", true, id, tablet.sign(&answer_bytes(&record, true))), Some(Told::Refused));
     assert_eq!(keeper.desk.answer_here(false, &answer_digest(&record, false)), Here::Denied);
     assert_eq!(raised.join().unwrap().came, Came::No(By::Local));
-    // A device list that isn't whole changes nothing: the hub's own lists are, and only drop.
+    // One revoked and one untrusted: none is left.
     assert!(world.folder.trust().unwrap().is_empty());
 }
 
@@ -703,4 +713,293 @@ fn the_service_unit_runs_the_link_as_the_box_running_user() {
     }
     // Its /tmp is the system's, where the open workspaces' sockets are, and its home is its own.
     assert!(!lines.iter().any(|line| line.starts_with("PrivateTmp=yes") || line.starts_with("ProtectHome=") || line.starts_with("User=root")));
+}
+
+// --- what review found ---
+
+/// Since when the hub marks this machine's token as used from two places.
+fn conflict(world: &World) -> Option<jiff::Timestamp> {
+    world.hub.rows().into_iter().find(|row| row.name == MACHINE).unwrap().conflict_since
+}
+
+/// With the link stopped, the hub takes a renewal on day 10 whose reply the link never saw: it
+/// holds the new token as the next one. The new token.
+fn renewed_unseen(world: &mut World) -> String {
+    world.stop_link();
+    let joined = world.joined();
+    world.hub.advance(SignedDuration::from_hours(10 * 24));
+    let new = format!("halti_mach_{}", hex(&util::random::<32>()));
+    let (status, _) = world.hub.call("POST", "/v1/renew", Some(&joined.token), Some(&json!({"token_hash": hex(&wire::token_hash(&new))})));
+    assert_eq!(status, 200);
+    world.folder.write_joined(&Joined { next: Some(new.clone()), ..joined }).unwrap();
+    new
+}
+
+#[test]
+fn a_lost_reply_to_the_new_token_s_first_call_marks_no_conflict() {
+    let mut world = World::new();
+    let new = renewed_unseen(&mut world);
+    // For a while every call reaches the hub and no reply comes back: the hub sees the new token
+    // used, and the link doesn't learn it.
+    world.hub.lose_replies(true);
+    world.start_link();
+    thread::sleep(Duration::from_millis(1500));
+    world.hub.lose_replies(false);
+    until("the link takes the new token", || world.joined().token == new);
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(conflict(&world), None, "the old token was sent after the new one was used");
+}
+
+#[test]
+fn the_old_token_is_not_sent_while_the_new_one_waits_to_be_tried() {
+    let mut world = World::new();
+    let phone = world.hub.pair_phone("pixel", &["slow"]);
+    world.trust(&phone, &["slow"]);
+    // An open workspace that never answers, so each look at it takes a while.
+    let socket = world.dir.0.join("slow.keep.sock");
+    let listener = keep::bind(&socket).unwrap().unwrap();
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.push(stream);
+        }
+    });
+    world.locals.0.lock().unwrap().push((WsName::parse("slow").unwrap(), Some(socket)));
+    let new = renewed_unseen(&mut world);
+    world.hub.reachable(false);
+    world.start_link();
+    thread::sleep(Duration::from_millis(400));
+    // The hub is back more than a day later: the old token's 24 hours are over.
+    world.hub.advance(SignedDuration::from_hours(25));
+    world.hub.reachable(true);
+    until("the link takes the new token", || world.joined().token == new);
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(conflict(&world), None, "the old token was sent before the new one was tried");
+}
+
+#[test]
+fn a_slow_stop_holds_up_no_answer() {
+    let mut world = World::new();
+    world.open("acme", limits());
+    let pixel = world.hub.pair_phone("pixel", &["acme"]);
+    world.trust(&pixel, &["acme"]);
+    let dev = RunId([1; 8]);
+    *world.keeper("acme").boxes.0.lock().unwrap() = vec![("dev".into(), dev)];
+    *world.keeper("acme").boxes.1.lock().unwrap() = Duration::from_secs(3);
+    until("the phone sees what runs", || pixel.state(&world.hub)["machines"][0]["workspaces"][0]["runs"] == json!([{"box": "dev", "run": dev.hex()}]));
+    let raised = world.keeper("acme").raise("web");
+    let record = world.shown(&pixel);
+    let (status, body) = pixel.stop(&world.hub, MACHINE, "acme", &[dev]);
+    assert_eq!(status, 202);
+    let stop = body["n"].as_u64().unwrap();
+    let state = || pixel.state(&world.hub)["sent"].as_array().unwrap().iter().find(|sent| sent["n"] == stop).map(|sent| sent["state"].as_str().unwrap().to_string());
+    until("the link takes the stop", || state().as_deref() == Some("taken"));
+    // While dev is put away, an answer goes through.
+    let at = Instant::now();
+    assert_eq!(pixel.answer(&world.hub, MACHINE, &record, true).0, 202);
+    assert!(matches!(raised.join().unwrap().came, Came::Yes(By::Device(_))));
+    assert!(at.elapsed() < Duration::from_secs(2), "the answer waited {:?} for the stop", at.elapsed());
+    assert_eq!(world.said(&pixel, stop), "stopped");
+}
+
+#[test]
+fn a_stop_the_link_handled_as_it_stopped_keeps_its_word() {
+    let mut world = World::new();
+    world.open("acme", limits());
+    let pixel = world.hub.pair_phone("pixel", &["acme"]);
+    world.trust(&pixel, &["acme"]);
+    let dev = RunId([1; 8]);
+    *world.keeper("acme").boxes.0.lock().unwrap() = vec![("dev".into(), dev)];
+    *world.keeper("acme").boxes.1.lock().unwrap() = Duration::from_millis(1500);
+    until("the phone sees what runs", || pixel.state(&world.hub)["machines"][0]["workspaces"][0]["runs"] == json!([{"box": "dev", "run": dev.hex()}]));
+    let (_, body) = pixel.stop(&world.hub, MACHINE, "acme", &[dev]);
+    let n = body["n"].as_u64().unwrap();
+    let state = || pixel.state(&world.hub)["sent"].as_array().unwrap().iter().find(|sent| sent["n"] == n).map(|sent| sent["state"].as_str().unwrap().to_string());
+    until("the link takes the stop", || state().as_deref() == Some("taken"));
+    // The link stops while dev is put away, before it could say so; the hub hands the stop over
+    // again once it runs again, and the open workspace says what it said the first time.
+    world.stop_link();
+    assert!(world.keeper("acme").boxes.runs().is_empty());
+    world.start_link();
+    assert_eq!(world.said(&pixel, n), "stopped");
+    // Handed over again while the first is still under way, as by a link that was killed and
+    // started again: it waits for the first, and is said the same.
+    let web = RunId([2; 8]);
+    *world.keeper("acme").boxes.0.lock().unwrap() = vec![("web".into(), web)];
+    let line = Records::Stop { ws: WsName::parse("acme").unwrap(), device: "pixel".into(), runs: vec![web], signature: pixel.sign(&wire::stop_bytes(MACHINE, "acme", &[web])) };
+    let socket = world.keeper("acme").socket.clone();
+    let first = {
+        let (socket, line) = (socket.clone(), line.clone());
+        thread::spawn(move || keep::tell(&socket, &line, LONG))
+    };
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(keep::tell(&socket, &line, LONG), Some(Told::Stopped(1)));
+    assert_eq!(first.join().unwrap(), Some(Told::Stopped(1)));
+}
+
+#[test]
+fn a_workspace_opened_before_the_join_takes_signed_stops_once_joined() {
+    let mut world = World::new();
+    let pixel = world.hub.pair_phone("pixel", &["acme"]);
+    world.trust(&pixel, &["acme"]);
+    // The machine leaves the hub, and acme is opened while it has joined none: its open workspace
+    // names this machine by its host, as records do.
+    assert!(world.folder.leave().unwrap());
+    let folder = world.folder.clone();
+    let desk = Desk::following(move || requests::machine_name_in(&folder), "acme".into(), limits(), Arc::new(Nobody));
+    let host = requests::machine_name_in(&world.folder);
+    let keeper = Keeper::start_with(&world.dir.0, &world.folder, "acme", desk);
+    world.opened("acme", keeper);
+    let before = world.keeper("acme").raise("dev");
+    until("it waits", || world.keeper("acme").desk.records().len() == 1);
+    // Joined again, as server-1.
+    assert!(world.hub.revoke(MACHINE));
+    let folder = world.folder.clone();
+    world.hub.pair_machine(MACHINE, move |line| join_at(&folder, line).map(drop));
+    assert_eq!(requests::machine_name_in(&world.folder), MACHINE);
+    // A stop of what the phone is shown counts.
+    let dev = RunId([1; 8]);
+    *world.keeper("acme").boxes.0.lock().unwrap() = vec![("dev".into(), dev)];
+    until("the phone sees what runs", || pixel.state(&world.hub)["machines"][0]["workspaces"][0]["runs"] == json!([{"box": "dev", "run": dev.hex()}]));
+    let (_, body) = pixel.stop(&world.hub, MACHINE, "acme", &[dev]);
+    assert_eq!(world.said(&pixel, body["n"].as_u64().unwrap()), "stopped");
+    assert!(world.keeper("acme").boxes.runs().is_empty());
+    // A request raised from now on names server-1 and reaches the phone; the one raised before
+    // names the host, and is answered here.
+    let after = world.keeper("acme").raise("dev");
+    let record = world.shown(&pixel);
+    assert_eq!(Record::decode(&record).unwrap().machine, MACHINE);
+    assert_eq!(pixel.answer(&world.hub, MACHINE, &record, true).0, 202);
+    assert!(matches!(after.join().unwrap().came, Came::Yes(By::Device(_))));
+    let waiting = world.keeper("acme").desk.records().remove(0);
+    assert_eq!(Record::decode(&waiting).unwrap().machine, host);
+    assert_eq!(world.keeper("acme").desk.answer_here(true, &answer_digest(&waiting, true)), Here::Approved);
+    assert_eq!(before.join().unwrap().came, Came::Yes(By::Local));
+}
+
+#[test]
+fn a_report_past_the_hub_s_limits_is_cut_to_them_and_the_trust_list_is_still_kept() {
+    let mut world = World::new();
+    world.open("acme", limits());
+    let pixel = world.hub.pair_phone("pixel", &["acme"]);
+    let tablet = world.hub.pair_phone("tablet", &["acme"]);
+    world.trust(&pixel, &["acme"]);
+    world.trust(&tablet, &["acme"]);
+    // One box more than a report names in a workspace.
+    *world.keeper("acme").boxes.0.lock().unwrap() = (0..=keep::STOP_RUNS_MAX as u8).map(|i| (format!("b{i}"), RunId([i; 8]))).collect();
+    until("the phone sees 32 of them", || pixel.state(&world.hub)["machines"][0]["workspaces"][0]["runs"].as_array().is_some_and(|runs| runs.len() == keep::STOP_RUNS_MAX));
+    assert!(world.hub.revoke("tablet"));
+    until("the machine drops the revoked phone", || world.folder.trust().unwrap().iter().all(|entry| entry.name != "tablet"));
+}
+
+/// A link joined as server-1 to a hub that answers as it is told, and this machine's workspaces.
+struct Faked {
+    _dir: Short,
+    hub: crate::hub::testing::FakeHub,
+    folder: Folder,
+    link: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+}
+
+impl Faked {
+    fn new(locals: Vec<(WsName, Option<PathBuf>)>) -> Faked {
+        let dir = Short::new();
+        let hub_dir = dir.0.join("hub");
+        std::fs::DirBuilder::new().mode(0o700).create(&hub_dir).unwrap();
+        let hub = crate::hub::testing::FakeHub::start(&hub_dir);
+        hub.answer("/v1/machine/inbox", 200, r#"{"items": []}"#);
+        let folder = Folder::at(&dir.0.join("link"));
+        let token = format!("halti_mach_{}", hex(&util::random::<32>()));
+        folder.write_joined(&Joined { version: 1, address: hub.address.clone(), pin: hex(&hub.pin), name: MACHINE.into(), token, next: None }).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (running, stopping) = (folder.clone(), stop.clone());
+        let link = thread::spawn(move || run::run(&running, &Locals(Mutex::new(locals)), TIMING, &stopping).unwrap());
+        Faked { _dir: dir, hub, folder, link: Some((stop, link)) }
+    }
+}
+
+impl Drop for Faked {
+    fn drop(&mut self) {
+        let (stop, link) = self.link.take().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        let _ = link.join();
+    }
+}
+
+#[test]
+fn an_item_of_a_kind_the_link_doesn_t_know_is_said_unknown() {
+    let faked = Faked::new(Vec::new());
+    let items = json!({"items": [
+        {"n": 1, "kind": "notice", "sealed": "abcd"},
+        {"n": 2, "kind": "question"},
+        {"n": 3},
+        {"n": 4, "kind": "stop", "device": "pixel", "ws": "acme"},
+        {"n": 5, "kind": "answer", "device": "pixel", "ws": "acme", "id": "00", "decision": "yes", "signature": "3006020101020101"},
+    ]});
+    faked.hub.answer("/v1/machine/inbox", 200, &items.to_string());
+    let said = json!([
+        {"n": 1, "said": "unknown"}, {"n": 2, "said": "unknown"}, {"n": 3, "said": "unknown"},
+        {"n": 4, "said": "malformed"}, {"n": 5, "said": "malformed"},
+    ]);
+    until("the link says what came of each", || faked.hub.sent("/v1/machine/inbox").iter().any(|body| body["done"] == said));
+}
+
+#[test]
+fn a_device_list_that_isn_t_whole_changes_no_trust() {
+    let pixel = Phone::new("pixel");
+    let (signing, agreement) = (pixel.signing_key(), pixel.agreement_key());
+    let listed = json!({"name": "pixel", "signing_key": hex(&signing), "agreement_key": hex(&agreement), "key_signature": hex(&pixel.sign(&wire::keys_bytes(&signing, &agreement))), "ws": ["acme"]});
+    let faked = Faked::new(vec![(WsName::parse("acme").unwrap(), None)]);
+    let entry = Entry {
+        name: "pixel".into(),
+        signing_key: hex(&signing),
+        agreement_key: hex(&agreement),
+        key_signature: listed["key_signature"].as_str().unwrap().into(),
+        ws: vec![WsName::parse("acme").unwrap()],
+    };
+    faked
+        .folder
+        .change_trust(|entries| {
+            entries.push(entry.clone());
+            ((), true)
+        })
+        .unwrap();
+    let reports = || faked.hub.sent("/v1/machine/state").len();
+    // A list with one entry that isn't one, and a reply that is no report: each is left as it is.
+    for reply in [json!({"devices": [listed, {"name": "tablet"}], "missing": []}), json!({"devices": "pixel", "missing": []}), json!({"missing": []})] {
+        faked.hub.answer("/v1/machine/state", 200, &reply.to_string());
+        let before = reports();
+        until("the link reports twice more", || reports() >= before + 2);
+        assert_eq!(faked.folder.trust().unwrap(), std::slice::from_ref(&entry), "{reply}");
+    }
+    // A whole list without pixel drops it.
+    faked.hub.answer("/v1/machine/state", 200, r#"{"devices": [], "missing": []}"#);
+    until("the link drops pixel", || faked.folder.trust().unwrap().is_empty());
+}
+
+#[test]
+fn a_hub_s_words_reach_the_terminal_only_as_words() {
+    let dir = Short::new();
+    let hub_dir = dir.0.join("hub");
+    std::fs::DirBuilder::new().mode(0o700).create(&hub_dir).unwrap();
+    let hub = crate::hub::testing::FakeHub::start(&hub_dir);
+    hub.answer("/v1/join", 400, r#"{"error": "\u001b[2J\u001b[Hjoined the hub as server-1\nall good"}"#);
+    let invite = wire::Invite { kind: wire::Kind::Machine, address: hub.address.clone(), pin: hub.pin, code: [1; 16] };
+    let folder = Folder::at(&dir.0.join("link"));
+    assert_eq!(format!("{:#}", join_at(&folder, &invite.to_string()).unwrap_err()), "the hub refused to join: 400 ?");
+    hub.answer("/v1/join", 400, r#"{"error": "malformed"}"#);
+    assert_eq!(format!("{:#}", join_at(&folder, &invite.to_string()).unwrap_err()), "the hub refused to join: 400 malformed");
+}
+
+#[test]
+fn a_renewal_under_way_writes_nothing_back_after_a_leave() {
+    let world = World::new();
+    world.hub.advance(SignedDuration::from_hours(10 * 24));
+    world.hub.delay(Duration::from_millis(1500));
+    until("a renewal is under way", || world.folder.joined().unwrap().is_some_and(|joined| joined.next.is_some()));
+    // halti hub leave, while the renewal waits for its reply.
+    assert!(world.folder.leave().unwrap());
+    world.hub.delay(Duration::ZERO);
+    thread::sleep(Duration::from_secs(3));
+    assert_eq!(world.folder.joined().unwrap(), None);
+    assert!(world.folder.machine_key().unwrap().is_none());
 }

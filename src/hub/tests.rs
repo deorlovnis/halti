@@ -1417,3 +1417,58 @@ fn a_machine_s_inbox_waits_for_what_a_phone_sends_and_keeps_it_until_done() {
 
 /// How long a machine's call for what phones sent it waits, in these tests.
 const INBOX_WAIT: Duration = Duration::from_millis(500);
+
+// --- the relay alone ---
+
+fn acme() -> Vec<halti_core::ids::WsName> {
+    vec![halti_core::ids::WsName::parse("acme").unwrap()]
+}
+
+#[test]
+fn a_phone_s_call_that_names_no_machine_the_hub_holds_leaves_nothing_held() {
+    let mut relay = relay::Relay::default();
+    let now = Timestamp::now();
+    for i in 0..100 {
+        let name = format!("nobody-{i}");
+        assert_eq!(relay.hide(&name, crate::requests::Id([0; 16]), &acme(), now), Err(wire::Refused::Gone));
+        assert!(relay.record(&name, crate::requests::Id([0; 16]), &acme(), now).is_none());
+    }
+    assert_eq!(relay.mailboxes(), 0);
+}
+
+#[test]
+fn a_request_the_hub_has_no_room_for_is_asked_for_once_it_has() {
+    let mut relay = relay::Relay::default();
+    let now = Timestamp::now();
+    let ids: Vec<[u8; 16]> = (1..=51).map(|id| [id; 16]).collect();
+    for id in 1..=51u8 {
+        let (record, bytes) = record("server-1", "acme", id);
+        assert_eq!(relay.post("server-1", record, bytes, now), if id == 51 { Err(wire::Refused::Full) } else { Ok(()) });
+    }
+    let reported = |ids: &[[u8; 16]]| relay::Reported { link: [5; 16], workspaces: Vec::new(), trusted: Vec::new(), ids: ids.to_vec() };
+    // Full: the one it couldn't take isn't asked for again at every report.
+    for _ in 0..3 {
+        assert_eq!(relay.report("server-1", reported(&ids), now), Vec::<[u8; 16]>::new());
+    }
+    // One answered at the machine makes room: the one that waits is asked for.
+    assert_eq!(relay.report("server-1", reported(&ids[1..]), now), vec![[51; 16]]);
+}
+
+#[test]
+fn a_phone_is_shown_the_last_64_it_sent_each_machine() {
+    let mut relay = relay::Relay::default();
+    let now = Timestamp::now();
+    let stop = || relay::What::Stop { ws: "acme".into(), runs: vec![crate::requests::RunId([1; 8])], signature: vec![0x30] };
+    // 64 sent, taken and said done; 64 more that wait.
+    for _ in 0..relay::ITEMS_MAX {
+        relay.queue("server-1", "pixel", stop(), now).unwrap();
+    }
+    let done: Vec<(u64, String)> = relay.take("server-1", &[], now).iter().map(|item| (item.n, "none".to_string())).collect();
+    relay.take("server-1", &done, now);
+    for _ in 0..relay::ITEMS_MAX {
+        relay.queue("server-1", "pixel", stop(), now).unwrap();
+    }
+    let view = relay.view("pixel", &acme(), &|_| Some((Vec::new(), None)), now);
+    let sent: Vec<u64> = view["sent"].as_array().unwrap().iter().map(|sent| sent["n"].as_u64().unwrap()).collect();
+    assert_eq!(sent, (65..=128).collect::<Vec<u64>>());
+}

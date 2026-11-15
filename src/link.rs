@@ -46,9 +46,9 @@ const JOIN_WAIT: Duration = Duration::from_secs(15);
 /// How long `devices trust` waits for the link: it asks the hub.
 const LINK_WAIT: Duration = Duration::from_secs(40);
 
-/// The name the hub knows this machine by, once it has joined one.
-pub fn joined_name() -> Option<String> {
-    Folder::here().joined().ok().flatten().map(|joined| joined.name)
+/// The name the hub whose join is in `folder` knows this machine by, once it has joined one.
+pub fn joined_name_in(folder: &Folder) -> Option<String> {
+    folder.joined().ok().flatten().map(|joined| joined.name)
 }
 
 /// The device of this name, if this machine trusts it now and its keys read.
@@ -115,7 +115,7 @@ pub fn join_at(folder: &Folder, line: &str) -> Result<(String, bool)> {
     let (status, reply) =
         pin::request(&invite.address, invite.pin, "POST", "/v1/join", None, Some(&body), JOIN_WAIT).map_err(|e| anyhow!("can't reach the hub at {}: {e:#}", invite.address))?;
     if status != 202 {
-        let word = reply["error"].as_str().unwrap_or("");
+        let word = reply["error"].as_str().filter(|word| wire::is_word(word)).unwrap_or("?");
         match word {
             "bad-code" => bail!("the hub refused the code: it was used, is older than 2 minutes, or is for a phone. run halti pair --machine NAME on the hub again"),
             _ => bail!("the hub refused to join: {status} {word}"),

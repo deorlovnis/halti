@@ -592,3 +592,46 @@ fn a_signed_answer_after_expiry_is_gone() {
     assert_eq!(raised.join().unwrap().came, Came::Expired);
     assert_eq!(desk.answer_signed(&trust, "pixel", true, record.id, &signed(&pixel, &bytes, true)), Here::Gone);
 }
+
+/// Boxes that run until a stop names them.
+struct Running(Mutex<Vec<(String, RunId)>>);
+
+impl Runs for Running {
+    fn runs(&self) -> Vec<(String, RunId)> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn stop(&self, runs: &[RunId]) -> u32 {
+        let mut boxes = self.0.lock().unwrap();
+        let before = boxes.len();
+        boxes.retain(|(_, run)| !runs.contains(run));
+        (before - boxes.len()) as u32
+    }
+}
+
+#[test]
+fn a_signed_answer_or_stop_handed_over_again_is_told_what_it_came_to() {
+    use rcgen::SigningKey;
+    let desk = desk(limits(), Script::with(vec![]));
+    let (pixel, trusted) = phone("pixel", &["acme"]);
+    let trust = |name: &str| (name == "pixel").then(|| trusted.clone());
+    let boxes = Running(Mutex::new(vec![("dev".into(), RunId([1; 8]))]));
+    let acme = halti_core::ids::WsName::parse("acme").unwrap();
+    // A yes that counted, handed over again as it was: approved again, and nothing more is done.
+    let raised = raising(&desk, "dev", false);
+    let (record, bytes) = the_one(&desk);
+    let answer = Records::Signed { ws: acme.clone(), device: "pixel".into(), yes: true, id: record.id, signature: signed(&pixel, &bytes, true) };
+    assert_eq!(told(&desk, &trust, &boxes, &answer), [Told::Approved]);
+    assert!(matches!(raised.join().unwrap().came, Came::Yes(By::Device(_))));
+    assert_eq!(told(&desk, &trust, &boxes, &answer), [Told::Approved]);
+    // Signed again, it is another answer: the request is gone.
+    let again = Records::Signed { ws: acme.clone(), device: "pixel".into(), yes: true, id: record.id, signature: signed(&pixel, &bytes, true) };
+    assert_eq!(told(&desk, &trust, &boxes, &again), [Told::Gone]);
+    // A stop likewise: the box it stopped is said stopped again; another signature stops nothing.
+    let stop = |signature: Vec<u8>| Records::Stop { ws: acme.clone(), device: "pixel".into(), runs: vec![RunId([1; 8])], signature };
+    let signature = pixel.sign(&crate::hub::wire::stop_bytes("mac-1", "acme", &[RunId([1; 8])])).unwrap();
+    assert_eq!(told(&desk, &trust, &boxes, &stop(signature.clone())), [Told::Stopped(1)]);
+    assert_eq!(told(&desk, &trust, &boxes, &stop(signature)), [Told::Stopped(1)]);
+    let other = pixel.sign(&crate::hub::wire::stop_bytes("mac-1", "acme", &[RunId([1; 8])])).unwrap();
+    assert_eq!(told(&desk, &trust, &boxes, &stop(other)), [Told::Stopped(0)]);
+}

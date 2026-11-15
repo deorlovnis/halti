@@ -91,7 +91,7 @@ pub fn serve(keep: Keep) -> Result<u8> {
     let settings = keep.settings.clone();
     let world = keep.vms.map(|vms| run::Real { vms, keys: KeyStore::of(&settings), settings: &settings });
     let ready = |name: &str, shown: &str, checked: &Checked| super::ready(name, shown, &checked.text, checked.policy.keep, &settings);
-    let desk = Desk::new(requests::machine_name(), keep.name.to_string(), requests::LIMITS, Arc::new(requests::TouchId));
+    let desk = Desk::following(requests::machine_name, keep.name.to_string(), requests::LIMITS, Arc::new(requests::TouchId));
     let trust = |name: &str| crate::link::trusted(name);
     let outside = Outside {
         world: world.as_ref().map(|world| world as &dyn World),
