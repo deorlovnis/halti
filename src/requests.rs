@@ -26,6 +26,11 @@
 //! An answer names the bytes it was shown: it is the SHA-256 of the record followed by one more
 //! field, `yes` or `no` (`answer_digest`). The open workspace rebuilds that from its own record, so
 //! an answer counts only for the request it was shown, once, before it expires.
+//!
+//! A phone's answer is a signature over those same bytes (`answer_bytes`) by a device this machine
+//! trusts for the workspace: ECDSA over P-256 with SHA-256 hashes them to the same digest. The open
+//! workspace checks it against the trusted key and its own record (`Desk::answer_signed`); the
+//! first answer that counts wins, from here or from a phone.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -33,9 +38,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
+use halti_core::device::DeviceKey;
 use sha2::{Digest, Sha256};
 
 use crate::fields::{self, NAME_MAX};
+use crate::keep::{Records, Told};
 use crate::util::{hex, random, say};
 
 /// The first field of every request.
@@ -72,10 +79,14 @@ pub fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// This machine's name, as records give it: its host name up to the first dot, lower case, every
-/// character the name rule doesn't take made `-`, without the `-` and `_` it would start with, cut
-/// at 32 bytes. `machine` if nothing is left.
+/// This machine's name, as records give it: the name its hub knows it by once it has joined one
+/// (`halti hub join`); before that its host name up to the first dot, lower case, every character
+/// the name rule doesn't take made `-`, without the `-` and `_` it would start with, cut at 32
+/// bytes, and `machine` if nothing is left.
 pub fn machine_name() -> String {
+    if let Some(name) = crate::link::joined_name() {
+        return name;
+    }
     let mut buf = [0u8; 256];
     let got = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
     let host = if got == 0 { String::from_utf8_lossy(&buf[..buf.iter().position(|b| *b == 0).unwrap_or(buf.len())]).into_owned() } else { String::new() };
@@ -120,6 +131,15 @@ pub struct RunId(pub [u8; 8]);
 impl RunId {
     pub fn random() -> RunId {
         RunId(random())
+    }
+
+    pub fn hex(&self) -> String {
+        hex(&self.0)
+    }
+
+    /// Its 16 lowercase hex characters back; None for anything else.
+    pub fn parse(text: &str) -> Option<RunId> {
+        Some(RunId(crate::util::unhex(text)?.try_into().ok()?))
     }
 }
 
@@ -241,12 +261,17 @@ fn printable(bytes: &[u8]) -> bool {
     bytes.iter().all(|b| (0x20..0x7f).contains(b))
 }
 
-/// What an answer to `record` says: the SHA-256 of the record's bytes followed by the decision as
-/// one more field: what an answer from anywhere else would sign.
-pub fn answer_digest(record: &[u8], yes: bool) -> [u8; 32] {
+/// What an answer to `record` signs: the record's bytes followed by the decision as one more field.
+pub fn answer_bytes(record: &[u8], yes: bool) -> Vec<u8> {
     let mut bytes = record.to_vec();
     fields::push(&mut bytes, if yes { b"yes" } else { b"no" });
-    Sha256::digest(&bytes).into()
+    bytes
+}
+
+/// What an answer to `record` says: the SHA-256 of `answer_bytes`, which is what a phone's
+/// signature over them signs.
+pub fn answer_digest(record: &[u8], yes: bool) -> [u8; 32] {
+    Sha256::digest(answer_bytes(record, yes)).into()
 }
 
 /// Seconds since 1970 by this machine's clock.
@@ -262,23 +287,50 @@ fn expiry_after(wait: Duration) -> u64 {
 }
 
 /// Who answered a request.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum By {
     /// The person at this machine: the prompt where the box runs, or `halti requests`.
     Local,
+    /// A trusted device, by a signature this machine checked.
+    Device(Arc<Signed>),
+}
+
+/// A phone's answer as it was checked: who signed it, and what, kept for the log so a later reader
+/// can check it again without the hub.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Signed {
+    pub device: String,
+    pub fingerprint: String,
+    /// The record as this machine made it; the signature is over it and the decision.
+    pub record: Vec<u8>,
+    pub signature: Vec<u8>,
 }
 
 impl By {
-    /// The `by` of the door's log line.
-    pub fn word(self) -> &'static str {
+    /// The `by` of the door's log line: `local`, or the device's name and fingerprint.
+    pub fn word(&self) -> String {
         match self {
-            By::Local => "local",
+            By::Local => "local".to_string(),
+            By::Device(signed) => format!("{} {}", signed.device, signed.fingerprint),
         }
     }
 }
 
+/// A device this machine trusts (`halti devices trust`): its signing key, and the workspaces it
+/// may answer for.
+#[derive(Clone, Debug)]
+pub struct Trusted {
+    pub name: String,
+    pub key: DeviceKey,
+    pub fingerprint: String,
+    pub ws: Vec<String>,
+}
+
+/// Finds a trusted device by its name, as the trust list says now.
+pub type Trust<'a> = &'a (dyn Fn(&str) -> Option<Trusted> + Sync);
+
 /// What a request came to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Came {
     Yes(By),
     No(By),
@@ -295,7 +347,7 @@ pub enum Came {
 }
 
 /// A request that was raised, or not: its id, if it got one, and what it came to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Raised {
     pub id: Option<Id>,
     pub came: Came,
@@ -336,6 +388,9 @@ pub enum Here {
     Declined,
     /// The prompt here already asks about a yes from another terminal for this request.
     Busy,
+    /// A signed answer that doesn't count: its device isn't trusted for this workspace, or the
+    /// signature isn't its own over this request and decision.
+    Refused,
 }
 
 /// One request that waits.
@@ -411,6 +466,28 @@ impl Desk {
     pub fn close(&self) {
         self.table().closed = true;
         self.changed.notify_all();
+    }
+
+    /// A phone's answer: `yes` or not, to request `id`, signed by the device named `device`. It
+    /// counts only if `trust` trusts that device for this workspace and the signature is its key's
+    /// over this machine's own record of `id` and the decision. Nothing is asked here: the phone
+    /// asked for its fingerprint or PIN. The first answer wins, as for one from here.
+    pub fn answer_signed(&self, trust: Trust, device: &str, yes: bool, id: Id, signature: &[u8]) -> Here {
+        let bytes = {
+            let table = self.table();
+            let Some(waiting) = table.waiting.iter().find(|waiting| waiting.record.id == id && !waiting.closed(Instant::now())) else { return Here::Gone };
+            waiting.bytes.clone()
+        };
+        let Some(trusted) = trust(device).filter(|trusted| trusted.ws.contains(&self.ws)) else { return Here::Refused };
+        if trusted.key.verify(&answer_bytes(&bytes, yes), signature).is_err() {
+            return Here::Refused;
+        }
+        let by = By::Device(Arc::new(Signed { device: trusted.name, fingerprint: trusted.fingerprint, record: bytes, signature: signature.to_vec() }));
+        match (self.settle(id, yes, by), yes) {
+            (false, _) => Here::Gone,
+            (true, true) => Here::Approved,
+            (true, false) => Here::Denied,
+        }
     }
 
     /// Settles request `id` as `yes` if it still waits, unanswered and unexpired: the first answer
@@ -553,8 +630,8 @@ impl Desk {
             self.prompt_where_box_runs(id, format!("let box {shown} send {action}"));
         }
         let came = self.wait_for(id, stopped);
-        self.after(box_name, came);
-        say(&format!("request {}: {}", id.short(), said(came)));
+        self.after(box_name, &came);
+        say(&format!("request {}: {}", id.short(), said(&came)));
         Raised { id: Some(id), came }
     }
 
@@ -564,9 +641,9 @@ impl Desk {
         let came = loop {
             let closed = table.closed;
             let Some(waiting) = table.waiting.iter().find(|waiting| waiting.record.id == id) else { break Came::Withdrawn };
-            match waiting.answer {
-                Some((true, by)) => break Came::Yes(by),
-                Some((false, by)) => break Came::No(by),
+            match &waiting.answer {
+                Some((true, by)) => break Came::Yes(by.clone()),
+                Some((false, by)) => break Came::No(by.clone()),
                 None if closed || stopped() => break Came::Withdrawn,
                 None if waiting.closed(Instant::now()) => break Came::Expired,
                 None => {}
@@ -580,7 +657,7 @@ impl Desk {
     }
 
     /// Counts a denial or an unanswered request against the box; a yes clears its count.
-    fn after(&self, box_name: &str, came: Came) {
+    fn after(&self, box_name: &str, came: &Came) {
         let mut table = self.table();
         let strikes = table.strikes.entry(box_name.to_string()).or_default();
         match came {
@@ -598,13 +675,58 @@ impl Desk {
 }
 
 /// What the terminal where the workspace is open says a request came to.
-fn said(came: Came) -> String {
+fn said(came: &Came) -> String {
     match came {
         Came::Yes(by) => format!("approved ({})", by.word()),
         Came::No(by) => format!("denied ({})", by.word()),
         Came::Expired => "not answered in time, so refused".to_string(),
         Came::Withdrawn => "withdrawn: its box stopped, or the workspace is closing".to_string(),
         Came::Full | Came::WorkspaceFull | Came::Resting => "refused".to_string(),
+    }
+}
+
+/// The boxes an open workspace runs, as a phone's stop names them: each by its run.
+pub trait Runs: Sync {
+    /// Every box that runs, and its run.
+    fn runs(&self) -> Vec<(String, RunId)>;
+    /// Stops the boxes whose runs these are, and says how many it stopped: a run it doesn't have
+    /// is passed over.
+    fn stop(&self, runs: &[RunId]) -> u32;
+}
+
+/// A phone's stop of `runs` in the desk's workspace, signed by the device named `device`: how many
+/// boxes it stopped, or None if it doesn't count. It counts only if `trust` trusts that device for
+/// this workspace and the signature is its key's over this machine's name, the workspace and the
+/// runs (`hub::wire::stop_bytes`). A run this workspace doesn't run is passed over, so a stop sent
+/// again stops nothing new.
+pub fn stop_signed(desk: &Desk, trust: Trust, boxes: &dyn Runs, device: &str, runs: &[RunId], signature: &[u8]) -> Option<u32> {
+    let trusted = trust(device).filter(|trusted| trusted.ws.contains(&desk.ws))?;
+    trusted.key.verify(&crate::hub::wire::stop_bytes(&desk.machine, &desk.ws, runs), signature).ok()?;
+    let count = boxes.stop(runs);
+    say(&format!("a stop signed by {} named {} runs of {}: stopped {count}", trusted.name, runs.len(), desk.ws));
+    Some(count)
+}
+
+/// What the open workspace whose desk this is answers to `records`, which name it: the lines of
+/// its reply, in order.
+pub fn told(desk: &Arc<Desk>, trust: Trust, boxes: &dyn Runs, records: &Records) -> Vec<Told> {
+    match records {
+        Records::List(_) => desk.records().into_iter().map(Told::Request).chain([Told::End]).collect(),
+        Records::Runs(_) => boxes.runs().into_iter().map(|(name, run)| Told::Run(name, run)).chain([Told::End]).collect(),
+        Records::Answer(_, yes, digest) => vec![told_by(desk.answer_here(*yes, digest))],
+        Records::Signed { device, yes, id, signature, .. } => vec![told_by(desk.answer_signed(trust, device, *yes, *id, signature))],
+        Records::Stop { device, runs, signature, .. } => vec![stop_signed(desk, trust, boxes, device, runs, signature).map_or(Told::Refused, Told::Stopped)],
+    }
+}
+
+fn told_by(here: Here) -> Told {
+    match here {
+        Here::Approved => Told::Approved,
+        Here::Denied => Told::Denied,
+        Here::Gone => Told::Gone,
+        Here::Declined => Told::Declined,
+        Here::Busy => Told::Busy,
+        Here::Refused => Told::Refused,
     }
 }
 

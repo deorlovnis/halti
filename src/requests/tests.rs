@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use halti_core::device::DeviceKey;
+
 use super::*;
 
 /// A record with every field fixed, and its bytes, SHA-256 and answers worked out apart from this
@@ -482,4 +484,111 @@ fn a_request_is_withdrawn_when_its_box_stops_or_the_workspace_closes() {
     desk.close();
     assert_eq!(raised.join().unwrap().came, Came::Withdrawn);
     assert_eq!(desk.asker("dev", RunId([7; 8])).raise(POST, false, &|| false), Raised { id: None, came: Came::Withdrawn });
+}
+
+// --- answers from a phone ---
+
+// Known answers, made apart from this code: the key by `openssl ecparam -name prime256v1 -genkey`
+// and `openssl pkey -pubout -outform DER`, the bytes by a few lines of Python following the text of
+// this module, and the signature by `openssl dgst -sha256 -sign` over them.
+const OPENSSL_KEY: &str = concat!(
+    "3059301306072a8648ce3d020106082a8648ce3d03010703420004ad474f6ad6407053a2fdb194da78b401e1c5768d31d9db888c3996aeeecc3747d9",
+    "4a1ea3f9aa90bc2e5cdec1617c9a4738cf570e9c62843d0fe5ce95a75e198d",
+);
+const ANSWER_YES_SIGNATURE: &str =
+    concat!("3046022100bb06b04aa4bf5e4bf2ef8f5c2e6a1956bcdc4cfe6f34ea2d9e57c39d19f805b5022100eb527ee01876a08fc15dd17f11ad77568da1f5107a43bc8b", "01c37309cda22f26",);
+
+fn unhexed(text: &str) -> Vec<u8> {
+    crate::util::unhex(text).unwrap()
+}
+
+#[test]
+fn a_phone_signs_the_bytes_whose_digest_a_local_answer_names() {
+    let bytes = known().encode().unwrap();
+    assert_eq!(hex(&answer_bytes(&bytes, true)), format!("{KNOWN}0003796573"));
+    assert_eq!(hex(&answer_bytes(&bytes, false)), format!("{KNOWN}00026e6f"));
+    // SHA-256 over them is the digest `halti requests` sends: what an ECDSA signature signs.
+    assert_eq!(<[u8; 32]>::from(Sha256::digest(answer_bytes(&bytes, true))), answer_digest(&bytes, true));
+    let key = DeviceKey::from_spki(&unhexed(OPENSSL_KEY)).unwrap();
+    assert_eq!(key.verify(&answer_bytes(&bytes, true), &unhexed(ANSWER_YES_SIGNATURE)), Ok(()));
+    assert!(key.verify(&answer_bytes(&bytes, false), &unhexed(ANSWER_YES_SIGNATURE)).is_err(), "a yes is no no");
+    let other = Record { id: Id([1; 16]), ..known() }.encode().unwrap();
+    assert!(key.verify(&answer_bytes(&other, true), &unhexed(ANSWER_YES_SIGNATURE)).is_err(), "nor a yes to another request");
+}
+
+/// A phone's signing key, and how a machine that trusts it for `ws` holds it.
+fn phone(name: &str, ws: &[&str]) -> (rcgen::KeyPair, Trusted) {
+    use rcgen::PublicKeyData;
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let spki = key.subject_public_key_info();
+    let trusted = Trusted {
+        name: name.into(),
+        key: DeviceKey::from_spki(&spki).unwrap(),
+        fingerprint: crate::hub::wire::fingerprint(&spki),
+        ws: ws.iter().map(|ws| ws.to_string()).collect(),
+    };
+    (key, trusted)
+}
+
+fn signed(key: &rcgen::KeyPair, bytes: &[u8], yes: bool) -> Vec<u8> {
+    use rcgen::SigningKey;
+    key.sign(&answer_bytes(bytes, yes)).unwrap()
+}
+
+#[test]
+fn a_signed_answer_counts_only_from_a_device_trusted_for_the_workspace() {
+    let script = Script::with(vec![Step::UntilWithdrawn]);
+    let desk = desk(limits(), script.clone());
+    let (pixel, pixel_trusted) = phone("pixel", &["acme"]);
+    let (tablet, tablet_trusted) = phone("tablet", &["beta"]);
+    let all = [pixel_trusted.clone(), tablet_trusted];
+    let trust = |name: &str| all.iter().find(|trusted| trusted.name == name).cloned();
+    let raised = raising(&desk, "dev", true);
+    let (record, bytes) = the_one(&desk);
+    until(|| script.asked().len() == 1);
+    // A device nobody trusts, one trusted for another workspace, another key under a trusted name,
+    // a signature over the other decision: each refused, and the request still waits.
+    for (device, key, yes) in [("nobody", &pixel, true), ("tablet", &tablet, true), ("pixel", &tablet, true), ("pixel", &pixel, false)] {
+        assert_eq!(desk.answer_signed(&trust, device, true, record.id, &signed(key, &bytes, yes)), Here::Refused, "{device}");
+    }
+    assert_eq!(desk.answer_signed(&trust, "pixel", true, Id([9; 16]), &signed(&pixel, &bytes, true)), Here::Gone, "no such request");
+    assert_eq!(desk.records().len(), 1);
+    // The right one: approved with nothing asked here, and the prompt here withdrawn.
+    assert_eq!(desk.answer_signed(&trust, "pixel", true, record.id, &signed(&pixel, &bytes, true)), Here::Approved);
+    let came = raised.join().unwrap().came;
+    let Came::Yes(By::Device(by)) = &came else { panic!("{came:?}") };
+    assert_eq!((by.device.as_str(), &by.fingerprint, &by.record), ("pixel", &pixel_trusted.fingerprint, &bytes));
+    assert_eq!(pixel_trusted.key.verify(&answer_bytes(&bytes, true), &by.signature), Ok(()), "kept as it was checked");
+    until(|| script.withdrawn() > 0);
+    assert_eq!(script.asked().len(), 1, "a signed yes asks nothing more here");
+    // The first answer won: the same again, or one from here, finds nothing.
+    assert_eq!(desk.answer_signed(&trust, "pixel", true, record.id, &signed(&pixel, &bytes, true)), Here::Gone);
+    assert_eq!(desk.answer_here(false, &answer_digest(&bytes, false)), Here::Gone);
+}
+
+#[test]
+fn a_signed_no_counts_and_an_answer_from_here_first_leaves_it_nothing() {
+    let desk = desk(limits(), Script::with(vec![]));
+    let (pixel, trusted) = phone("pixel", &["acme"]);
+    let trust = |name: &str| (name == "pixel").then(|| trusted.clone());
+    let raised = raising(&desk, "dev", false);
+    let (record, bytes) = the_one(&desk);
+    assert_eq!(desk.answer_signed(&trust, "pixel", false, record.id, &signed(&pixel, &bytes, false)), Here::Denied);
+    assert!(matches!(raised.join().unwrap().came, Came::No(By::Device(_))));
+    let raised = raising(&desk, "dev", false);
+    let (record, bytes) = the_one(&desk);
+    assert_eq!(desk.answer_here(true, &answer_digest(&bytes, true)), Here::Approved);
+    assert_eq!(desk.answer_signed(&trust, "pixel", false, record.id, &signed(&pixel, &bytes, false)), Here::Gone);
+    assert_eq!(raised.join().unwrap().came, Came::Yes(By::Local));
+}
+
+#[test]
+fn a_signed_answer_after_expiry_is_gone() {
+    let desk = desk(Limits { wait: Duration::from_millis(300), ..limits() }, Script::with(vec![]));
+    let (pixel, trusted) = phone("pixel", &["acme"]);
+    let trust = |name: &str| (name == "pixel").then(|| trusted.clone());
+    let raised = raising(&desk, "dev", false);
+    let (record, bytes) = the_one(&desk);
+    assert_eq!(raised.join().unwrap().came, Came::Expired);
+    assert_eq!(desk.answer_signed(&trust, "pixel", true, record.id, &signed(&pixel, &bytes, true)), Here::Gone);
 }

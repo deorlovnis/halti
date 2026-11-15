@@ -416,12 +416,19 @@ struct Entry {
     down: u64,
     /// `allowed`, `asked:yes`, `asked:no`, `closed`, `blocked:<why>` or `failed:<why>`.
     decision: String,
-    /// Who answered a request a write raised: `local`, the person at this machine.
+    /// Who answered a request a write raised: `local`, the person at this machine, or a trusted
+    /// device's name and fingerprint.
     #[serde(skip_serializing_if = "Option::is_none")]
-    by: Option<&'static str>,
+    by: Option<String>,
     /// The id of the request a write raised, in hex.
     #[serde(skip_serializing_if = "Option::is_none")]
     request: Option<String>,
+    /// A device's answer, as it was checked: the request's record and the signature over it and
+    /// the decision, in hex, so it can be checked again from the log alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
 }
 
 impl Entry {
@@ -440,7 +447,14 @@ impl Entry {
             decision: decision.to_string(),
             by: None,
             request: None,
+            record: None,
+            signature: None,
         }
+    }
+
+    /// `entry` with who answered its request, and a device's signed answer if it was one.
+    fn signed(by: Option<String>, signed: Option<&requests::Signed>, entry: Entry) -> Entry {
+        Entry { by, record: signed.map(|s| crate::util::hex(&s.record)), signature: signed.map(|s| crate::util::hex(&s.signature)), ..entry }
     }
 }
 

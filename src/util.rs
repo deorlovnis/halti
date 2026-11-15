@@ -43,6 +43,25 @@ pub fn random<const N: usize>() -> [u8; N] {
     bytes
 }
 
+/// Numbers the files in the making of this process.
+static MAKING: AtomicUsize = AtomicUsize::new(0);
+
+/// Replaces the file at `path` whole with a 0600 one holding `bytes`, or leaves it as it was: the
+/// new file is written and synced beside it, then renamed over it.
+pub fn replace_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use anyhow::Context;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let name = path.file_name().and_then(|n| n.to_str()).expect("halti names its own files");
+    let new = path.with_file_name(format!(".{name}.{}-{}", process::id(), MAKING.fetch_add(1, Ordering::Relaxed)));
+    let written = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&new).and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()));
+    if let Err(e) = written.and_then(|()| fs::rename(&new, path)) {
+        let _ = fs::remove_file(&new);
+        return Err(e).with_context(|| format!("writing {}", path.display()));
+    }
+    Ok(())
+}
+
 /// A line on stdout that may go nowhere: once the terminal is closed, a write fails, and
 /// `println!` would panic where a box is being put away.
 pub fn say(line: &str) {

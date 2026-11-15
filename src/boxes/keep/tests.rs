@@ -14,7 +14,7 @@ use halti_core::ids::WsId;
 
 use super::*;
 use crate::engine::VmSpec;
-use crate::requests::{Asker, By, Came, Prompt, Prompted, Raised, Record, answer_digest};
+use crate::requests::{Asker, By, Came, Prompt, Prompted, Raised, Record, Trusted, answer_digest};
 use crate::ws::boxes::{put_away_left, stop_others};
 use crate::{chain, door};
 
@@ -234,12 +234,27 @@ struct Bench {
     looked: AtomicUsize,
     /// The requests its boxes wait on.
     desk: Arc<Desk>,
+    /// The devices this machine trusts.
+    trusted: Mutex<Vec<Trusted>>,
 }
 
 impl Bench {
     fn new(fake: Fake) -> Bench {
         let desk = Desk::new("mac-1".into(), "acme".into(), requests::LIMITS, Arc::new(Nobody));
-        Bench { dir: Short::new(), fake, close: AtomicBool::new(false), wiped: Mutex::new(None), went_back: AtomicBool::new(false), looked: AtomicUsize::new(0), desk }
+        Bench {
+            dir: Short::new(),
+            fake,
+            close: AtomicBool::new(false),
+            wiped: Mutex::new(None),
+            went_back: AtomicBool::new(false),
+            looked: AtomicUsize::new(0),
+            desk,
+            trusted: Mutex::default(),
+        }
+    }
+
+    fn trust(&self, name: &str) -> Option<Trusted> {
+        self.trusted.lock().unwrap().iter().find(|trusted| trusted.name == name).cloned()
     }
 
     fn layout(&self) -> Layout {
@@ -299,6 +314,7 @@ impl Bench {
             wipe: &wipe,
             refused: &refused,
             desk: &self.desk,
+            trust: &|name| self.trust(name),
         };
         let socket = self.socket();
         thread::scope(|scope| {
@@ -642,7 +658,7 @@ fn a_second_keeper_never_takes_a_socket_that_answers() {
     bench.layout().prepare().unwrap();
     let _other = keep::bind(&socket).unwrap().unwrap();
     let ready = |_: &str, _: &str, _: &Checked| Ok(());
-    let outside = Outside { world: None, vms: None, ready: &ready, close: &bench.close, wipe: &|| {}, refused: &|| false, desk: &bench.desk };
+    let outside = Outside { world: None, vms: None, ready: &ready, close: &bench.close, wipe: &|| {}, refused: &|| false, desk: &bench.desk, trust: &|_| None };
     let error = serve_with(bench.keep(&[]), &outside).unwrap_err();
     assert_eq!(error.to_string(), "another workspace is open at acme's socket");
     assert!(socket.exists());
@@ -669,8 +685,9 @@ fn a_box_is_stopping_as_its_last_session_leaves_or_a_stop_is_asked() {
         closers: Mutex::default(),
         done: AtomicBool::new(false),
         desk: &bench.desk,
+        trust: &|_| None,
     };
-    let running = |round| Slot { round, state: State::Running, sessions: 1, stop: Arc::default(), word: None };
+    let running = |round| Slot { round, state: State::Running, sessions: 1, stop: Arc::default(), word: None, run: RunId([round as u8; 8]) };
     let state = |box_name: &str| keeper.table().boxes[box_name].state;
     keeper.table().boxes.insert("dev".into(), running(1));
     assert!(!keeper.last_left("dev", 1));
@@ -682,7 +699,7 @@ fn a_box_is_stopping_as_its_last_session_leaves_or_a_stop_is_asked() {
     // A stop: stopping as it is asked, and answered once the box is put away.
     keeper.table().boxes.insert("web".into(), running(2));
     thread::scope(|scope| {
-        let stopping = scope.spawn(|| keeper.stop("web"));
+        let stopping = scope.spawn(|| keeper.stop_box("web"));
         until(|| state("web") == State::Stopping);
         assert!(keeper.table().boxes["web"].stop.load(Ordering::SeqCst));
         keeper.table().boxes.remove("web");
@@ -809,6 +826,87 @@ fn each_run_s_door_raises_its_requests_on_the_desk_with_a_run_id_of_its_own() {
         assert_ne!(runs[0], runs[1], "a run id is drawn as the box starts");
         // The second run's box may still be being put away, and is counted then.
         assert!(matches!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0 | 1))));
+    });
+    assert_eq!(code.unwrap(), 0);
+}
+
+/// A phone's signing key, and how this machine trusts it, for acme.
+fn phone(name: &str) -> (rcgen::KeyPair, Trusted) {
+    use rcgen::PublicKeyData;
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let spki = key.subject_public_key_info();
+    let trusted =
+        Trusted { name: name.into(), key: halti_core::device::DeviceKey::from_spki(&spki).unwrap(), fingerprint: crate::hub::wire::fingerprint(&spki), ws: vec!["acme".into()] };
+    (key, trusted)
+}
+
+fn sign(key: &rcgen::KeyPair, bytes: &[u8]) -> Vec<u8> {
+    use rcgen::SigningKey;
+    key.sign(bytes).unwrap()
+}
+
+#[test]
+fn a_signed_answer_counts_on_the_socket_only_from_a_trusted_device() {
+    let bench = Bench::new(Fake::default());
+    let (pixel, trusted) = phone("pixel");
+    let (stranger, _) = phone("stranger");
+    bench.trusted.lock().unwrap().push(trusted);
+    let code = bench.keeping(&[], false, |socket| {
+        let asker = bench.desk.asker("dev", RunId([7; 8]));
+        thread::scope(|scope| {
+            let raised = scope.spawn(|| asker.raise("POST https://api.example.com/v1/x", false, &|| false));
+            let (record, bytes) = the_one_at(socket);
+            let line = |device: &str, key: &rcgen::KeyPair| Records::Signed {
+                ws: acme(),
+                device: device.into(),
+                yes: true,
+                id: record.id,
+                signature: sign(key, &requests::answer_bytes(&bytes, true)),
+            };
+            assert_eq!(keep::tell(socket, &line("stranger", &stranger), LONG), Some(Told::Refused));
+            assert_eq!(keep::tell(socket, &line("pixel", &stranger), LONG), Some(Told::Refused));
+            assert_eq!(keep::tell(socket, &line("pixel", &pixel), LONG), Some(Told::Approved));
+            assert!(matches!(raised.join().unwrap().came, Came::Yes(By::Device(_))));
+            assert_eq!(keep::tell(socket, &line("pixel", &pixel), LONG), Some(Told::Gone));
+        });
+        assert_eq!(keep::runs(socket, &acme(), LONG), Some(Ok(Vec::new())));
+        assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
+    });
+    assert_eq!(code.unwrap(), 0);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+fn a_signed_stop_stops_the_runs_it_names_and_only_those() {
+    let bench = Bench::new(Fake::default());
+    let (pixel, trusted) = phone("pixel");
+    let (stranger, _) = phone("stranger");
+    bench.trusted.lock().unwrap().push(trusted);
+    let (dev, web) = (bench.vm("dev"), bench.vm("web"));
+    let code = bench.keeping(&[("dev", ""), ("web", "")], true, |socket| {
+        let (_, mut dev_session) = session(socket, "dev");
+        let (_, _web_session) = session(socket, "web");
+        let runs = keep::runs(socket, &acme(), LONG).unwrap().unwrap();
+        assert_eq!(runs.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["dev", "web"]);
+        assert_ne!(runs[0].1, runs[1].1, "each run its own id");
+        let dev_run = runs[0].1;
+        let stop = |key: &rcgen::KeyPair, machine: &str, runs: Vec<RunId>| Records::Stop {
+            ws: acme(),
+            device: "pixel".into(),
+            signature: sign(key, &crate::hub::wire::stop_bytes(machine, "acme", &runs)),
+            runs,
+        };
+        // Another key, or signed for another machine's name: nothing stops.
+        assert_eq!(keep::tell(socket, &stop(&stranger, "mac-1", vec![dev_run]), LONG), Some(Told::Refused));
+        assert_eq!(keep::tell(socket, &stop(&pixel, "mac-2", vec![dev_run]), LONG), Some(Told::Refused));
+        assert_eq!(bench.fake.up(), BTreeSet::from([dev.clone(), web.clone()]));
+        // Signed: the box of that run is put away, and its session told.
+        assert_eq!(keep::tell(socket, &stop(&pixel, "mac-1", vec![dev_run, RunId([9; 8])]), LONG), Some(Told::Stopped(1)));
+        assert_eq!(said_on(&mut dev_session), Some(Reply::Stopped));
+        assert_eq!(bench.fake.up(), BTreeSet::from([web.clone()]));
+        // Sent again, it stops nothing new, and a later run of dev isn't the one it named.
+        assert_eq!(keep::tell(socket, &stop(&pixel, "mac-1", vec![dev_run]), LONG), Some(Told::Stopped(0)));
+        assert!(matches!(ask(socket, Request::Close(acme())), Some(Reply::Closed(1))));
     });
     assert_eq!(code.unwrap(), 0);
 }

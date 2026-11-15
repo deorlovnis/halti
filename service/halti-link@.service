@@ -1,0 +1,32 @@
+# The link as a service on a Linux server: `halti link` from boot, as the user that runs the boxes,
+# whether or not a workspace is open. It holds that user's machine token and no key, reaches the
+# open workspaces on their sockets in /tmp, and the hub over the network.
+#
+# Join first, as that user: halti hub join STRING. Then, with that user's name for USER:
+#   sudo cp service/halti-link@.service /etc/systemd/system/ && sudo systemctl enable --now halti-link@USER
+# What it says is in the journal: journalctl -u halti-link@USER
+
+[Unit]
+Description=halti link for %i: carries requests, state, answers and stops between this machine and its hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+ExecStart=/usr/local/bin/halti link
+Restart=always
+RestartSec=5
+UMask=0077
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=full
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

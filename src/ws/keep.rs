@@ -53,6 +53,7 @@ pub struct Opened {
 /// `halti open [NAME] [--type]`: refused before anything is asked if another terminal keeps it open;
 /// otherwise asked as `[workspace.approval] open` says, and kept open by `main`.
 pub fn open(typed: Option<&str>, type_it: bool) -> Result<Opened> {
+    crate::link::warn_if_refused();
     let settings = config::settings();
     memory::harden();
     let here = Here::at(&settings.workspaces.path);

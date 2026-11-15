@@ -31,6 +31,7 @@
 //! The functions here work on any pair of streams, so tests run them over plain sockets.
 
 use std::io::{self, BufReader, Read, Write};
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use url::Url;
@@ -45,7 +46,7 @@ use crate::config::Word;
 use crate::index::Index;
 use crate::mask::{Masker, Stream};
 use crate::policy::{self, Fetch, Mode};
-use crate::requests::{self, Came, Raised};
+use crate::requests::{self, By, Came, Raised};
 use crate::source::Hint;
 use crate::ws::OS;
 use crate::{approve, source};
@@ -282,11 +283,13 @@ fn refusal(status: u16, decision: &'static str, message: impl Into<String>) -> R
     Refusal { status, decision, message: message.into(), asked: Asked::default() }
 }
 
-/// For the log line of a write that raised a request: its id, and who answered it.
+/// For the log line of a write that raised a request: its id, who answered it, and a phone's
+/// signed answer as it was checked.
 #[derive(Default)]
 struct Asked {
     request: Option<String>,
-    by: Option<&'static str>,
+    by: Option<String>,
+    signed: Option<Arc<requests::Signed>>,
 }
 
 /// Whose rules decide about writes.
@@ -354,13 +357,17 @@ fn decide(sh: &Shared, kind: Kind, rules: &Rules, method: &str, host: &str, targ
 /// What a write that raised a request does, as the request came to; the agent is told why not.
 fn came_to(raised: Raised, shown: &str, method: &str, url: &str, limits: requests::Limits) -> Result<(&'static str, Asked), Refusal> {
     let request = raised.id.map(|id| id.hex());
-    let no = |decision: &'static str, why: String, by: Option<&'static str>| {
-        let message = format!("{method} {url} wasn't approved{why}");
-        Err(Refusal { asked: Asked { request: request.clone(), by }, ..refusal(403, decision, message) })
+    let signed = |by: &By| match by {
+        By::Device(signed) => Some(signed.clone()),
+        By::Local => None,
     };
-    match raised.came {
-        Came::Yes(by) => Ok(("asked:yes", Asked { request: request.clone(), by: Some(by.word()) })),
-        Came::No(by) => no("asked:no", String::new(), Some(by.word())),
+    let no = |decision: &'static str, why: String, by: Option<&By>| {
+        let message = format!("{method} {url} wasn't approved{why}");
+        Err(Refusal { asked: Asked { request: request.clone(), by: by.map(By::word), signed: by.and_then(signed) }, ..refusal(403, decision, message) })
+    };
+    match &raised.came {
+        Came::Yes(by) => Ok(("asked:yes", Asked { request: request.clone(), by: Some(by.word()), signed: signed(by) })),
+        Came::No(by) => no("asked:no", String::new(), Some(by)),
         Came::Expired => no("asked:no", format!(": nobody answered within {} seconds", limits.wait.as_secs()), None),
         Came::Withdrawn => no("asked:no", ": the box is stopping".into(), None),
         Came::Full => no("blocked:requests", format!(": box {shown} has {} requests waiting already", limits.per_box), None),
@@ -451,14 +458,16 @@ fn exchange<G: Read + Write, U: Read + Write>(
     let (decision, asked) = match decide(sh, kind, &rules, &method_shown, ctx.host, target, &url) {
         Ok(decided) => decided,
         Err(r) => {
-            sh.log.write(&Entry { request: r.asked.request.clone(), by: r.asked.by, ..entry(&method_shown, &url, Some(r.status), r.decision, counts) });
+            sh.log.write(&Entry {
+                request: r.asked.request.clone(),
+                ..Entry::signed(r.asked.by.clone(), r.asked.signed.as_deref(), entry(&method_shown, &url, Some(r.status), r.decision, counts))
+            });
             return refuse(guest, &head, framing, &r, keep);
         }
     };
     let entry = |method: &str, url: &str, status: Option<u16>, decision: &str, counts: &Counts| Entry {
         request: asked.request.clone(),
-        by: asked.by,
-        ..entry(method, url, status, decision, counts)
+        ..Entry::signed(asked.by.clone(), asked.signed.as_deref(), entry(method, url, status, decision, counts))
     };
 
     // The request, on its way: what the site sets replaces what the guest sent.

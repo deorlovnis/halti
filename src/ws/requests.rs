@@ -63,8 +63,26 @@ fn waiting() -> Result<(usize, Vec<Found>)> {
     Ok((open, found))
 }
 
+/// This machine's workspaces, each with the socket of its open workspace if its lock is held: what
+/// this machine's link asks. One whose files don't read is left out.
+pub fn workspaces() -> Vec<(WsName, Option<PathBuf>)> {
+    let settings = config::settings();
+    let here = Here::at(&settings.workspaces.path);
+    let Ok(entries) = ws_list(&here.files, &here.anchor) else { return Vec::new() };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let (Some(record), true) = (entry.record, entry.pinned) else { return None };
+            let kept = Kept::of(&here, record.id).ok()?;
+            let socket = kept.held().then(|| kept.socket());
+            Some((entry.name, socket))
+        })
+        .collect()
+}
+
 /// `halti requests`: one line for each request that waits.
 pub fn list() -> Result<()> {
+    crate::link::warn_if_refused();
     let (open, found) = waiting()?;
     if open == 0 {
         println!("no workspace is open, so no request waits");
@@ -93,6 +111,7 @@ pub fn answer(typed: &str, yes: bool) -> Result<()> {
     if !io::stdin().is_terminal() {
         bail!("halti requests answers only at a terminal");
     }
+    crate::link::warn_if_refused();
     let (_, found) = waiting()?;
     let found = pick(&found, typed)?;
     let (short, ws) = (found.record.id.short(), &found.ws);

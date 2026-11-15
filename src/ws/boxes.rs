@@ -455,6 +455,7 @@ pub enum Run {
 /// too, and so are its store and its sockets; then the workspace is opened, as
 /// `[workspace.approval] open` says. `main` chooses it as the place and starts the box.
 pub fn run(target_text: &str, command: Vec<String>, type_it: bool) -> Result<Run> {
+    crate::link::warn_if_refused();
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
     let vms = boxes::vms(&settings)?;

@@ -12,8 +12,9 @@
 //! - `admin.sock`: the socket `halti pair`, `halti devices` and `halti revoke` reach the running hub
 //!   through, as the same user (see `admin`).
 //!
-//! Pairings under way, the renewal nonces used, the key renewal nonces are made with, and how many
-//! connections are open live in memory only.
+//! Pairings under way, the renewal nonces used, the key renewal nonces are made with, how many
+//! connections are open, and all that the hub carries between machines and phones (`relay`) live in
+//! memory only.
 //!
 //! A change the table can't write down is not reported as made. One that would let a token work, a
 //! pairing or a renewal, is undone and refused. One that stops a token (a revoke, a `token
@@ -22,10 +23,13 @@
 
 mod admin;
 mod listen;
-mod pin;
+pub mod pin;
+mod relay;
 mod table;
 pub mod wire;
 
+#[cfg(test)]
+pub mod testing;
 #[cfg(test)]
 mod tests;
 
@@ -34,9 +38,9 @@ use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::{process, thread};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
@@ -48,6 +52,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::util;
+use relay::Relay;
 use table::{Row, Table};
 
 pub use admin::{devices, pair, revoke};
@@ -59,6 +64,8 @@ const ALPN: &[u8] = b"http/1.1";
 /// Ports the hub never listens on: a box's door connects to these, so a door taken over could reach
 /// a hub there on the same machine.
 const DOOR_PORTS: [u16; 3] = [53, 80, 443];
+/// How long a machine's call for what phones sent it waits for something to come, at most.
+pub const INBOX_WAIT: Duration = Duration::from_secs(25);
 
 /// The time, as the hub counts days. Tests pass one they move by hand.
 pub trait Clock: Send + Sync {
@@ -85,6 +92,12 @@ pub struct Hub {
     table: Mutex<Table>,
     /// Woken at every change to the table, for a `halti pair` that waits for its claim.
     changed: Condvar,
+    /// What it carries between machines and phones.
+    relay: Mutex<Relay>,
+    /// Woken when a phone sends a machine something, or a row is revoked.
+    sent: Condvar,
+    /// How long a machine's call for what phones sent it waits; tests make it shorter.
+    inbox_wait: Duration,
 }
 
 /// The table's file.
@@ -114,7 +127,18 @@ impl Hub {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Table::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        Ok(Hub { dir: dir.to_path_buf(), pin, nonce_key: util::random(), address: address.to_string(), clock, table: Mutex::new(table), changed: Condvar::new() })
+        Ok(Hub {
+            dir: dir.to_path_buf(),
+            pin,
+            nonce_key: util::random(),
+            address: address.to_string(),
+            clock,
+            table: Mutex::new(table),
+            changed: Condvar::new(),
+            relay: Mutex::default(),
+            sent: Condvar::new(),
+            inbox_wait: INBOX_WAIT,
+        })
     }
 
     fn now(&self) -> Timestamp {
@@ -175,23 +199,8 @@ impl Hub {
 
     fn save(&self, table: &Table) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(&Stored { version: 1, rows: table.rows() })?;
-        replace(&self.dir.join("table.json"), &bytes)
+        util::replace_private(&self.dir.join("table.json"), &bytes)
     }
-}
-
-/// Numbers the files in the making of this process.
-static COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// Replaces the file whole with a 0600 one, or leaves it as it was.
-fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
-    let name = path.file_name().and_then(|n| n.to_str()).expect("the hub names its own files");
-    let new = path.with_file_name(format!(".{name}.{}-{}", process::id(), COUNT.fetch_add(1, Ordering::Relaxed)));
-    let written = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&new).and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()));
-    if let Err(e) = written.and_then(|()| fs::rename(&new, path)) {
-        let _ = fs::remove_file(&new);
-        return Err(e).with_context(|| format!("writing {}", path.display()));
-    }
-    Ok(())
 }
 
 /// The hub's folder, made if it isn't there, and open to this user alone.
