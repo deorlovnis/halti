@@ -117,6 +117,7 @@ fn a_box_boots_runs_as_the_agent_and_as_root_and_keeps_its_disk_across_a_stop() 
         browser: None,
         browser_socket: None,
         browser_tokens: Default::default(),
+        requests: None,
     })
     .unwrap();
 

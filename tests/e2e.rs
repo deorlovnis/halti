@@ -1482,6 +1482,34 @@ fn sigint_and_sighup_close_it() {
 }
 
 #[test]
+fn requests_lists_what_open_workspaces_wait_on_and_answers_only_at_a_terminal() {
+    let env = Env::new();
+    let said = |args: &[&str]| env.halti(&[&["requests"][..], args].concat());
+    let none = said(&[]);
+    assert!(none.status.success() && stdout(&none) == "no workspace is open, so no request waits\n", "{}", stderr(&none));
+    assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
+    let open = Open::start(env.ws_box_command(PASSPHRASE, "true").args(["open", "acme"]));
+    assert!(open.is_open(), "{}", open.err.lock().unwrap());
+    // The open workspace is asked on its socket, and nothing is asked here.
+    let listed = said(&[]);
+    assert!(listed.status.success() && stdout(&listed) == "no request waits\n" && asked(&listed) == 0 && prompted(&listed) == 0, "{}", stderr(&listed));
+    let socket = keeper_socket(&env, "acme");
+    assert_eq!(talk(&socket, "halti-keep/2 list acme\n").as_deref(), Some("halti-keep/2 end\n"));
+    assert_eq!(talk(&socket, "halti-keep/2 list globex\n").as_deref(), Some("halti-keep/2 other\n"));
+    let digest = "ab".repeat(32);
+    assert_eq!(talk(&socket, &format!("halti-keep/2 answer acme yes {digest}\n")).as_deref(), Some("halti-keep/2 gone\n"));
+    // An answer is refused before anything is looked up where there is no terminal.
+    for args in [&["approve", "abcd1234"][..], &["deny", "abcd1234"]] {
+        let answered = said(args);
+        assert!(!answered.status.success(), "{args:?}");
+        assert_eq!(stderr(&answered), "halti: halti requests answers only at a terminal\n");
+    }
+    let closed = env.ws_box(PASSPHRASE, "true", &["close", "acme"]);
+    assert!(closed.status.success(), "{}", stderr(&closed));
+    assert!(open.wait().status.success());
+}
+
+#[test]
 fn a_killed_keeper_is_cleaned_up_by_the_next_open() {
     let env = Env::new();
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());

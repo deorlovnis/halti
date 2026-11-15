@@ -18,13 +18,14 @@
 //! is never printed. Only `open` saves a typed passphrase again.
 //!
 //! `open` keeps a workspace open in its terminal until `close`, Ctrl-C or a closed terminal ends
-//! it (`keep`).
+//! it (`keep`). `requests` lists and answers what its boxes ask while it is open.
 
 pub mod boxes;
 mod files;
 pub mod keep;
 mod memory;
 pub mod policies;
+pub mod requests;
 mod saved;
 mod tty;
 

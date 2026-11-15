@@ -44,7 +44,7 @@ use crate::engine::{self, Vms};
 use crate::index::Index;
 use crate::keep::{No, Refused};
 use crate::source::{self, BoxItem};
-use crate::{door, names, policy, seal};
+use crate::{door, names, policy, requests, seal};
 
 /// Where the store's folders appear in the VM, and where `ro` folders go.
 const GUEST_HOME: &str = "/home/agent";
@@ -225,6 +225,8 @@ pub struct Request<'a> {
     /// Whether the person is asked as `[box.approval] run` says: not where opening the workspace
     /// was the approval.
     pub confirm: bool,
+    /// Where the door raises a write that asks as a request: a box an open workspace runs has one.
+    pub requests: Option<requests::Asker>,
 }
 
 pub fn vm_name(id: &str) -> String {
@@ -489,6 +491,7 @@ impl Running<'_> {
             browser: Some(Arc::new(InBox::new(sessions, launch, policy.browser.downloads))),
             browser_socket: browser_vm.as_ref().map(|_| browser_socket),
             browser_tokens: tokens,
+            requests: req.requests.clone(),
         };
 
         self.browser = browser_vm;
@@ -1280,6 +1283,7 @@ mod tests {
             stop_with: "halti box stop r".into(),
             mounts: MountRule::Guarded(vec![config_dir(), store_root(), crate::config::workspaces_in_effect()]),
             confirm: true,
+            requests: None,
         }
     }
 

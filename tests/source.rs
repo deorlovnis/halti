@@ -353,6 +353,8 @@ fn the_macos_only_code_is_frozen() {
     // until the Mac adapters are written on a Mac, which updates these hashes.
     for (path, starts, sha256) in [
         ("src/approve.rs", "fn ask_person(", "b7b125f8ba2dabaa2481bdfea29cfc6d779a96ab8f3542fe7c9dadfb55db2bdf"),
+        // The Touch ID a request asks, taken down once the request is answered elsewhere.
+        ("src/approve.rs", "fn ask_person_until(", "451c10d3c98c46b77923c8a5254738a302fce615a302481ff89e478a7b76a14a"),
         ("src/keychain.rs", "mod backend {", "c3d98940a584a9742da7b7320e60843eca9ea2387779635ef6027c2b3442a3b8"),
         // A workspace's saved passphrase: in the login keychain only, opened by its path under the
         // passwd entry's home, and written only as a new item, never an update of one that is there.

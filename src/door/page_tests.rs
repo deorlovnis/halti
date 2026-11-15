@@ -179,6 +179,7 @@ fn scenario(dir: &Path, yes: bool) {
             log_key: LOG_KEY,
             browser_socket: Some(browser_socket),
             browser_tokens: tokens.clone(),
+            requests: None,
             browser: None,
         },
         net,

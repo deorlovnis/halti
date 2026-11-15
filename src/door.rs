@@ -46,7 +46,7 @@ use crate::browse::BoxBrowser;
 use crate::chain::Chain;
 use crate::mcp::{self, Scope};
 use crate::names;
-use crate::policy;
+use crate::{policy, requests};
 use addr::{Allow, Net};
 pub use page::Tokens;
 pub use tls::{BoxCa, PURPOSE as CA_PURPOSE};
@@ -98,6 +98,9 @@ pub struct Config {
     pub browser_socket: Option<PathBuf>,
     /// Which runner speaks for which site; the browser side fills it (see `Tokens`).
     pub browser_tokens: Tokens,
+    /// For a box an open workspace runs: where a write that asks is raised as a request, which the
+    /// prompt here or `halti requests` answers (see `crate::requests`). None: it is asked here alone.
+    pub requests: Option<requests::Asker>,
 }
 
 /// Which VM's socket a connection came in on. The only thing that tells them apart: nothing a
@@ -413,11 +416,31 @@ struct Entry {
     down: u64,
     /// `allowed`, `asked:yes`, `asked:no`, `closed`, `blocked:<why>` or `failed:<why>`.
     decision: String,
+    /// Who answered a request a write raised: `local`, the person at this machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    by: Option<&'static str>,
+    /// The id of the request a write raised, in hex.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request: Option<String>,
 }
 
 impl Entry {
     fn new(kind: &'static str, decision: &str) -> Self {
-        Self { kind, site: None, host: None, addr: None, path: None, method: None, url: None, status: None, up: 0, down: 0, decision: decision.to_string() }
+        Self {
+            kind,
+            site: None,
+            host: None,
+            addr: None,
+            path: None,
+            method: None,
+            url: None,
+            status: None,
+            up: 0,
+            down: 0,
+            decision: decision.to_string(),
+            by: None,
+            request: None,
+        }
     }
 }
 

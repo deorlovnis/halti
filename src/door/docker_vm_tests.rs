@@ -49,6 +49,7 @@ impl DockerBox {
             ca: Some(ca.clone()),
             browser_socket: None,
             browser_tokens: Default::default(),
+            requests: None,
             browser: None,
         };
         let door = Door::start(config).unwrap();

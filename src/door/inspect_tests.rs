@@ -27,6 +27,7 @@ use super::{Config, Shared};
 use crate::approval::Means;
 use crate::chain::Chain;
 use crate::policy::{self, Mode};
+use crate::requests::{self, Desk, Here, Prompt, Prompted, Record, RunId, answer_digest};
 use crate::util::TempDir;
 use crate::{approve, keychain};
 
@@ -347,6 +348,7 @@ fn shared_asking(dir: &Path, name: &str, writes: Mode, allow_writes: &[&str], as
         ca: None,
         browser_socket: None,
         browser_tokens: Default::default(),
+        requests: None,
     };
     Arc::new(Shared::new(config, Dial::system()).unwrap())
 }
@@ -813,4 +815,125 @@ fn the_log_chains(dir: &Path, yes: bool) {
     fs::write(&path, &original).unwrap();
     chain.verify().unwrap();
     assert!(Chain::new(&path, [1; 32]).verify().is_err(), "only the box's key verifies it");
+}
+
+// --- a box an open workspace runs ---
+
+/// The prompt here, saying one thing every time it is asked.
+struct Saying(Prompted);
+
+impl Prompt for Saying {
+    fn ask(&self, _reason: &str, _withdrawn: &dyn Fn() -> bool) -> Prompted {
+        self.0
+    }
+}
+
+/// A door whose box an open workspace runs, with no sites: its writes follow `[net]`, which asks,
+/// approved by `ask`, and raise requests on `desk`.
+fn shared_raising(dir: &Path, name: &str, ask: Option<Means>, desk: &Arc<Desk>) -> Arc<Shared> {
+    let config = Config {
+        name: "acme/dev".into(),
+        socket: dir.join("unused.sock"),
+        port: None,
+        allow: vec!["*".into()],
+        model: None,
+        sites: Vec::new(),
+        net: Net { writes: Mode::Ask, allow_writes: Vec::new(), ask },
+        log: dir.join(format!("{name}.log")),
+        log_key: LOG_KEY,
+        browser: None,
+        ca: None,
+        browser_socket: None,
+        browser_tokens: Default::default(),
+        requests: Some(desk.asker("dev", RunId([7; 8]))),
+    };
+    Arc::new(Shared::new(config, Dial::system()).unwrap())
+}
+
+/// Answers the next request that waits on `desk`, as another terminal would; its id.
+fn answering(desk: &Arc<Desk>, yes: bool) -> JoinHandle<String> {
+    let desk = desk.clone();
+    thread::spawn(move || {
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            if let Some(bytes) = desk.records().pop() {
+                let id = Record::decode(&bytes).unwrap().id.hex();
+                let said = desk.answer_here(yes, &answer_digest(&bytes, yes));
+                assert_eq!(said, if yes { Here::Approved } else { Here::Denied });
+                return id;
+            }
+            assert!(std::time::Instant::now() < deadline, "no request was raised");
+            thread::sleep(Duration::from_millis(10));
+        }
+    })
+}
+
+#[test]
+fn a_write_of_a_box_an_open_workspace_runs_waits_as_a_request() {
+    let dir = TempDir::new("halti-inspect-requests").unwrap();
+    let host = "web.example.com";
+    // Nothing here asks (Linux): the request waits for another terminal's answer.
+    let desk = Desk::new("mac-1".into(), "acme".into(), requests::LIMITS, Arc::new(Saying(Prompted::Unshown)));
+    let sh = shared_raising(&dir.0, "nowhere", None, &desk);
+    let mut rig = Rig::new(&sh, host);
+    let yes = answering(&desk, true);
+    let (reply, body) = rig.guest.post(host, "/submit?token=sekrit", &[], "data");
+    assert_eq!((reply.status, body.as_str()), (200, "got data"));
+    let approved = yes.join().unwrap();
+    let no = answering(&desk, false);
+    let (reply, body) = rig.guest.post(host, "/submit", &[], "data");
+    assert_eq!((reply.status, body.as_str()), (403, "halti: POST https://web.example.com/submit wasn't approved\n"));
+    let denied = no.join().unwrap();
+    assert_eq!(rig.reached().len(), 1, "a denied write never reaches the site");
+    assert!(rig.finish_asked().is_empty(), "nothing asked on the door's own thread");
+    let lines = log_lines(&dir.0, "nowhere");
+    let posts: Vec<(Value, Value, Value)> = lines.iter().map(|l| (l["decision"].clone(), l["by"].clone(), l["request"].clone())).collect();
+    assert_eq!(posts, [(json!("asked:yes"), json!("local"), json!(approved)), (json!("asked:no"), json!("local"), json!(denied))]);
+    assert_eq!(lines[0]["url"], format!("https://web.example.com/submit?token={MASK}"));
+
+    // Touch ID here (a Mac): it answers, and the request names who did.
+    let desk = Desk::new("mac-1".into(), "acme".into(), requests::LIMITS, Arc::new(Saying(Prompted::Yes)));
+    let sh = shared_raising(&dir.0, "touchid", Some(Means::TouchId), &desk);
+    let mut rig = Rig::new(&sh, host);
+    assert_eq!(rig.guest.post(host, "/submit", &[], "data").0.status, 200);
+    rig.finish();
+    let line = log_lines(&dir.0, "touchid").remove(0);
+    assert_eq!((line["decision"].clone(), line["by"].clone()), (json!("asked:yes"), json!("local")));
+    assert_eq!(line["request"].as_str().map(str::len), Some(32));
+    // `none` lets it through and raises nothing.
+    let sh = shared_raising(&dir.0, "none", Some(Means::None), &desk);
+    let mut rig = Rig::new(&sh, host);
+    assert_eq!(rig.guest.post(host, "/submit", &[], "data").0.status, 200);
+    rig.finish();
+    let line = log_lines(&dir.0, "none").remove(0);
+    assert_eq!((line["decision"].clone(), line["by"].clone(), line["request"].clone()), (json!("allowed"), Value::Null, Value::Null));
+}
+
+#[test]
+fn a_request_nobody_answers_or_one_too_many_is_refused_saying_why() {
+    let dir = TempDir::new("halti-inspect-unanswered").unwrap();
+    let host = "web.example.com";
+    let limits = requests::Limits { wait: Duration::from_secs(1), per_box: 1, ..requests::LIMITS };
+    let desk = Desk::new("mac-1".into(), "acme".into(), limits, Arc::new(Saying(Prompted::Unshown)));
+    let sh = shared_raising(&dir.0, "unanswered", None, &desk);
+    let mut rig = Rig::new(&sh, host);
+    let (reply, body) = rig.guest.post(host, "/submit", &[], "data");
+    assert_eq!((reply.status, body.as_str()), (403, "halti: POST https://web.example.com/submit wasn't approved: nobody answered within 1 seconds\n"));
+    rig.finish();
+    // One waits already: the next is refused at once, and raises nothing.
+    let waits = desk.asker("dev", RunId([7; 8]));
+    let waiting = thread::spawn(move || waits.raise("POST https://web.example.com/other", false, &|| false));
+    while desk.records().is_empty() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut rig = Rig::new(&sh, host);
+    let (reply, body) = rig.guest.post(host, "/submit", &[], "data");
+    assert_eq!((reply.status, body.as_str()), (403, "halti: POST https://web.example.com/submit wasn't approved: box acme/dev has 1 requests waiting already\n"));
+    rig.finish();
+    desk.close();
+    assert_eq!(waiting.join().unwrap().came, requests::Came::Withdrawn);
+    let lines = log_lines(&dir.0, "unanswered");
+    let decisions: Vec<(Value, Value)> = lines.iter().map(|l| (l["decision"].clone(), l["by"].clone())).collect();
+    assert_eq!(decisions, [(json!("asked:no"), Value::Null), (json!("blocked:requests"), Value::Null)]);
+    assert!(lines[0]["request"].is_string() && lines[1]["request"].is_null());
 }

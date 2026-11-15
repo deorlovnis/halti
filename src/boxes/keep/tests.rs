@@ -14,6 +14,7 @@ use halti_core::ids::WsId;
 
 use super::*;
 use crate::engine::VmSpec;
+use crate::requests::{Asker, By, Came, Prompt, Prompted, Raised, Record, answer_digest};
 use crate::ws::boxes::{put_away_left, stop_others};
 use crate::{chain, door};
 
@@ -32,6 +33,8 @@ struct Fake {
     /// How long a VM takes to start, and to stop.
     slow_start: Duration,
     slow_stop: Duration,
+    /// What each door it started raises its requests through.
+    askers: Mutex<Vec<Option<Asker>>>,
 }
 
 impl Fake {
@@ -83,7 +86,8 @@ impl World for Fake {
         self.stop(vm);
     }
 
-    fn start_door(&self, _cfg: door::Config) -> Result<Box<dyn Any>> {
+    fn start_door(&self, cfg: door::Config) -> Result<Box<dyn Any>> {
+        self.askers.lock().unwrap().push(cfg.requests);
         Ok(Box::new(()))
     }
 
@@ -209,6 +213,15 @@ fn policy(extra: &str) -> (Vec<u8>, BoxPolicy) {
     (text.into_bytes(), policy)
 }
 
+/// The prompt here where there is none, as on Linux: it says nothing.
+struct Nobody;
+
+impl Prompt for Nobody {
+    fn ask(&self, _reason: &str, _withdrawn: &dyn Fn() -> bool) -> Prompted {
+        Prompted::Unshown
+    }
+}
+
 /// A workspace's boxes in a short folder, and what its keeper is given.
 struct Bench {
     dir: Short,
@@ -219,11 +232,14 @@ struct Bench {
     /// The workspace's files went back, until the keeper is told so; and how often it looked.
     went_back: AtomicBool,
     looked: AtomicUsize,
+    /// The requests its boxes wait on.
+    desk: Arc<Desk>,
 }
 
 impl Bench {
     fn new(fake: Fake) -> Bench {
-        Bench { dir: Short::new(), fake, close: AtomicBool::new(false), wiped: Mutex::new(None), went_back: AtomicBool::new(false), looked: AtomicUsize::new(0) }
+        let desk = Desk::new("mac-1".into(), "acme".into(), requests::LIMITS, Arc::new(Nobody));
+        Bench { dir: Short::new(), fake, close: AtomicBool::new(false), wiped: Mutex::new(None), went_back: AtomicBool::new(false), looked: AtomicUsize::new(0), desk }
     }
 
     fn layout(&self) -> Layout {
@@ -282,6 +298,7 @@ impl Bench {
             close: &self.close,
             wipe: &wipe,
             refused: &refused,
+            desk: &self.desk,
         };
         let socket = self.socket();
         thread::scope(|scope| {
@@ -625,7 +642,7 @@ fn a_second_keeper_never_takes_a_socket_that_answers() {
     bench.layout().prepare().unwrap();
     let _other = keep::bind(&socket).unwrap().unwrap();
     let ready = |_: &str, _: &str, _: &Checked| Ok(());
-    let outside = Outside { world: None, vms: None, ready: &ready, close: &bench.close, wipe: &|| {}, refused: &|| false };
+    let outside = Outside { world: None, vms: None, ready: &ready, close: &bench.close, wipe: &|| {}, refused: &|| false, desk: &bench.desk };
     let error = serve_with(bench.keep(&[]), &outside).unwrap_err();
     assert_eq!(error.to_string(), "another workspace is open at acme's socket");
     assert!(socket.exists());
@@ -651,6 +668,7 @@ fn a_box_is_stopping_as_its_last_session_leaves_or_a_stop_is_asked() {
         waiting: AtomicUsize::new(0),
         closers: Mutex::default(),
         done: AtomicBool::new(false),
+        desk: &bench.desk,
     };
     let running = |round| Slot { round, state: State::Running, sessions: 1, stop: Arc::default(), word: None };
     let state = |box_name: &str| keeper.table().boxes[box_name].state;
@@ -699,6 +717,98 @@ fn files_that_went_back_are_looked_for_while_open() {
         until(|| bench.looked.load(Ordering::SeqCst) >= 3);
         assert!(!bench.went_back.load(Ordering::SeqCst));
         assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
+    });
+    assert_eq!(code.unwrap(), 0);
+}
+
+/// The one request that waits at the socket: its record and bytes, once it waits.
+fn the_one_at(socket: &Path) -> (Record, Vec<u8>) {
+    until(|| keep::list(socket, &acme(), LONG).is_some_and(|listed| listed.is_ok_and(|records| records.len() == 1)));
+    let bytes = keep::list(socket, &acme(), LONG).unwrap().unwrap().remove(0);
+    (Record::decode(&bytes).unwrap(), bytes)
+}
+
+#[test]
+fn a_request_is_listed_and_answered_on_the_socket_in_records() {
+    let bench = Bench::new(Fake::default());
+    let code = bench.keeping(&[], false, |socket| {
+        assert_eq!(keep::list(socket, &acme(), LONG), Some(Ok(Vec::new())));
+        let asker = bench.desk.asker("dev", RunId([7; 8]));
+        thread::scope(|scope| {
+            let raised = scope.spawn(|| asker.raise("POST https://api.example.com/v1/x", false, &|| false));
+            let (record, bytes) = the_one_at(socket);
+            assert_eq!((record.ws.as_str(), record.box_name.as_str(), record.action.as_str()), ("acme", "dev", "POST https://api.example.com/v1/x"));
+            // Another workspace's name does nothing; another decision's digest names nothing.
+            let globex = WsName::parse("globex").unwrap();
+            assert_eq!(keep::answer(socket, &globex, true, answer_digest(&bytes, true), LONG), Some(Told::Other));
+            assert_eq!(keep::list(socket, &globex, LONG), Some(Err(Told::Other)));
+            assert_eq!(keep::answer(socket, &acme(), true, answer_digest(&bytes, false), LONG), Some(Told::Gone));
+            assert_eq!(keep::answer(socket, &acme(), true, answer_digest(&bytes, true), LONG), Some(Told::Approved));
+            assert_eq!(raised.join().unwrap(), Raised { id: Some(record.id), came: Came::Yes(By::Local) });
+            // The first answer won: the second finds nothing.
+            assert_eq!(keep::answer(socket, &acme(), false, answer_digest(&bytes, false), LONG), Some(Told::Gone));
+            assert_eq!(keep::list(socket, &acme(), LONG), Some(Ok(Vec::new())));
+        });
+        // A denial counts at once.
+        thread::scope(|scope| {
+            let raised = scope.spawn(|| asker.raise("DELETE https://api.example.com/v1/x", false, &|| false));
+            let (_, bytes) = the_one_at(socket);
+            assert_eq!(keep::answer(socket, &acme(), false, answer_digest(&bytes, false), LONG), Some(Told::Denied));
+            assert_eq!(raised.join().unwrap().came, Came::No(By::Local));
+        });
+        // The lines of names are answered as before.
+        assert_eq!(running(socket), Some(Reply::Open(0)));
+        assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
+    });
+    assert_eq!(code.unwrap(), 0);
+}
+
+#[test]
+fn closing_withdraws_the_requests_that_wait() {
+    let bench = Bench::new(Fake::default());
+    let asker = bench.desk.asker("dev", RunId([7; 8]));
+    let came = thread::scope(|scope| {
+        let mut raised = None;
+        let code = bench.keeping(&[], false, |socket| {
+            raised = Some(scope.spawn(|| asker.raise("POST https://api.example.com/v1/x", false, &|| false)));
+            the_one_at(socket);
+            assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
+        });
+        assert_eq!(code.unwrap(), 0);
+        raised.unwrap().join().unwrap().came
+    });
+    assert_eq!(came, Came::Withdrawn);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+fn each_run_s_door_raises_its_requests_on_the_desk_with_a_run_id_of_its_own() {
+    let bench = Bench::new(Fake::default());
+    let code = bench.keeping(&[("dev", "")], true, |socket| {
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            // The first run's box may still be being put away.
+            let (reply, stream) = loop {
+                match session(socket, "dev") {
+                    (Reply::Busy, _) => thread::sleep(Duration::from_millis(20)),
+                    started => break started,
+                }
+            };
+            assert_eq!(reply, Reply::Started);
+            let asker = bench.fake.askers.lock().unwrap().last().cloned().flatten().expect("the door was given an asker");
+            thread::scope(|scope| {
+                let raised = scope.spawn(|| asker.raise("POST https://api.example.com/v1/x", false, &|| false));
+                let (record, bytes) = the_one_at(socket);
+                assert_eq!(record.shown(), "acme/dev");
+                runs.push(record.run);
+                assert_eq!(keep::answer(socket, &acme(), true, answer_digest(&bytes, true), LONG), Some(Told::Approved));
+                assert_eq!(raised.join().unwrap().came, Came::Yes(By::Local));
+            });
+            drop(stream);
+        }
+        assert_ne!(runs[0], runs[1], "a run id is drawn as the box starts");
+        // The second run's box may still be being put away, and is counted then.
+        assert!(matches!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0 | 1))));
     });
     assert_eq!(code.unwrap(), 0);
 }

@@ -972,6 +972,32 @@ fn the_keeper_socket_is_not_in_a_box() {
 
 #[test]
 #[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
+fn from_inside_a_box_requests_and_open_fail_and_the_socket_is_out_of_reach() {
+    let Some(image) = agent_image() else { return };
+    let home = Home::new("keep-escape");
+    let name = box_name("keep-escape");
+    home.workspace_with_box("acme", ACME, &name, &basic("acme", "acme-token-0001"), &image);
+    let (mut keeper, _said) = home.open("acme", ACME);
+    let socket = home.keeper_socket("acme");
+    let (answer, _session) = keeper_start(&socket, "acme", &name);
+    assert_eq!(answer, "halti-keep/1 started\n");
+    until_running("halti-wsbox-", &name);
+    // The commands, and the socket dialed at the host's own path: the box has neither.
+    let dial = format!(
+        "import socket\ns = socket.socket(socket.AF_UNIX)\ntry:\n    s.connect(\"{}\")\n    s.sendall(b\"halti-keep/2 list acme\\n\")\n    print(\"reached\", s.recv(64))\nexcept Exception as e:\n    print(\"unreached\", type(e).__name__)\n",
+        socket.display()
+    );
+    let script = format!("halti requests; echo \"requests $?\"; halti open acme; echo \"open $?\"; python3 -c '{dial}'");
+    let out = home.halti().args(["ws", "run", &format!("acme/{name}"), "--", "sh", "-c", &script]).output().unwrap();
+    let seen = String::from_utf8_lossy(&out.stdout);
+    assert!(seen.contains("requests 127\n") && seen.contains("open 127\n"), "{seen}");
+    assert!(seen.contains("unreached FileNotFoundError") && !seen.contains("reached b"), "{seen}");
+    home.close("acme");
+    assert!(keeper.wait().unwrap().success());
+}
+
+#[test]
+#[ignore = "needs Apple's `container`; run with `mise run e2e-box`"]
 fn a_token_set_while_open_is_used_at_once() {
     let Some(image) = agent_image() else { return };
     let home = Home::new("keep-rotate");

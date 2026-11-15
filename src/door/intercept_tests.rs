@@ -208,6 +208,7 @@ fn the_door_ends_tls_for_a_guest_that_trusts_only_the_box_ca() {
             ca: Some(box_ca.clone()),
             browser_socket: None,
             browser_tokens: Default::default(),
+            requests: None,
             browser: None,
         },
         net,
@@ -336,6 +337,7 @@ fn real_vm_tools_trust_the_door_and_only_the_door() {
         ca: Some(ca.clone()),
         browser_socket: None,
         browser_tokens: Default::default(),
+        requests: None,
         browser: None,
     };
     let door = Door::start(config).unwrap();
