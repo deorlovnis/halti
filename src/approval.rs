@@ -30,7 +30,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use halti_core::platform::Os;
 
 use crate::config::approved::{self, Found, Place};
-use crate::config::{Engine, Manager, Settings, Word};
+use crate::config::{Keys, Manager, Settings, Word};
 use crate::{approve, policy, util};
 
 /// What can ask for an approval.
@@ -200,10 +200,11 @@ impl Action {
 }
 
 /// A rule's means that this system has, without those asked on the terminal when an agent holds it.
-/// A box's action has none where no box engine is, and a workspace's only the passphrase where no
-/// password manager is.
+/// A box's action has none where no box keeps its key outside a workspace (Linux, where only a
+/// workspace's boxes run, and its own lines approve them), and a workspace's only the passphrase
+/// where no password manager is.
 fn kept(rule: &Rule, os: Os) -> Vec<Means> {
-    if rule.of_box() && !Engine::ALL.iter().any(|engine| engine.on(os)) {
+    if rule.of_box() && !Keys::ALL.iter().any(|keys| keys.on(os)) {
         return Vec::new();
     }
     let managed = Manager::ALL.iter().any(|manager| *manager != Manager::None && manager.on(os));
@@ -391,7 +392,8 @@ mod tests {
     fn every_rule_keeps_its_whole_list_where_its_means_are() {
         for rule in RULES {
             assert_eq!(rule.action.accepts(Os::Macos), rule.accepts, "{:?}", rule.action);
-            // No box runs on Linux, so nothing there approves a box's action; and no password manager is there, so a
+            // Today's boxes, kept outside a workspace, don't run on Linux, so nothing there approves a box's action
+            // (a workspace's box is approved by its workspace's lines); and no password manager is there, so a
             // workspace's action takes its passphrase only.
             let linux = |means: &Means| *means != Means::TouchId && !rule.of_box() && (!rule.manager || *means == Means::Passphrase);
             let linux: Vec<Means> = rule.accepts.iter().copied().filter(linux).collect();

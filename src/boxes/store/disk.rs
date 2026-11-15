@@ -178,12 +178,203 @@ pub fn usage(disk: &Path) -> (u64, Option<SystemTime>) {
     (bytes, newest)
 }
 
+/// The notes of `ws box new` and `halti open` about what `what` names (`box acme/dev keeps`), kept
+/// in the workspace's folder `wsdir`, which halti doesn't encrypt: whether the disk that holds
+/// `wsdir` is a dm-crypt one, and swap that isn't. halti can't tell a disk its owner unlocks from
+/// one that unlocks itself at boot, so the first says only what was checked.
+pub fn at_rest_notes(what: &str, wsdir: &Path) -> Vec<String> {
+    let sys = Path::new("/sys");
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let swaps = fs::read_to_string("/proc/swaps").unwrap_or_default();
+    let real = fs::canonicalize(wsdir).unwrap_or_else(|_| wsdir.to_path_buf());
+    let encrypted = device_of(&mountinfo, &real).is_some_and(|device| crypt(sys, &device));
+    notes(what, wsdir, encrypted, clear_swap(sys, &swaps))
+}
+
+fn notes(what: &str, wsdir: &Path, encrypted: bool, clear_swap: bool) -> Vec<String> {
+    let mut said = vec![match encrypted {
+        true => format!(
+            "note: what {what} is not encrypted by halti here. {} is on a dm-crypt disk. this protects it only if you unlock that disk yourself after each boot",
+            wsdir.display()
+        ),
+        false => format!("note: what {what} is not encrypted. anyone with a copy of this server's disk can read it. see the README: an encrypted data disk"),
+    }];
+    if clear_swap {
+        said.push("note: this server has swap that is not encrypted. tokens and workspace keys can be written to it".to_string());
+    }
+    said
+}
+
+/// Where a block device is in `sys`: its kernel name (`dm-1`, `sda2`), by `MAJOR:MINOR` or by a
+/// path to it under /dev.
+#[derive(Debug, PartialEq)]
+enum Device {
+    Number(String),
+    Path(PathBuf),
+}
+
+/// The device of the mount that holds `path`, from mountinfo's lines: the mount whose mount point
+/// is the longest that `path` is in. Its number, unless that is one no device has (major 0, as a
+/// btrfs or an overlay mount has), then the path of its source.
+fn device_of(mountinfo: &str, path: &Path) -> Option<Device> {
+    let mut best: Option<(usize, Device)> = None;
+    for line in mountinfo.lines() {
+        let Some((fields, after)) = line.split_once(" - ") else { continue };
+        let fields: Vec<&str> = fields.split(' ').collect();
+        let (Some(number), Some(point)) = (fields.get(2), fields.get(4)) else { continue };
+        let point = PathBuf::from(unescape(point));
+        if !path.starts_with(&point) || best.as_ref().is_some_and(|(length, _)| *length > point.as_os_str().len()) {
+            continue;
+        }
+        let device = match number.split_once(':') {
+            Some(("0", _)) | None => match after.split(' ').nth(1) {
+                Some(source) if source.starts_with("/dev/") => Device::Path(PathBuf::from(unescape(source))),
+                _ => Device::Number((*number).to_string()),
+            },
+            Some(_) => Device::Number((*number).to_string()),
+        };
+        best = Some((point.as_os_str().len(), device));
+    }
+    best.map(|(_, device)| device)
+}
+
+/// mountinfo's escapes of a space, a tab, a new line and a backslash (`\040`) undone.
+fn unescape(text: &str) -> String {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'\\'
+            && let Some(code) = text.get(at + 1..at + 4).and_then(|digits| u8::from_str_radix(digits, 8).ok())
+        {
+            out.push(code);
+            at += 4;
+            continue;
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether `device` is a dm-crypt one, or is mapped straight onto one, as LVM on LUKS is: its
+/// `dm/uuid` in `sys`, or one of its slaves', starts with `CRYPT-`.
+fn crypt(sys: &Path, device: &Device) -> bool {
+    let name = match device {
+        Device::Number(number) => fs::read_link(sys.join("dev/block").join(number)).ok().and_then(|link| link.file_name().map(|n| n.to_string_lossy().into_owned())),
+        Device::Path(path) => fs::canonicalize(path).ok().and_then(|real| real.file_name().map(|n| n.to_string_lossy().into_owned())),
+    };
+    let Some(name) = name else { return false };
+    let block = sys.join("class/block").join(&name);
+    let slaves = fs::read_dir(block.join("slaves")).into_iter().flatten().flatten().map(|entry| entry.path());
+    std::iter::once(block.clone()).chain(slaves).any(|dev| fs::read_to_string(dev.join("dm/uuid")).is_ok_and(|uuid| uuid.starts_with("CRYPT-")))
+}
+
+/// A device number as Linux writes it, `MAJOR:MINOR`.
+fn number(dev: u64) -> String {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xffff_f000);
+    let minor = (dev & 0xff) | ((dev >> 12) & 0xffff_ff00);
+    format!("{major}:{minor}")
+}
+
+/// Whether swap that isn't encrypted is on, from /proc/swaps: a swap file counts as the disk it is
+/// on, and zram is memory.
+fn clear_swap(sys: &Path, swaps: &str) -> bool {
+    swaps.lines().skip(1).any(|line| {
+        let mut fields = line.split_whitespace();
+        let (Some(name), Some(kind)) = (fields.next(), fields.next()) else { return false };
+        let name = unescape(name);
+        if name.starts_with("/dev/zram") {
+            return false;
+        }
+        let device = match kind {
+            "file" => match fs::metadata(&name) {
+                Ok(meta) => Device::Number(number(meta.dev())),
+                Err(_) => return true,
+            },
+            _ => Device::Path(PathBuf::from(name)),
+        };
+        !crypt(sys, &device)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::*;
     use crate::util::TempDir;
+
+    /// A made-up /sys: `dm-0` is dm-crypt, `dm-1` is LVM on it, `sda2` is a plain partition.
+    fn sys(dir: &Path) -> PathBuf {
+        let sys = dir.join("sys");
+        for (name, number, uuid) in [("dm-0", "253:0", Some("CRYPT-LUKS2-0123-data")), ("dm-1", "253:1", Some("LVM-abc")), ("sda2", "8:2", None)] {
+            let block = sys.join("class/block").join(name);
+            fs::create_dir_all(block.join("slaves")).unwrap();
+            if let Some(uuid) = uuid {
+                fs::create_dir_all(block.join("dm")).unwrap();
+                fs::write(block.join("dm/uuid"), format!("{uuid}\n")).unwrap();
+            }
+            fs::create_dir_all(sys.join("dev/block")).unwrap();
+            symlink(format!("../../devices/virtual/block/{name}"), sys.join("dev/block").join(number)).unwrap();
+        }
+        fs::create_dir(sys.join("class/block/dm-1/slaves/dm-0")).unwrap();
+        fs::create_dir_all(sys.join("class/block/dm-1/slaves/dm-0/dm")).unwrap();
+        fs::write(sys.join("class/block/dm-1/slaves/dm-0/dm/uuid"), "CRYPT-LUKS2-0123-data\n").unwrap();
+        sys
+    }
+
+    const MOUNTINFO: &str = "22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n\
+                             30 22 253:0 / /data rw,relatime shared:5 - ext4 /dev/mapper/data rw\n\
+                             31 22 253:1 / /srv/lvm\\040disk rw,relatime shared:6 - xfs /dev/mapper/vg-ws rw\n\
+                             32 22 0:45 /@home /home rw,relatime shared:7 - btrfs /dev/sda2 rw\n";
+
+    #[test]
+    fn the_note_says_whether_the_disk_is_encrypted() {
+        let dir = TempDir::new("halti-at-rest").unwrap();
+        let sys = sys(&dir.0);
+        let on = |path: &str| device_of(MOUNTINFO, Path::new(path));
+        assert_eq!(on("/data/halti-ws/0123"), Some(Device::Number("253:0".into())));
+        assert_eq!(on("/datab/ws"), Some(Device::Number("8:2".into())), "a mount point is a folder, not a prefix of a name");
+        assert_eq!(on("/srv/lvm disk/ws"), Some(Device::Number("253:1".into())));
+        assert_eq!(on("/home/deor/Library"), Some(Device::Path("/dev/sda2".into())), "a mount with no device number is read by its source");
+        let encrypted = |path: &str| on(path).is_some_and(|device| crypt(&sys, &device));
+        assert!(encrypted("/data/halti-ws") && encrypted("/srv/lvm disk/ws"));
+        assert!(!encrypted("/home/deor/ws") && !encrypted("/var/ws"));
+        assert!(!crypt(&sys, &Device::Number("9:9".into())), "a device /sys doesn't know");
+
+        let wsdir = Path::new("/data/halti-ws/0123");
+        assert_eq!(
+            notes("box acme/dev keeps", wsdir, true, false),
+            [
+                "note: what box acme/dev keeps is not encrypted by halti here. /data/halti-ws/0123 is on a dm-crypt disk. this protects it only if you unlock that disk yourself after each boot"
+            ]
+        );
+        assert_eq!(
+            notes("box acme/dev keeps", wsdir, false, true),
+            [
+                "note: what box acme/dev keeps is not encrypted. anyone with a copy of this server's disk can read it. see the README: an encrypted data disk",
+                "note: this server has swap that is not encrypted. tokens and workspace keys can be written to it"
+            ]
+        );
+        // This machine's own answer has the one line or the other, and names the box.
+        let said = at_rest_notes("box acme/dev keeps", &dir.0);
+        assert!(said[0].starts_with("note: what box acme/dev keeps is not encrypted") && (1..=2).contains(&said.len()), "{said:?}");
+    }
+
+    #[test]
+    fn swap_that_isn_t_encrypted_is_said() {
+        let dir = TempDir::new("halti-swap").unwrap();
+        let sys = sys(&dir.0);
+        fs::create_dir_all(dir.0.join("dev/mapper")).unwrap();
+        symlink(sys.join("class/block/dm-0"), dir.0.join("dev/mapper/swap")).unwrap();
+        let header = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+        assert!(!clear_swap(&sys, header), "none");
+        assert!(!clear_swap(&sys, &format!("{header}/dev/zram0 partition 1024 0 100\n")), "zram is memory");
+        assert!(!clear_swap(&sys, &format!("{header}{} partition 1024 0 -2\n", dir.0.join("dev/mapper/swap").display())));
+        assert!(clear_swap(&sys, &format!("{header}{} partition 1024 0 -2\n", sys.join("class/block/sda2").display())));
+        assert!(clear_swap(&sys, &format!("{header}/nowhere/swapfile file 1024 0 -2\n")), "a file that can't be read counts as clear");
+    }
 
     #[test]
     fn halti_s_folders_are_the_store_s_own() {

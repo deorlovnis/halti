@@ -32,6 +32,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -50,7 +51,7 @@ use crate::keep::{No, Refused};
 use crate::policy::{self, Approval, Mode, Site, Status};
 use crate::source::{self, BoxItem, Hint};
 use crate::util::{config_dir, expand_home, home, store_root};
-use crate::{approve, config, engine, legacy, names, parse_env, parse_resource};
+use crate::{approve, config, engine, legacy, names, parse_env, parse_resource, vmm};
 pub use login::login;
 use store::Layout;
 
@@ -242,6 +243,10 @@ pub enum MountRule {
     /// mounted disks: a rule that allows names them all, where a list that refuses would miss the
     /// next one.
     Workspace(Vec<PathBuf>),
+    /// A workspace's boxes on an engine that is given the box's disk (Linux's): as `Workspace`, and
+    /// no more than that engine can do. It shares no folder, so nothing is mounted read-only, and
+    /// it has no Rosetta, nor Docker yet.
+    WorkspaceDisk(Vec<PathBuf>),
 }
 
 impl MountRule {
@@ -251,13 +256,17 @@ impl MountRule {
         MountRule::Guarded(own_folders(settings))
     }
 
-    /// A workspace's rule, with the same folders of halti's kept out.
+    /// A workspace's rule, with the same folders of halti's kept out, for the engine the settings
+    /// pick.
     pub fn workspace(settings: &Settings) -> MountRule {
-        MountRule::Workspace(own_folders(settings))
+        match vms(settings) {
+            Ok(vms) if vms.takes_disk() => MountRule::WorkspaceDisk(own_folders(settings)),
+            _ => MountRule::Workspace(own_folders(settings)),
+        }
     }
 
     fn in_workspace(&self) -> bool {
-        matches!(self, MountRule::Workspace(_))
+        matches!(self, MountRule::Workspace(_) | MountRule::WorkspaceDisk(_))
     }
 }
 
@@ -269,7 +278,7 @@ fn own_folders(settings: &Settings) -> Vec<PathBuf> {
 pub fn mount_problem_in(path: &Path, rule: &MountRule) -> Option<String> {
     match rule {
         MountRule::Guarded(own) => mount_problem_among(path, own),
-        MountRule::Workspace(own) => outside_plain_home(path, &home()).or_else(|| mount_problem_among(path, own)),
+        MountRule::Workspace(own) | MountRule::WorkspaceDisk(own) => outside_plain_home(path, &home()).or_else(|| mount_problem_among(path, own)),
     }
 }
 
@@ -341,6 +350,13 @@ impl BoxPolicy {
         if let Some(model) = &self.model {
             parse_resource(model).map_err(|e| anyhow!("model '{model}': {e}"))?;
         }
+        let on_disk = matches!(rule, Mounts::Under(MountRule::WorkspaceDisk(_)));
+        if on_disk && self.rosetta {
+            bail!("rosetta is only on a mac");
+        }
+        if on_disk && self.docker {
+            bail!("docker = true: Docker doesn't run in a box on linux yet. set docker = false");
+        }
         let mut seen = BTreeSet::new();
         for site in &self.sites {
             parse_resource(site).map_err(|e| anyhow!("sites: '{site}': {e}"))?;
@@ -387,6 +403,9 @@ impl BoxPolicy {
                 "rw" => bail!("[[mount]] {}: rw isn't available, a box can't change your files; use clone and `halti box export`", m.path),
                 other => bail!("[[mount]] {}: mode '{other}' isn't clone or ro", m.path),
             }
+            if on_disk && m.readonly() {
+                bail!("[[mount]] {}: a box on linux can't mount a folder read-only yet. use mode = \"clone\"", m.path);
+            }
             let host = m.host();
             if !host.is_absolute() || host.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
                 bail!("[[mount]] path '{}' must be absolute or start with ~/, without . or ..", m.path);
@@ -402,7 +421,7 @@ impl BoxPolicy {
                         bail!("[[mount]] path '{}' {why}", m.path);
                     }
                 }
-                Mounts::Under(rule @ MountRule::Workspace(_)) => {
+                Mounts::Under(rule @ (MountRule::Workspace(_) | MountRule::WorkspaceDisk(_))) => {
                     if let Some(why) = mount_problem_in(&host, rule) {
                         bail!("[[mount]] {}: {why}", m.path);
                     }
@@ -550,8 +569,15 @@ fn ask_for(world: &dyn approval::World, settings: &Settings, action: Action, rea
 pub(crate) fn vms(settings: &Settings) -> Result<&'static dyn Vms> {
     match settings.engine {
         Some(Engine::Container) => Ok(&engine::Container),
+        Some(Engine::CloudHypervisor) => Ok(cloud_hypervisor()),
         None => bail!("boxes can't run on this system: halti has no box engine for it"),
     }
+}
+
+/// Cloud Hypervisor, as install-linux.sh installs it: one for the process.
+fn cloud_hypervisor() -> &'static vmm::CloudHypervisor {
+    static ENGINE: OnceLock<vmm::CloudHypervisor> = OnceLock::new();
+    ENGINE.get_or_init(vmm::CloudHypervisor::installed)
 }
 
 /// Where box keys are kept (see `Keys`): the one place a box's store key is read, written and
@@ -1387,7 +1413,7 @@ mod tests {
         assert!(ask_for(&no, &mine, Action::BoxExport, "export it").is_ok());
         assert_eq!(no.calls(), ["touch id: export it", "sudo: delete box research"]);
 
-        // No box runs on Linux: halti says so, and asks nothing.
+        // Today's boxes, kept outside a workspace, don't run on Linux: halti says so, and asks nothing.
         let linux = config::Settings::builtin(Os::Linux);
         let error = ask_for(&fake, &linux, Action::BoxDelete, "delete box research").unwrap_err();
         assert_eq!(error.to_string(), "deleting a box needs an approval this system can't give");
@@ -1399,14 +1425,42 @@ mod tests {
         let mac = config::Settings::builtin(Os::Macos);
         assert!(vms(&mac).is_ok());
         assert_eq!(KeyStore::of(&mac).place(), "in the Keychain");
-        // Nothing here touches the Keychain: there is no place for keys on Linux.
+        assert!(!vms(&mac).unwrap().takes_disk());
+        // Linux's engine is given the box's disk; nothing here touches the Keychain: there is no
+        // place for keys on Linux.
         let linux = config::Settings::builtin(Os::Linux);
-        assert_eq!(vms(&linux).err().map(|e| e.to_string()).as_deref(), Some("boxes can't run on this system: halti has no box engine for it"));
+        assert!(vms(&linux).unwrap().takes_disk());
+        let mut none = linux.clone();
+        none.engine = None;
+        assert_eq!(vms(&none).err().map(|e| e.to_string()).as_deref(), Some("boxes can't run on this system: halti has no box engine for it"));
+        assert!(matches!(MountRule::workspace(&linux), MountRule::WorkspaceDisk(_)));
+        assert!(matches!(MountRule::workspace(&mac), MountRule::Workspace(_)));
+        assert!(matches!(MountRule::workspace(&none), MountRule::Workspace(_)));
         let nowhere = KeyStore::of(&linux);
         assert!(!nowhere.exists("research") && nowhere.get("research").is_none() && !nowhere.delete("research"));
         assert_eq!(nowhere.set("research", "k").unwrap_err().to_string(), "a box's key can't be kept on this system");
         let error = nowhere.open_key("research").unwrap_err().to_string();
         assert_eq!(error, "the key of box research isn't anywhere on this system, so its store can't be opened (halti box rm research)");
+    }
+
+    #[test]
+    fn rosetta_and_read_only_mounts_are_refused_for_this_engine() {
+        let own = vec![config_dir(), store_root()];
+        let (disk, mac) = (MountRule::WorkspaceDisk(own.clone()), MountRule::Workspace(own));
+        let refused = |text: &str| format!("{:#}", BoxPolicy::parse_in(text, &disk).err().unwrap_or_else(|| panic!("accepted: {text}")));
+        assert_eq!(refused("rosetta = true\n"), "rosetta is only on a mac");
+        assert_eq!(refused("docker = true\n"), "docker = true: Docker doesn't run in a box on linux yet. set docker = false");
+        let ro = "[[mount]]\npath = \"~/src\"\nmode = \"ro\"\n";
+        assert_eq!(refused(ro), "[[mount]] ~/src: a box on linux can't mount a folder read-only yet. use mode = \"clone\"");
+        // A Mac's workspace box takes each, and a clone is taken on both.
+        for text in ["rosetta = true\n", "docker = true\n", ro] {
+            BoxPolicy::parse_in(text, &mac).unwrap();
+        }
+        let clone = BoxPolicy::parse_in("[[mount]]\npath = \"~/src\"\n", &disk).unwrap();
+        assert!(!clone.mounts[0].readonly());
+        // The workspace's own rule still holds: a hidden folder is refused there too.
+        assert!(refused("[[mount]]\npath = \"~/.ssh\"\n").contains("a box in a workspace mounts only folders"));
+        assert!(BoxPolicy::parse_in("run = [\"claude\"]\nunknown = 1\n", &disk).is_err());
     }
 
     #[test]

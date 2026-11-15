@@ -24,8 +24,7 @@
 //! command line, not by asking its control socket, so one too busy to answer is still found, kept
 //! from a second start on the same disk, and stopped.
 //!
-//! Nothing names this engine yet: it is reached by its tests only.
-#![allow(dead_code)] // no setting or command picks this engine yet
+//! `[box] engine = "cloud-hypervisor"` picks it, Linux's only engine (`boxes::vms`).
 
 pub mod exec;
 
@@ -69,7 +68,7 @@ const KERNEL: &str = "images/bzImage";
 const IMAGES: &str = "images";
 /// The VM's sockets in its folder: the vsock device, which the door and the exec client dial, and
 /// the VM program's control socket.
-const VSOCK: &str = "vsock.sock";
+const VSOCK: &str = store::VM_VSOCK;
 const API: &str = "api.sock";
 
 /// How long an answer on the vsock device or the control socket may take.
@@ -136,11 +135,21 @@ impl CloudHypervisor {
             program: lib.join(PROGRAM),
             kernel: lib.join(KERNEL),
             images: lib.join(IMAGES),
-            kvm: "/dev/kvm".into(),
+            kvm: kvm_device(),
             sockets: store::sockets(uid).join(names::WS_SOCKETS),
             waits: Waits::REAL,
         }
     }
+}
+
+/// KVM's device. A debug build's tests name another file (`HALTI_TEST_KVM`), so a missing or a
+/// closed device is seen on a machine that has one.
+fn kvm_device() -> PathBuf {
+    #[cfg(halti_dev)]
+    if let Some(path) = crate::util::dev_var("HALTI_TEST_KVM") {
+        return path.into();
+    }
+    PathBuf::from("/dev/kvm")
 }
 
 /// A VM's own files, from its name.
@@ -529,6 +538,12 @@ fn console_tail(console: &Path) -> String {
 
 impl Vms for CloudHypervisor {
     fn available(&self) -> Result<()> {
+        self.ready()
+    }
+
+    /// KVM, and the pinned VM program and kernel, before anything is asked: without them no box
+    /// starts, and a passphrase would be asked for nothing.
+    fn checked_first(&self) -> Result<()> {
         self.ready()
     }
 

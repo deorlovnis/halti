@@ -10,6 +10,12 @@
 //!
 //! Everything outside halti (the approval, the engine, the door) is reached through `World`, so the
 //! sequence can be tested with fakes while the store is real.
+//!
+//! An engine given the box's disk (`World::takes_disk`, Linux's) differs in four places, and the
+//! order is the same: the VM gets the store's disk and no folder; the door dials a port on the VM's
+//! own socket; what halti writes into the box's home, and the folders a policy clones, go through
+//! the box once its VM runs (`pipe`), since the box alone reads its disk; and its VM's console is a
+//! file beside its lock.
 
 use std::any::Any;
 use std::fs;
@@ -83,10 +89,8 @@ pub trait World: Sync {
     fn record_log_head(&self, name: &str, head: &chain::Head) -> Result<()>;
     fn exec(&self, vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus>;
     /// Whether the engine is given the box's disk in place of mounts (`Vms::takes_disk`).
-    #[allow(dead_code)] // no engine of a run takes a disk yet
     fn takes_disk(&self) -> bool;
     /// Run a command in the VM as the agent, bytes in and bytes out (`Vms::pipe`).
-    #[allow(dead_code)] // for an engine that takes a disk
     fn pipe(&self, vm: &str, cmd: &[String], input: &[u8]) -> Result<Vec<u8>>;
 }
 
@@ -299,7 +303,8 @@ pub fn start<'a>(layout: &'a Layout, world: &'a dyn World, req: &'a Request<'a>)
         world,
         req,
         vm: layout.vm(&req.id),
-        socket: layout.socket(&req.id),
+        // An engine that starts its VMs itself is dialed on the VM's own socket.
+        socket: if world.takes_disk() { layout.vm_door_socket(&req.id) } else { layout.socket(&req.id) },
         mnt: layout.mount_point(&req.id),
         log_key: [0; 32],
         env: Vec::new(),
@@ -361,6 +366,7 @@ impl Running<'_> {
             fs::write(layout.bearer(&req.id), if uses_bearer { "1" } else { "0" }).with_context(|| format!("noting how box {} reaches its model", req.shown))?;
         }
 
+        let on_disk = world.takes_disk();
         let mnt = self.mnt.clone();
         let (bundle, key) = if req.persistent {
             (layout.bundle(req.name), world.key(req.name)?)
@@ -378,6 +384,11 @@ impl Running<'_> {
         if !req.persistent {
             store.shred_on_close();
         }
+        // halti's own files of the box: the mounted store on a Mac, the folder beside its disk on
+        // Linux.
+        let mnt = store.path().to_path_buf();
+        self.mnt = mnt.clone();
+        let disk = store.disk().map(Path::to_path_buf);
         self.store = Some(store);
         self.unless_stopped()?;
         let ca = Arc::new(box_ca(&mnt, req.name, &key, req.persistent)?);
@@ -385,20 +396,28 @@ impl Running<'_> {
         self.sealed = Some(Sessions::new(&mnt, &key, true));
         let _ = store::log_event(&mnt, &self.log_key, "box", &req.id, 0, "started");
 
-        // The folders are changed here, while no VM has them.
-        for replaced in prepare_home(&mnt, policy.docker).with_context(|| format!("box {}", req.shown))? {
-            crate::util::warn(&format!("box {}: {} was a link or a special file, so halti replaced it and followed nothing", req.shown, replaced.display()));
-        }
-        let mut mounts = vec![
-            engine::Mount { host: mnt.join("home"), guest: GUEST_HOME.into(), readonly: false },
-            engine::Mount { host: mnt.join("work"), guest: GUEST_WORK.into(), readonly: false },
-            engine::Mount { host: mnt.join("downloads"), guest: GUEST_DOWNLOADS.into(), readonly: false },
-        ];
-        for (mount, host) in &folders {
-            if mount.readonly() {
-                mounts.push(engine::Mount { host: host.clone(), guest: format!("{GUEST_MOUNTS}/{}", mount.name()), readonly: true });
-            } else {
-                clone_into(&mnt.join("work"), &mount.name(), host)?;
+        // The folders are changed here, while no VM has them: on a disk only the box reads, once
+        // its VM runs, through it.
+        let mut mounts = Vec::new();
+        if on_disk {
+            if let Some((mount, _)) = folders.iter().find(|(mount, _)| mount.readonly()) {
+                return Err(anyhow!("[[mount]] {}: a box on linux can't mount a folder read-only yet. use mode = \"clone\"", mount.path).into());
+            }
+        } else {
+            for replaced in prepare_home(&mnt, policy.docker).with_context(|| format!("box {}", req.shown))? {
+                crate::util::warn(&format!("box {}: {} was a link or a special file, so halti replaced it and followed nothing", req.shown, replaced.display()));
+            }
+            mounts = vec![
+                engine::Mount { host: mnt.join("home"), guest: GUEST_HOME.into(), readonly: false },
+                engine::Mount { host: mnt.join("work"), guest: GUEST_WORK.into(), readonly: false },
+                engine::Mount { host: mnt.join("downloads"), guest: GUEST_DOWNLOADS.into(), readonly: false },
+            ];
+            for (mount, host) in &folders {
+                if mount.readonly() {
+                    mounts.push(engine::Mount { host: host.clone(), guest: format!("{GUEST_MOUNTS}/{}", mount.name()), readonly: true });
+                } else {
+                    clone_into(&mnt.join("work"), &mount.name(), host)?;
+                }
             }
         }
 
@@ -431,14 +450,14 @@ impl Running<'_> {
             mounts,
             docker: policy.docker,
             rosetta: policy.rosetta,
-            disk: None,
-            console: None,
+            disk: if on_disk { disk } else { None },
+            console: on_disk.then(|| layout.console(&req.id)),
         };
         let config = door::Config {
             // A workspace's box is named with its workspace, in the door's answers and the audit log.
             name: if layout.in_workspace() { req.shown.clone() } else { req.id.clone() },
             socket,
-            port: None,
+            port: on_disk.then_some(names::DOOR_PORT),
             allow: policy.allow(),
             model: policy.model.clone(),
             sites: policy.sites.clone(),
@@ -455,6 +474,13 @@ impl Running<'_> {
         self.vm_armed = true;
         world.start_vm(&spec)?;
         self.unless_stopped()?;
+        if on_disk {
+            prepare_home_in(world, &vm, policy.docker).with_context(|| format!("box {}", req.shown))?;
+            for (mount, host) in &folders {
+                clone_through(world, &vm, &mount.name(), host)?;
+            }
+            self.unless_stopped()?;
+        }
         self.door = Some(world.start_door(config)?);
         world.install_ca(&vm, &ca.cert_pem())?;
         self.unless_stopped()?;
@@ -713,24 +739,82 @@ fn clone_into(work: &Path, name: &str, host: &Path) -> Result<()> {
 /// or a special file.
 fn prepare_home(mnt: &Path, docker: bool) -> Result<Vec<PathBuf>> {
     let mut replaced = Vec::new();
+    for (file, change) in home_changes(docker) {
+        replaced.extend(merge_json(mnt, &format!("home/{file}"), change)?);
+    }
+    Ok(replaced)
+}
+
+/// A change to a JSON object in a file of the agent's home.
+type Change = fn(&mut Map<String, Value>);
+
+/// The files of the agent's home that halti changes, as `prepare_home` says, and how.
+fn home_changes(docker: bool) -> Vec<(&'static str, Change)> {
+    let mut changes: Vec<(&'static str, Change)> = Vec::new();
     // The Docker CLI hands containers the door's proxy (they can't reach the agent's 127.0.0.1).
     if docker {
-        replaced.extend(merge_json(mnt, "home/.docker/config.json", |o| {
+        changes.push((".docker/config.json", |o| {
             o.insert("proxies".into(), engine::docker_proxies());
-        })?);
+        }));
     }
-    replaced.extend(merge_json(mnt, "home/.claude/settings.json", |o| {
+    changes.push((".claude/settings.json", |o| {
         o.insert("skipWebFetchPreflight".into(), json!(true));
-    })?);
+    }));
     // User-scope MCP servers live in ~/.claude.json.
-    replaced.extend(merge_json(mnt, "home/.claude.json", |o| {
+    changes.push((".claude.json", |o| {
         o.insert("hasCompletedOnboarding".into(), json!(true));
         let servers = o.entry("mcpServers").or_insert_with(|| json!({}));
         if let Some(servers) = servers.as_object_mut() {
             servers.insert(names::MCP_SERVER_KEY.into(), json!({ "type": "stdio", "command": names::SHIM, "args": ["mcp"], "env": {} }));
         }
-    })?);
-    Ok(replaced)
+    }));
+    changes
+}
+
+/// Reads a file of the agent's (`$1`): a plain file only, never what a link points at.
+const READ_FILE: &str = "if [ -f \"$1\" ] && [ ! -L \"$1\" ]; then cat \"$1\"; fi";
+/// Writes a file of the agent's (`$1`) from the input: a new file, then renamed in its place, so a
+/// link there is replaced, not written through.
+const WRITE_FILE: &str = "mkdir -p \"$(dirname \"$1\")\" && rm -rf \"$1.halti-new\" && cat > \"$1.halti-new\" && mv -f \"$1.halti-new\" \"$1\"";
+/// Says `there` if something is at `$1`, a link that leads nowhere too.
+const THERE: &str = "if [ -e \"$1\" ] || [ -L \"$1\" ]; then echo there; fi";
+/// Unpacks a folder from the input as `$1`, which isn't there: into a new folder, then renamed.
+const UNPACK: &str = "rm -rf \"$1.halti-new\" && mkdir \"$1.halti-new\" && tar -x -f - -C \"$1.halti-new\" && mv \"$1.halti-new\" \"$1\"";
+
+/// `sh -c SCRIPT` with `path` as its `$1`, so no path is ever part of a script.
+fn script(script: &str, path: &str) -> Vec<String> {
+    ["sh", "-c", script, "sh", path].map(String::from).to_vec()
+}
+
+/// `prepare_home`, for a box whose home is on a disk only the box reads, once its VM runs: each file
+/// read through the box as the agent, changed here, and written back the same way. What the box
+/// sends is taken only as a JSON object; anything else is made anew, as on a Mac.
+fn prepare_home_in(world: &dyn World, vm: &str, docker: bool) -> Result<()> {
+    for (file, change) in home_changes(docker) {
+        let path = format!("{GUEST_HOME}/{file}");
+        let found = world.pipe(vm, &script(READ_FILE, &path), b"").with_context(|| format!("reading {path}"))?;
+        let mut value = serde_json::from_slice::<Value>(&found).ok().filter(Value::is_object).unwrap_or_else(|| json!({}));
+        change(value.as_object_mut().expect("an object"));
+        let text = serde_json::to_string_pretty(&value)? + "\n";
+        world.pipe(vm, &script(WRITE_FILE, &path), text.as_bytes()).with_context(|| format!("writing {path}"))?;
+    }
+    Ok(())
+}
+
+/// `clone_into`, for a box whose work is on a disk only the box reads: the folder is sent once,
+/// as a tar stream the box unpacks as the agent into work/<name>. Later runs keep the agent's own
+/// copy, a link in its place too.
+fn clone_through(world: &dyn World, vm: &str, name: &str, host: &Path) -> Result<()> {
+    let dst = format!("{GUEST_WORK}/{name}");
+    if world.pipe(vm, &script(THERE, &dst), b"")? == b"there\n" {
+        return Ok(());
+    }
+    let (tar, skipped) = store::tar_tree(host).with_context(|| format!("copying {} into the box", host.display()))?;
+    world.pipe(vm, &script(UNPACK, &dst), &tar).with_context(|| format!("copying {} into the box", host.display()))?;
+    if skipped > 0 {
+        crate::util::warn(&format!("{skipped} links and special files in {} weren't copied", host.display()));
+    }
+    Ok(())
 }
 
 /// Changes the JSON object in the file `rel` of the store `mnt`; one that isn't there, isn't a plain
@@ -846,6 +930,10 @@ mod tests {
         stopped: bool,
         /// The VMs stopped, by name.
         stopped_vms: Vec<String>,
+        /// The disk and the console the VM was given.
+        disk: Option<(Option<PathBuf>, Option<PathBuf>)>,
+        /// The socket and the port the door dials.
+        dialed: Option<(PathBuf, Option<u32>)>,
     }
 
     /// Records what a run does; `exec` can change files the way the agent would.
@@ -874,6 +962,9 @@ mod tests {
         hook: Option<Hook>,
         browser_hook: Option<BrowserHook>,
         recording: Option<Check>,
+        /// An engine given the box's disk: what the box keeps on it is in this folder, which
+        /// `pipe` runs its commands against.
+        disk: Option<PathBuf>,
     }
 
     impl Fake {
@@ -910,7 +1001,10 @@ mod tests {
         fn start_vm(&self, spec: &engine::VmSpec) -> Result<()> {
             self.note("start_vm");
             let mounts = spec.mounts.iter().map(|m| (m.host.clone(), m.guest.clone(), m.readonly)).collect();
-            self.seen.lock().unwrap().spec = Some((spec.name.clone(), spec.image.clone(), spec.cpus, spec.memory.clone(), spec.socket.clone(), mounts, spec.docker));
+            let mut seen = self.seen.lock().unwrap();
+            seen.spec = Some((spec.name.clone(), spec.image.clone(), spec.cpus, spec.memory.clone(), spec.socket.clone(), mounts, spec.docker));
+            seen.disk = Some((spec.disk.clone(), spec.console.clone()));
+            drop(seen);
             *self.running.lock().unwrap() = true;
             Ok(())
         }
@@ -931,6 +1025,7 @@ mod tests {
             let mut seen = self.seen.lock().unwrap();
             seen.door_ca = cfg.ca.as_ref().map(|ca| ca.cert_pem());
             seen.net = Some((cfg.net.writes, cfg.net.allow_writes, cfg.log_key, cfg.net.ask));
+            seen.dialed = Some((cfg.socket.clone(), cfg.port));
             seen.door = Some((cfg.allow, cfg.model, cfg.sites, cfg.log));
             seen.browser = cfg.browser;
             Ok(Box::new(()))
@@ -1028,12 +1123,34 @@ mod tests {
         }
 
         fn takes_disk(&self) -> bool {
-            false
+            self.disk.is_some()
         }
 
-        fn pipe(&self, _vm: &str, _cmd: &[String], _input: &[u8]) -> Result<Vec<u8>> {
-            self.note("pipe");
-            Ok(Vec::new())
+        /// Runs the command here, as `sh` does in the box, with the guest path it is given found in
+        /// the box's folder.
+        fn pipe(&self, _vm: &str, cmd: &[String], input: &[u8]) -> Result<Vec<u8>> {
+            use std::process::{Command, Stdio};
+            let root = self.disk.as_ref().expect("a box given its disk");
+            let kind =
+                [(READ_FILE, "read"), (WRITE_FILE, "write"), (THERE, "there"), (UNPACK, "unpack")].iter().find(|(text, _)| *text == cmd[2]).map_or("other", |(_, kind)| kind);
+            self.note(format!("pipe: {kind} {}", cmd[4]));
+            assert_eq!((&cmd[..2], cmd[3].as_str()), (&["sh".to_string(), "-c".to_string()][..], "sh"));
+            let mut child = Command::new("sh")
+                .args(["-c", &cmd[2], "sh"])
+                .arg(root.join(cmd[4].trim_start_matches('/')))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let mut stdin = child.stdin.take().unwrap();
+            let input = input.to_vec();
+            let writer = thread::spawn(move || stdin.write_all(&input));
+            let out = child.wait_with_output()?;
+            writer.join().unwrap()?;
+            if !out.status.success() {
+                bail!("{kind}: {}", String::from_utf8_lossy(&out.stderr));
+            }
+            Ok(out.stdout)
         }
     }
 
@@ -1963,6 +2080,132 @@ mod tests {
         run(&s.layout, &fake, &request(&s, &p, false)).unwrap();
         assert!(fake.calls().contains(&"exec".to_string()));
         assert!(!s.layout.bearer("r").exists());
+    }
+
+    /// A box's folders on its disk, as the box's shim makes them, and a policy that clones `proj`.
+    fn on_disk(s: &Setup) -> (PathBuf, BoxPolicy) {
+        let root = s.dir.0.join("in-the-box");
+        for folder in ["home/agent", "work", "downloads"] {
+            fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let proj = s.dir.0.join("proj");
+        fs::create_dir_all(proj.join("sub")).unwrap();
+        fs::write(proj.join("README"), "original").unwrap();
+        fs::write(proj.join("sub/run.sh"), "#!/bin/sh").unwrap();
+        let policy = format!("image = \"{DIGEST}\"\nmodel = \"anthropic\"\nsites = [\"github\"]\n[[mount]]\npath = \"{}\"\n", proj.display());
+        (root, BoxPolicy::parse(&policy).unwrap())
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "a Linux store")]
+    fn a_disk_engine_gets_no_mounts() {
+        let s = setup();
+        let (root, p) = on_disk(&s);
+        let fake = Fake { disk: Some(root), ..Fake::default() };
+        assert_eq!(run(&s.layout, &fake, &request(&s, &p, false)).unwrap(), 0);
+        let seen = fake.seen.lock().unwrap();
+        let (name, _, _, _, socket, mounts, _) = seen.spec.clone().unwrap();
+        assert_eq!(name, "halti-box-r");
+        assert!(mounts.is_empty(), "no folder of this machine: {mounts:?}");
+        // The VM gets the store's disk, and its console beside the box's lock.
+        assert_eq!(seen.disk, Some((Some(s.layout.ephemeral_bundle("r")), Some(s.layout.open_dir().join("r.console")))));
+        // The door dials the VM's own socket, on the door's port.
+        assert_eq!(socket, s.layout.vm_sockets("r").join("vsock.sock"));
+        assert_eq!(seen.dialed, Some((socket, Some(names::DOOR_PORT))));
+        // halti's own files are beside the disk, which nothing here mounts.
+        let (_, _, _, log) = seen.door.clone().unwrap();
+        assert_eq!(log, s.layout.root.join("temp/r.d/log/door.log"));
+        assert!(!store::is_mounted(&s.layout.mount_point("r")));
+        drop(seen);
+        assert_put_away(&s);
+        assert!(!s.layout.root.join("temp/r.d").exists(), "a box that isn't kept leaves neither");
+
+        // A read-only mount can't be given: refused before anything starts.
+        let ro = BoxPolicy::parse(&format!("image = \"{DIGEST}\"\n[[mount]]\npath = \"{}\"\nmode = \"ro\"\n", s.dir.0.join("proj").display())).unwrap();
+        let fake = Fake { disk: Some(s.dir.0.join("in-the-box")), ..Fake::default() };
+        let error = format!("{:#}", run(&s.layout, &fake, &request(&s, &ro, false)).unwrap_err());
+        assert!(error.contains("a box on linux can't mount a folder read-only yet"), "{error}");
+        assert!(!fake.calls().iter().any(|call| call == "start_vm"), "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn the_engine_is_asked_before_the_passphrase() {
+        let s = setup();
+        let (root, p) = on_disk(&s);
+        // No KVM: nothing is asked, opened or started.
+        let fake = Fake { disk: Some(root), unavailable: true, ..Fake::default() };
+        let req = request(&s, &p, false);
+        let Err(refused) = start(&s.layout, &fake, &req) else { panic!("there is no engine") };
+        assert_eq!(refused.no, No::Engine);
+        assert_eq!(fake.calls(), ["available"]);
+        assert_put_away(&s);
+        assert!(!s.layout.root.join("temp/r.d").exists());
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "a Linux store")]
+    fn the_home_is_prepared_through_the_box_after_it_starts() {
+        let s = setup();
+        let (root, p) = on_disk(&s);
+        let home = root.join("home/agent");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(home.join(".claude/settings.json"), r#"{"theme":"dark","skipWebFetchPreflight":false}"#).unwrap();
+        // A link the agent left, to a file outside its home: replaced, not followed.
+        fs::write(s.dir.0.join("outside.json"), r#"{"theirs":1}"#).unwrap();
+        std::os::unix::fs::symlink(s.dir.0.join("outside.json"), home.join(".claude.json")).unwrap();
+        let fake = Fake { disk: Some(root.clone()), settles: true, ..Fake::default() };
+        run(&s.layout, &fake, &request(&s, &p, false)).unwrap();
+        let calls = fake.calls();
+        let at = |call: &str| calls.iter().position(|c| c == call).unwrap_or_else(|| panic!("{call}: {calls:?}"));
+        assert!(at("start_vm") < at("pipe: read /home/agent/.claude/settings.json") && at("pipe: write /home/agent/.claude.json") < at("start_door"), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains(".docker")), "no Docker settings without docker = true");
+
+        let settings: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude/settings.json")).unwrap()).unwrap();
+        assert_eq!((settings["theme"].clone(), settings["skipWebFetchPreflight"].clone()), (json!("dark"), json!(true)), "merged, not replaced");
+        assert!(!fs::symlink_metadata(home.join(".claude.json")).unwrap().file_type().is_symlink());
+        let claude: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(claude["mcpServers"][names::MCP_SERVER_KEY]["command"], json!(names::SHIM));
+        assert_eq!(claude["theirs"], Value::Null, "what the link led to wasn't read");
+        assert_eq!(fs::read_to_string(s.dir.0.join("outside.json")).unwrap(), r#"{"theirs":1}"#);
+
+        // What the agent wrote there since is kept at the next start; what isn't JSON is made anew.
+        let mut kept = claude.clone();
+        kept["projects"] = json!({"/work/proj": {}});
+        fs::write(home.join(".claude.json"), kept.to_string()).unwrap();
+        fs::write(home.join(".claude/settings.json"), "not json").unwrap();
+        run(&s.layout, &Fake { disk: Some(root), ..Fake::default() }, &request(&s, &p, false)).unwrap();
+        let claude: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(claude["projects"], json!({"/work/proj": {}}));
+        let settings: Value = serde_json::from_str(&fs::read_to_string(home.join(".claude/settings.json")).unwrap()).unwrap();
+        assert_eq!(settings, json!({"skipWebFetchPreflight": true}));
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "a Linux store")]
+    fn a_clone_is_sent_once() {
+        let s = setup();
+        let (root, p) = on_disk(&s);
+        let first = Fake { disk: Some(root.clone()), ..Fake::default() };
+        run(&s.layout, &first, &request(&s, &p, false)).unwrap();
+        assert!(first.calls().contains(&"pipe: unpack /work/proj".to_string()), "{:?}", first.calls());
+        let work = root.join("work/proj");
+        assert_eq!(fs::read_to_string(work.join("README")).unwrap(), "original");
+        assert_eq!(fs::read_to_string(work.join("sub/run.sh")).unwrap(), "#!/bin/sh");
+        assert!(!root.join("work/proj.halti-new").exists());
+
+        // The agent's own copy stays; the source's change isn't sent again.
+        fs::write(work.join("README"), "agent's edit").unwrap();
+        fs::write(s.dir.0.join("proj/README"), "changed here").unwrap();
+        let second = Fake { disk: Some(root.clone()), ..Fake::default() };
+        run(&s.layout, &second, &request(&s, &p, false)).unwrap();
+        assert!(second.calls().contains(&"pipe: there /work/proj".to_string()) && !second.calls().iter().any(|c| c.starts_with("pipe: unpack")), "{:?}", second.calls());
+        assert_eq!(fs::read_to_string(work.join("README")).unwrap(), "agent's edit");
+        // Nor through a link the agent put in its place.
+        fs::remove_dir_all(&work).unwrap();
+        std::os::unix::fs::symlink(s.dir.0.join("gone"), &work).unwrap();
+        let third = Fake { disk: Some(root), ..Fake::default() };
+        run(&s.layout, &third, &request(&s, &p, false)).unwrap();
+        assert!(!third.calls().iter().any(|c| c.starts_with("pipe: unpack")) && !s.dir.0.join("gone").exists());
     }
 
     #[test]

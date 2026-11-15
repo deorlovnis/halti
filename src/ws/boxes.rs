@@ -132,6 +132,7 @@ pub fn new(target_text: &str, type_it: bool) -> Result<()> {
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
     let vms = boxes::vms(&settings)?;
+    vms.checked_first()?;
     let here = Here::at(&settings.workspaces.path);
     let found = find(&here, &name, box_name)?;
     let rule = MountRule::workspace(&settings);
@@ -202,6 +203,10 @@ fn make_with(
         });
     }
     let mut said = Said::default();
+    // Where halti doesn't encrypt a store, what protects it is said.
+    if keep && let Some(wsdir) = found.layout.root.parent() {
+        said.out.extend(boxes::store::at_rest_notes(&format!("box {shown} keeps"), wsdir));
+    }
     said.out.push(match keep {
         true => format!("made box {shown}. run it with: halti ws run {shown}"),
         false => format!("made box {shown}. it keeps nothing between runs. run it with: halti ws run {shown}"),
@@ -327,7 +332,11 @@ fn listing(here: &Here, name: &WsName, rule: &MountRule) -> Result<Said> {
         let bundle = layout.bundle(box_name);
         let state = match (boxes::store::is_held(&layout.lock(box_name)), bundle.exists(), parsed.as_ref().is_some_and(|parsed| !parsed.keep)) {
             (true, _, _) => "open",
+            // A store halti doesn't encrypt isn't locked when its box stops.
+            (false, true, _) if !boxes::store::ENCRYPTED => "stopped",
             (false, true, _) => "locked",
+            // A Mac's store, in a workspaces folder copied here: it can't be opened on Linux.
+            (false, false, _) if cfg!(target_os = "linux") && macs_store(&folder, box_name) => "mac store",
             (false, false, true) => "shredded",
             (false, false, false) => "no store",
         };
@@ -341,6 +350,11 @@ fn listing(here: &Here, name: &WsName, rule: &MountRule) -> Result<Said> {
         out.push(format!("{box_name:<20} {state:<9} {size:>9}  {used:<17} {sites:<24} {sessions:<16} {about}").trim_end().to_string());
     }
     Ok(Said { out, notes: Vec::new() })
+}
+
+/// Whether `folder` holds box `box_name`'s store as a Mac makes it.
+fn macs_store(folder: &Path, box_name: &str) -> bool {
+    names::STORES.iter().filter(|end| **end != names::STORE).any(|end| folder.join(format!("{box_name}{end}")).exists())
 }
 
 /// `halti ws box rm WS/BOX [--type]`: with the box stopped, one approval as `[workspace.approval] rm`
@@ -380,6 +394,10 @@ fn rm_with(here: &Here, found: &Found, vms: Option<&dyn Vms>, way: &Way<'_>, typ
     }
     boxes::store::shred(&bundle)?;
     boxes::run::sweep(&found.layout, box_name)?;
+    let console = found.layout.console(box_name);
+    for file in [console.clone(), console.with_extension("console.log")] {
+        let _ = fs::remove_file(file);
+    }
     if found.files.forget_approved(box_name).is_err() {
         said.notes.push(format!("the approved copy of box {shown} couldn't be removed. remove {}", found.files.copy_path(box_name).display()));
     }
@@ -391,10 +409,13 @@ fn rm_with(here: &Here, found: &Found, vms: Option<&dyn Vms>, way: &Way<'_>, typ
     if has_file {
         said.out.push(format!("kept its policy {} (halti ws box new {shown} makes a fresh box from it)", found.files.path(box_name).display()));
     }
-    said.out.push(format!(
-        "Time Machine may still hold encrypted copies of the store. They stay closed unless restored together with {}'s files from before this, and opened with its passphrase.",
-        found.name
-    ));
+    said.out.push(match boxes::store::ENCRYPTED {
+        true => format!(
+            "Time Machine may still hold encrypted copies of the store. They stay closed unless restored together with {}'s files from before this, and opened with its passphrase.",
+            found.name
+        ),
+        false => "A snapshot or a backup of this server's disk may still hold the box's disk, which isn't encrypted.".to_string(),
+    });
     Ok(said)
 }
 
@@ -418,6 +439,7 @@ pub fn run(target_text: &str, command: Vec<String>, type_it: bool) -> Result<Run
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
     let vms = boxes::vms(&settings)?;
+    vms.checked_first()?;
     memory::harden();
     let here = Here::at(&settings.workspaces.path);
     let found = find(&here, &name, box_name)?;
@@ -502,6 +524,7 @@ pub fn stop(target_text: &str) -> Result<()> {
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
     let vms = boxes::vms(&settings)?;
+    vms.checked_first()?;
     let here = Here::at(&settings.workspaces.path);
     let found = find(&here, &name, box_name)?;
     let kept = Kept::of(&here, found.id)?;
@@ -579,7 +602,9 @@ fn put_away_lost(layout: &Layout, box_name: &str, shown: &str, vms: &dyn Vms) ->
 
 /// `halti ws box log WS/BOX [-n N] [--type]`: the last lines of what went through the box's door. A
 /// box that runs is read as it is, asking nothing; otherwise the workspace is opened, as `open`
-/// says, for the store's key, and the store is opened read-only while it is read.
+/// says, for the store's key, and the store is opened read-only while it is read. A store halti
+/// doesn't encrypt (Linux's) keeps its log in a plain file, read as it is and asking nothing,
+/// running or not: a question there would look like a protection that isn't there.
 pub fn log(target_text: &str, last: usize, type_it: bool) -> Result<()> {
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
@@ -607,6 +632,9 @@ fn log_with(here: &Here, found: &Found, way: &Way<'_>, typing: &dyn Fn() -> TtyP
     found.layout.prepare()?;
     let mnt = found.layout.mount_point(box_name);
     let read = |mnt: &Path| fs::read_to_string(boxes::store::door_log(mnt)).unwrap_or_default();
+    if !boxes::store::ENCRYPTED {
+        return Ok(read(boxes::store::open(&bundle, &mnt, "", true)?.path()));
+    }
     let Some(_held) = boxes::store::lock(&found.layout.lock(box_name))? else {
         if !boxes::store::is_mounted(&mnt) {
             bail!("box {shown} is being opened or closed by another halti: try again in a moment");
@@ -763,6 +791,17 @@ pub fn stop_others(layout: &Layout, vms: &dyn Vms) -> (Vec<String>, Vec<String>)
         if let_go { stopped.push(name) } else { held.push(name) }
     }
     (stopped, held)
+}
+
+/// The notes of `halti open` about how what the workspace `name` (id `id`) keeps in its boxes'
+/// stores is kept at rest, where halti doesn't encrypt them: none if it has no store.
+pub(super) fn at_rest(here: &Here, name: &WsName, id: WsId) -> Vec<String> {
+    let folder = boxes_dir(&here.root, id);
+    let kept = stores_in(&folder).unwrap_or_default().iter().any(|store| folder.join(format!("{store}{}", names::STORE)).exists());
+    if !kept {
+        return Vec::new();
+    }
+    boxes::store::at_rest_notes(&format!("{name}'s boxes keep"), &here.root.join(id.to_string()))
 }
 
 /// An open workspace as other commands find it, by the id its record names: the lock that
@@ -997,6 +1036,40 @@ mod tests {
         fs::remove_file(&scratch).unwrap();
         assert_eq!(delete().unwrap().out, ["deleted workspace acme"]);
         assert!(!here.root.join(found.id.to_string()).exists() && here.id_of(&acme).is_none());
+    }
+
+    /// On Linux a box's log is a plain file beside its disk: read as it is, running or not, and
+    /// nothing is asked. Removing the box says what halti can't take back.
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "needs mkfs.ext4")]
+    fn ws_box_log_asks_nothing_on_a_disk_store() {
+        let dir = TempDir::new("halti-ws-disk-log").unwrap();
+        let here = Here::at(&dir.0.join("ws"));
+        let acme = WsName::parse("acme").unwrap();
+        let copies = OneCopy(Cell::new(None));
+        new_with(&here, &acme, &TtyPassphrase::new(false).answering(ACME).saving(), &copies).unwrap();
+        let found = find(&here, &acme, "dev").unwrap();
+        let world = Fake::answering(true, true);
+        let way = Way { world: &world, copies: &copies, means: Some(Means::TouchId), detail: None };
+        let said = make_with(&here, &found, b"run = [\"claude\"]\nkeep = true\n", None, true, &way, &not_typed, &boxes::store::create).unwrap();
+        // The note says what protects the store, before the line that it was made.
+        assert!(said.out[0].starts_with("note: what box acme/dev keeps is not encrypted"), "{:?}", said.out);
+        assert_eq!(said.out.last().unwrap(), "made box acme/dev. run it with: halti ws run acme/dev");
+        world.calls();
+
+        let log = found.layout.root.join("dev.d/log/door.log");
+        assert_eq!(log_with(&here, &found, &way, &|| panic!("nothing is typed")).unwrap(), "");
+        fs::write(&log, "{\"host\":\"example.com\"}\n").unwrap();
+        assert_eq!(log_with(&here, &found, &way, &|| panic!("nothing is typed")).unwrap(), "{\"host\":\"example.com\"}\n");
+        // A box that runs holds its lock: read the same way.
+        let held = boxes::store::lock(&found.layout.lock("dev")).unwrap().unwrap();
+        assert_eq!(log_with(&here, &found, &way, &|| panic!("nothing is typed")).unwrap(), "{\"host\":\"example.com\"}\n");
+        drop(held);
+        assert!(world.calls().is_empty(), "nothing is asked");
+
+        let said = rm_with(&here, &found, None, &way, &not_typed).unwrap();
+        assert_eq!(said.out.last().unwrap(), "A snapshot or a backup of this server's disk may still hold the box's disk, which isn't encrypted.");
+        assert_eq!(log_with(&here, &found, &way, &|| panic!("nothing is typed")).unwrap_err().to_string(), "box acme/dev has no store. make one with: halti ws box new acme/dev");
     }
 
     #[test]

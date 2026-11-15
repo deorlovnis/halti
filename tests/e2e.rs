@@ -70,6 +70,8 @@ impl Env {
             .env("HALTI_BOX_DIR", self.dir.join("box"))
             .env("HALTI_TEST_KEYCHAIN", self.dir.join("keychain"))
             .env("HALTI_TEST_APPROVE", "yes")
+            // No KVM, whatever this machine has: a box on Linux is refused before anything starts.
+            .env("HALTI_TEST_KVM", self.dir.join("no-kvm"))
             .env_remove("HALTI_REFRESHING")
             .env_remove(format!("{}REFRESHING", legacy::ENV_PREFIX))
             .current_dir(&self.dir)
@@ -1487,19 +1489,18 @@ fn a_killed_keeper_is_cleaned_up_by_the_next_open() {
     fs::write(boxes.join("policies/dev.toml"), box_text(false)).unwrap();
     fs::write(boxes.join("open/dev.lock"), "").unwrap();
     fs::create_dir_all(boxes.join(format!("temp/dev{}", names::STORE))).unwrap();
-    // Not open: a ping nobody answers lists it closed, and close puts away what was left, where
-    // there is an engine to stop its VMs.
+    // Not open: a ping nobody answers lists it closed, and close puts away what was left.
     let listed = stdout(&ws(&env, PASSPHRASE, &["ws", "ls"]));
     assert!(listed.lines().any(|line| line.starts_with("acme ") && line.contains(" closed ")), "{listed}");
     let (path, _calls) = env.fake_engine();
     let closed = env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["close", "acme"]).output().unwrap();
-    let left = if cfg!(target_os = "macos") { "acme isn't open. put away what its last open left: dev\n" } else { "acme isn't open\n" };
+    let left = "acme isn't open. put away what its last open left: dev\n";
     assert!(closed.status.success() && stdout(&closed) == left, "{}{}", stdout(&closed), stderr(&closed));
-    assert_eq!(boxes.join(format!("temp/dev{}", names::STORE)).exists(), cfg!(not(target_os = "macos")));
+    assert!(!boxes.join(format!("temp/dev{}", names::STORE)).exists());
     // The next open takes the socket's place, and says what it put away.
     fs::create_dir_all(boxes.join(format!("temp/dev{}", names::STORE))).unwrap();
     let opened = open_then_close(&env, env.ws_box_command(PASSPHRASE, "true").env("PATH", &path).args(["open", "acme"]), "acme");
-    let put_away = if cfg!(target_os = "macos") { "put away what the last open of acme left: dev\n" } else { "" };
+    let put_away = "put away what the last open of acme left: dev\n";
     assert!(opened.status.success() && stdout(&opened) == format!("{put_away}{}closed acme\n", is_open("acme")), "{}{}", stdout(&opened), stderr(&opened));
 }
 
@@ -1517,13 +1518,12 @@ fn a_start_through_the_socket_says_why_it_was_refused() {
     let socket = keeper_socket(&env, "acme");
     let start = |line: &str| talk(&socket, line).unwrap_or_default();
     // Asked nothing, it starts the box as `ws run` would, and says only the kind of refusal: here
-    // the model, which acme has no policy for. Where there is no engine, it says that.
-    let refused = if cfg!(target_os = "macos") { "halti-keep/1 no site anthropic\n" } else { "halti-keep/1 no engine\n" };
+    // the model, which acme has no policy for. On Linux, where no box was made without KVM, that
+    // there is no box.
+    let refused = if cfg!(target_os = "macos") { "halti-keep/1 no site anthropic\n" } else { "halti-keep/1 no box\n" };
     assert_eq!(start("halti-keep/1 start acme dev\n"), refused);
     // A box it hasn't, another workspace's name and another version say so, and do nothing.
-    if cfg!(target_os = "macos") {
-        assert_eq!(start("halti-keep/1 start acme web\n"), "halti-keep/1 no box\n");
-    }
+    assert_eq!(start("halti-keep/1 start acme web\n"), "halti-keep/1 no box\n");
     assert_eq!(start("halti-keep/1 start globex dev\n"), "halti-keep/1 other\n");
     assert_eq!(start("halti-keep/2 start acme dev\n"), "halti-keep/1 unsupported\n");
     assert_eq!(start("halti-keep/1 ping acme\n"), "halti-keep/1 open 0\n");
@@ -1540,7 +1540,7 @@ fn a_start_through_the_socket_says_why_it_was_refused() {
     let why = if cfg!(target_os = "macos") {
         "halti: box acme/dev was not started: box acme/dev uses anthropic: anthropic has no policy in acme. write one with: halti ws policy edit acme/anthropic\n"
     } else {
-        "halti: box acme/dev was not started: boxes can't run on this system: halti has no box engine for it\n"
+        "halti: box acme/dev was not started: there is no box acme/dev. make one with: halti ws box new acme/dev\n"
     };
     assert!(stderr(&opened).contains(why), "{}", stderr(&opened));
     assert_eq!(asked(&opened), 1);
@@ -1568,7 +1568,7 @@ fn a_held_lock_nobody_answers_at_is_being_opened_and_listed_closed() {
     let closed = env.ws_box(PASSPHRASE, "true", &["close", "acme"]);
     assert!(!closed.status.success() && asked(&closed) == 0, "{}", stderr(&closed));
     assert_eq!(stderr(&closed), "halti: acme is being opened or closed: try again in a moment\n");
-    // A run and a stop never fall back to asking. Where there is no engine, they stop before that.
+    // A run and a stop never fall back to asking. Where boxes can't run, they stop before that.
     for args in [["ws", "run", "acme/dev"], ["ws", "stop", "acme/dev"]] {
         let out = env.ws_box(PASSPHRASE, "true", &args);
         assert!(!out.status.success() && asked(&out) == 0, "{args:?}: {}", stderr(&out));
@@ -1632,7 +1632,7 @@ fn run_elsewhere(env: &Env, name: &str, box_name: &str, vms: &Path) -> thread::J
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "only a Mac has a box engine")]
+#[cfg_attr(not(target_os = "macos"), ignore = "the stand-in engine is Apple's tool")]
 fn close_stops_the_boxes_other_terminals_run_and_counts_them() {
     let env = Env::new();
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
@@ -1656,7 +1656,7 @@ fn close_stops_the_boxes_other_terminals_run_and_counts_them() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "only a Mac has a box engine")]
+#[cfg_attr(not(target_os = "macos"), ignore = "the stand-in engine is Apple's tool")]
 fn a_box_another_terminal_runs_that_holds_on_leaves_the_workspace_not_closed() {
     let env = Env::new();
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
@@ -1678,7 +1678,7 @@ fn a_box_another_terminal_runs_that_holds_on_leaves_the_workspace_not_closed() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "only a Mac has a box engine")]
+#[cfg_attr(not(target_os = "macos"), ignore = "the stand-in engine is Apple's tool")]
 fn files_that_went_back_while_open_are_said_once_where_it_is_open() {
     let env = Env::new();
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
@@ -1725,7 +1725,7 @@ fn answer_once(socket: &Path, answer: &str) -> thread::JoinHandle<(String, UnixS
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "only a Mac has a box engine")]
+#[cfg_attr(not(target_os = "macos"), ignore = "the stand-in engine is Apple's tool")]
 fn a_run_and_a_stop_of_an_open_workspace_say_each_answer_in_their_own_words() {
     let env = Env::new();
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
@@ -1803,7 +1803,7 @@ fn a_run_and_a_stop_of_an_open_workspace_say_each_answer_in_their_own_words() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "only a Mac has a box engine")]
+#[cfg_attr(not(target_os = "macos"), ignore = "the stand-in engine is Apple's tool")]
 fn a_run_of_an_open_workspace_holds_its_session_and_stops_its_box_once_it_is_gone() {
     let env = Env::new();
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
@@ -2775,7 +2775,7 @@ fn approved_copy(env: &Env) -> PathBuf {
     env.dir.join("home").join(DEV_CONFIG_DIR).join("approved").join(format!("{uid}.toml"))
 }
 
-/// The box sections of a Mac's template. No box runs on Linux, so its template has none.
+/// The box sections of a Mac's template.
 const BOX_SECTIONS: &str = "\n[box]\nengine = \"container\"          # container\nkeys   = \"keychain\"           # where a box's key is kept: keychain\n\n\
                             [box.approval]\nrun    = \"touchid\"            # opening a box: touchid | sudo | none\n\
                             policy = \"touchid\"            # approving a changed box policy: touchid | sudo | none\n\
@@ -2783,9 +2783,14 @@ const BOX_SECTIONS: &str = "\n[box]\nengine = \"container\"          # container
                             export = \"touchid\"            # copying files out of a box: touchid | sudo | none\n\
                             delete = \"touchid\"            # deleting a box: touchid | sudo | none\n";
 
+/// Linux's box section: its one engine. A workspace's box keeps its key in the workspace, and no
+/// `[box.approval]` line has a means there.
+const LINUX_BOX: &str = "\n[box]\nengine = \"cloud-hypervisor\"   # cloud-hypervisor\n";
+
 /// The template a debug build has on this system.
 fn template() -> String {
-    let (default, config, boxes) = if cfg!(target_os = "macos") { ("sudo | touchid | passphrase", "sudo | touchid", BOX_SECTIONS) } else { ("sudo | passphrase", "sudo", "") };
+    let (default, config, boxes) =
+        if cfg!(target_os = "macos") { ("sudo | touchid | passphrase", "sudo | touchid", BOX_SECTIONS) } else { ("sudo | passphrase", "sudo", LINUX_BOX) };
     let (managers, ws, set) =
         if cfg!(target_os = "macos") { ("none | keychain", "passphrase | sudo | touchid | none", "passphrase | sudo | touchid") } else { ("none", "passphrase", "passphrase") };
     format!(
@@ -2827,7 +2832,8 @@ fn config_shows_the_template_and_what_is_in_effect() {
     let last = if cfg!(target_os = "macos") {
         "\n[box.approval]\nrun    = \"touchid\"\npolicy = \"touchid\"\nwrite  = \"touchid\"\nexport = \"touchid\"\ndelete = \"touchid\"\n"
     } else {
-        "\n[workspace.approval]\nopen   = \"passphrase\"\nset    = \"passphrase\"\nrm     = \"passphrase\"\npolicy = \"passphrase\"\ndelete = \"passphrase\"\n"
+        "\n[workspace.approval]\nopen   = \"passphrase\"\nset    = \"passphrase\"\nrm     = \"passphrase\"\npolicy = \"passphrase\"\ndelete = \"passphrase\"\n\n\
+         [box]\nengine = \"cloud-hypervisor\"\n"
     };
     assert!(stdout(&shown).ends_with(last), "{}", stdout(&shown));
     assert!(!config_file(&env).exists() && !approved_copy(&env).exists(), "showing writes nothing");
@@ -3338,14 +3344,30 @@ fn wsdir(env: &Env, name: &str) -> PathBuf {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "a Mac has a box engine")]
-fn ws_box_needs_a_box_engine() {
+#[cfg_attr(not(target_os = "linux"), ignore = "KVM is Linux's")]
+fn ws_box_needs_kvm() {
     let env = Env::new();
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
-    let refused = "halti: boxes can't run on this system: halti has no box engine for it\n";
-    for args in [&["ws", "box", "new", "acme/dev"][..], &["ws", "run", "acme/dev"], &["ws", "stop", "acme/dev"]] {
+    let boxes = [&["ws", "box", "new", "acme/dev"][..], &["ws", "run", "acme/dev"], &["ws", "stop", "acme/dev"]];
+    // No KVM: each is refused before anything is asked or made.
+    let refused = format!("halti: boxes can't run on this server: it has no {}\n", env.dir.join("no-kvm").display());
+    for args in boxes {
         let out = env.ws_box(PASSPHRASE, "true", args);
         assert!(!out.status.success() && stderr(&out) == refused && asked(&out) == 0, "{args:?}: {}", stderr(&out));
+    }
+    assert!(!wsdir(&env, "acme").join("boxes").exists(), "nothing was made");
+    // KVM this user may not use: the same, with what to do.
+    let closed = env.dir.join("kvm");
+    fs::write(&closed, "").unwrap();
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+    // SAFETY: geteuid(2) can't fail.
+    if unsafe { libc::geteuid() } != 0 {
+        for args in boxes {
+            let out = env.ws_box_command(PASSPHRASE, "true").env("HALTI_TEST_KVM", &closed).args(args).output().unwrap();
+            let said = stderr(&out);
+            let refused = format!("halti: boxes can't run on this server: you may not use {} (sudo usermod -aG kvm ", closed.display());
+            assert!(!out.status.success() && said.starts_with(&refused) && said.ends_with(", then log in again)\n") && asked(&out) == 0, "{args:?}: {said}");
+        }
     }
     assert!(!wsdir(&env, "acme").join("boxes").exists(), "nothing was made");
     // Listing and removing need none: no store can be there.
@@ -3420,7 +3442,7 @@ fn deleting_a_workspace_removes_its_boxes_folder() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "no box runs on Linux")]
+#[cfg_attr(not(target_os = "macos"), ignore = "a box on Linux needs KVM")]
 fn a_miss_never_reaches_the_keychain() {
     let env = Env::new();
     // The Keychain has an anthropic, approved and with its token; acme has none.
@@ -3516,7 +3538,7 @@ fn a_workspace_box_is_made_approved_listed_and_removed() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "no box runs on Linux")]
+#[cfg_attr(not(target_os = "macos"), ignore = "a box on Linux needs KVM")]
 fn ws_run_refuses_before_asking() {
     let env = Env::new();
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
@@ -3560,7 +3582,7 @@ fn ws_run_refuses_before_asking() {
 }
 
 #[test]
-#[cfg_attr(not(target_os = "macos"), ignore = "no box runs on Linux")]
+#[cfg_attr(not(target_os = "macos"), ignore = "a box on Linux needs KVM")]
 fn a_box_policy_with_a_hidden_mount_is_refused() {
     let env = Env::new();
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());

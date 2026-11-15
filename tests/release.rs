@@ -17,7 +17,7 @@ use std::{env, fs};
 const DEBUG: &str = env!("CARGO_BIN_EXE_halti");
 
 /// Every variable a debug build reads to switch a protection off or move its files.
-const HOOKS: [&str; 11] = [
+const HOOKS: [&str; 12] = [
     "HALTI_TEST_APPROVE",
     "HALTI_TEST_KEYCHAIN",
     "HALTI_TEST_LOGIN_RUNNER",
@@ -29,6 +29,7 @@ const HOOKS: [&str; 11] = [
     "HALTI_POLICY_DIR",
     "HALTI_BOX_DIR",
     "HALTI_AUDIT",
+    "HALTI_TEST_KVM",
 ];
 
 fn release() -> PathBuf {
@@ -86,6 +87,7 @@ impl Dirs {
             .env("HALTI_BOX_DIR", hooks.join("box"))
             .env("HALTI_AUDIT", hooks.join("audit.log"))
             .env("HALTI_AUDIT_KEY", "test-key")
+            .env("HALTI_TEST_KVM", hooks.join("kvm"))
             .env("EDITOR", "true")
             .env_remove("VISUAL")
             .env_remove("HALTI_REFRESHING")
@@ -280,7 +282,8 @@ const TEMPLATE: &str = "# halti config. edit with: halti config\n\n[approval]\nd
                         set    = \"passphrase\"         # storing a secret in a workspace: passphrase\n\
                         rm     = \"passphrase\"         # removing secrets from a workspace: passphrase\n\
                         policy = \"passphrase\"         # approving a policy in a workspace: passphrase\n\
-                        delete = \"passphrase\"         # deleting a workspace: passphrase\n";
+                        delete = \"passphrase\"         # deleting a workspace: passphrase\n\n\
+                        [box]\nengine = \"cloud-hypervisor\"   # cloud-hypervisor\n";
 
 #[test]
 #[ignore = "needs a ci-release binary: HALTI_RELEASE_BIN=<path>, as check.sh sets"]

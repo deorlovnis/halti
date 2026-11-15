@@ -1040,7 +1040,7 @@ mod tests {
         assert!(ask_to_approve(&no, &sudo, &prepared(&["app", "box.research"])).is_err());
         assert_eq!(no.calls().len(), 1, "a refused Touch ID asks nothing more");
 
-        // No box runs on Linux, so nothing there approves a box's policy, and halti says so.
+        // Today's boxes don't run on Linux, so nothing there approves a box's policy, and halti says so.
         let error = ask_to_approve(&fake, &Settings::builtin(Os::Linux), &prepared(&["app", "box.research"])).unwrap_err();
         assert_eq!(error.to_string(), "approving a changed box policy needs an approval this system can't give");
         assert!(fake.calls().is_empty(), "not even the resources are asked for");

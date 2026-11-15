@@ -97,24 +97,30 @@ impl Word for Store {
     }
 }
 
-/// What runs a box's VMs: Apple's container, which is only on a Mac. Another engine is one more
-/// variant, and one more arm where a box picks it (`boxes::vms`).
+/// What runs a box's VMs: Apple's container, which is only on a Mac, or Cloud Hypervisor with
+/// KVM, which is only on Linux. Another engine is one more variant, and one more arm where a box
+/// picks it (`boxes::vms`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Engine {
     Container,
+    CloudHypervisor,
 }
 
 impl Word for Engine {
-    const ALL: &'static [Engine] = &[Engine::Container];
+    const ALL: &'static [Engine] = &[Engine::Container, Engine::CloudHypervisor];
 
     fn name(self) -> &'static str {
         match self {
             Engine::Container => "container",
+            Engine::CloudHypervisor => "cloud-hypervisor",
         }
     }
 
     fn on(self, os: Os) -> bool {
-        os == Os::Macos
+        match self {
+            Engine::Container => os == Os::Macos,
+            Engine::CloudHypervisor => os == Os::Linux,
+        }
     }
 }
 
@@ -502,7 +508,8 @@ fn word<W: Word>(key: &str, value: &DeValue<'_>, allowed: &[W], os: Os) -> Resul
         return Ok(named);
     }
     if !named.on(os) {
-        return Err(format!("{} is only on a mac", named.name()));
+        let there = if os == Os::Macos { "linux" } else { "a mac" };
+        return Err(format!("{} is only on {there}", named.name()));
     }
     Err(format!("{key} can't be {}. it can {}", named.name(), choices(allowed)))
 }
@@ -857,7 +864,11 @@ mod tests {
 
     const BOTH: [Os; 2] = [Os::Macos, Os::Linux];
 
-    /// The box sections of a Mac's template. No box runs on Linux, so its template has none.
+    /// The box section of Linux's template: its one engine, and no other line, since a workspace's
+    /// box keeps its key in the workspace and no `[box.approval]` line has a means there.
+    const LINUX_BOX: &str = "\n[box]\nengine = \"cloud-hypervisor\"   # cloud-hypervisor\n";
+
+    /// The box sections of a Mac's template.
     const BOX_SECTIONS: &str = "\n[box]\nengine = \"container\"          # container\nkeys   = \"keychain\"           # where a box's key is kept: keychain\n\n\
                                 [box.approval]\nrun    = \"touchid\"            # opening a box: touchid | sudo | none\n\
                                 policy = \"touchid\"            # approving a changed box policy: touchid | sudo | none\n\
@@ -871,7 +882,7 @@ mod tests {
     fn expected(os: Os) -> String {
         let (default, config, managers, ws, set, boxes) = match os {
             Os::Macos => ("sudo | touchid | passphrase", "sudo | touchid", "none | keychain", "passphrase | sudo | touchid | none", "passphrase | sudo | touchid", BOX_SECTIONS),
-            Os::Linux => ("sudo | passphrase", "sudo", "none", "passphrase", "passphrase", ""),
+            Os::Linux => ("sudo | passphrase", "sudo", "none", "passphrase", "passphrase", LINUX_BOX),
         };
         format!(
             "# halti config. edit with: halti config\n\n[approval]\ndefault = \"sudo\"              # {default}\n\
@@ -992,7 +1003,9 @@ mod tests {
             ("[secrets]\nstore = \"keychain\"\n", Os::Macos, 2, "store can only be files"),
             ("[workspace]\npassphrase = \"typed\"\n", Os::Macos, 2, "passphrase can be own or generate"),
             ("[box]\nengine = \"tart\"\n", Os::Macos, 2, "engine can only be container"),
-            ("[box]\nengine = \"container\"\n", Os::Linux, 2, "engine can't be set on this system"),
+            ("[box]\nengine = \"container\"\n", Os::Linux, 2, "container is only on a mac"),
+            ("[box]\nengine = \"cloud-hypervisor\"\n", Os::Macos, 2, "cloud-hypervisor is only on linux"),
+            ("[box]\nengine = \"tart\"\n", Os::Linux, 2, "engine can only be cloud-hypervisor"),
             ("[box]\nkeys = \"files\"\n", Os::Macos, 2, "keys can only be keychain"),
             ("[box]\nkeys = \"keychain\"\n", Os::Linux, 2, "keys can't be set on this system"),
             ("[box]\nrun = \"touchid\"\n", Os::Macos, 2, "[box] has no setting with this name"),
@@ -1092,11 +1105,6 @@ mod tests {
             assert_eq!(BOX_ACTIONS.map(|action| settings.means(action)), [Some(Means::TouchId); 5], "{default}");
             assert_eq!((settings.engine, settings.keys), (Some(Engine::Container), Some(Keys::Keychain)));
         }
-        // No box runs on Linux: no lines, and nothing approves a box's action.
-        let linux = Settings::builtin(Os::Linux);
-        assert_eq!((linux.engine, linux.keys), (None, None));
-        assert_eq!(BOX_ACTIONS.map(|action| linux.means(action)), [None; 5]);
-        assert!(!template(Os::Linux).contains("box") && !linux.render(Os::Linux).contains("box"));
         assert_eq!(default_choices(Os::Macos), [Means::Sudo, Means::TouchId, Means::Passphrase], "a box's none isn't a default");
 
         // A line says otherwise, and what is shown reads back the same.
@@ -1106,6 +1114,37 @@ mod tests {
         assert_ne!(mine, Settings::builtin(Os::Macos));
         assert_eq!(parse(&mine.render(Os::Macos), Os::Macos), Ok(mine.clone()));
         assert_eq!(parse(&format!("{HEADER}\n{}", mine.lines(Os::Macos, true)), Os::Macos), Ok(mine));
+    }
+
+    #[test]
+    fn cloud_hypervisor_is_only_on_linux() {
+        assert_eq!(here::<Engine>(Os::Linux), [Engine::CloudHypervisor]);
+        assert_eq!(here::<Engine>(Os::Macos), [Engine::Container]);
+        assert_eq!(Engine::CloudHypervisor.name(), "cloud-hypervisor");
+        let linux = parse("[box]\nengine = \"cloud-hypervisor\"\n", Os::Linux).unwrap();
+        assert_eq!(linux, Settings::builtin(Os::Linux), "the line says what the template does");
+        assert_eq!(parse("[box]\nengine = \"cloud-hypervisor\"\n", Os::Macos).unwrap_err().why, "cloud-hypervisor is only on linux");
+        // A Mac keeps its own, and `container` is still refused on Linux.
+        assert_eq!(Settings::builtin(Os::Macos).engine, Some(Engine::Container));
+        assert_eq!(parse("[box]\nengine = \"container\"\n", Os::Linux).unwrap_err().why, "container is only on a mac");
+    }
+
+    #[test]
+    fn linux_has_the_engine_with_no_box_line() {
+        // A file with no [box] section, as every copy approved before boxes ran on Linux, has the
+        // engine: boxes are on for every Linux halti at once.
+        let before = template(Os::Linux).split("\n[box]").next().unwrap().to_string();
+        assert!(!before.contains("box"), "{before}");
+        let linux = parse(&before, Os::Linux).unwrap();
+        assert_eq!(linux, Settings::builtin(Os::Linux));
+        assert_eq!((linux.engine, linux.keys), (Some(Engine::CloudHypervisor), None));
+        // No `[box.approval]` line has a means here, and none is shown: a workspace's box asks as
+        // its workspace's lines say, and nothing can answer a write's ask.
+        assert_eq!(BOX_ACTIONS.map(|action| linux.means(action)), [None; 5]);
+        assert!(template(Os::Linux).ends_with(LINUX_BOX), "{}", template(Os::Linux));
+        assert!(linux.render(Os::Linux).ends_with("\n[box]\nengine = \"cloud-hypervisor\"\n"), "{}", linux.render(Os::Linux));
+        assert!(!template(Os::Linux).contains("[box.approval]") && !template(Os::Linux).contains("keys"));
+        assert_eq!(parse(&linux.render(Os::Linux), Os::Linux), Ok(linux));
     }
 
     #[test]

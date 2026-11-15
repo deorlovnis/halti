@@ -13,7 +13,8 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{env, fs};
 
-const UNAME: &str = "#!/bin/sh\ncase \"$1\" in -s) echo Linux ;; -m) echo x86_64 ;; *) echo Linux ;; esac\n";
+/// `uname -m` and `-r` answer as `UNAME_M` and `UNAME_R` say, else as an x86-64 server's would.
+const UNAME: &str = "#!/bin/sh\ncase \"$1\" in -s) echo Linux ;; -m) echo \"${UNAME_M:-x86_64}\" ;; -r) echo \"${UNAME_R:-6.8.0-1017-azure}\" ;; *) echo Linux ;; esac\n";
 const ID: &str = "#!/bin/sh\ncase \"$1\" in -u) echo 1000 ;; -un) echo tester ;; *) echo 'uid=1000(tester)' ;; esac\n";
 /// `sudo -n -k true` answers as `SUDO_NO_PASSWORD` says; anything else is written down.
 const SUDO: &str = "#!/bin/sh\nif [ \"$1\" = -n ]; then [ \"$SUDO_NO_PASSWORD\" = yes ]; exit; fi\necho \"$*\" >>\"$SUDO_LOG\"\n";
@@ -74,6 +75,9 @@ impl Repo {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("SUDO_LOG", self.path("sudo.log"))
             .env("SUDO_NO_PASSWORD", if no_password { "yes" } else { "no" })
+            .env("HALTI_KVM_DEVICE", self.path("no-kvm"))
+            .env_remove("UNAME_M")
+            .env_remove("UNAME_R")
             .env_remove("CARGO_TARGET_DIR");
         for (k, v) in envs {
             cmd.env(k, v);
@@ -155,6 +159,51 @@ fn sudo_without_a_password_is_said_once_and_plainly() {
     let warning = "warning: tester can use sudo without a password, so any program running as tester is root here; see README \"On a Linux server\"";
     assert!(text(&out.stderr).lines().any(|l| l == warning), "{}", text(&out.stderr));
     assert!(!text(&out.stderr).contains("breaks out of a box"), "{}", text(&out.stderr));
+}
+
+/// Whether boxes can run here is said last, after halti is installed. Where they can't, nothing of
+/// theirs is downloaded, built or installed.
+#[test]
+fn whether_boxes_can_run_is_said_after_halti_is_installed() {
+    let repo = Repo::new();
+    repo.stamp(&repo.path("repo/target"), &repo.git(&["rev-parse", "HEAD"]));
+    let kvm = repo.path("kvm");
+    fs::write(&kvm, "").unwrap();
+    let said = |envs: &[(&str, &Path)]| {
+        let _ = fs::remove_file(repo.path("sudo.log"));
+        let out = repo.install(envs, false);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let lines: Vec<String> = text(&out.stdout).lines().map(String::from).collect();
+        assert_eq!(lines[lines.len() - 2], "installed /usr/local/bin/halti", "{lines:?}");
+        assert!(!repo.sudo_log().contains("/usr/local/lib/halti"), "nothing of the boxes': {}", repo.sudo_log());
+        lines.last().unwrap().clone()
+    };
+    let no_kvm = format!("this server can't run boxes: it has no {}. it needs a dedicated server, or a cloud server with nested virtualization", repo.path("no-kvm").display());
+    assert_eq!(said(&[]), no_kvm);
+    assert_eq!(said(&[("UNAME_M", Path::new("aarch64")), ("HALTI_KVM_DEVICE", &kvm)]), "this server can't run boxes: halti pins a VM program for x86-64 servers only");
+    assert_eq!(
+        said(&[("UNAME_R", Path::new("6.1.0-26-cloud-amd64")), ("HALTI_KVM_DEVICE", &kvm)]),
+        "this server can't run boxes: cloud-hypervisor needs Linux 6.8 or newer, and this is 6.1"
+    );
+}
+
+/// The VM program and the kernel are checked against the pins the engine checks them against, in
+/// src/vmm.rs, which the script reads; and the agent image is made a disk by box/to-disk.sh.
+#[test]
+fn what_boxes_run_on_is_pinned_where_the_engine_pins_it() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = fs::read_to_string(root.join("install-linux.sh")).unwrap();
+    let vmm = fs::read_to_string(root.join("src/vmm.rs")).unwrap();
+    for part in ["program", "kernel"] {
+        let pinned = vmm.split(&format!("{part}: \"")).nth(1).map(|rest| &rest[..64]).unwrap();
+        assert!(pinned.bytes().all(|b| b.is_ascii_hexdigit()), "{part}: {pinned}");
+    }
+    assert!(script.contains("grep -oE \"$1: \\\"[0-9a-f]{64}\\\"\" src/vmm.rs"), "the pins are read from src/vmm.rs");
+    assert!(script.contains("box/to-disk.sh \"$agent:install\" \"$work/agent.img\""));
+    // The versions the pins are of, as src/vmm.rs names them.
+    for version in ["v54.1", "ch-release-v7.2.8-20261009"] {
+        assert!(script.contains(&format!("/{version}/")) && vmm.contains(version), "{version}");
+    }
 }
 
 #[test]

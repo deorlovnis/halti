@@ -137,6 +137,11 @@ pub struct VmSpec {
 pub trait Vms: Sync {
     /// The engine is installed and ready.
     fn available(&self) -> Result<()>;
+    /// What is checked before a person is asked anything for a box: that this machine can run it
+    /// at all. Apple's tool is asked once the box starts (`available`), as it always was.
+    fn checked_first(&self) -> Result<()> {
+        Ok(())
+    }
     fn running(&self, name: &str) -> bool;
     /// Start a VM, detached; it is removed when it stops.
     fn run(&self, spec: &VmSpec) -> Result<()>;
