@@ -13,8 +13,9 @@ use serde_json::{Value, json};
 
 use super::table::Caller;
 use super::wire::{self, Kind, Refused};
-use super::{Hub, locked, random};
+use super::{Hub, locked};
 use crate::door::http;
+use crate::util;
 
 /// The longest request head.
 pub const HEAD_MAX: usize = 8 * 1024;
@@ -260,8 +261,8 @@ fn nonce(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refuse
     if caller.kind != Kind::Device {
         return Err(Refused::WrongKind);
     }
-    let (nonce, until) = hub.with_table(|table, now| table.nonce(caller, &hub.nonce_key, random(), now))?;
-    Ok((200, json!({"nonce": wire::hex(&nonce), "expires": wire::time(until)})))
+    let (nonce, until) = hub.with_table(|table, now| table.nonce(caller, &hub.nonce_key, util::random(), now))?;
+    Ok((200, json!({"nonce": util::hex(&nonce), "expires": wire::time(until)})))
 }
 
 fn renew(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refused> {

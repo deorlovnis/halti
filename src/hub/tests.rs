@@ -22,7 +22,7 @@ use super::table::{Listed, TokenState};
 use super::wire::{self, Invite, Kind};
 use super::*;
 use crate::door::http;
-use crate::util::TempDir;
+use crate::util::{TempDir, random};
 
 /// The tests' clock: it moves only when told.
 struct Hands(Mutex<Timestamp>);
@@ -126,7 +126,7 @@ struct Phone {
 }
 
 fn token(kind: Kind) -> String {
-    format!("{}{}", kind.prefix(), wire::hex(&random::<32>()))
+    format!("{}{}", kind.prefix(), util::hex(&random::<32>()))
 }
 
 impl Phone {
@@ -156,13 +156,13 @@ impl Phone {
         };
         let signature = self.sign(&wire::pair_bytes(&invite.pin, &request));
         json!({
-            "code": wire::hex(&request.code),
-            "signing_key": wire::hex(&request.signing_key),
-            "agreement_key": wire::hex(&request.agreement_key),
-            "key_signature": wire::hex(&request.key_signature),
-            "token_hash": wire::hex(&request.token_hash),
+            "code": util::hex(&request.code),
+            "signing_key": util::hex(&request.signing_key),
+            "agreement_key": util::hex(&request.agreement_key),
+            "key_signature": util::hex(&request.key_signature),
+            "token_hash": util::hex(&request.token_hash),
             "push": request.push,
-            "signature": wire::hex(&signature),
+            "signature": util::hex(&signature),
         })
     }
 }
@@ -179,7 +179,7 @@ impl Machine {
     }
 
     fn join_body(&self, invite: &Invite) -> Value {
-        json!({"code": wire::hex(&invite.code), "machine_key": wire::hex(&self.key.subject_public_key_info()), "token_hash": wire::hex(&wire::token_hash(&self.token))})
+        json!({"code": util::hex(&invite.code), "machine_key": util::hex(&self.key.subject_public_key_info()), "token_hash": util::hex(&wire::token_hash(&self.token))})
     }
 }
 
@@ -269,14 +269,14 @@ fn renew_phone(hub: &Running, phone: &Phone) -> (String, u16, Value) {
     let new = token(Kind::Device);
     let hash = wire::token_hash(&new);
     let signature = phone.sign(&wire::renew_bytes(&hub.pin, "pixel", &nonce, &hash));
-    let body = json!({"nonce": wire::hex(&nonce), "token_hash": wire::hex(&hash), "signature": wire::hex(&signature)});
+    let body = json!({"nonce": util::hex(&nonce), "token_hash": util::hex(&hash), "signature": util::hex(&signature)});
     let (status, body) = hub.call("POST", "/v1/renew", Some(&phone.token), Some(&body));
     (new, status, body)
 }
 
 fn renew_machine(hub: &Running, token_: &str) -> (String, u16, Value) {
     let new = token(Kind::Machine);
-    let (status, body) = hub.call("POST", "/v1/renew", Some(token_), Some(&json!({"token_hash": wire::hex(&wire::token_hash(&new))})));
+    let (status, body) = hub.call("POST", "/v1/renew", Some(token_), Some(&json!({"token_hash": util::hex(&wire::token_hash(&new))})));
     (new, status, body)
 }
 
@@ -390,7 +390,7 @@ fn a_pairing_request_with_a_bad_signature_is_refused() {
     let mut other = pairing.invite.clone();
     other.pin[0] ^= 1;
     let mut body = phone.pair_body(&other, "");
-    body["code"] = wire::hex(&pairing.invite.code).into();
+    body["code"] = util::hex(&pairing.invite.code).into();
     assert_eq!(hub.call("POST", "/v1/pair", None, Some(&body)), (403, error("bad-signature")));
     // A push address changed after signing.
     let mut body = phone.pair_body(&pairing.invite, "fcm:abc");
@@ -399,11 +399,11 @@ fn a_pairing_request_with_a_bad_signature_is_refused() {
     // The agreement key vouched for by another key.
     let mut body = phone.pair_body(&pairing.invite, "");
     let stranger = Phone::new();
-    body["key_signature"] = wire::hex(&stranger.sign(&wire::keys_bytes(&phone.signing_key(), &phone.agreement.subject_public_key_info()))).into();
+    body["key_signature"] = util::hex(&stranger.sign(&wire::keys_bytes(&phone.signing_key(), &phone.agreement.subject_public_key_info()))).into();
     assert_eq!(hub.call("POST", "/v1/pair", None, Some(&body)), (403, error("bad-signature")));
     // A key that isn't one.
     let mut body = phone.pair_body(&pairing.invite, "");
-    body["signing_key"] = wire::hex(&[0u8; 91]).into();
+    body["signing_key"] = util::hex(&[0u8; 91]).into();
     assert_eq!(hub.call("POST", "/v1/pair", None, Some(&body)), (400, error("malformed")));
     // None of these used the code: the right request still pairs.
     assert_eq!(hub.call("POST", "/v1/pair", None, Some(&phone.pair_body(&pairing.invite, ""))).0, 202);
@@ -531,7 +531,7 @@ fn ask_nonce(hub: &Running, token_: &str) -> [u8; 16] {
 
 /// A phone's renewal with this token, nonce, new token hash and signature.
 fn send_renewal(hub: &Running, token_: &str, nonce: &[u8; 16], hash: &[u8; 32], signature: &[u8]) -> (u16, Value) {
-    hub.call("POST", "/v1/renew", Some(token_), Some(&json!({"nonce": wire::hex(nonce), "token_hash": wire::hex(hash), "signature": wire::hex(signature)})))
+    hub.call("POST", "/v1/renew", Some(token_), Some(&json!({"nonce": util::hex(nonce), "token_hash": util::hex(hash), "signature": util::hex(signature)})))
 }
 
 #[test]
@@ -554,7 +554,7 @@ fn a_nonce_is_good_once_for_two_minutes() {
     // Asking again gives another and leaves the first good. A refused renewal leaves its nonce
     // good too, a body that isn't one included.
     let (first, second) = (ask_nonce(&hub, &phone.token), ask_nonce(&hub, &phone.token));
-    let no_hash = json!({"nonce": wire::hex(&first), "signature": wire::hex(&sign(&phone, &first, &hash))});
+    let no_hash = json!({"nonce": util::hex(&first), "signature": util::hex(&sign(&phone, &first, &hash))});
     assert_eq!(hub.call("POST", "/v1/renew", Some(&phone.token), Some(&no_hash)), (400, error("malformed")));
     assert_eq!(send_renewal(&hub, &phone.token, &first, &hash, &sign(&phone, &first, &[0; 32])), (403, error("bad-signature")));
     let new = token(Kind::Device);
@@ -628,7 +628,7 @@ fn a_renewal_with_a_bad_signature_is_refused() {
         ("another hub", Box::new(|n| phone.sign(&wire::renew_bytes(&other_pin, "pixel", n, &hash)))),
         ("another name", Box::new(|n| phone.sign(&wire::renew_bytes(&hub.pin, "tablet", n, &hash)))),
         ("another token", Box::new(|n| phone.sign(&wire::renew_bytes(&hub.pin, "pixel", n, &[0; 32])))),
-        ("the pairing's bytes", Box::new(|n| phone.sign(&wire::fields(&[wire::PAIR_LABEL.as_bytes(), n])))),
+        ("the pairing's bytes", Box::new(|n| phone.sign(&crate::fields::join(&[wire::PAIR_LABEL.as_bytes(), n])))),
     ];
     let nonce = ask_nonce(&hub, &phone.token);
     for (what, sign) in attempts {
@@ -645,7 +645,7 @@ fn a_new_token_must_be_new() {
     let phone = paired_phone(&hub, "pixel");
     let nonce: [u8; 16] = wire::unhex(hub.call("POST", "/v1/renew/nonce", Some(&phone.token), None).1["nonce"].as_str().unwrap()).unwrap();
     let same = wire::token_hash(&phone.token);
-    let body = json!({"nonce": wire::hex(&nonce), "token_hash": wire::hex(&same), "signature": wire::hex(&phone.sign(&wire::renew_bytes(&hub.pin, "pixel", &nonce, &same)))});
+    let body = json!({"nonce": util::hex(&nonce), "token_hash": util::hex(&same), "signature": util::hex(&phone.sign(&wire::renew_bytes(&hub.pin, "pixel", &nonce, &same)))});
     assert_eq!(hub.call("POST", "/v1/renew", Some(&phone.token), Some(&body)), (400, error("malformed")));
 }
 
@@ -1156,7 +1156,7 @@ fn a_table_file_that_was_changed_by_hand_is_refused() {
     let path = hub.folder.join("table.json");
     let text = fs::read_to_string(&path).unwrap();
     // Another agreement key, which the signing key never vouched for.
-    let other = wire::hex(&KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap().subject_public_key_info());
+    let other = util::hex(&KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap().subject_public_key_info());
     let stored: Value = serde_json::from_str(&text).unwrap();
     let agreement = stored["rows"][0]["keys"]["device"]["agreement"].as_str().unwrap().to_string();
     fs::write(&path, text.replace(&agreement, &other)).unwrap();

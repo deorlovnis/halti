@@ -50,7 +50,7 @@ fn an_answer_is_the_record_shown_and_its_decision() {
     assert_ne!(answer_digest(&other, true), answer_digest(&bytes, true));
     // A record followed by its decision is no record: the two never read as one another.
     let mut followed = bytes.clone();
-    push_field(&mut followed, b"yes");
+    fields::push(&mut followed, b"yes");
     assert_eq!(Record::decode(&followed), None);
 }
 
@@ -67,9 +67,9 @@ fn a_record_that_breaks_any_rule_is_refused_whole() {
     // Each field broken, in the bytes as they would arrive.
     let swapped = |from: &[u8], to: &[u8]| {
         let mut field = Vec::new();
-        push_field(&mut field, from);
+        fields::push(&mut field, from);
         let mut other = Vec::new();
-        push_field(&mut other, to);
+        fields::push(&mut other, to);
         let at = bytes.windows(field.len()).position(|w| w == field).unwrap();
         [&bytes[..at], &other[..], &bytes[at + field.len()..]].concat()
     };
@@ -114,10 +114,10 @@ fn names_are_lowercase_letters_digits_dashes_and_underscores_up_to_32_bytes() {
     for good in ["acme", "dev", "server-1", "a_b", "0", &"x".repeat(32)] {
         check_name(good).unwrap();
     }
-    for bad in ["", "Acme", "a.b", "a/b", "a b", "é", &"x".repeat(33)] {
+    for bad in ["", "Acme", "a.b", "a/b", "a b", "é", "-a", "_a", &"x".repeat(33)] {
         assert!(check_name(bad).is_err(), "{bad}");
     }
-    assert_eq!(check_name("A").unwrap_err().to_string(), "\"A\" isn't a name a record takes: 1 to 32 of a-z, 0-9, - and _");
+    assert_eq!(check_name("A").unwrap_err().to_string(), "\"A\" isn't a name a record takes: 1 to 32 of a-z, 0-9, - and _, starting with a letter or digit");
     // A host name becomes one.
     assert_eq!(machine_from("Deniss-MacBook-Pro.local"), "deniss-macbook-pro");
     assert_eq!(machine_from("server_1"), "server_1");
@@ -125,6 +125,10 @@ fn names_are_lowercase_letters_digits_dashes_and_underscores_up_to_32_bytes() {
     assert_eq!(machine_from(&"h".repeat(40)), "h".repeat(32));
     assert_eq!(machine_from(""), "machine");
     assert_eq!(machine_from(".local"), "machine");
+    // Nor does it start with what a name can't start with.
+    assert_eq!(machine_from("_build"), "build");
+    assert_eq!(machine_from("été"), "t-");
+    assert_eq!(machine_from("--"), "machine");
     check_name(&machine_name()).unwrap();
 }
 
@@ -143,13 +147,7 @@ fn an_action_is_printable_ascii_and_says_where_it_was_cut() {
 }
 
 #[test]
-fn hex_reads_back_only_as_written() {
-    assert_eq!(hex(&[0, 0xab, 0xff]), "00abff");
-    assert_eq!(unhex("00abff"), Some(vec![0, 0xab, 0xff]));
-    assert_eq!(unhex(""), Some(vec![]));
-    for bad in ["0", "00AB", "0g", "+1", " 1"] {
-        assert_eq!(unhex(bad), None, "{bad}");
-    }
+fn ids_are_hex_and_random() {
     let id = Id([0xab; 16]);
     assert_eq!((id.hex().len(), id.short()), (32, "abababab".to_string()));
     assert_ne!(Id::random(), Id::random());

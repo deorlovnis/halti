@@ -189,6 +189,9 @@ use halti_core::ids::WsName;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::fields;
+use crate::util::{self, hex};
+
 /// What the signing key signs to vouch for the agreement key.
 pub const KEYS_LABEL: &str = "halti-device-keys-v1";
 /// What a phone signs to pair.
@@ -244,20 +247,9 @@ impl fmt::Display for Kind {
     }
 }
 
-/// Fields run together as the signed bytes are: each a 2-byte big-endian length, then the field.
-/// Every field here is far below 64 KiB; one that isn't is a bug.
-pub fn fields(parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for part in parts {
-        out.extend_from_slice(&u16::try_from(part.len()).expect("a field under 64 KiB").to_be_bytes());
-        out.extend_from_slice(part);
-    }
-    out
-}
-
 /// What the signing key signs to vouch for the agreement key.
 pub fn keys_bytes(signing_key: &[u8], agreement_key: &[u8]) -> Vec<u8> {
-    fields(&[KEYS_LABEL.as_bytes(), signing_key, agreement_key])
+    fields::join(&[KEYS_LABEL.as_bytes(), signing_key, agreement_key])
 }
 
 /// What a phone's pairing request says, all of which it signs.
@@ -272,12 +264,12 @@ pub struct PairRequest {
 
 /// What a phone signs to pair with the hub whose pin is `pin`.
 pub fn pair_bytes(pin: &[u8; 32], request: &PairRequest) -> Vec<u8> {
-    fields(&[PAIR_LABEL.as_bytes(), pin, &request.code, &request.signing_key, &request.agreement_key, &request.key_signature, &request.token_hash, request.push.as_bytes()])
+    fields::join(&[PAIR_LABEL.as_bytes(), pin, &request.code, &request.signing_key, &request.agreement_key, &request.key_signature, &request.token_hash, request.push.as_bytes()])
 }
 
 /// What a phone signs to renew its token.
 pub fn renew_bytes(pin: &[u8; 32], name: &str, nonce: &[u8; 16], token_hash: &[u8; 32]) -> Vec<u8> {
-    fields(&[RENEW_LABEL.as_bytes(), pin, name.as_bytes(), nonce, token_hash])
+    fields::join(&[RENEW_LABEL.as_bytes(), pin, name.as_bytes(), nonce, token_hash])
 }
 
 impl PairRequest {
@@ -396,11 +388,11 @@ fn bytes<const N: usize>(text: &str) -> Result<[u8; N], Refused> {
 }
 
 fn key(text: &str) -> Result<Vec<u8>, Refused> {
-    unhex_any(text).filter(|key| key.len() == KEY_LEN).ok_or(Refused::Malformed)
+    util::unhex(text).filter(|key| key.len() == KEY_LEN).ok_or(Refused::Malformed)
 }
 
 fn signature(text: &str) -> Result<Vec<u8>, Refused> {
-    unhex_any(text).filter(|sig| !sig.is_empty() && sig.len() <= device::SIGNATURE_MAX).ok_or(Refused::Malformed)
+    util::unhex(text).filter(|sig| !sig.is_empty() && sig.len() <= device::SIGNATURE_MAX).ok_or(Refused::Malformed)
 }
 
 /// The SHA-256 of a token's text.
@@ -418,37 +410,15 @@ pub fn bearer(value: &str) -> Option<(Kind, [u8; 32])> {
     Some((kind, token_hash(token)))
 }
 
-/// Lowercase hex.
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Exactly `N` bytes from lowercase hex.
 pub fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
-    let bytes = unhex_any(text)?;
-    bytes.try_into().ok()
-}
-
-/// Bytes from lowercase hex, of any length.
-pub fn unhex_any(text: &str) -> Option<Vec<u8>> {
-    let digit = |c: u8| match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        _ => None,
-    };
-    let text = text.as_bytes();
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    text.chunks(2).map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?)).collect()
+    util::unhex(text)?.try_into().ok()
 }
 
 /// A device's or a machine's name: 1 to 32 of a-z, 0-9, `-` and `_`, starting with a letter or a
-/// digit. Never echoed when refused.
+/// digit (`fields::is_name`). Never echoed when refused.
 pub fn check_name(name: &str) -> Result<(), Refused> {
-    let ok = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
-    let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() > 32 || !ok(bytes[0]) || !bytes.iter().all(|&c| ok(c) || c == b'-' || c == b'_') {
+    if !fields::is_name(name) {
         return Err(Refused::Malformed);
     }
     Ok(())
@@ -641,7 +611,7 @@ mod tests {
         415a59db25171210";
 
     fn bytes(text: &str) -> Vec<u8> {
-        unhex_any(text).unwrap()
+        util::unhex(text).unwrap()
     }
 
     fn request() -> PairRequest {
@@ -653,14 +623,6 @@ mod tests {
             token_hash: unhex(TOKEN_HASH).unwrap(),
             push: PUSH.to_string(),
         }
-    }
-
-    #[test]
-    fn fields_are_length_prefixed_and_nothing_else() {
-        assert_eq!(fields(&[b"ab", b""]), [0x00, 0x02, b'a', b'b', 0x00, 0x00]);
-        assert_eq!(fields(&[]), Vec::<u8>::new());
-        // A byte moved from one field to the next makes other bytes.
-        assert_ne!(fields(&[b"ab", b"c"]), fields(&[b"a", b"bc"]));
     }
 
     #[test]

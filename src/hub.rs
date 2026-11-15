@@ -29,8 +29,8 @@ pub mod wire;
 #[cfg(test)]
 mod tests;
 
-use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -114,7 +114,7 @@ impl Hub {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Table::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        Ok(Hub { dir: dir.to_path_buf(), pin, nonce_key: random(), address: address.to_string(), clock, table: Mutex::new(table), changed: Condvar::new() })
+        Ok(Hub { dir: dir.to_path_buf(), pin, nonce_key: util::random(), address: address.to_string(), clock, table: Mutex::new(table), changed: Condvar::new() })
     }
 
     fn now(&self) -> Timestamp {
@@ -289,16 +289,9 @@ pub fn serve(listen: &str, address: Option<&str>) -> Result<()> {
     let hub = Arc::new(Hub::open(&dir, &address, pin, Arc::new(SystemClock))?);
     let listener = TcpListener::bind(at).with_context(|| format!("listening on {at}"))?;
     util::say(&format!("hub listening on {at}, reached at {address}"));
-    util::say(&format!("pin {}", wire::hex(&pin)));
+    util::say(&format!("pin {}", util::hex(&pin)));
     let admin_hub = hub.clone();
     thread::spawn(move || admin::serve(admin_hub, admin));
     listen::run(hub, listener, config, listen::Limits::HUB);
     Ok(())
-}
-
-/// N bytes from the system's random source.
-fn random<const N: usize>() -> [u8; N] {
-    let mut bytes = [0; N];
-    File::open("/dev/urandom").and_then(|mut source| source.read_exact(&mut bytes)).expect("reading /dev/urandom");
-    bytes
 }

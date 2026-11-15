@@ -22,6 +22,7 @@ mod config;
 mod door;
 mod engine;
 mod fetch;
+mod fields;
 mod hub;
 mod index;
 mod keep;

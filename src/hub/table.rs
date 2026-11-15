@@ -565,7 +565,7 @@ fn replaced(row: &Row, hash: &[u8; 32]) -> bool {
 /// What ties a renewal nonce to its row: 8 bytes of an HMAC-SHA256 over the row's name, when it
 /// was paired, and the nonce's first 8 bytes, its time and its random part.
 fn nonce_mac(key: &[u8; 32], row: &Row, head: &[u8]) -> [u8; 8] {
-    let mac = crate::audit::hmac_sha256(key, &[&wire::fields(&[row.name.as_bytes(), &row.paired.as_nanosecond().to_be_bytes(), head])]);
+    let mac = crate::audit::hmac_sha256(key, &[&crate::fields::join(&[row.name.as_bytes(), &row.paired.as_nanosecond().to_be_bytes(), head])]);
     wire::unhex(&mac[..16]).expect("an HMAC is hex")
 }
 
@@ -574,12 +574,12 @@ mod hexed {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&super::wire::hex(bytes))
+        s.serialize_str(&crate::util::hex(bytes))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let text = String::deserialize(d)?;
-        super::wire::unhex_any(&text).ok_or_else(|| serde::de::Error::custom("not lowercase hex"))
+        crate::util::unhex(&text).ok_or_else(|| serde::de::Error::custom("not lowercase hex"))
     }
 }
 
@@ -588,7 +588,7 @@ mod hexed32 {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&super::wire::hex(bytes))
+        s.serialize_str(&crate::util::hex(bytes))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {

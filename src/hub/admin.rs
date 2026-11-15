@@ -42,7 +42,7 @@ use qrcode::render::unicode::Dense1x2;
 
 use super::table::{CODE_LIFE, Claim, Listed, NotPaired, TokenState};
 use super::wire::{self, Invite, Kind};
-use super::{Hub, locked, random};
+use super::{Hub, locked};
 use crate::keep;
 use crate::util;
 
@@ -157,7 +157,7 @@ fn session(hub: &Hub, mut stream: UnixStream) {
 
 /// One pairing, from its code to the y or N at the terminal.
 fn pairing(hub: &Hub, stream: &mut UnixStream, kind: Kind, name: &str, ws: Vec<WsName>) -> io::Result<()> {
-    let code = random::<16>();
+    let code = util::random::<16>();
     let id = match hub.with_table(|table, now| table.start(kind, name, ws, code, now)) {
         Ok(id) => id,
         Err(why) => return say(stream, not_paired(why)),
