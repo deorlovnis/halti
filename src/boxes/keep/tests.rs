@@ -664,19 +664,23 @@ fn a_second_keeper_never_takes_a_socket_that_answers() {
     assert!(socket.exists());
 }
 
-#[test]
-fn a_box_is_stopping_as_its_last_session_leaves_or_a_stop_is_asked() {
-    let bench = Bench::new(Fake::default());
-    let (name, layout, mounts) = (acme(), bench.layout(), MountRule::Workspace(Vec::new()));
-    let check = |_: &str| -> Result<Checked, Refused> { Err(Refused::new(No::Box, anyhow!("no box here"))) };
-    let ready = |_: &str, _: &str, _: &Checked| Ok(());
-    let keeper = Keeper {
-        name: &name,
-        layout: &layout,
-        mounts: &mounts,
+fn no_box(_: &str) -> Result<Checked, Refused> {
+    Err(Refused::new(No::Box, anyhow!("no box here")))
+}
+
+fn ready(_: &str, _: &str, _: &Checked) -> Result<(), Refused> {
+    Ok(())
+}
+
+/// A keeper with no engine and no socket, whose table a test fills itself.
+fn bare<'a>(bench: &'a Bench, name: &'a WsName, layout: &'a Layout, mounts: &'a MountRule) -> Keeper<'a> {
+    Keeper {
+        name,
+        layout,
+        mounts,
         write: None,
         world: None,
-        check: &check,
+        check: &no_box,
         ready: &ready,
         close: &bench.close,
         table: Mutex::default(),
@@ -686,10 +690,21 @@ fn a_box_is_stopping_as_its_last_session_leaves_or_a_stop_is_asked() {
         done: AtomicBool::new(false),
         desk: &bench.desk,
         trust: &|_| None,
-    };
-    let running = |round| Slot { round, state: State::Running, sessions: 1, stop: Arc::default(), word: None, run: RunId([round as u8; 8]) };
+    }
+}
+
+/// A box that runs, started in `round`, its run named by the round too.
+fn running_in(round: u64) -> Slot {
+    Slot { round, state: State::Running, sessions: 1, stop: Arc::default(), word: None, run: RunId([round as u8; 8]) }
+}
+
+#[test]
+fn a_box_is_stopping_as_its_last_session_leaves_or_a_stop_is_asked() {
+    let bench = Bench::new(Fake::default());
+    let (name, layout, mounts) = (acme(), bench.layout(), MountRule::Workspace(Vec::new()));
+    let keeper = bare(&bench, &name, &layout, &mounts);
     let state = |box_name: &str| keeper.table().boxes[box_name].state;
-    keeper.table().boxes.insert("dev".into(), running(1));
+    keeper.table().boxes.insert("dev".into(), running_in(1));
     assert!(!keeper.last_left("dev", 1));
     // Its last session leaves: as the box's thread sees that, the box is stopping, so a start
     // that comes after is busy, and never joins a box that is being put away.
@@ -697,15 +712,45 @@ fn a_box_is_stopping_as_its_last_session_leaves_or_a_stop_is_asked() {
     assert!(keeper.last_left("dev", 1));
     assert_eq!(state("dev"), State::Stopping);
     // A stop: stopping as it is asked, and answered once the box is put away.
-    keeper.table().boxes.insert("web".into(), running(2));
+    keeper.table().boxes.insert("web".into(), running_in(2));
     thread::scope(|scope| {
-        let stopping = scope.spawn(|| keeper.stop_box("web"));
+        let stopping = scope.spawn(|| keeper.stop_box("web", None));
         until(|| state("web") == State::Stopping);
         assert!(keeper.table().boxes["web"].stop.load(Ordering::SeqCst));
         keeper.table().boxes.remove("web");
         keeper.changed.notify_all();
         assert_eq!(stopping.join().unwrap(), Reply::Stopped);
     });
+}
+
+#[test]
+fn a_signed_stop_leaves_a_later_run_of_a_box_it_named() {
+    let bench = Bench::new(Fake::default());
+    let (name, layout, mounts) = (acme(), bench.layout(), MountRule::Workspace(Vec::new()));
+    let keeper = bare(&bench, &name, &layout, &mounts);
+    let state = |box_name: &str| keeper.table().boxes.get(box_name).map(|slot| (slot.run, slot.state));
+    let (dev, web, later_web) = (running_in(1), running_in(2), running_in(3));
+    let (dev_run, web_run, later_run) = (dev.run, web.run, later_web.run);
+    keeper.table().boxes.insert("dev".into(), dev);
+    keeper.table().boxes.insert("web".into(), web);
+    thread::scope(|scope| {
+        let stopping = scope.spawn(|| Runs::stop(&keeper, &[dev_run, web_run]));
+        // While dev is put away, web's run ends by itself and web starts again with a new run.
+        until(|| state("dev") == Some((dev_run, State::Stopping)));
+        keeper.table().boxes.insert("web".into(), later_web);
+        keeper.table().boxes.remove("dev");
+        keeper.changed.notify_all();
+        until(|| stopping.is_finished() || state("web") != Some((later_run, State::Running)));
+        let later = state("web");
+        // Let a stop that took the later run end, so the test fails rather than waits.
+        if later != Some((later_run, State::Running)) {
+            keeper.table().boxes.remove("web");
+            keeper.changed.notify_all();
+        }
+        assert_eq!(stopping.join().unwrap(), 1);
+        assert_eq!(later, Some((later_run, State::Running)), "the later run of web was never signed for");
+    });
+    assert!(!keeper.table().boxes["web"].stop.load(Ordering::SeqCst));
 }
 
 #[test]

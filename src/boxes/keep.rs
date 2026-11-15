@@ -315,7 +315,7 @@ impl<'a> Keeper<'a> {
             None => Reply::Unsupported,
             Some(request) if request.ws() != self.name => Reply::Other,
             Some(Request::Start(_, name)) => return self.start(scope, stream, name),
-            Some(Request::Stop(_, name)) => self.stop_box(&name),
+            Some(Request::Stop(_, name)) => self.stop_box(&name, None),
             Some(Request::Close(_)) => return self.asked_to_close(stream),
             Some(Request::Ping(_)) => Reply::Open(self.running()),
         };
@@ -523,13 +523,14 @@ impl<'a> Keeper<'a> {
     }
 
     /// `stop`: the box is asked to stop, and answered once it is put away. It is stopping from
-    /// then on, so a start that comes after is `busy`.
-    fn stop_box(&self, name: &str) -> Reply {
+    /// then on, so a start that comes after is `busy`. With a `run`, only that run of the box is
+    /// stopped: a later run of it is `idle`.
+    fn stop_box(&self, name: &str, run: Option<RunId>) -> Reply {
         let mut table = self.table();
         if self.closing_in(&table) {
             return Reply::Busy;
         }
-        let Some(slot) = table.boxes.get_mut(name) else { return Reply::Idle };
+        let Some(slot) = table.boxes.get_mut(name).filter(|slot| run.is_none_or(|run| slot.run == run)) else { return Reply::Idle };
         if slot.state != State::Running {
             return Reply::Busy;
         }
@@ -585,10 +586,12 @@ impl Runs for Keeper<'_> {
         self.table().boxes.iter().filter(|(_, slot)| slot.state == State::Running).map(|(name, slot)| (name.clone(), slot.run)).collect()
     }
 
-    /// Each box whose run is named is stopped as `stop` stops it, one after another.
+    /// Each box whose run is named is stopped as `stop` stops it, one after another, as long as
+    /// that run is still the box's: one whose run ended while another was put away may have
+    /// started again, with a run nobody named.
     fn stop(&self, runs: &[RunId]) -> u32 {
-        let named: Vec<String> = self.runs().into_iter().filter(|(_, run)| runs.contains(run)).map(|(name, _)| name).collect();
-        let stopped = named.iter().filter(|name| self.stop_box(name) == Reply::Stopped).count();
+        let named: Vec<(String, RunId)> = self.runs().into_iter().filter(|(_, run)| runs.contains(run)).collect();
+        let stopped = named.iter().filter(|(name, run)| self.stop_box(name, Some(*run)) == Reply::Stopped).count();
         u32::try_from(stopped).unwrap_or(u32::MAX)
     }
 }
