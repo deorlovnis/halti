@@ -33,7 +33,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
@@ -618,14 +618,19 @@ impl Vms for CloudHypervisor {
     }
 
     /// Run a command as the agent, with the terminal if there is one. Its environment travels in
-    /// the request, not on a command line.
+    /// the request, not on a command line. A box stopped meanwhile (`ws stop`, a closed workspace)
+    /// ends the command with it, and its connection before it can say how: the command ended as
+    /// the stop's SIGTERM ends one, as it does on a Mac.
     fn exec(&self, name: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus> {
         let paths = self.paths(name)?;
         let stream = dial(&paths.vsock, names::EXEC_PORT, ANSWER_WAIT)?;
         let size = tty.then(|| exec::terminal_size(0).unwrap_or(exec::Size { rows: 24, cols: 80 }));
         let request = Request { root: false, tty: size, argv: cmd, env };
         let (mut out, mut err) = (io::stdout(), io::stderr());
-        exec::run(stream, &request, Input::Stdin, Sink { out: &mut out, err: &mut err, most: None }, None)
+        match exec::run(stream, &request, Input::Stdin, Sink { out: &mut out, err: &mut err, most: None }, None) {
+            Err(_) if self.ended(name, &paths, self.waits.stop + self.waits.halt) => Ok(ExitStatus::from_raw(libc::SIGTERM)),
+            ran => ran,
+        }
     }
 
     fn install_ca(&self, name: &str, pem: &str) -> Result<()> {
@@ -995,6 +1000,31 @@ mod tests {
         assert!(got.unwrap_err().to_string().starts_with(&format!("{name} did not start in 2 seconds")));
         assert!(took < Duration::from_millis(4500), "{took:?}");
         assert!(!e.running(&name));
+    }
+
+    /// A box that is stopped while the agent's command runs: the command ended as the stop's
+    /// SIGTERM ends one. A box that runs on and drops the connection: that is said.
+    #[test]
+    fn a_command_of_a_box_that_is_stopped_ends_as_stopped() {
+        let (_dir, e, name, paths) = short("cut", quick(Duration::from_millis(500)));
+        let vsock = UnixListener::bind(&paths.vsock).unwrap();
+        thread::spawn(move || {
+            for mut s in vsock.incoming().flatten() {
+                let mut line = [0u8; 13];
+                let _ = s.read_exact(&mut line);
+                let _ = s.write_all(b"OK 7001\n");
+                // the request, then the connection ends with no last frame
+                let _ = exec::read_frame(&mut s);
+            }
+        });
+        let pid = child_vm(&name);
+        let cmd = ["true".to_string()];
+        // the box runs on: its end of the connection closed, or reset, is an error
+        assert!(e.exec(&name, &[], &cmd, false).is_err());
+        // SAFETY: kill(2) of the stand-in started above, as a stop ends the VM program.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let status = e.exec(&name, &[], &cmd, false).unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
 
     /// A box that writes to its console without end is stopped once the file passes its limit.
