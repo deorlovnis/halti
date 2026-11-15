@@ -644,13 +644,16 @@ fn a_signed_stop_leaves_each_run_named_with_another_box() {
     let desk = desk(limits(), Script::with(vec![]));
     let (pixel, trusted) = phone("pixel", &["acme"]);
     let trust = |name: &str| (name == "pixel").then(|| trusted.clone());
-    let (dev, prod, web) = (RunId([1; 8]), RunId([2; 8]), RunId([3; 8]));
-    let boxes = Running(Mutex::new(vec![("dev".into(), dev), ("prod".into(), prod), ("web".into(), web)]));
+    let (dev, prod, web, devel) = (RunId([1; 8]), RunId([2; 8]), RunId([3; 8]), RunId([4; 8]));
+    let boxes = Running(Mutex::new(vec![("dev".into(), dev), ("devel".into(), devel), ("prod".into(), prod), ("web".into(), web)]));
     let stop = |runs: &[(&str, RunId)]| {
         let runs: Vec<(String, RunId)> = runs.iter().map(|(name, run)| (name.to_string(), *run)).collect();
         let signature = pixel.sign(&crate::hub::wire::stop_bytes("mac-1", "acme", &runs)).unwrap();
         stop_signed(&desk, &trust, &boxes, "pixel", &runs, &signature)
     };
+    // A name that is only the start of the box's, or goes on past it, is another box's.
+    assert_eq!(stop(&[("de", dev), ("devel", dev), ("dev", devel)]), Some(Told::Stopped { stopped: 0, wrong_box: 3 }));
+    assert_eq!(stop(&[("devel", devel)]), Some(Told::Stopped { stopped: 1, wrong_box: 0 }));
     // prod's run named as dev's, and web's as a box that isn't there: both run on. dev, named with
     // its own box, stops; a run that isn't there is passed over.
     assert_eq!(stop(&[("dev", dev), ("dev", prod), ("scratch", web), ("dev", RunId([9; 8]))]), Some(Told::Stopped { stopped: 1, wrong_box: 2 }));
