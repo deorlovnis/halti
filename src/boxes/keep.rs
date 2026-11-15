@@ -4,6 +4,9 @@
 //! the approval. A start held open is a session of its box, and a box stops when its last session
 //! ends, or when it is asked to.
 //!
+//! A write its boxes' policies say to ask about waits on its desk as a request (`crate::requests`),
+//! which the socket lists and answers in records, for `halti requests` in another terminal.
+//!
 //! Closing is one order, whatever asked for it (`halti close`, Ctrl-C, a closed terminal, `kill`):
 //! from the first moment every start is refused (`busy`); every box is asked to stop and is put
 //! away, one that is still starting once its start is done; the boxes of the workspace that other
@@ -28,7 +31,8 @@ use super::{BoxPolicy, KeyStore, MountRule};
 use crate::approval::{Action, Means};
 use crate::config::Settings;
 use crate::engine::Vms;
-use crate::keep::{self, No, Refused, Reply, Request};
+use crate::keep::{self, No, Records, Refused, Reply, Request, Told};
+use crate::requests::{self, Desk, Here, RunId};
 use crate::source;
 use crate::util::{say, sha256_hex, warn};
 
@@ -84,6 +88,7 @@ pub fn serve(keep: Keep) -> Result<u8> {
     let settings = keep.settings.clone();
     let world = keep.vms.map(|vms| run::Real { vms, keys: KeyStore::of(&settings), settings: &settings });
     let ready = |name: &str, shown: &str, checked: &Checked| super::ready(name, shown, &checked.text, checked.policy.keep, &settings);
+    let desk = Desk::new(requests::machine_name(), keep.name.to_string(), requests::LIMITS, Arc::new(requests::TouchId));
     let outside = Outside {
         world: world.as_ref().map(|world| world as &dyn World),
         vms: keep.vms,
@@ -91,6 +96,7 @@ pub fn serve(keep: Keep) -> Result<u8> {
         close: run::signalled(),
         wipe: &|| source::current().close(),
         refused: &|| source::current().refused_reread(),
+        desk: &desk,
     };
     serve_with(keep, &outside)
 }
@@ -109,6 +115,8 @@ struct Outside<'a> {
     wipe: &'a (dyn Fn() + Sync),
     /// True once, after a lookup found the workspace's files gone back to an older state.
     refused: &'a (dyn Fn() -> bool + Sync),
+    /// Where its boxes' writes that ask wait as requests.
+    desk: &'a Arc<Desk>,
 }
 
 fn serve_with(keep: Keep, outside: &Outside) -> Result<u8> {
@@ -140,6 +148,7 @@ fn serve_with(keep: Keep, outside: &Outside) -> Result<u8> {
         waiting: AtomicUsize::new(0),
         closers: Mutex::default(),
         done: AtomicBool::new(false),
+        desk: outside.desk,
     };
     let held = thread::scope(|scope| {
         let keeper = &keeper;
@@ -238,6 +247,8 @@ struct Keeper<'a> {
     closers: Mutex<(Vec<UnixStream>, Option<u32>)>,
     /// Closed and answered: nothing more is accepted.
     done: AtomicBool,
+    /// The requests its boxes wait on.
+    desk: &'a Arc<Desk>,
 }
 
 fn reply(stream: &mut UnixStream, reply: Reply) {
@@ -282,6 +293,9 @@ impl<'a> Keeper<'a> {
         let line = keep::read_line(&mut stream, keep::LINE_WAIT);
         self.waiting.fetch_sub(1, Ordering::SeqCst);
         let Some(line) = line else { return };
+        if let Some(records) = Records::parse(&line) {
+            return self.records(&mut stream, &records);
+        }
         let answer = match Request::parse(&line) {
             None => Reply::Unsupported,
             Some(request) if request.ws() != self.name => Reply::Other,
@@ -291,6 +305,35 @@ impl<'a> Keeper<'a> {
             Some(Request::Ping(_)) => Reply::Open(self.running()),
         };
         reply(&mut stream, answer);
+    }
+
+    /// The requests its boxes wait on: each record, or what came of an answer. An answer that asks
+    /// here first is answered once that is done.
+    fn records(&self, stream: &mut UnixStream, records: &Records) {
+        if records.ws() != self.name {
+            let _ = keep::write_line(stream, &Told::Other.line());
+            return;
+        }
+        match records {
+            Records::List(_) => {
+                for record in self.desk.records() {
+                    if keep::write_line(stream, &Told::Request(record).line()).is_err() {
+                        return;
+                    }
+                }
+                let _ = keep::write_line(stream, &Told::End.line());
+            }
+            Records::Answer(_, yes, digest) => {
+                let told = match self.desk.answer_here(*yes, digest) {
+                    Here::Approved => Told::Approved,
+                    Here::Denied => Told::Denied,
+                    Here::Gone => Told::Gone,
+                    Here::Declined => Told::Declined,
+                    Here::Busy => Told::Busy,
+                };
+                let _ = keep::write_line(stream, &told.line());
+            }
+        }
     }
 
     /// How many boxes run.
@@ -420,6 +463,7 @@ impl<'a> Keeper<'a> {
             stop_with: format!("halti ws stop {shown}"),
             mounts: self.mounts.clone(),
             confirm: false,
+            requests: Some(self.desk.asker(name, RunId::random())),
         };
         match run::start(self.layout, world, &request) {
             Err(refused) => self.refused(name, round, &shown, stop, refused),
@@ -509,6 +553,7 @@ impl<'a> Keeper<'a> {
     /// Refuses every start from now on, asks every box to stop, and waits until each is put away
     /// (one still starting finishes its start first). Returns how many were put away.
     fn put_all_away(&self) -> usize {
+        self.desk.close();
         let mut table = self.table();
         table.closing = true;
         for slot in table.boxes.values() {

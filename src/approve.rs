@@ -6,6 +6,8 @@ use std::cell::RefCell;
 
 use anyhow::{Result, bail};
 
+use crate::requests::Prompted;
+
 thread_local! {
     /// How each prompt this thread asked was answered since its last `take_answers` (true:
     /// approved). Kept per thread: where several boxes run in one process, a call reads back only
@@ -77,6 +79,66 @@ fn ask_person(reason: &str) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn ask_person(reason: &str) -> Result<()> {
     bail!("not approved (Touch ID needs macOS): {reason}")
+}
+
+/// Asks as `confirm` does, until `withdrawn` says the question is gone: then the window is taken
+/// down. A no is the person's own, a Cancel or a failed try. A window that couldn't be shown, or
+/// was taken down, says nothing, and neither does a system with no Touch ID.
+pub fn ask_until(reason: &str, withdrawn: &dyn Fn() -> bool) -> Prompted {
+    // Automated tests answer for the user. Release builds don't contain this.
+    #[cfg(halti_dev)]
+    if let Some(answer) = crate::util::dev_var("HALTI_TEST_APPROVE") {
+        eprintln!("halti: [test] {reason}: {}", answer.to_string_lossy());
+        return if answer == "yes" { Prompted::Yes } else { Prompted::No };
+    }
+    ask_person_until(reason, withdrawn)
+}
+
+#[cfg(target_os = "macos")]
+fn ask_person_until(reason: &str, withdrawn: &dyn Fn() -> bool) -> Prompted {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+
+    use block2::RcBlock;
+    use objc2::runtime::Bool;
+    use objc2_foundation::{NSError, NSString};
+    use objc2_local_authentication::{LAContext, LAPolicy};
+
+    /// How long the window waits for an answer before it is taken down.
+    const TIMEOUT: Duration = Duration::from_secs(120);
+    /// How often `withdrawn` is looked at.
+    const LOOK_EVERY: Duration = Duration::from_millis(100);
+    /// LocalAuthentication's codes for a failed try and for Cancel: the person's no.
+    const FAILED: isize = -1;
+    const CANCELLED: isize = -2;
+
+    let context = unsafe { LAContext::new() };
+    let (tx, rx) = mpsc::channel();
+    let reply = RcBlock::new(move |ok: Bool, error: *mut NSError| {
+        let failure = (!ok.as_bool()).then(|| unsafe { error.as_ref() }.map_or(CANCELLED, |e| e.code()));
+        let _ = tx.send(failure);
+    });
+    unsafe {
+        context.evaluatePolicy_localizedReason_reply(LAPolicy::DeviceOwnerAuthentication, &NSString::from_str(reason), &reply);
+    }
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match rx.recv_timeout(LOOK_EVERY) {
+            Ok(None) => return Prompted::Yes,
+            Ok(Some(FAILED | CANCELLED)) => return Prompted::No,
+            Ok(Some(_)) | Err(RecvTimeoutError::Disconnected) => return Prompted::Unshown,
+            Err(RecvTimeoutError::Timeout) if withdrawn() || Instant::now() >= deadline => {
+                unsafe { context.invalidate() };
+                return Prompted::Unshown;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ask_person_until(_reason: &str, _withdrawn: &dyn Fn() -> bool) -> Prompted {
+    Prompted::Unshown
 }
 
 #[cfg(test)]

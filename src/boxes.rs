@@ -759,6 +759,7 @@ pub fn run(name: &str, temp: bool, command: Vec<String>) -> Result<u8> {
         stop_with: format!("halti box stop {name}"),
         mounts: MountRule::guarded(&settings),
         confirm: true,
+        requests: None,
     };
     run_request(&layout, vms, &settings, &request)
 }
@@ -821,6 +822,7 @@ pub fn run_in(start: Start) -> Result<u8> {
         shown,
         mounts,
         confirm: false,
+        requests: None,
     };
     run_request(&layout, vms, &settings, &request)
 }

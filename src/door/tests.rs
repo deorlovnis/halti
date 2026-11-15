@@ -324,6 +324,7 @@ fn scenario(dir: &Path) {
             log_key: LOG_KEY,
             browser_socket: None,
             browser_tokens: Default::default(),
+            requests: None,
             browser: None,
         },
         net,
@@ -521,6 +522,7 @@ fn model_refusals(dir: &Path) {
             ca: None,
             browser_socket: None,
             browser_tokens: Default::default(),
+            requests: None,
             browser: None,
         };
         let door = Door::start_with(config, Net::system()).unwrap();
@@ -599,6 +601,7 @@ fn live_door() {
         ca: None,
         browser_socket: None,
         browser_tokens: Default::default(),
+        requests: None,
         browser: None,
     })
     .unwrap();
@@ -624,6 +627,7 @@ fn bad_allow_patterns_stop_the_door_from_starting() {
         log_key: LOG_KEY,
         browser_socket: None,
         browser_tokens: Default::default(),
+        requests: None,
         browser: None,
     };
     let err = Door::start(cfg).err().expect("should fail");
@@ -665,6 +669,7 @@ fn dialing_door(dir: &Path, socket: std::path::PathBuf, port: u32) -> Door {
         log_key: LOG_KEY,
         browser_socket: None,
         browser_tokens: Default::default(),
+        requests: None,
         browser: None,
     })
     .unwrap()

@@ -19,6 +19,20 @@
 //!
 //! What a word says is never taken on trust where it matters: a client that is told a workspace was
 //! closed or a box stopped waits until its lock is free (see `ws::keep`).
+//!
+//! Beside those lines, a second version carries the requests the workspace's boxes wait on, as
+//! records (`crate::requests`), in hex:
+//!
+//! ```text
+//! request = "halti-keep/2 list " WS "\n"                      the requests that wait
+//!         | "halti-keep/2 answer " WS " " ("yes" | "no") " " DIGEST "\n"
+//! reply   = *("halti-keep/2 request " HEX "\n") "halti-keep/2 end\n"
+//!         | "halti-keep/2 " ("approved" | "denied" | "gone" | "declined" | "other") "\n"
+//! ```
+//!
+//! A request line is held to the same 128 bytes; a reply line may be as long as a record makes it.
+//! An answer names its request by the 64 hex characters of `requests::answer_digest`: the record
+//! it was shown and the decision. Still no passphrase, key or value crosses.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -35,10 +49,16 @@ use halti_core::boxkey::check_box;
 use halti_core::ids::WsName;
 use halti_core::item::ItemKey;
 
+use crate::requests;
+
 /// The first word of every line.
 const VERSION: &str = "halti-keep/1";
+/// The first word of every line about requests.
+const RECORDS: &str = "halti-keep/2";
 /// The longest line, its newline included.
 pub const LINE_MAX: usize = 128;
+/// The longest line that answers a request about requests: one record, in hex.
+const RECORD_LINE_MAX: usize = 8192;
 /// How long the open workspace waits for a request's line.
 pub const LINE_WAIT: Duration = Duration::from_secs(5);
 /// How long a client waits to be let in.
@@ -252,9 +272,104 @@ impl Reply {
     }
 }
 
+/// What a command asks of an open workspace about the requests its boxes wait on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Records {
+    /// Say every request that waits.
+    List(WsName),
+    /// Answer the request whose record, with this decision, makes this digest.
+    Answer(WsName, bool, [u8; 32]),
+}
+
+impl Records {
+    /// The workspace it names.
+    pub fn ws(&self) -> &WsName {
+        match self {
+            Records::List(ws) | Records::Answer(ws, _, _) => ws,
+        }
+    }
+
+    pub fn line(&self) -> String {
+        match self {
+            Records::List(ws) => format!("{RECORDS} list {ws}\n"),
+            Records::Answer(ws, yes, digest) => format!("{RECORDS} answer {ws} {} {}\n", if *yes { "yes" } else { "no" }, requests::hex(digest)),
+        }
+    }
+
+    /// A line without its newline. None for another version, verb or shape.
+    pub fn parse(line: &str) -> Option<Records> {
+        let words: Vec<&str> = line.strip_prefix(RECORDS)?.strip_prefix(' ')?.split(' ').collect();
+        match words[..] {
+            ["list", ws] => Some(Records::List(WsName::parse(ws).ok()?)),
+            ["answer", ws, decision @ ("yes" | "no"), digest] => {
+                let digest = requests::unhex(digest)?.try_into().ok()?;
+                Some(Records::Answer(WsName::parse(ws).ok()?, decision == "yes", digest))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What an open workspace answers about its requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Told {
+    /// One request that waits: its record.
+    Request(Vec<u8>),
+    /// No more requests wait.
+    End,
+    Approved,
+    Denied,
+    /// No request waits with that record: answered already, expired, or never raised.
+    Gone,
+    /// The prompt asked before a yes said no, or could not be shown.
+    Declined,
+    /// That prompt already asks about another yes to the same request: nothing was done.
+    Busy,
+    /// The request named another workspace: nothing was done.
+    Other,
+}
+
+impl Told {
+    pub fn line(&self) -> String {
+        let words = match self {
+            Told::Request(record) => format!("request {}", requests::hex(record)),
+            Told::End => "end".into(),
+            Told::Approved => "approved".into(),
+            Told::Denied => "denied".into(),
+            Told::Gone => "gone".into(),
+            Told::Declined => "declined".into(),
+            Told::Busy => "busy".into(),
+            Told::Other => "other".into(),
+        };
+        format!("{RECORDS} {words}\n")
+    }
+
+    /// A line without its newline. None for anything that isn't one of the words, or a record that
+    /// isn't hex.
+    pub fn parse(line: &str) -> Option<Told> {
+        let words: Vec<&str> = line.strip_prefix(RECORDS)?.strip_prefix(' ')?.split(' ').collect();
+        Some(match words[..] {
+            ["request", record] => Told::Request(requests::unhex(record).filter(|bytes| !bytes.is_empty())?),
+            ["end"] => Told::End,
+            ["approved"] => Told::Approved,
+            ["denied"] => Told::Denied,
+            ["gone"] => Told::Gone,
+            ["declined"] => Told::Declined,
+            ["busy"] => Told::Busy,
+            ["other"] => Told::Other,
+            _ => return None,
+        })
+    }
+}
+
 /// Reads one line of printable ASCII, at most `LINE_MAX` bytes with its newline, within `wait`,
 /// and nothing after it. None for a longer, slower or other line, or a connection that ends first.
 pub fn read_line(stream: &mut UnixStream, wait: Duration) -> Option<String> {
+    read_line_of(stream, wait, LINE_MAX)
+}
+
+/// As `read_line`, for a line of at most `max` bytes with its newline.
+fn read_line_of(stream: &mut UnixStream, wait: Duration, max: usize) -> Option<String> {
     let deadline = Instant::now() + wait;
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
@@ -265,7 +380,7 @@ pub fn read_line(stream: &mut UnixStream, wait: Duration) -> Option<String> {
         match stream.read(&mut byte) {
             Ok(0) => return None,
             Ok(_) if byte[0] == b'\n' => return String::from_utf8(line).ok(),
-            Ok(_) if (0x20..0x7f).contains(&byte[0]) && line.len() < LINE_MAX - 1 => line.push(byte[0]),
+            Ok(_) if (0x20..0x7f).contains(&byte[0]) && line.len() < max - 1 => line.push(byte[0]),
             Ok(_) => return None,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return None,
@@ -386,6 +501,29 @@ pub fn ask_held(path: &Path, request: &Request, wait: Duration) -> Asked {
     }
 }
 
+/// The records of the requests the open workspace `ws` at `path` waits on, each as it was sent.
+/// None if nothing answered in time, or not as a list does; `Other` as an error word.
+pub fn list(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<Vec<u8>>, Told>> {
+    let mut stream = connect(path)?;
+    write_line(&mut stream, &Records::List(ws.clone()).line()).ok()?;
+    let mut records = Vec::new();
+    loop {
+        match Told::parse(&read_line_of(&mut stream, wait, RECORD_LINE_MAX)?)? {
+            Told::Request(record) => records.push(record),
+            Told::End => return Some(Ok(records)),
+            other => return Some(Err(other)),
+        }
+    }
+}
+
+/// Answers a request of the open workspace `ws` at `path`: the one whose record, with `yes`, makes
+/// `digest`. What it says, or None if nothing answered within `wait`.
+pub fn answer(path: &Path, ws: &WsName, yes: bool, digest: [u8; 32], wait: Duration) -> Option<Told> {
+    let mut stream = connect(path)?;
+    write_line(&mut stream, &Records::Answer(ws.clone(), yes, digest).line()).ok()?;
+    Told::parse(&read_line(&mut stream, wait)?)
+}
+
 /// Whether the other end has closed `stream` and nothing is left to read: looked at without waiting.
 fn ended(stream: &mut UnixStream) -> bool {
     if stream.set_nonblocking(true).is_err() {
@@ -446,6 +584,66 @@ mod tests {
         {
             assert_eq!(Reply::parse(line), None, "{line}");
         }
+    }
+
+    #[test]
+    fn a_line_about_requests_reads_only_as_what_was_written() {
+        let digest = [0xab; 32];
+        let longest = WsName::parse(&"w".repeat(32)).unwrap();
+        for records in [Records::List(acme()), Records::Answer(acme(), true, digest), Records::Answer(longest.clone(), false, [0; 32])] {
+            let line = records.line();
+            assert_eq!(Records::parse(line.strip_suffix('\n').unwrap()), Some(records), "{line}");
+            assert_eq!(Request::parse(line.strip_suffix('\n').unwrap()), None, "never a line of names");
+        }
+        assert_eq!(Records::List(acme()).line(), "halti-keep/2 list acme\n");
+        assert_eq!(Records::Answer(acme(), true, digest).line(), format!("halti-keep/2 answer acme yes {}\n", "ab".repeat(32)));
+        // An answer fits a line of a request, with the longest name.
+        assert_eq!(Records::Answer(longest, true, digest).line().len(), 122);
+        for told in [Told::Request(vec![0, 1, 0xff]), Told::End, Told::Approved, Told::Denied, Told::Gone, Told::Declined, Told::Busy, Told::Other] {
+            let line = told.line();
+            assert_eq!(Told::parse(line.strip_suffix('\n').unwrap()), Some(told), "{line}");
+        }
+        assert_eq!(Told::Request(vec![0, 1, 0xff]).line(), "halti-keep/2 request 0001ff\n");
+        for line in [
+            "halti-keep/2 answer acme maybe abab",
+            &format!("halti-keep/2 answer acme yes {}", "ab".repeat(31)),
+            &format!("halti-keep/2 answer acme yes {}", "AB".repeat(32)),
+            &format!("halti-keep/2 answer Acme yes {}", "ab".repeat(32)),
+            "halti-keep/2 list acme extra",
+            "halti-keep/2 list",
+            "halti-keep/1 list acme",
+            "halti-keep/2 ping acme",
+        ] {
+            assert_eq!(Records::parse(line), None, "{line}");
+        }
+        for line in ["halti-keep/2 request", "halti-keep/2 request ", "halti-keep/2 request 0g", "halti-keep/2 request 0001 x", "halti-keep/2 approved yes", "halti-keep/1 end"] {
+            assert_eq!(Told::parse(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_list_reads_records_until_its_end() {
+        let dir = TempDir::new("halti-keep-list").unwrap();
+        let path = dir.0.join("t.keep.sock");
+        let listener = bind(&path).unwrap().unwrap();
+        let record = vec![0x5a; 3000];
+        let sent = record.clone();
+        let answering = thread::spawn(move || {
+            for told in [vec![Told::Request(sent.clone()), Told::Request(vec![1]), Told::End], vec![Told::Request(sent), Told::Other]] {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert_eq!(read_line(&mut stream, LINE_WAIT).as_deref(), Some("halti-keep/2 list acme"));
+                for told in told {
+                    write_line(&mut stream, &told.line()).unwrap();
+                }
+            }
+        });
+        // A record far longer than a line of names comes whole.
+        assert_eq!(list(&path, &acme(), LINE_WAIT), Some(Ok(vec![record, vec![1]])));
+        assert_eq!(list(&path, &acme(), LINE_WAIT), Some(Err(Told::Other)));
+        answering.join().unwrap();
+        // Nothing listens: no answer.
+        let _ = fs::remove_file(&path);
+        assert_eq!(list(&path, &acme(), Duration::from_millis(300)), None);
     }
 
     #[test]

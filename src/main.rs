@@ -34,6 +34,7 @@ mod mcp;
 mod names;
 mod policy;
 mod refresh;
+mod requests;
 #[cfg(all(halti_dev, target_os = "linux"))]
 mod sandbox;
 mod seal;
@@ -208,6 +209,13 @@ enum Cmd {
         /// The workspace; may be left out when there is only one
         name: Option<String>,
     },
+    /// List the writes the boxes of open workspaces wait on you to approve, or answer one (asks nothing here)
+    #[command(after_help = "A write a box's policy says to ask about waits up to 120 seconds, then is refused. \
+                            On a Mac the terminal where its workspace is open asks Touch ID before an approval counts.")]
+    Requests {
+        #[command(subcommand)]
+        action: Option<RequestsCmd>,
+    },
     /// How this binary was built: whether it has the test hooks, its target, and where it keeps its files
     #[command(name = "build-info", hide = true)]
     BuildInfo,
@@ -314,6 +322,20 @@ Closing a window (or Enter) takes the session; Ctrl-C skips that site. --all sig
         tools: Vec<PathBuf>,
         #[arg(last = true, value_name = "CMD")]
         command: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RequestsCmd {
+    /// Let the box send it (needs a terminal)
+    Approve {
+        /// The request's id as halti requests lists it, or enough of its start
+        id: String,
+    },
+    /// Refuse it (needs a terminal)
+    Deny {
+        /// The request's id as halti requests lists it, or enough of its start
+        id: String,
     },
 }
 
@@ -919,7 +941,7 @@ fn cmd_run(resources: Vec<String>, command: Vec<String>) -> Result<u8> {
 /// Every other command keeps its secrets in the Keychain.
 fn source_for(cmd: &Cmd) -> Option<source::Source> {
     match cmd {
-        Cmd::Ws { .. } | Cmd::Open { .. } | Cmd::Close { .. } | Cmd::Config { .. } | Cmd::BuildInfo => None,
+        Cmd::Ws { .. } | Cmd::Open { .. } | Cmd::Close { .. } | Cmd::Requests { .. } | Cmd::Config { .. } | Cmd::BuildInfo => None,
         #[cfg(all(halti_dev, target_os = "linux"))]
         Cmd::SandboxInit { .. } => None,
         Cmd::Set { .. }
@@ -1043,6 +1065,11 @@ fn run() -> ExitCode {
             Err(e) => Err(e),
         },
         Cmd::Close { name } => ok(ws::keep::close(name.as_deref())),
+        Cmd::Requests { action } => ok(match action {
+            None => ws::requests::list(),
+            Some(RequestsCmd::Approve { id }) => ws::requests::answer(&id, true),
+            Some(RequestsCmd::Deny { id }) => ws::requests::answer(&id, false),
+        }),
         Cmd::BuildInfo => {
             cmd_build_info();
             Ok(0)

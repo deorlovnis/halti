@@ -7,8 +7,10 @@
 //!   ask for objects). Everything else is a write, and so is anything that asks for an
 //!   `Upgrade` (WebSocket). Reads pass. A write follows the site's `[fetch] writes` on the
 //!   hosts of one of the box's sites, and `[net] writes` and `allow_writes` everywhere else;
-//!   `ask` is a Touch ID per write (for `[net]`, as `[box.approval] write` says). A refused
-//!   request gets a 403 with the reason, and the connection stays usable.
+//!   `ask` is a Touch ID per write (for `[net]`, as `[box.approval] write` says). In a box an open
+//!   workspace runs, `ask` raises a request instead, which that Touch ID or `halti requests`
+//!   answers (see `crate::requests`). A refused request gets a 403 with the reason, and the
+//!   connection stays usable.
 //! - **Credentials for any tool.** On the hosts of one of the box's sites (read fresh from its
 //!   approved policy, like the model gateway does), the site's auth header and fixed headers
 //!   replace whatever the guest sent, whatever tool sent it.
@@ -39,10 +41,13 @@ use super::http::{self, Body, Framing, Head};
 use super::{Entry, Shared, page};
 use crate::approval::{self, Action, Means};
 use crate::audit::mask_url;
+use crate::config::Word;
 use crate::index::Index;
 use crate::mask::{Masker, Stream};
 use crate::policy::{self, Fetch, Mode};
+use crate::requests::{self, Came, Raised};
 use crate::source::Hint;
+use crate::ws::OS;
 use crate::{approve, source};
 
 /// A refused request's body is read and dropped, if it is no longer than this; a longer one ends
@@ -270,10 +275,18 @@ struct Refusal {
     status: u16,
     decision: &'static str,
     message: String,
+    asked: Asked,
 }
 
 fn refusal(status: u16, decision: &'static str, message: impl Into<String>) -> Refusal {
-    Refusal { status, decision, message: message.into() }
+    Refusal { status, decision, message: message.into(), asked: Asked::default() }
+}
+
+/// For the log line of a write that raised a request: its id, and who answered it.
+#[derive(Default)]
+struct Asked {
+    request: Option<String>,
+    by: Option<&'static str>,
 }
 
 /// Whose rules decide about writes.
@@ -286,11 +299,11 @@ enum Rules<'a> {
     Page(&'a page::Rules),
 }
 
-/// What the request does at this host: `allowed`, or `asked:yes` after Touch ID, or why not. A write
-/// `[net]` asks about is `allowed` when `[box.approval] write` says none.
-fn decide(sh: &Shared, kind: Kind, rules: &Rules, method: &str, host: &str, target: &str, url: &str) -> Result<&'static str, Refusal> {
+/// What the request does at this host: `allowed`, or `asked:yes` after Touch ID or a request's
+/// yes, or why not. A write `[net]` asks about is `allowed` when `[box.approval] write` says none.
+fn decide(sh: &Shared, kind: Kind, rules: &Rules, method: &str, host: &str, target: &str, url: &str) -> Result<(&'static str, Asked), Refusal> {
     if kind == Kind::Read {
-        return Ok("allowed");
+        return Ok(("allowed", Asked::default()));
     }
     // A site rules its own hosts; the box's exceptions are for the rest.
     let (mode, who, hint) = match rules {
@@ -311,19 +324,52 @@ fn decide(sh: &Shared, kind: Kind, rules: &Rules, method: &str, host: &str, targ
             let reason = format!("let box {} send {method} {url}", sh.cfg.name);
             // The agent holds the terminal, so what is asked there never approves its writes.
             let means = sh.cfg.net.ask.filter(|means| !means.asks_on_terminal());
+            if matches!(rules, Rules::Net) && means == Some(Means::None) {
+                return Ok(("allowed", Asked::default()));
+            }
+            if let Some(asker) = &sh.cfg.requests {
+                // A site's own `ask` is Touch ID's wherever there is Touch ID; `[net]`'s is its line's.
+                let confirm = match rules {
+                    Rules::Net => means == Some(Means::TouchId),
+                    Rules::Fetch(_) | Rules::Page(_) => Means::TouchId.on(OS),
+                };
+                let raised = asker.raise(&requests::action(method, url), confirm, &|| sh.stopped());
+                return came_to(raised, &sh.cfg.name, method, url, asker.limits());
+            }
             let asked = match rules {
-                Rules::Net if means == Some(Means::None) => return Ok("allowed"),
                 Rules::Net => approval::ask_by(&approval::Real, means, Action::BoxWrite, &reason).map(drop),
                 Rules::Fetch(_) | Rules::Page(_) => approve::confirm(&reason),
             };
             match asked {
-                Ok(()) => Ok("asked:yes"),
+                Ok(()) => Ok(("asked:yes", Asked::default())),
                 // Nothing here can approve it: the answer says so.
                 Err(e) if means.is_none() && matches!(rules, Rules::Net) => Err(refusal(403, "asked:no", format!("{method} {url} wasn't approved: {e}"))),
                 Err(_) => Err(refusal(403, "asked:no", format!("{method} {url} wasn't approved"))),
             }
         }
-        (Mode::Allow, _) => Ok("allowed"),
+        (Mode::Allow, _) => Ok(("allowed", Asked::default())),
+    }
+}
+
+/// What a write that raised a request does, as the request came to; the agent is told why not.
+fn came_to(raised: Raised, shown: &str, method: &str, url: &str, limits: requests::Limits) -> Result<(&'static str, Asked), Refusal> {
+    let request = raised.id.map(|id| id.hex());
+    let no = |decision: &'static str, why: String, by: Option<&'static str>| {
+        let message = format!("{method} {url} wasn't approved{why}");
+        Err(Refusal { asked: Asked { request: request.clone(), by }, ..refusal(403, decision, message) })
+    };
+    match raised.came {
+        Came::Yes(by) => Ok(("asked:yes", Asked { request: request.clone(), by: Some(by.word()) })),
+        Came::No(by) => no("asked:no", String::new(), Some(by.word())),
+        Came::Expired => no("asked:no", format!(": nobody answered within {} seconds", limits.wait.as_secs()), None),
+        Came::Withdrawn => no("asked:no", ": the box is stopping".into(), None),
+        Came::Full => no("blocked:requests", format!(": box {shown} has {} requests waiting already", limits.per_box), None),
+        Came::WorkspaceFull => no("blocked:requests", format!(": box {shown}'s workspace has {} requests waiting already", limits.per_desk), None),
+        Came::Resting => no(
+            "blocked:requests",
+            format!(": box {shown}'s last {} requests were refused or not answered, so its writes that ask are refused for {} minutes", limits.strikes, limits.rest.as_secs() / 60),
+            None,
+        ),
     }
 }
 
@@ -402,12 +448,17 @@ fn exchange<G: Read + Write, U: Read + Write>(
         (None, Some(site)) => Rules::Fetch(site),
         (None, None) => Rules::Net,
     };
-    let decision = match decide(sh, kind, &rules, &method_shown, ctx.host, target, &url) {
-        Ok(decision) => decision,
+    let (decision, asked) = match decide(sh, kind, &rules, &method_shown, ctx.host, target, &url) {
+        Ok(decided) => decided,
         Err(r) => {
-            sh.log.write(&entry(&method_shown, &url, Some(r.status), r.decision, counts));
+            sh.log.write(&Entry { request: r.asked.request.clone(), by: r.asked.by, ..entry(&method_shown, &url, Some(r.status), r.decision, counts) });
             return refuse(guest, &head, framing, &r, keep);
         }
+    };
+    let entry = |method: &str, url: &str, status: Option<u16>, decision: &str, counts: &Counts| Entry {
+        request: asked.request.clone(),
+        by: asked.by,
+        ..entry(method, url, status, decision, counts)
     };
 
     // The request, on its way: what the site sets replaces what the guest sent.
