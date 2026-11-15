@@ -39,6 +39,7 @@ impl DockerBox {
         let config = Config {
             name: name.clone(),
             socket: spec.socket.clone(),
+            port: None,
             allow,
             model: None,
             sites: vec![],
@@ -80,6 +81,8 @@ fn vm_spec(name: &str, image: &str, dir: &Path, memory: &str, docker: bool) -> e
         mounts: vec![engine::Mount { host: dir.join("home"), guest: "/home/agent".into(), readonly: false }],
         docker,
         rosetta: false,
+        disk: None,
+        console: None,
     }
 }
 

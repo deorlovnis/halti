@@ -94,11 +94,17 @@ pub const DOOR_KIND: &str = "halti";
 
 /// For an engine whose host dials the box over vsock (`halti-shim serve --vsock`): the port the
 /// door dials in place of `DOOR_SOCKET`, and the port of the shim's exec service. Compiled into
-/// the shim; no engine of this crate dials them yet.
-#[allow(dead_code)]
+/// the shim.
+#[allow(dead_code)] // the door is told it once a box runs on such an engine
 pub const DOOR_PORT: u32 = 7000;
-#[allow(dead_code)]
 pub const EXEC_PORT: u32 = 7001;
+
+/// The shim's mode as the first process of a VM that boots the image itself: the VM program's
+/// kernel command line runs `SHIM_PATH` with it.
+pub const SHIM_BOOT: &str = "boot";
+
+/// The vsock id of every box's VM. Each VM's device is its own, so one id serves them all.
+pub const GUEST_CID: u32 = 3;
 
 /// What a box holds in place of the model key, which the door's gateway swaps for the real one.
 /// Box homes and the agents' own configs hold it, and other agents built for boxes send it too.
@@ -121,6 +127,15 @@ pub const WS_BROWSER_VM_PREFIX: &str = "halti-wsbrowser-";
 
 /// The folder of a workspace's boxes' sockets, inside the sockets folder (`/tmp/halti-<uid>/ws`).
 pub const WS_SOCKETS: &str = "ws";
+
+/// The end of the name of the folder of a VM's own sockets in that folder, `<tag>-<box>.vm`, where
+/// an engine that starts the VM program itself keeps its vsock and control sockets.
+pub const VM_SOCKETS: &str = ".vm";
+
+/// Where a Linux server keeps, owned by root, what its boxes run on: the VM program, the box
+/// kernel, and the box images, `images/<image>/<64 hex>.img`, each file named by the sha256 that
+/// box policies pin. install-linux.sh puts them there.
+pub const LINUX_LIB: &str = "/usr/local/lib/halti";
 
 /// The end of the name of an open workspace's socket in that folder, `<tag>.keep.sock`. No box name
 /// has a dot, so it is never a box's socket.
@@ -153,7 +168,8 @@ mod tests {
         assert_eq!((STANDIN, MCP_SERVER_KEY), ("halti-managed", "halti"));
         assert_eq!((BOX_VM_PREFIX, BROWSER_VM_PREFIX), ("halti-box-", "halti-browser-"));
         assert_eq!((WS_BOX_VM_PREFIX, WS_BROWSER_VM_PREFIX, WS_SOCKETS), ("halti-wsbox-", "halti-wsbrowser-", "ws"));
-        assert_eq!((KEEP_SOCKET, KEEPER_LOCK), (".keep.sock", "keeper.lock"));
+        assert_eq!((KEEP_SOCKET, KEEPER_LOCK, VM_SOCKETS), (".keep.sock", "keeper.lock", ".vm"));
+        assert_eq!((SHIM_BOOT, GUEST_CID, LINUX_LIB), ("boot", 3, "/usr/local/lib/halti"));
         let today = [BOX_VM_PREFIX, BROWSER_VM_PREFIX, crate::legacy::BOX_VM_PREFIX, crate::legacy::BROWSER_VM_PREFIX];
         for new in [WS_BOX_VM_PREFIX, WS_BROWSER_VM_PREFIX] {
             for old in today {

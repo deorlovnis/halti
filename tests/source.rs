@@ -53,6 +53,9 @@ const TEST: &[&str] = &[
     "HALTI_DOOR_LIVE",
     "HALTI_DOOR_ALLOW",
     "HALTI_DOOR_SECONDS",
+    "HALTI_KVM_PROGRAM",
+    "HALTI_KVM_KERNEL",
+    "HALTI_KVM_IMAGES",
 ];
 
 /// Never read by halti: set for other programs, or named in text.

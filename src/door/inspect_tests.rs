@@ -336,6 +336,7 @@ fn shared_asking(dir: &Path, name: &str, writes: Mode, allow_writes: &[&str], as
     let config = Config {
         name: "testbox".into(),
         socket: dir.join("unused.sock"),
+        port: None,
         allow: vec!["*".into()],
         model: None,
         sites: vec!["app".into(), "readonly".into(), "askme".into(), "pending".into()],

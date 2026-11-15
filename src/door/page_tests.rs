@@ -169,6 +169,7 @@ fn scenario(dir: &Path, yes: bool) {
         Config {
             name: "pagebox".into(),
             socket: agent_socket,
+            port: None,
             allow: vec!["https://app.example.com".into()],
             model: None,
             sites: vec!["app".into(), "loose".into(), "askme".into(), "fetchonly".into()],

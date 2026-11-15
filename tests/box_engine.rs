@@ -206,6 +206,8 @@ fn vm_has_only_the_door() {
         mounts: vec![engine::Mount { host: home.clone(), guest: "/home/agent".into(), readonly: false }, engine::Mount { host: ro, guest: "/ro".into(), readonly: true }],
         docker: false,
         rosetta: false,
+        disk: None,
+        console: None,
     };
     let door = TestDoor::start(&spec.socket);
     let vm = Vm(name.clone());

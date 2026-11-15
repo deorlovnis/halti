@@ -39,6 +39,7 @@ mod sandbox;
 mod seal;
 mod source;
 mod util;
+mod vmm;
 mod ws;
 
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};

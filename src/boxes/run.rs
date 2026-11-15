@@ -82,6 +82,12 @@ pub trait World: Sync {
     /// Keep where the box's log chain stands, outside the store.
     fn record_log_head(&self, name: &str, head: &chain::Head) -> Result<()>;
     fn exec(&self, vm: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus>;
+    /// Whether the engine is given the box's disk in place of mounts (`Vms::takes_disk`).
+    #[allow(dead_code)] // no engine of a run takes a disk yet
+    fn takes_disk(&self) -> bool;
+    /// Run a command in the VM as the agent, bytes in and bytes out (`Vms::pipe`).
+    #[allow(dead_code)] // for an engine that takes a disk
+    fn pipe(&self, vm: &str, cmd: &[String], input: &[u8]) -> Result<Vec<u8>>;
 }
 
 /// The real thing, as the settings say: the engine `[box] engine` picked, where `[box] keys` keeps
@@ -166,6 +172,14 @@ impl World for Real<'_> {
         // `container exec` shares the terminal and may leave it non-blocking.
         crate::util::blocking_stdio();
         status
+    }
+
+    fn takes_disk(&self) -> bool {
+        self.vms.takes_disk()
+    }
+
+    fn pipe(&self, vm: &str, cmd: &[String], input: &[u8]) -> Result<Vec<u8>> {
+        self.vms.pipe(vm, cmd, input)
     }
 }
 
@@ -417,11 +431,14 @@ impl Running<'_> {
             mounts,
             docker: policy.docker,
             rosetta: policy.rosetta,
+            disk: None,
+            console: None,
         };
         let config = door::Config {
             // A workspace's box is named with its workspace, in the door's answers and the audit log.
             name: if layout.in_workspace() { req.shown.clone() } else { req.id.clone() },
             socket,
+            port: None,
             allow: policy.allow(),
             model: policy.model.clone(),
             sites: policy.sites.clone(),
@@ -1008,6 +1025,15 @@ mod tests {
                 return Ok(ExitStatus::from_raw(15));
             }
             Ok(ExitStatus::from_raw(0))
+        }
+
+        fn takes_disk(&self) -> bool {
+            false
+        }
+
+        fn pipe(&self, _vm: &str, _cmd: &[String], _input: &[u8]) -> Result<Vec<u8>> {
+            self.note("pipe");
+            Ok(Vec::new())
         }
     }
 
@@ -1813,6 +1839,15 @@ mod tests {
         fn image_digest(&self, _reference: &str) -> Result<String> {
             self.calls.lock().unwrap().push("image_digest".into());
             Ok(DIGEST.into())
+        }
+
+        fn takes_disk(&self) -> bool {
+            false
+        }
+
+        fn pipe(&self, _name: &str, _cmd: &[String], _input: &[u8]) -> Result<Vec<u8>> {
+            self.calls.lock().unwrap().push("pipe".into());
+            Ok(Vec::new())
         }
     }
 

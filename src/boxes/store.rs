@@ -162,6 +162,14 @@ impl Layout {
         self.sockets.join(format!("{}.sock", self.named(id)))
     }
 
+    /// The folder of the sockets of a VM that the box's engine starts itself (`vmm`): those of
+    /// that VM alone, beside the agent's socket. Its name has a dot, which no box name has, so it
+    /// is never another box's socket.
+    #[allow(dead_code)] // for an engine that starts its VMs itself
+    pub fn vm_sockets(&self, id: &str) -> PathBuf {
+        self.sockets.join(format!("{}{}", self.named(id), names::VM_SOCKETS))
+    }
+
     /// The socket of the box's browser VM, next to the agent's. In a workspace its name has a dot,
     /// which no box name has, so it is never another box's agent socket.
     #[allow(dead_code)] // for the browser VM of box runs
@@ -223,7 +231,7 @@ impl Layout {
 }
 
 /// The sockets folder of this build: /tmp/halti-<uid>, /tmp/halti-dev-<uid> for debug builds.
-fn sockets(uid: u32) -> PathBuf {
+pub(crate) fn sockets(uid: u32) -> PathBuf {
     // Debug builds' VMs publish their sockets apart from an installed halti's.
     PathBuf::from(format!("/tmp/{}-{uid}", if cfg!(halti_dev) { "halti-dev" } else { "halti" }))
 }
@@ -234,7 +242,7 @@ fn uid() -> Result<u32> {
 }
 
 /// A folder only this user can enter. One that exists must already be ours, not a link, and private.
-fn private_dir(dir: &Path, uid: u32) -> Result<()> {
+pub(crate) fn private_dir(dir: &Path, uid: u32) -> Result<()> {
     if let Some(parent) = dir.parent().filter(|p| !p.exists()) {
         fs::create_dir_all(parent)?;
     }
