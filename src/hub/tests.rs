@@ -358,8 +358,12 @@ fn a_name_is_taken_by_a_row_or_a_pairing_under_way() {
     paired_phone(&hub, "pixel");
     assert_eq!(begin(&hub, device("pixel", &["beta"])).err(), Some(Outcome::Taken));
     assert_eq!(begin(&hub, machine("pixel")).err(), Some(Outcome::Taken));
+    // A pairing under way is no row: it is told apart, since devices and revoke don't know it.
     let under_way = begin(&hub, machine("server-1")).unwrap();
-    assert_eq!(begin(&hub, device("server-1", &["acme"])).err(), Some(Outcome::Taken));
+    assert_eq!(begin(&hub, device("server-1", &["acme"])).err(), Some(Outcome::Busy));
+    assert_eq!(begin(&hub, machine("server-1")).err(), Some(Outcome::Busy));
+    assert!(!hub.list().iter().any(|row| row.name == "server-1"));
+    assert!(!admin::revoke_at(&hub.socket(), "server-1").unwrap());
     drop(under_way);
 }
 
@@ -458,7 +462,7 @@ fn a_revoked_token_stops_at_once() {
 
 #[test]
 fn a_phone_renews_on_any_day_until_day_90() {
-    for day in [0, 1, 20, 29, 30, 31, 60, 89] {
+    for day in 0..90 {
         let hub = start();
         let phone = paired_phone(&hub, "pixel");
         hub.at(day * DAY + SignedDuration::from_secs(3600));
@@ -518,39 +522,101 @@ fn the_replaced_token_works_until_the_new_one_is_used() {
 /// A little under the 24 hours the replaced token keeps.
 const OLD_TOKEN_LEFT: SignedDuration = SignedDuration::from_secs(24 * 3600 - 1);
 
+/// Asks for a renewal nonce with this token.
+fn ask_nonce(hub: &Running, token_: &str) -> [u8; 16] {
+    let (status, body) = hub.call("POST", "/v1/renew/nonce", Some(token_), None);
+    assert_eq!(status, 200, "{body}");
+    wire::unhex(body["nonce"].as_str().unwrap()).unwrap()
+}
+
+/// A phone's renewal with this token, nonce, new token hash and signature.
+fn send_renewal(hub: &Running, token_: &str, nonce: &[u8; 16], hash: &[u8; 32], signature: &[u8]) -> (u16, Value) {
+    hub.call("POST", "/v1/renew", Some(token_), Some(&json!({"nonce": wire::hex(nonce), "token_hash": wire::hex(hash), "signature": wire::hex(signature)})))
+}
+
 #[test]
 fn a_nonce_is_good_once_for_two_minutes() {
     let hub = start();
+    let mut phone = paired_phone(&hub, "pixel");
+    let sign = |phone: &Phone, nonce: &[u8; 16], hash: &[u8; 32]| phone.sign(&wire::renew_bytes(&hub.pin, "pixel", nonce, hash));
+    let hash = wire::token_hash(&token(Kind::Device));
+    // A nonce the hub never gave, or one it gave with any byte changed.
+    assert_eq!(send_renewal(&hub, &phone.token, &[7; 16], &hash, &sign(&phone, &[7; 16], &hash)), (403, error("bad-nonce")));
+    let nonce = ask_nonce(&hub, &phone.token);
+    for i in [0, 3, 4, 15] {
+        let mut other = nonce;
+        other[i] ^= 1;
+        assert_eq!(send_renewal(&hub, &phone.token, &other, &hash, &sign(&phone, &other, &hash)), (403, error("bad-nonce")), "byte {i}");
+    }
+    // Too late.
+    hub.advance(SignedDuration::from_secs(120));
+    assert_eq!(send_renewal(&hub, &phone.token, &nonce, &hash, &sign(&phone, &nonce, &hash)), (403, error("bad-nonce")));
+    // Asking again gives another and leaves the first good. A refused renewal leaves its nonce
+    // good too, a body that isn't one included.
+    let (first, second) = (ask_nonce(&hub, &phone.token), ask_nonce(&hub, &phone.token));
+    let no_hash = json!({"nonce": wire::hex(&first), "signature": wire::hex(&sign(&phone, &first, &hash))});
+    assert_eq!(hub.call("POST", "/v1/renew", Some(&phone.token), Some(&no_hash)), (400, error("malformed")));
+    assert_eq!(send_renewal(&hub, &phone.token, &first, &hash, &sign(&phone, &first, &[0; 32])), (403, error("bad-signature")));
+    let new = token(Kind::Device);
+    let new_hash = wire::token_hash(&new);
+    assert_eq!(send_renewal(&hub, &phone.token, &first, &new_hash, &sign(&phone, &first, &new_hash)).0, 200);
+    phone.token = new;
+    // A renewal it made used it up; the second is still good.
+    let newer = wire::token_hash(&token(Kind::Device));
+    assert_eq!(send_renewal(&hub, &phone.token, &first, &newer, &sign(&phone, &first, &newer)), (403, error("bad-nonce")));
+    assert_eq!(send_renewal(&hub, &phone.token, &second, &newer, &sign(&phone, &second, &newer)).0, 200);
+}
+
+#[test]
+fn a_nonce_is_good_only_for_the_row_it_was_given_to() {
+    let hub = start();
     let phone = paired_phone(&hub, "pixel");
     let sign = |nonce: &[u8; 16], hash: &[u8; 32]| phone.sign(&wire::renew_bytes(&hub.pin, "pixel", nonce, hash));
-    let ask = || -> [u8; 16] { wire::unhex(hub.call("POST", "/v1/renew/nonce", Some(&phone.token), None).1["nonce"].as_str().unwrap()).unwrap() };
-    let renew = |nonce: &[u8; 16], hash: &[u8; 32], signature: &[u8]| {
-        hub.call("POST", "/v1/renew", Some(&phone.token), Some(&json!({"nonce": wire::hex(nonce), "token_hash": wire::hex(hash), "signature": wire::hex(signature)})))
-    };
     let hash = wire::token_hash(&token(Kind::Device));
-    // No nonce asked for, or another one.
-    assert_eq!(renew(&[7; 16], &hash, &sign(&[7; 16], &hash)), (403, error("bad-nonce")));
-    let nonce = ask();
-    let mut other = nonce;
-    other[0] ^= 1;
-    assert_eq!(renew(&other, &hash, &sign(&other, &hash)), (403, error("bad-nonce")));
-    // That try used the nonce up.
-    assert_eq!(renew(&nonce, &hash, &sign(&nonce, &hash)), (403, error("bad-nonce")));
-    // Too late.
-    let nonce = ask();
-    hub.advance(SignedDuration::from_secs(120));
-    assert_eq!(renew(&nonce, &hash, &sign(&nonce, &hash)), (403, error("bad-nonce")));
-    // Asking again replaces it.
-    let (first, second) = (ask(), ask());
-    assert_eq!(renew(&first, &hash, &sign(&first, &hash)), (403, error("bad-nonce")));
-    assert_ne!(first, second);
+    // Another phone's.
+    let tablet = paired_phone(&hub, "tablet");
+    let theirs = ask_nonce(&hub, &tablet.token);
+    assert_eq!(send_renewal(&hub, &phone.token, &theirs, &hash, &sign(&theirs, &hash)), (403, error("bad-nonce")));
+    // One given to this name before it was revoked and paired again.
+    let before = ask_nonce(&hub, &phone.token);
+    assert!(admin::revoke_at(&hub.socket(), "pixel").unwrap());
+    hub.advance(SignedDuration::from_secs(1));
+    let again = paired_phone(&hub, "pixel");
+    let signed = again.sign(&wire::renew_bytes(&hub.pin, "pixel", &before, &hash));
+    assert_eq!(send_renewal(&hub, &again.token, &before, &hash, &signed), (403, error("bad-nonce")));
+}
+
+#[test]
+fn a_copy_of_a_phone_token_cannot_keep_the_phone_from_renewing() {
+    // On a day the token works, and after day 30, when the copy can still ask for nonces.
+    for day in [5, 45] {
+        let hub = start();
+        let phone = paired_phone(&hub, "pixel");
+        let copy = phone.token.clone();
+        hub.at(day * DAY);
+        let nonce = ask_nonce(&hub, &phone.token);
+        // While the phone asks for a fingerprint, the copy asks for nonces and sends what it can.
+        let stranger = Phone::new();
+        for _ in 0..3 {
+            let its = ask_nonce(&hub, &copy);
+            let hash = wire::token_hash(&token(Kind::Device));
+            assert_eq!(send_renewal(&hub, &copy, &its, &hash, &stranger.sign(&wire::renew_bytes(&hub.pin, "pixel", &its, &hash))), (403, error("bad-signature")), "day {day}");
+            assert_eq!(send_renewal(&hub, &copy, &nonce, &hash, &stranger.sign(&wire::renew_bytes(&hub.pin, "pixel", &nonce, &hash))), (403, error("bad-signature")), "day {day}");
+        }
+        let new = token(Kind::Device);
+        let hash = wire::token_hash(&new);
+        assert_eq!(send_renewal(&hub, &phone.token, &nonce, &hash, &phone.sign(&wire::renew_bytes(&hub.pin, "pixel", &nonce, &hash))).0, 200, "day {day}");
+        // Once the phone uses its new token, the copy is worth nothing.
+        assert_eq!(hub.call("GET", "/v1/me", Some(&new), None).0, 200, "day {day}");
+        assert_eq!(hub.call("POST", "/v1/renew/nonce", Some(&copy), None), (401, error("unknown")), "day {day}");
+    }
 }
 
 /// Signs a renewal for a nonce, somehow.
 type Sign<'a> = Box<dyn Fn(&[u8; 16]) -> Vec<u8> + 'a>;
 
 #[test]
-fn a_renewal_with_a_bad_signature_is_refused_and_uses_its_nonce() {
+fn a_renewal_with_a_bad_signature_is_refused() {
     let hub = start();
     let phone = paired_phone(&hub, "pixel");
     let stranger = Phone::new();
@@ -564,15 +630,13 @@ fn a_renewal_with_a_bad_signature_is_refused_and_uses_its_nonce() {
         ("another token", Box::new(|n| phone.sign(&wire::renew_bytes(&hub.pin, "pixel", n, &[0; 32])))),
         ("the pairing's bytes", Box::new(|n| phone.sign(&wire::fields(&[wire::PAIR_LABEL.as_bytes(), n])))),
     ];
+    let nonce = ask_nonce(&hub, &phone.token);
     for (what, sign) in attempts {
-        let nonce: [u8; 16] = wire::unhex(hub.call("POST", "/v1/renew/nonce", Some(&phone.token), None).1["nonce"].as_str().unwrap()).unwrap();
-        let body = json!({"nonce": wire::hex(&nonce), "token_hash": wire::hex(&hash), "signature": wire::hex(&sign(&nonce))});
-        assert_eq!(hub.call("POST", "/v1/renew", Some(&phone.token), Some(&body)), (403, error("bad-signature")), "{what}");
-        let right = json!({"nonce": wire::hex(&nonce), "token_hash": wire::hex(&hash), "signature": wire::hex(&phone.sign(&wire::renew_bytes(&hub.pin, "pixel", &nonce, &hash)))});
-        assert_eq!(hub.call("POST", "/v1/renew", Some(&phone.token), Some(&right)), (403, error("bad-nonce")), "{what}");
+        assert_eq!(send_renewal(&hub, &phone.token, &nonce, &hash, &sign(&nonce)), (403, error("bad-signature")), "{what}");
     }
-    // The token itself was never replaced.
+    // The token itself was never replaced, and the nonce is still good for the right signature.
     assert_eq!(hub.call("GET", "/v1/me", Some(&phone.token), None).1["issued"], json!(START));
+    assert_eq!(send_renewal(&hub, &phone.token, &nonce, &hash, &phone.sign(&wire::renew_bytes(&hub.pin, "pixel", &nonce, &hash))).0, 200);
 }
 
 #[test]
@@ -684,6 +748,96 @@ fn an_old_token_past_its_24_hours_marks_a_conflict() {
 }
 
 #[test]
+fn any_earlier_machine_token_used_again_marks_a_conflict() {
+    // A copy renews on day 10 and day 20; the real machine comes back with its day-0 token.
+    let hub = start();
+    let machine_ = paired_machine(&hub, "server-1");
+    hub.at(10 * DAY);
+    let (second, status, _) = renew_machine(&hub, &machine_.token);
+    assert_eq!(status, 200);
+    assert_eq!(hub.call("GET", "/v1/me", Some(&second), None).0, 200);
+    hub.at(20 * DAY);
+    let (third, status, _) = renew_machine(&hub, &second);
+    assert_eq!(status, 200);
+    assert_eq!(hub.call("GET", "/v1/me", Some(&third), None).0, 200);
+    hub.at(25 * DAY);
+    assert_eq!(hub.call("GET", "/v1/me", Some(&machine_.token), None), (401, error("conflict")));
+    assert_eq!(hub.row("server-1").conflict_since, Some(START.parse::<Timestamp>().unwrap() + 25 * DAY));
+
+    // The same from a backup restored after the token in it expired, and with a renewal.
+    let hub = start();
+    let machine_ = paired_machine(&hub, "server-1");
+    let mut held = machine_.token.clone();
+    for day in [10, 20, 30] {
+        hub.at(day * DAY);
+        let (new, status, _) = renew_machine(&hub, &held);
+        assert_eq!(status, 200, "day {day}");
+        assert_eq!(hub.call("GET", "/v1/me", Some(&new), None).0, 200, "day {day}");
+        held = new;
+    }
+    hub.at(35 * DAY);
+    assert_eq!(renew_machine(&hub, &machine_.token).2, error("conflict"));
+    assert!(hub.row("server-1").conflict_since.is_some());
+}
+
+#[test]
+fn an_earlier_machine_token_is_forgotten_90_days_after_its_issue() {
+    let hub = start();
+    let machine_ = paired_machine(&hub, "server-1");
+    let mut held = machine_.token.clone();
+    let mut tokens = vec![held.clone()];
+    for day in [10, 20, 30, 40, 50, 60, 70, 80] {
+        hub.at(day * DAY);
+        let (new, status, _) = renew_machine(&hub, &held);
+        assert_eq!(status, 200, "day {day}");
+        assert_eq!(hub.call("GET", "/v1/me", Some(&new), None).0, 200, "day {day}");
+        tokens.push(new.clone());
+        held = new;
+    }
+    // The day-0 token is gone; the day-10 one is still known.
+    hub.at(90 * DAY);
+    assert_eq!(hub.call("GET", "/v1/me", Some(&tokens[0]), None), (401, error("unknown")));
+    assert_eq!(hub.row("server-1").conflict_since, None);
+    assert_eq!(hub.call("GET", "/v1/me", Some(&tokens[1]), None), (401, error("conflict")));
+}
+
+#[test]
+fn a_marked_machine_is_paired_again_only_after_a_revoke() {
+    let hub = start();
+    let machine_ = paired_machine(&hub, "server-1");
+    hub.at(10 * DAY);
+    let (new, status, _) = renew_machine(&hub, &machine_.token);
+    assert_eq!(status, 200);
+    assert_eq!(hub.call("GET", "/v1/me", Some(&new), None).0, 200);
+    assert_eq!(hub.call("GET", "/v1/me", Some(&machine_.token), None), (401, error("conflict")));
+    // Past day 30 the machine's token has expired, and its name is still not free.
+    hub.at(41 * DAY);
+    assert_eq!(begin(&hub, machine("server-1")).err(), Some(Outcome::Marked));
+    assert_eq!(begin(&hub, device("server-1", &["acme"])).err(), Some(Outcome::Marked));
+    assert!(hub.row("server-1").conflict_since.is_some());
+    assert!(admin::revoke_at(&hub.socket(), "server-1").unwrap());
+    paired_machine(&hub, "server-1");
+    assert_eq!(hub.row("server-1").conflict_since, None);
+
+    // Marked while its pairing waits for the terminal: the y there pairs nothing.
+    let hub = start();
+    let machine_ = paired_machine(&hub, "server-1");
+    hub.at(10 * DAY);
+    let (new, status, _) = renew_machine(&hub, &machine_.token);
+    assert_eq!(status, 200);
+    assert_eq!(hub.call("GET", "/v1/me", Some(&new), None).0, 200);
+    hub.at(41 * DAY);
+    let again = Machine::new();
+    let pairing = begin(&hub, machine("server-1")).unwrap();
+    assert_eq!(hub.call("POST", "/v1/join", None, Some(&again.join_body(&pairing.invite))).0, 202);
+    assert_eq!(pairing.claimed(), None);
+    assert_eq!(hub.call("GET", "/v1/me", Some(&machine_.token), None), (401, error("conflict")));
+    assert_eq!(pairing.answer(true), Outcome::Marked);
+    assert_eq!(hub.call("GET", "/v1/me", Some(&again.token), None), (401, error("unknown")));
+    assert!(hub.row("server-1").conflict_since.is_some());
+}
+
+#[test]
 fn a_phone_has_no_conflict_mark() {
     let hub = start();
     let phone = paired_phone(&hub, "pixel");
@@ -741,10 +895,24 @@ fn a_slow_request_is_closed_without_a_reply() {
     let _ = stream.read_to_end(&mut rest);
     assert!(rest.is_empty(), "{rest:?}");
     assert!(started.elapsed() < Duration::from_secs(5));
-    // A TCP connection that never starts TLS is closed too.
+    // A TCP connection that never starts TLS is closed too, by the hub: a read that only times out
+    // is not a close.
     let mut tcp = TcpStream::connect(&hub.address).unwrap();
     tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    assert_eq!(tcp.read(&mut [0; 16]).unwrap_or(0), 0);
+    let started = std::time::Instant::now();
+    let read = tcp.read(&mut [0; 16]);
+    assert!(matches!(read, Ok(0)) || matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset), "{read:?}");
+    assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+#[test]
+fn a_request_line_that_is_not_one_gets_no_reply() {
+    let hub = start();
+    for line in ["GET /v1/me", "GET  /v1/me HTTP/1.1", "GET /v1/me HTTP/1.1 x", "GET /v1/me FTP/1.0", " /v1/me HTTP/1.1"] {
+        assert_eq!(hub.raw(format!("{line}\r\n\r\n").as_bytes()), None, "{line}");
+    }
+    assert_eq!(hub.raw(b"GET /v1/me HTTP/1.1\r\nNo colon\r\n\r\n"), None);
+    assert_eq!(hub.raw(b"GET /v1/me HTTP/1.1\r\n\r\n"), Some((401, error("no-token"))));
 }
 
 /// Whether the hub closes a connection at once: one more than its limits allow.
@@ -768,6 +936,22 @@ fn connections_past_the_limits_are_closed_before_tls() {
     let _held: Vec<TcpStream> = (0..2).map(|_| TcpStream::connect(&hub.address).unwrap()).collect();
     thread::sleep(Duration::from_millis(200));
     assert!(closed_at_once(&hub.address), "a third in all");
+}
+
+#[test]
+fn the_gate_counts_an_ipv6_64_as_one_address() {
+    let gate = Arc::new(listen::Gate::new(Limits::HUB));
+    let ip = |text: &str| -> std::net::IpAddr { text.parse().unwrap() };
+    let held: Vec<_> = (1..=8).map(|i| gate.enter(ip(&format!("2001:db8:1:2::{i}"))).unwrap()).collect();
+    assert!(gate.enter(ip("2001:db8:1:2:ffff::9")).is_none(), "the same /64");
+    let _next = gate.enter(ip("2001:db8:1:3::1")).unwrap();
+    // IPv4 counts each address, also as a dual-stack listener sees it.
+    let v4: Vec<_> = (0..8).map(|_| gate.enter(ip("192.0.2.9")).unwrap()).collect();
+    assert!(gate.enter(ip("::ffff:192.0.2.9")).is_none());
+    assert!(gate.enter(ip("::ffff:192.0.2.10")).is_some());
+    drop((held, v4));
+    assert_eq!(listen::from(ip("2001:db8:1:2:3:4:5:6")), ip("2001:db8:1:2::"));
+    assert_eq!(listen::from(ip("::ffff:10.0.0.1")), ip("10.0.0.1"));
 }
 
 #[test]
@@ -889,19 +1073,80 @@ fn the_table_and_the_key_outlive_a_restart() {
     first.at(10 * DAY);
     let (new, status, _) = renew_machine(&first, &machine_.token);
     assert_eq!(status, 200);
+    let seen = first.list();
     let (pin, Running { _dir: dir, .. }) = (first.pin, first);
     let mode = |name: &str| fs::metadata(folder.join(name)).unwrap().permissions().mode() & 0o777;
     assert_eq!((mode("table.json"), mode("tls-key.pem")), (0o600, 0o600));
     // The same key gives the same pin; the rows, the replaced token and the last-seen times come back.
     assert_eq!(pin_of(&tls_key(&folder).unwrap()), pin);
     let hub = Hub::open(&folder, "127.0.0.1:1", pin, clock).unwrap();
-    let mut table = locked(&hub.table);
     let now = hub.now();
+    assert_eq!(locked(&hub.table).list(now), seen);
+    let mut table = locked(&hub.table);
     assert_eq!(table.authenticate(Kind::Device, &wire::token_hash(&phone.token), false, now).map(|c| c.name), Ok("pixel".to_string()));
     assert_eq!(table.authenticate(Kind::Machine, &wire::token_hash(&new), false, now).map(|c| c.name), Ok("server-1".to_string()));
     assert_eq!(table.authenticate(Kind::Machine, &wire::token_hash(&machine_.token), false, now).err(), Some(wire::Refused::Conflict));
     drop(table);
     drop(dir);
+}
+
+#[test]
+fn last_seen_is_written_down_as_the_hub_shows_it() {
+    let hub = start();
+    let machine_ = paired_machine(&hub, "server-1");
+    // A client that calls every 30 seconds for 20 minutes.
+    for i in 0..=40 {
+        hub.at(SignedDuration::from_secs(30 * i));
+        assert_eq!(hub.call("GET", "/v1/me", Some(&machine_.token), None).0, 200);
+    }
+    let shown = hub.row("server-1").last_seen.unwrap();
+    let last = START.parse::<Timestamp>().unwrap() + SignedDuration::from_secs(1200);
+    assert!(shown <= last && last.duration_since(shown) < SignedDuration::from_secs(60), "{shown}");
+    let written = Hub::open(&hub.folder, "x:1", hub.pin, hub.clock.clone()).unwrap();
+    let now = written.now();
+    assert_eq!(locked(&written.table).list(now)[0].last_seen, Some(shown));
+}
+
+#[test]
+fn a_change_the_hub_cannot_write_down_is_not_reported_as_made() {
+    let hub = start();
+    let phone = paired_phone(&hub, "pixel");
+    let machine_ = paired_machine(&hub, "server-1");
+    // The table's file is a folder now: no write can replace it.
+    let path = hub.folder.join("table.json");
+    let text = fs::read_to_string(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("in-the-way"), "").unwrap();
+
+    // A revoke holds, and says it isn't written down.
+    let said = admin::revoke_at(&hub.socket(), "pixel").unwrap_err().to_string();
+    assert!(said.contains("could not write") && said.contains("restarts"), "{said}");
+    assert_eq!(hub.call("GET", "/v1/me", Some(&phone.token), None), (401, error("unknown")));
+    // A pairing is not made.
+    let tablet = Phone::new();
+    let pairing = begin(&hub, device("tablet", &["acme"])).unwrap();
+    assert_eq!(hub.call("POST", "/v1/pair", None, Some(&tablet.pair_body(&pairing.invite, ""))).0, 202);
+    pairing.claimed();
+    assert_eq!(pairing.answer(true), Outcome::Unwritten);
+    assert_eq!(hub.call("GET", "/v1/me", Some(&tablet.token), None), (401, error("unknown")));
+    assert!(!hub.list().iter().any(|row| row.name == "tablet"));
+    // Nor is a renewal: the token sent still works, the new one doesn't.
+    hub.at(10 * DAY);
+    let (new, status, body) = renew_machine(&hub, &machine_.token);
+    assert_eq!((status, body), (503, error("unavailable")));
+    assert_eq!(hub.call("GET", "/v1/me", Some(&new), None), (401, error("unknown")));
+    assert_eq!(hub.call("GET", "/v1/me", Some(&machine_.token), None).1["issued"], json!(START));
+
+    // Once the file can be written, the next call writes what holds: the revoke, and no more.
+    fs::remove_dir_all(&path).unwrap();
+    fs::write(&path, &text).unwrap();
+    assert_eq!(hub.call("GET", "/v1/me", Some(&machine_.token), None).0, 200);
+    let reopened = Hub::open(&hub.folder, "x:1", hub.pin, hub.clock.clone()).unwrap();
+    let now = reopened.now();
+    let mut table = locked(&reopened.table);
+    assert_eq!(table.list(now).iter().map(|row| row.name.as_str()).collect::<Vec<_>>(), ["server-1"]);
+    assert_eq!(table.authenticate(Kind::Machine, &wire::token_hash(&machine_.token), false, now).map(|c| c.name), Ok("server-1".to_string()));
 }
 
 #[test]

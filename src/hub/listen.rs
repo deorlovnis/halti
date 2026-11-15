@@ -24,7 +24,8 @@ pub const BODY_MAX: usize = 4 * 1024;
 pub const REQUEST_WAIT: Duration = Duration::from_secs(10);
 /// How long the reply may take to be written.
 const REPLY_WAIT: Duration = Duration::from_secs(10);
-/// Connections open at once, and from one IP address.
+/// Connections open at once, and from one address: an IPv4 address, or an IPv6 /64, which one host
+/// commonly holds whole.
 pub const CONNECTIONS: usize = 64;
 pub const PER_ADDRESS: usize = 8;
 
@@ -40,7 +41,7 @@ impl Limits {
     pub const HUB: Limits = Limits { request_wait: REQUEST_WAIT, connections: CONNECTIONS, per_address: PER_ADDRESS };
 }
 
-/// How many connections are open, in all and from each address.
+/// How many connections are open, in all and from each address, as `from` counts them.
 pub struct Gate {
     limits: Limits,
     open: Mutex<(usize, HashMap<IpAddr, usize>)>,
@@ -59,6 +60,7 @@ impl Gate {
 
     /// A pass for one more connection from `ip`, if the limits have room.
     pub fn enter(self: &Arc<Gate>, ip: IpAddr) -> Option<Pass> {
+        let ip = from(ip);
         let mut open = locked(&self.open);
         let from = open.1.get(&ip).copied().unwrap_or(0);
         if open.0 >= self.limits.connections || from >= self.limits.per_address {
@@ -67,6 +69,15 @@ impl Gate {
         open.0 += 1;
         open.1.insert(ip, from + 1);
         Some(Pass { gate: self.clone(), ip })
+    }
+}
+
+/// The address a connection from `ip` counts against: an IPv4 address as it is, also when a
+/// dual-stack listener sees it as IPv6, and an IPv6 address as its /64.
+pub fn from(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
+        v4 => v4,
     }
 }
 
@@ -131,14 +142,14 @@ impl Write for Timed {
 }
 
 /// One request read, and the reply written: or nothing at all, for a request that doesn't come in
-/// time or isn't one.
+/// time or isn't one, a request line that isn't `METHOD TARGET HTTP/...` included.
 fn connection(hub: &Hub, tcp: TcpStream, tls: Arc<ServerConfig>, request_wait: Duration) {
     let Ok(conn) = ServerConnection::new(tls) else { return };
     let mut stream = StreamOwned::new(conn, Timed { tcp, deadline: Instant::now() + request_wait });
     let request: Option<Result<(http::Head, Vec<u8>), Refused>> = {
         let mut reader = BufReader::new((&mut stream).take((HEAD_MAX + BODY_MAX + 1024) as u64));
         match http::read_head(&mut reader) {
-            Ok(Some(head)) if head_len(&head) <= HEAD_MAX => match http::read_body(&mut reader, &head, BODY_MAX) {
+            Ok(Some(head)) if head_len(&head) <= HEAD_MAX && head.parts().is_some() => match http::read_body(&mut reader, &head, BODY_MAX) {
                 Ok(body) => Some(Ok((head, body))),
                 Err(e) if e.kind() == io::ErrorKind::FileTooLarge => {
                     // What was sent is read first, as far as the limits go: closing with it unread
@@ -154,7 +165,7 @@ fn connection(hub: &Hub, tcp: TcpStream, tls: Arc<ServerConfig>, request_wait: D
     };
     let Some(request) = request else { return };
     let (status, body) = match request.and_then(|(head, body): (http::Head, Vec<u8>)| {
-        let (method, target, _) = head.parts().ok_or(Refused::NotFound)?;
+        let (method, target, _) = head.parts().expect("checked as it was read");
         route(hub, method, target, head.header("authorization"), &body)
     }) {
         Ok(reply) => reply,
@@ -249,8 +260,7 @@ fn nonce(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refuse
     if caller.kind != Kind::Device {
         return Err(Refused::WrongKind);
     }
-    let nonce = random::<16>();
-    let until = hub.with_table(|table, now| table.nonce(caller, nonce, now));
+    let (nonce, until) = hub.with_table(|table, now| table.nonce(caller, &hub.nonce_key, random(), now))?;
     Ok((200, json!({"nonce": wire::hex(&nonce), "expires": wire::time(until)})))
 }
 
@@ -258,11 +268,11 @@ fn renew(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refuse
     let expires = match caller.kind {
         Kind::Device => {
             let renewal = wire::device_renew_body(body)?;
-            hub.with_table(|table, now| table.renew_device(caller, &renewal, &hub.pin, now))?
+            hub.grant(|table, now| table.renew_device(caller, &renewal, &hub.pin, &hub.nonce_key, now)).ok_or(Refused::Unwritten)??
         }
         Kind::Machine => {
             let hash = wire::machine_renew_body(body)?;
-            hub.with_table(|table, now| table.renew_machine(caller, hash, now))?
+            hub.grant(|table, now| table.renew_machine(caller, hash, now)).ok_or(Refused::Unwritten)??
         }
     };
     Ok((200, json!({"expires": wire::time(expires)})))

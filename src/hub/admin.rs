@@ -5,17 +5,22 @@
 //!
 //! ```text
 //! client: "halti-hub/1 pair device NAME WS[,WS...]" | "halti-hub/1 pair machine NAME"
-//! hub:    "halti-hub/1 code INVITE" | "halti-hub/1 taken" | "halti-hub/1 bad"
+//! hub:    "halti-hub/1 code INVITE" | "halti-hub/1 NOT" | "halti-hub/1 bad"
 //! hub:    "halti-hub/1 claimed device FINGERPRINT" | "halti-hub/1 claimed machine" | "halti-hub/1 expired"
 //! client: "halti-hub/1 confirm" | "halti-hub/1 refuse"
-//! hub:    "halti-hub/1 paired" | "halti-hub/1 refused" | "halti-hub/1 taken" | "halti-hub/1 gone"
+//! hub:    "halti-hub/1 paired" | "halti-hub/1 refused" | "halti-hub/1 NOT" | "halti-hub/1 unwritten"
 //!
 //! client: "halti-hub/1 devices"
 //! hub:    "halti-hub/1 row JSON" for each row, then "halti-hub/1 end"
 //!
 //! client: "halti-hub/1 revoke NAME"
-//! hub:    "halti-hub/1 revoked" | "halti-hub/1 unknown"
+//! hub:    "halti-hub/1 revoked" | "halti-hub/1 unknown" | "halti-hub/1 unwritten"
 //! ```
+//!
+//! NOT says why the name can't be paired: `taken` by a row, `marked` by a row with a token
+//! conflict, `busy` with another pairing under way, or the pairing is `gone`. `unwritten` is a
+//! change the hub could not write down: a pairing, which is then not made, or a revoke, which holds
+//! until the hub restarts.
 //!
 //! A pairing lasts as long as its connection: the client that goes, Ctrl-C at `halti pair` say,
 //! takes the pairing with it, claimed or not. FINGERPRINT is the 20 hex characters people compare.
@@ -138,8 +143,13 @@ fn session(hub: &Hub, mut stream: UnixStream) {
             rows.iter().try_for_each(|row| say(&mut stream, &format!("row {}", serde_json::to_string(row).expect("a row as JSON")))).and_then(|()| say(&mut stream, "end"))
         }
         Some(Request::Revoke(name)) => {
-            let found = hub.with_table(|table, _| table.revoke(&name));
-            say(&mut stream, if found { "revoked" } else { "unknown" })
+            let (found, written) = hub.with_table_written(|table, _| table.revoke(&name));
+            let word = match (found, written) {
+                (false, _) => "unknown",
+                (true, true) => "revoked",
+                (true, false) => "unwritten",
+            };
+            say(&mut stream, word)
         }
         None => say(&mut stream, "bad"),
     };
@@ -148,7 +158,10 @@ fn session(hub: &Hub, mut stream: UnixStream) {
 /// One pairing, from its code to the y or N at the terminal.
 fn pairing(hub: &Hub, stream: &mut UnixStream, kind: Kind, name: &str, ws: Vec<WsName>) -> io::Result<()> {
     let code = random::<16>();
-    let Ok(id) = hub.with_table(|table, now| table.start(kind, name, ws, code, now)) else { return say(stream, "taken") };
+    let id = match hub.with_table(|table, now| table.start(kind, name, ws, code, now)) {
+        Ok(id) => id,
+        Err(why) => return say(stream, not_paired(why)),
+    };
     let invite = Invite { kind, address: hub.address.clone(), pin: hub.pin, code };
     if say(stream, &format!("code {invite}")).is_err() {
         hub.with_table(|table, _| table.drop_pairing(id));
@@ -183,10 +196,23 @@ fn pairing(hub: &Hub, stream: &mut UnixStream, kind: Kind, name: &str, ws: Vec<W
         hub.with_table(|table, _| table.drop_pairing(id));
         return say(stream, "refused");
     }
-    match hub.with_table(|table, now| table.confirm(id, now)) {
-        Ok(()) => say(stream, "paired"),
-        Err(NotPaired::Taken) => say(stream, "taken"),
-        Err(NotPaired::Gone) => say(stream, "gone"),
+    match hub.grant(|table, now| table.confirm(id, now)) {
+        Some(Ok(())) => say(stream, "paired"),
+        Some(Err(why)) => say(stream, not_paired(why)),
+        None => {
+            hub.with_table(|table, _| table.drop_pairing(id));
+            say(stream, "unwritten")
+        }
+    }
+}
+
+/// The word for why a name can't be paired.
+fn not_paired(why: NotPaired) -> &'static str {
+    match why {
+        NotPaired::Taken => "taken",
+        NotPaired::Marked => "marked",
+        NotPaired::Busy => "busy",
+        NotPaired::Gone => "gone",
     }
 }
 
@@ -210,8 +236,27 @@ pub enum Outcome {
     Refused,
     /// Nobody used the code in its time.
     Expired,
-    /// The name is taken by a row or another pairing.
+    /// A row has the name.
     Taken,
+    /// A row with a token conflict has the name.
+    Marked,
+    /// Another pairing under way has the name.
+    Busy,
+    /// The hub could not write the pairing down, so it made none.
+    Unwritten,
+}
+
+impl Outcome {
+    /// The outcome a word of the hub's names, other than `paired` and `refused`.
+    fn from_word(word: &str) -> Option<Outcome> {
+        match word {
+            "taken" => Some(Outcome::Taken),
+            "marked" => Some(Outcome::Marked),
+            "busy" => Some(Outcome::Busy),
+            "unwritten" => Some(Outcome::Unwritten),
+            _ => None,
+        }
+    }
 }
 
 /// Asks the hub at `socket` for a pairing and follows it: `show` gets the pairing string, and once
@@ -223,8 +268,7 @@ pub fn pair_at(socket: &Path, request: &Request, mut show: impl FnMut(&Invite), 
     let first = hear(&mut stream, LINE_WAIT).ok_or_else(lost)?;
     let invite = match first.split_once(' ') {
         Some(("code", line)) => Invite::parse(line).ok_or_else(lost)?,
-        _ if first == "taken" => return Ok(Outcome::Taken),
-        _ => bail!("the hub refused the request"),
+        _ => return Outcome::from_word(&first).ok_or_else(|| anyhow!("the hub refused the request")),
     };
     show(&invite);
     // The code's time, and a little more for the hub to say it is over.
@@ -240,10 +284,10 @@ pub fn pair_at(socket: &Path, request: &Request, mut show: impl FnMut(&Invite), 
     };
     let yes = confirm(fingerprint.as_deref())?;
     keep::write_line(&mut stream, &format!("{VERSION} {}\n", if yes { "confirm" } else { "refuse" }))?;
-    Ok(match hear(&mut stream, LINE_WAIT).ok_or_else(lost)?.as_str() {
+    let last = hear(&mut stream, LINE_WAIT).ok_or_else(lost)?;
+    Ok(match last.as_str() {
         "paired" => Outcome::Paired,
-        "taken" => Outcome::Taken,
-        _ => Outcome::Refused,
+        other => Outcome::from_word(other).unwrap_or(Outcome::Refused),
     })
 }
 
@@ -307,6 +351,9 @@ pub fn pair(device: Option<&str>, machine: Option<&str>, ws: &[String]) -> Resul
         Outcome::Refused => bail!("{name} was not paired. if the phone or the machine had no say in it, someone else used the code: check halti devices"),
         Outcome::Expired => bail!("nobody used the code in time: nothing was paired"),
         Outcome::Taken => bail!("{name} is taken: halti devices lists it. revoke it first to pair it again"),
+        Outcome::Marked => bail!("{name} has a token conflict: its token was used from two places. revoke it first (halti revoke {name}), then pair it again"),
+        Outcome::Busy => bail!("another halti pair for {name} is under way: let it end, then try again"),
+        Outcome::Unwritten => bail!("the hub could not write its table, so nothing was paired: its log says why"),
     }
 }
 
@@ -364,13 +411,17 @@ pub fn devices() -> Result<()> {
     Ok(())
 }
 
-/// Revokes the row at the hub at `socket`; whether there was one.
+/// Revokes the row at the hub at `socket`; whether there was one. A revoke the hub could not write
+/// down is an error that says so.
 pub fn revoke_at(socket: &Path, name: &str) -> Result<bool> {
     let mut stream = reach(socket)?;
     keep::write_line(&mut stream, &Request::Revoke(name.to_string()).line())?;
     match hear(&mut stream, LINE_WAIT).as_deref() {
         Some("revoked") => Ok(true),
         Some("unknown") => Ok(false),
+        Some("unwritten") => bail!(
+            "{name}'s token no longer works, but the hub could not write that down (its log says why). it tries again at each call; if it restarts before it can, {name} is back: revoke it again then"
+        ),
         _ => bail!("the hub stopped answering"),
     }
 }

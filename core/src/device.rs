@@ -166,9 +166,14 @@ mod tests {
         compressed[1] = 0x39;
         let mut off_curve = good.clone();
         off_curve[90] ^= 0x01;
+        // The same bytes naming another curve: prime192v1, whose OID differs in its last byte.
         let mut other_curve = good.clone();
-        other_curve[24] ^= 0x01;
-        for bad in [point.to_vec(), [good.as_slice(), &[0]].concat(), good[..90].to_vec(), compressed, off_curve, other_curve, vec![], vec![0; SPKI_LEN]] {
+        assert_eq!(&other_curve[15..23], hex("2a8648ce3d030107"), "prime256v1's OID");
+        other_curve[22] = 0x01;
+        // A bit string whose length isn't the point's.
+        let mut long_bits = good.clone();
+        long_bits[24] ^= 0x01;
+        for bad in [point.to_vec(), [good.as_slice(), &[0]].concat(), good[..90].to_vec(), compressed, off_curve, other_curve, long_bits, vec![], vec![0; SPKI_LEN]] {
             assert_eq!(DeviceKey::from_spki(&bad), Err(Refusal::Unreadable), "{bad:02x?}");
             assert_eq!(check_agreement_key(&bad), Err(Refusal::Unreadable), "{bad:02x?}");
         }

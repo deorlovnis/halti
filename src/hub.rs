@@ -12,7 +12,13 @@
 //! - `admin.sock`: the socket `halti pair`, `halti devices` and `halti revoke` reach the running hub
 //!   through, as the same user (see `admin`).
 //!
-//! Pairings under way, renewal nonces and how many connections are open live in memory only.
+//! Pairings under way, the renewal nonces used, the key renewal nonces are made with, and how many
+//! connections are open live in memory only.
+//!
+//! A change the table can't write down is not reported as made. One that would let a token work, a
+//! pairing or a renewal, is undone and refused. One that stops a token (a revoke, a `token
+//! conflict` mark, a row deleted at day 90) holds in memory, `halti revoke` says that a restart
+//! would undo it, and the hub tries the write again at every later call.
 
 mod admin;
 mod listen;
@@ -71,6 +77,8 @@ impl Clock for SystemClock {
 pub struct Hub {
     dir: PathBuf,
     pin: [u8; 32],
+    /// What renewal nonces are made with: drawn at each start, so a restart ends the ones given out.
+    nonce_key: [u8; 32],
     /// Where clients reach it, as the pairing string says.
     address: String,
     clock: Arc<dyn Clock>,
@@ -106,7 +114,7 @@ impl Hub {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Table::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        Ok(Hub { dir: dir.to_path_buf(), pin, address: address.to_string(), clock, table: Mutex::new(table), changed: Condvar::new() })
+        Ok(Hub { dir: dir.to_path_buf(), pin, nonce_key: random(), address: address.to_string(), clock, table: Mutex::new(table), changed: Condvar::new() })
     }
 
     fn now(&self) -> Timestamp {
@@ -114,20 +122,55 @@ impl Hub {
     }
 
     /// Runs `f` on the table at the hub's time, writes the rows down if they changed, and wakes
-    /// whoever waits for a change. A failed write is said on stderr and the table goes on in memory:
-    /// the next change writes it all again.
+    /// whoever waits for a change.
     fn with_table<T>(&self, f: impl FnOnce(&mut Table, Timestamp) -> T) -> T {
+        self.with_table_written(f).0
+    }
+
+    /// As `with_table`, and whether the file now holds every change: false when the write failed.
+    /// That is said on stderr, and the changes stay in memory; every later call tries the write
+    /// again.
+    fn with_table_written<T>(&self, f: impl FnOnce(&mut Table, Timestamp) -> T) -> (T, bool) {
         let mut table = locked(&self.table);
         let now = self.now();
         let out = f(&mut table, now);
-        if table.take_dirty()
-            && let Err(e) = self.save(&table)
-        {
-            util::warn(&format!("{e:#}"));
+        let written = self.write(&mut table);
+        drop(table);
+        self.changed.notify_all();
+        (out, written)
+    }
+
+    /// As `with_table`, for a change that lets a token work: a pairing or a renewal. If `f` made it
+    /// and it can't be written down, it is undone and None comes back, so nobody is told of a token
+    /// that a restart would forget.
+    fn grant<T, E>(&self, f: impl FnOnce(&mut Table, Timestamp) -> Result<T, E>) -> Option<Result<T, E>> {
+        let mut table = locked(&self.table);
+        let before = table.clone();
+        let now = self.now();
+        let out = f(&mut table, now);
+        let written = self.write(&mut table);
+        if out.is_ok() && !written {
+            *table = before;
         }
         drop(table);
         self.changed.notify_all();
-        out
+        (out.is_err() || written).then_some(out)
+    }
+
+    /// Writes the rows down if they changed since the last write that worked; whether the file
+    /// holds them.
+    fn write(&self, table: &mut Table) -> bool {
+        if !table.take_dirty() {
+            return true;
+        }
+        match self.save(table) {
+            Ok(()) => true,
+            Err(e) => {
+                util::warn(&format!("{e:#}"));
+                table.set_dirty();
+                false
+            }
+        }
     }
 
     fn save(&self, table: &Table) -> Result<()> {

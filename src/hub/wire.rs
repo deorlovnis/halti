@@ -21,9 +21,12 @@
 //!   (request line and headers) may be at most 8 KiB, the body at most 4 KiB, sent with
 //!   `Content-Length` (chunked is read too, within the same limit). A request that is slower, a
 //!   head that is longer or malformed, and a TLS handshake that fails get no reply: the connection
-//!   is closed. A body over 4 KiB is answered `413 too-large`.
-//! - At most 64 connections at once, and 8 from one IP address. One more is closed as soon as it is
-//!   accepted, before TLS.
+//!   is closed. A head is malformed when its request line isn't exactly `METHOD TARGET
+//!   HTTP/VERSION`, one space between each, or a header line has no `:` or a name that isn't an
+//!   HTTP token. A body over 4 KiB is answered `413 too-large`.
+//! - At most 64 connections at once, and 8 from one address: an IPv4 address, or for IPv6 the first
+//!   64 bits of the address. An IPv4 address that reaches the hub as IPv6 (`::ffff:a.b.c.d`) counts
+//!   as itself. One more is closed as soon as it is accepted, before TLS.
 //! - Every request with a token is checked against the hub's table before anything else is done.
 //!
 //! # Encodings
@@ -122,11 +125,14 @@
 //! expired:
 //!
 //! 1. `POST /v1/renew/nonce`, no body: `200 {"nonce": "<16 bytes>", "expires": "<time>"}`. A nonce
-//!    is good for one renewal, for 2 minutes; asking again replaces it.
+//!    is good for one renewal, for 2 minutes, and only for this device. Asking again gives another
+//!    and leaves the first good. The client treats its bytes as opaque; a hub restart ends every
+//!    nonce given out.
 //! 2. `POST /v1/renew`, body `{"nonce": "<16 bytes>", "token_hash": "<32 bytes>", "signature":
 //!    "<DER>"}`: the hash of a new token the app drew, and the signing key's signature over the
 //!    fields `halti-renew-v1`, the pin (32), the device's name, the nonce (16), the new token hash
-//!    (32). The nonce is used up by this call, whatever its outcome. `200 {"expires": "<time>"}`.
+//!    (32). A renewal that is made uses its nonce up; one that is refused leaves it good, so a
+//!    client may correct and send again within its time. `200 {"expires": "<time>"}`.
 //!
 //! **Renewing a machine's token**: `POST /v1/renew`, body `{"token_hash": "<32 bytes>"}`, nothing
 //! signed. `200 {"expires": "<time>"}`.
@@ -142,10 +148,12 @@
 //! - The token a renewal replaced keeps working until the new one is first used, and for at most
 //!   24 hours, never past its own day 30. It is not taken for a renewal: a phone gets
 //!   `401 replaced`. A client that sent a renewal and got no reply tries its new token first.
-//! - **Token conflict.** A machine's replaced token used after that, or used to ask for a renewal
-//!   at all, marks the machine's row: the hub cannot tell which side is the real machine. That call
-//!   gets `401 conflict`; the current token still works, its `/v1/me` shows the mark, and its
-//!   renewal gets `409 conflict`. Only `halti revoke` on the hub clears the mark.
+//! - **Token conflict.** The hub keeps every token a machine had, until 90 days after that token's
+//!   issue. One of them used after it stopped working, or used to ask for a renewal at all, marks
+//!   the machine's row: the hub cannot tell which side is the real machine. That call gets `401
+//!   conflict`; the current token still works, its `/v1/me` shows the mark, and its renewal gets
+//!   `409 conflict`. Only `halti revoke` on the hub clears the mark; until then a pairing of the
+//!   name is refused at the hub's terminal.
 //!
 //! # Errors
 //!
@@ -156,7 +164,7 @@
 //! |---|---|---|
 //! | 400 | `malformed` | The body isn't the JSON of that call: a field missing or unknown, bad hex, a wrong length, a bad name, a key not on the curve, a new token hash equal to one the row holds |
 //! | 401 | `no-token` | No `Authorization: Bearer` with a token of the right form |
-//! | 401 | `unknown` | No such token: never paired, refused at the terminal, revoked, deleted, or replaced long ago |
+//! | 401 | `unknown` | No such token: never paired, refused at the terminal, revoked, deleted, a phone's replaced token after it stopped working, or a machine's 90 days after its issue |
 //! | 401 | `pending` | Paired, and nobody has answered at the hub's terminal yet |
 //! | 401 | `expired` | Past day 30, for a call it no longer admits |
 //! | 401 | `replaced` | A phone's replaced token, sent to a renewal call |
@@ -170,6 +178,7 @@
 //! | 405 | `method` | The path takes another method |
 //! | 409 | `conflict` | A renewal of a machine whose row is marked |
 //! | 413 | `too-large` | A body over 4 KiB |
+//! | 503 | `unavailable` | A renewal the hub could not write down: nothing changed, and the token sent still works. Try again later |
 //!
 //! A client shows these words, never a body as text.
 
@@ -514,6 +523,8 @@ pub enum Refused {
     /// A renewal of a machine whose row is marked.
     Marked,
     TooLarge,
+    /// A renewal the hub could not write down, and so undid.
+    Unwritten,
 }
 
 impl Refused {
@@ -526,6 +537,7 @@ impl Refused {
             Refused::Method => 405,
             Refused::Marked => 409,
             Refused::TooLarge => 413,
+            Refused::Unwritten => 503,
         }
     }
 
@@ -546,6 +558,7 @@ impl Refused {
             Refused::NotFound => "not-found",
             Refused::Method => "method",
             Refused::TooLarge => "too-large",
+            Refused::Unwritten => "unavailable",
         }
     }
 
@@ -797,6 +810,7 @@ mod tests {
             (Refused::Method, 405, "method"),
             (Refused::Marked, 409, "conflict"),
             (Refused::TooLarge, 413, "too-large"),
+            (Refused::Unwritten, 503, "unavailable"),
         ];
         for (refused, status, word) in all {
             assert_eq!((refused.status(), refused.word()), (status, word));

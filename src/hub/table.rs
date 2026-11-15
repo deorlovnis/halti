@@ -2,9 +2,10 @@
 //! and how long that token lives. The hub keeps nothing else about them, and no key of any
 //! workspace: a row holds public keys only.
 //!
-//! Pairings that are under way and renewal nonces are held beside the rows, in memory only. Every
-//! rule here takes the time as an argument, so the tests can be any day of a token's life; the hub
-//! passes its own clock. The numbers of a token's life are the constants below, and nowhere else.
+//! Pairings that are under way and the renewal nonces already used are held beside the rows, in
+//! memory only. Every rule here takes the time as an argument, so the tests can be any day of a
+//! token's life; the hub passes its own clock. The numbers of a token's life are the constants
+//! below, and nowhere else.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -22,7 +23,7 @@ pub const MACHINE_RENEW_FROM: SignedDuration = SignedDuration::from_hours(10 * 2
 /// How long after its token's day 30 a phone may still renew it. A machine has no such time.
 pub const LATE_RENEWAL: SignedDuration = SignedDuration::from_hours(60 * 24);
 /// How long a row is kept from its token's issue, if the token is never renewed: then it is deleted.
-/// A phone's last renewal is on the last day of it.
+/// A phone's last renewal is on the last day of it. A machine's earlier tokens are kept as long.
 pub const KEPT: SignedDuration = SignedDuration::from_hours((30 + 60) * 24);
 /// How long the token a renewal replaced keeps working, at most: until the new one is first used.
 pub const OLD_TOKEN: SignedDuration = SignedDuration::from_hours(24);
@@ -32,7 +33,7 @@ pub const CODE_LIFE: SignedDuration = SignedDuration::from_secs(120);
 pub const NONCE_LIFE: SignedDuration = SignedDuration::from_secs(120);
 /// Seconds in a day, for counting a token's days left.
 const DAY_SECS: i64 = 24 * 3600;
-/// How often a row's "last seen" time is written down, at most; between those it is kept in memory.
+/// How often a row's "last seen" time moves, and so is written down, at most.
 const SEEN_EVERY: SignedDuration = SignedDuration::from_secs(60);
 
 /// A paired phone or machine.
@@ -50,6 +51,10 @@ pub struct Row {
     pub token: Token,
     /// The token the last renewal replaced.
     pub old: Option<OldToken>,
+    /// A machine's tokens before the one it holds, the one in `old` too, each until `KEPT` after its
+    /// issue: any of them used again marks the row, as a copy's would.
+    #[serde(default)]
+    pub retired: Vec<Token>,
     /// When the hub saw this machine's token used from two places.
     pub conflict_since: Option<Timestamp>,
     pub last_seen: Option<Timestamp>,
@@ -200,12 +205,13 @@ pub enum TokenState {
     Expired,
 }
 
-/// The rows, the pairings under way and the nonces given out.
-#[derive(Default)]
+/// The rows, the pairings under way, and the renewal nonces used, each with the time it stops
+/// being good anyway. The hub keeps no nonce it gives out (see `Table::nonce`).
+#[derive(Clone, Default)]
 pub struct Table {
     rows: BTreeMap<String, Row>,
     pairings: Vec<Pairing>,
-    nonces: HashMap<String, ([u8; 16], Timestamp)>,
+    used: HashMap<[u8; 16], Timestamp>,
     next_id: u64,
     /// Whether the rows changed since they were last written down.
     dirty: bool,
@@ -214,8 +220,12 @@ pub struct Table {
 /// Why a pairing can't be started or finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotPaired {
-    /// The name is taken by a row or by another pairing.
+    /// A row has the name.
     Taken,
+    /// A row has the name and is marked `token conflict`: only a revoke frees it.
+    Marked,
+    /// Another pairing under way has the name.
+    Busy,
     /// The pairing is gone: refused, its code expired unclaimed, or never there.
     Gone,
 }
@@ -248,33 +258,43 @@ impl Table {
         std::mem::take(&mut self.dirty)
     }
 
-    /// Deletes every row whose token was issued `KEPT` ago or more. For a phone this is a revoke.
+    /// Notes that the rows are not written down as they are, so the next call writes them.
+    pub fn set_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Deletes every row whose token was issued `KEPT` ago or more, and a machine's earlier tokens
+    /// as old. For a phone this is a revoke.
     pub fn purge(&mut self, now: Timestamp) {
         let before = self.rows.len();
         self.rows.retain(|_, row| now < row.token.issued + KEPT);
-        if self.rows.len() != before {
-            self.dirty = true;
-            let rows = &self.rows;
-            self.nonces.retain(|name, _| rows.contains_key(name));
+        self.dirty |= self.rows.len() != before;
+        for row in self.rows.values_mut() {
+            let before = row.retired.len();
+            row.retired.retain(|token| now < token.issued + KEPT);
+            self.dirty |= row.retired.len() != before;
         }
+        self.used.retain(|_, until| now < *until);
         self.pairings.retain(|p| p.claim.is_some() || now < p.until);
     }
 
-    /// Whether a new pairing may take `name`: no row and no pairing has it, except a machine's
-    /// row whose token has expired, which a machine's pairing replaces.
-    fn free(&self, kind: Kind, name: &str, now: Timestamp) -> bool {
-        let row_ok = match self.rows.get(name) {
-            None => true,
-            Some(row) => kind == Kind::Machine && row.kind() == Kind::Machine && now >= row.expires(),
-        };
-        row_ok && !self.pairings.iter().any(|p| p.name == name)
+    /// Whether a row lets a new pairing of `kind` take `name`: none has it, or a machine's whose
+    /// token has expired, which a machine's pairing replaces. A marked row is never replaced.
+    fn row_free(&self, kind: Kind, name: &str, now: Timestamp) -> Result<(), NotPaired> {
+        match self.rows.get(name) {
+            None => Ok(()),
+            Some(row) if row.conflict_since.is_some() => Err(NotPaired::Marked),
+            Some(row) if kind == Kind::Machine && row.kind() == Kind::Machine && now >= row.expires() => Ok(()),
+            Some(_) => Err(NotPaired::Taken),
+        }
     }
 
     /// Starts a pairing of `name`, with `code`, which the caller drew. Its id comes back.
     pub fn start(&mut self, kind: Kind, name: &str, ws: Vec<WsName>, code: [u8; 16], now: Timestamp) -> Result<u64, NotPaired> {
         self.purge(now);
-        if !self.free(kind, name, now) {
-            return Err(NotPaired::Taken);
+        self.row_free(kind, name, now)?;
+        if self.pairings.iter().any(|p| p.name == name) {
+            return Err(NotPaired::Busy);
         }
         self.next_id += 1;
         self.pairings.push(Pairing { id: self.next_id, code, kind, name: name.to_string(), ws, until: now + CODE_LIFE, claim: None });
@@ -291,10 +311,10 @@ impl Table {
         self.pairings.retain(|p| p.id != id);
     }
 
-    /// Whether a token hash is held anywhere: by a row, as its token or the one it replaced, or by a
+    /// Whether a token hash is held anywhere: by a row, as its token or one it replaced, or by a
     /// claim. A new token must be none of these.
     fn hash_held(&self, hash: &[u8; 32]) -> bool {
-        self.rows.values().any(|row| same(&row.token.hash, hash) || row.old.as_ref().is_some_and(|old| same(&old.hash, hash)))
+        self.rows.values().any(|row| same(&row.token.hash, hash) || replaced(row, hash))
             || self.pairings.iter().filter_map(|p| p.claim.as_ref()).any(|claim| same(claim.token_hash(), hash))
     }
 
@@ -340,13 +360,7 @@ impl Table {
         self.purge(now);
         let Some(at) = self.pairings.iter().position(|p| p.id == id && p.claim.is_some()) else { return Err(NotPaired::Gone) };
         let pairing = self.pairings.remove(at);
-        let free = match self.rows.get(&pairing.name) {
-            None => true,
-            Some(row) => pairing.kind == Kind::Machine && row.kind() == Kind::Machine && now >= row.expires(),
-        };
-        if !free {
-            return Err(NotPaired::Taken);
-        }
+        self.row_free(pairing.kind, &pairing.name, now)?;
         let (keys, token_hash, push) = match pairing.claim.expect("a claimed pairing") {
             Claim::Device { signing, agreement, binding, token_hash, push } => (Keys::Device { signing, agreement, binding }, token_hash, push),
             Claim::Machine { key, token_hash } => (Keys::Machine { key }, token_hash, String::new()),
@@ -361,10 +375,10 @@ impl Table {
             paired: now,
             token: Token { hash: token_hash, issued: now },
             old: None,
+            retired: Vec::new(),
             conflict_since: None,
             last_seen: None,
         };
-        self.nonces.remove(&row.name);
         self.rows.insert(pairing.name, row);
         self.dirty = true;
         Ok(())
@@ -372,7 +386,6 @@ impl Table {
 
     /// Deletes a row; whether there was one.
     pub fn revoke(&mut self, name: &str) -> bool {
-        self.nonces.remove(name);
         let found = self.rows.remove(name).is_some();
         self.dirty |= found;
         found
@@ -403,11 +416,12 @@ impl Table {
             self.seen(&caller.name, now);
             return Ok(caller);
         }
-        if let Some(row) = self.rows.values_mut().find(|row| row.old.as_ref().is_some_and(|old| same(&old.hash, hash))) {
+        if let Some(row) = self.rows.values_mut().find(|row| replaced(row, hash)) {
             if row.kind() != kind {
                 return Err(Refused::Unknown);
             }
-            let works = row.old.as_ref().is_some_and(|old| now < old.until);
+            // Only the token the last renewal replaced may still work; a machine's earlier ones never.
+            let works = row.old.as_ref().is_some_and(|old| same(&old.hash, hash) && now < old.until);
             return match kind {
                 Kind::Machine if !works || renewal => {
                     if row.conflict_since.is_none() {
@@ -431,13 +445,14 @@ impl Table {
         Err(Refused::Unknown)
     }
 
-    /// Notes that a row's token was used now. It is written down when it is new, or a while old.
+    /// Notes that a row's token was used now. "Last seen" moves only when it is a while old, so
+    /// what is written down is what the hub shows, to within that while.
     fn seen(&mut self, name: &str, now: Timestamp) {
-        if let Some(row) = self.rows.get_mut(name) {
-            if row.last_seen.is_none_or(|seen| now.duration_since(seen) >= SEEN_EVERY) {
-                self.dirty = true;
-            }
+        if let Some(row) = self.rows.get_mut(name)
+            && row.last_seen.is_none_or(|seen| now.duration_since(seen) >= SEEN_EVERY)
+        {
             row.last_seen = Some(now);
+            self.dirty = true;
         }
     }
 
@@ -446,18 +461,28 @@ impl Table {
         self.rows.get(name)
     }
 
-    /// A nonce for a phone's renewal, drawn by the caller; it replaces any before it. When it
-    /// stops being good comes back.
-    pub fn nonce(&mut self, caller: &Caller, nonce: [u8; 16], now: Timestamp) -> Timestamp {
-        let until = now + NONCE_LIFE;
-        self.nonces.insert(caller.name.clone(), (nonce, until));
-        until
+    /// A nonce for a phone's renewal, and when it stops being good. The hub keeps none: a nonce is
+    /// that time in seconds, 4 bytes, then `drawn`, 4 random bytes, then a MAC under `key` over
+    /// those and the row, 8 bytes, which only this hub process can make. So asking for one changes
+    /// nothing, and a copy of the token that asks can't spoil the nonce the phone holds.
+    pub fn nonce(&self, caller: &Caller, key: &[u8; 32], drawn: [u8; 4], now: Timestamp) -> Result<([u8; 16], Timestamp), Refused> {
+        let row = self.rows.get(&caller.name).ok_or(Refused::Unknown)?;
+        let until = u32::try_from((now + NONCE_LIFE).as_second()).expect("the hub's clock is between 1970 and 2106");
+        let mut nonce = [0; 16];
+        nonce[..4].copy_from_slice(&until.to_be_bytes());
+        nonce[4..8].copy_from_slice(&drawn);
+        let mac = nonce_mac(key, row, &nonce[..8]);
+        nonce[8..].copy_from_slice(&mac);
+        Ok((nonce, Timestamp::from_second(until.into()).expect("a u32 of seconds is a time")))
     }
 
     /// Gives a row a new token, the one it had working on for a while.
     fn replace_token(&mut self, name: &str, hash: [u8; 32], now: Timestamp) -> Timestamp {
         let row = self.rows.get_mut(name).expect("a caller's row");
         let old_until = (now + OLD_TOKEN).min(row.expires());
+        if row.kind() == Kind::Machine {
+            row.retired.push(row.token.clone());
+        }
         row.old = Some(OldToken { hash: row.token.hash, until: old_until });
         row.token = Token { hash, issued: now };
         self.dirty = true;
@@ -465,21 +490,23 @@ impl Table {
     }
 
     /// A phone's renewal, signed by its key over the hub's pin, its name, the nonce and the new
-    /// token's hash. The nonce is used up whatever the outcome. When the new token expires comes
-    /// back.
-    pub fn renew_device(&mut self, caller: &Caller, renewal: &DeviceRenewal, pin: &[u8; 32], now: Timestamp) -> Result<Timestamp, Refused> {
-        let given = self.nonces.remove(&caller.name);
-        let Some((nonce, until)) = given else { return Err(Refused::BadNonce) };
-        if !same(&nonce, &renewal.nonce) || now >= until {
+    /// token's hash, the nonce one this hub gave this row with `key`. A renewal that is made uses
+    /// its nonce up; one refused leaves it as it was. When the new token expires comes back.
+    pub fn renew_device(&mut self, caller: &Caller, renewal: &DeviceRenewal, pin: &[u8; 32], key: &[u8; 32], now: Timestamp) -> Result<Timestamp, Refused> {
+        let row = self.rows.get(&caller.name).ok_or(Refused::Unknown)?;
+        let (head, mac) = renewal.nonce.split_at(8);
+        let secs = u32::from_be_bytes(head[..4].try_into().expect("4 bytes"));
+        let until = Timestamp::from_second(secs.into()).expect("a u32 of seconds is a time");
+        if !same(mac, &nonce_mac(key, row, head)) || now >= until || self.used.contains_key(&renewal.nonce) {
             return Err(Refused::BadNonce);
         }
-        let row = self.rows.get(&caller.name).ok_or(Refused::Unknown)?;
         let Keys::Device { signing, .. } = &row.keys else { return Err(Refused::WrongKind) };
-        let key = DeviceKey::from_spki(signing).map_err(|_| Refused::Unknown)?;
-        key.verify(&wire::renew_bytes(pin, &caller.name, &renewal.nonce, &renewal.token_hash), &renewal.signature).map_err(|_| Refused::BadSignature)?;
+        let device = DeviceKey::from_spki(signing).map_err(|_| Refused::Unknown)?;
+        device.verify(&wire::renew_bytes(pin, &caller.name, &renewal.nonce, &renewal.token_hash), &renewal.signature).map_err(|_| Refused::BadSignature)?;
         if self.hash_held(&renewal.token_hash) {
             return Err(Refused::Malformed);
         }
+        self.used.insert(renewal.nonce, until);
         Ok(self.replace_token(&caller.name, renewal.token_hash, now))
     }
 
@@ -528,6 +555,18 @@ impl Table {
             })
             .collect()
     }
+}
+
+/// Whether `hash` is a token the row had before the one it holds, and still knows.
+fn replaced(row: &Row, hash: &[u8; 32]) -> bool {
+    row.old.as_ref().is_some_and(|old| same(&old.hash, hash)) || row.retired.iter().any(|token| same(&token.hash, hash))
+}
+
+/// What ties a renewal nonce to its row: 8 bytes of an HMAC-SHA256 over the row's name, when it
+/// was paired, and the nonce's first 8 bytes, its time and its random part.
+fn nonce_mac(key: &[u8; 32], row: &Row, head: &[u8]) -> [u8; 8] {
+    let mac = crate::audit::hmac_sha256(key, &[&wire::fields(&[row.name.as_bytes(), &row.paired.as_nanosecond().to_be_bytes(), head])]);
+    wire::unhex(&mac[..16]).expect("an HMAC is hex")
 }
 
 /// Bytes as lowercase hex in the table's file.
