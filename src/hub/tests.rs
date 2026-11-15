@@ -1458,7 +1458,7 @@ fn a_request_the_hub_has_no_room_for_is_asked_for_once_it_has() {
 fn a_phone_is_shown_the_last_64_it_sent_each_machine() {
     let mut relay = relay::Relay::default();
     let now = Timestamp::now();
-    let stop = || relay::What::Stop { ws: "acme".into(), runs: vec![crate::requests::RunId([1; 8])], signature: vec![0x30] };
+    let stop = || relay::What::Stop { ws: "acme".into(), runs: vec![("dev".into(), crate::requests::RunId([1; 8]))], signature: vec![0x30] };
     // 64 sent, taken and said done; 64 more that wait.
     for _ in 0..relay::ITEMS_MAX {
         relay.queue("server-1", "pixel", stop(), now).unwrap();

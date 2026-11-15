@@ -491,7 +491,7 @@ impl Desk {
         drop(counted);
         let told = work();
         let mut counted = self.counted.lock().unwrap_or_else(PoisonError::into_inner);
-        let counts = matches!(told, Told::Approved | Told::Denied | Told::Stopped(1..));
+        let counts = matches!(told, Told::Approved | Told::Denied | Told::Stopped { stopped: 1.., .. });
         counted.retain_mut(|(line, said)| {
             if *line == key {
                 *said = Some(told.clone());
@@ -750,17 +750,34 @@ pub trait Runs: Sync {
     fn stop(&self, runs: &[RunId]) -> u32;
 }
 
-/// A phone's stop of `runs` in the desk's workspace, signed by the device named `device`: how many
-/// boxes it stopped, or None if it doesn't count. It counts only if `trust` trusts that device for
-/// this workspace and the signature is its key's over this machine's name, the workspace and the
-/// runs (`hub::wire::stop_bytes`). A run this workspace doesn't run is passed over, so a stop sent
-/// again stops nothing new.
-pub fn stop_signed(desk: &Desk, trust: Trust, boxes: &dyn Runs, device: &str, runs: &[RunId], signature: &[u8]) -> Option<u32> {
+/// A phone's stop of `runs` in the desk's workspace, each named with the box the phone showed it
+/// under, signed by the device named `device`: how many boxes it stopped, and how many of its runs
+/// run here in another box than the one named with them; or None if it doesn't count. It counts only
+/// if `trust` trusts that device for this workspace and the signature is its key's over this
+/// machine's name, the workspace and the runs with their boxes (`hub::wire::stop_bytes`). A run
+/// that runs here in another box is not stopped: the phone was shown something else, so the stop
+/// is not what its device signed for. A run this workspace doesn't run is passed over, so a stop
+/// sent again stops nothing new.
+pub fn stop_signed(desk: &Desk, trust: Trust, boxes: &dyn Runs, device: &str, runs: &[(String, RunId)], signature: &[u8]) -> Option<Told> {
     let trusted = trust(device).filter(|trusted| trusted.ws.contains(&desk.ws))?;
     trusted.key.verify(&crate::hub::wire::stop_bytes(&(desk.machine)(), &desk.ws, runs), signature).ok()?;
-    let count = boxes.stop(runs);
-    say(&format!("a stop signed by {} named {} of {}: stopped {count}", trusted.name, runs_named(runs.len()), desk.ws));
-    Some(count)
+    // A run's box never changes: its id is drawn as the box starts.
+    let running = boxes.runs();
+    let mut named = Vec::new();
+    let mut wrong_box = 0u32;
+    for (box_name, run) in runs {
+        match running.iter().find(|(_, id)| id == run) {
+            Some((real, _)) if real != box_name => {
+                wrong_box += 1;
+                say(&format!("a stop signed by {} named run {} of {} as box {box_name}, but it is box {real}'s: not stopped", trusted.name, run.hex(), desk.ws));
+            }
+            Some(_) => named.push(*run),
+            None => {}
+        }
+    }
+    let stopped = if named.is_empty() { 0 } else { boxes.stop(&named) };
+    say(&format!("a stop signed by {} named {} of {}: stopped {stopped}", trusted.name, runs_named(runs.len()), desk.ws));
+    Some(Told::Stopped { stopped, wrong_box })
 }
 
 /// `1 run`, `2 runs`.
@@ -776,7 +793,7 @@ pub fn told(desk: &Arc<Desk>, trust: Trust, boxes: &dyn Runs, records: &Records)
         Records::Runs(_) => boxes.runs().into_iter().map(|(name, run)| Told::Run(name, run)).chain([Told::End]).collect(),
         Records::Answer(_, yes, digest) => vec![told_by(desk.answer_here(*yes, digest))],
         Records::Signed { device, yes, id, signature, .. } => vec![desk.once(records, || told_by(desk.answer_signed(trust, device, *yes, *id, signature)))],
-        Records::Stop { device, runs, signature, .. } => vec![desk.once(records, || stop_signed(desk, trust, boxes, device, runs, signature).map_or(Told::Refused, Told::Stopped))],
+        Records::Stop { device, runs, signature, .. } => vec![desk.once(records, || stop_signed(desk, trust, boxes, device, runs, signature).unwrap_or(Told::Refused))],
     }
 }
 

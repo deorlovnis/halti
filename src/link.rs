@@ -5,7 +5,7 @@
 //! The hub is never trusted to say yes. A phone's answer or stop counts only at the open workspace
 //! it names, and only if it is signed by a device this machine trusts for that workspace, over this
 //! machine's own record (`requests::Desk::answer_signed`) or its own name, the workspace and the
-//! runs (`requests::stop_signed`). Trust is added only at a terminal here, after two comparisons:
+//! runs, each with its box (`requests::stop_signed`). Trust is added only at a terminal here, after two comparisons:
 //! the phone's fingerprint, read from the hub and shown here, and the machine code, shown here and
 //! on the phone, which computes it from what the hub passed on. Each value is made from the keys
 //! of one side, so a hub that swaps a key must match a fixed 80-bit value. Trust is dropped when the

@@ -440,7 +440,7 @@ fn answer(hub: &Hub, caller: &Caller, scope: &[WsName], body: &[u8]) -> Result<(
 
 /// A phone's signed stop of runs in a workspace it may see.
 fn stop(hub: &Hub, caller: &Caller, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refused> {
-    let (machine, ws, runs, signature) = relay::stop_body(body)?;
+    let relay::Stop { machine, ws, runs, signature } = relay::stop_body(body)?;
     if !scope.contains(&ws) || !machine_known(hub, &machine) {
         return Err(Refused::Gone);
     }

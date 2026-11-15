@@ -357,10 +357,12 @@ impl Phone {
         self.answer_signed_by(self, hub, machine, record, yes)
     }
 
-    /// Stops these runs of `ws` on `machine`.
-    pub fn stop(&self, hub: &TestHub, machine: &str, ws: &str, runs: &[RunId]) -> (u16, Value) {
-        let signature = self.sign(&wire::stop_bytes(machine, ws, runs));
-        let body = json!({"machine": machine, "ws": ws, "runs": runs.iter().map(RunId::hex).collect::<Vec<_>>(), "signature": util::hex(&signature)});
+    /// Stops these runs of `ws` on `machine`, each named with its box.
+    pub fn stop(&self, hub: &TestHub, machine: &str, ws: &str, runs: &[(&str, RunId)]) -> (u16, Value) {
+        let runs: Vec<(String, RunId)> = runs.iter().map(|(name, run)| (name.to_string(), *run)).collect();
+        let signature = self.sign(&wire::stop_bytes(machine, ws, &runs));
+        let listed: Vec<Value> = runs.iter().map(|(name, run)| json!({"box": name, "run": run.hex()})).collect();
+        let body = json!({"machine": machine, "ws": ws, "runs": listed, "signature": util::hex(&signature)});
         hub.call("POST", "/v1/stop", Some(&self.token), Some(&body))
     }
 }

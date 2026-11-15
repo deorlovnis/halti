@@ -89,10 +89,11 @@ pub struct Item {
     pub said: Option<String>,
 }
 
+/// A signed answer, or a signed stop of runs, each with the box the phone named it with.
 #[derive(Clone, Debug)]
 pub enum What {
     Answer { ws: String, id: Id, yes: bool, signature: Vec<u8> },
-    Stop { ws: String, runs: Vec<RunId>, signature: Vec<u8> },
+    Stop { ws: String, runs: Vec<(String, RunId)>, signature: Vec<u8> },
 }
 
 impl What {
@@ -204,8 +205,7 @@ pub fn report_body(body: &[u8]) -> Result<Reported, Refused> {
         if ws.runs.len() > STOP_RUNS_MAX {
             return Err(Refused::Malformed);
         }
-        let runs = ws.runs.into_iter().map(|run| Ok((name(&run.box_name)?, run_id(&run.run)?))).collect::<Result<Vec<_>, Refused>>()?;
-        workspaces.push(WsState { name: ws_name(&ws.name)?, open: ws.open, runs });
+        workspaces.push(WsState { name: ws_name(&ws.name)?, open: ws.open, runs: named_runs(ws.runs)? });
     }
     let trusted = body.trusted.into_iter().map(|entry| Ok(TrustedOn { device: name(&entry.device)?, ws: wire::workspaces(&entry.ws)? })).collect::<Result<Vec<_>, Refused>>()?;
     let ids = body.requests.iter().map(|id| wire::bytes(id)).collect::<Result<Vec<[u8; 16]>, Refused>>()?;
@@ -223,6 +223,16 @@ fn ws_name(text: &str) -> Result<WsName, Refused> {
 
 fn run_id(text: &str) -> Result<RunId, Refused> {
     Ok(RunId(wire::bytes(text)?))
+}
+
+/// Runs as a body names them: each by its box and its id.
+fn named_runs(runs: Vec<RunBody>) -> Result<Vec<(String, RunId)>, Refused> {
+    runs.into_iter().map(|run| Ok((name(&run.box_name)?, run_id(&run.run)?))).collect()
+}
+
+/// Runs as a reply names them.
+fn runs_json(runs: &[(String, RunId)]) -> Vec<Value> {
+    runs.iter().map(|(name, run)| json!({"box": name, "run": run.hex()})).collect()
 }
 
 #[derive(Deserialize)]
@@ -286,18 +296,26 @@ pub fn answer_body(body: &[u8]) -> Result<(String, Id, bool, Vec<u8>), Refused> 
 struct StopBody {
     machine: String,
     ws: String,
-    runs: Vec<String>,
+    runs: Vec<RunBody>,
     signature: String,
 }
 
-/// A phone's stop: the machine, the workspace, the runs, and the signature.
-pub fn stop_body(body: &[u8]) -> Result<(String, WsName, Vec<RunId>, Vec<u8>), Refused> {
+/// A phone's stop as its body gives it.
+pub struct Stop {
+    pub machine: String,
+    pub ws: WsName,
+    /// Each run, with the box the phone named it with.
+    pub runs: Vec<(String, RunId)>,
+    pub signature: Vec<u8>,
+}
+
+/// A phone's stop, from the body of its call.
+pub fn stop_body(body: &[u8]) -> Result<Stop, Refused> {
     let body: StopBody = wire::json(body)?;
     if body.runs.is_empty() || body.runs.len() > STOP_RUNS_MAX {
         return Err(Refused::Malformed);
     }
-    let runs = body.runs.iter().map(|run| run_id(run)).collect::<Result<Vec<_>, Refused>>()?;
-    Ok((name(&body.machine)?, ws_name(&body.ws)?, runs, wire::signature(&body.signature)?))
+    Ok(Stop { machine: name(&body.machine)?, ws: ws_name(&body.ws)?, runs: named_runs(body.runs)?, signature: wire::signature(&body.signature)? })
 }
 
 #[derive(Deserialize)]
@@ -492,7 +510,7 @@ impl Relay {
                 let mut entry = json!({"n": item.n, "kind": item.what.kind(), "machine": name, "ws": item.what.ws(), "state": state, "at": wire::time(item.at)});
                 match &item.what {
                     What::Answer { id, .. } => entry["id"] = id.hex().into(),
-                    What::Stop { runs, .. } => entry["runs"] = runs.iter().map(RunId::hex).collect::<Vec<_>>().into(),
+                    What::Stop { runs, .. } => entry["runs"] = runs_json(runs).into(),
                 }
                 sent.push(entry);
             }
@@ -506,7 +524,7 @@ impl Relay {
                 .workspaces
                 .iter()
                 .filter(|state| ws.contains(&&state.name))
-                .map(|state| json!({"name": state.name, "open": state.open, "runs": state.runs.iter().map(|(name, run)| json!({"box": name, "run": run.hex()})).collect::<Vec<_>>()}))
+                .map(|state| json!({"name": state.name, "open": state.open, "runs": runs_json(&state.runs)}))
                 .collect();
             machines.push(json!({
                 "name": name,
@@ -532,7 +550,7 @@ pub fn item_json(item: &Item) -> Value {
         }),
         What::Stop { ws, runs, signature } => json!({
             "n": item.n, "kind": "stop", "device": item.from, "ws": ws,
-            "runs": runs.iter().map(RunId::hex).collect::<Vec<_>>(), "signature": hex(signature),
+            "runs": runs_json(runs), "signature": hex(signature),
         }),
     }
 }

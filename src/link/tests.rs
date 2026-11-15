@@ -487,28 +487,57 @@ fn a_signed_stop_stops_its_runs_and_says_so() {
     *world.keeper("acme").boxes.0.lock().unwrap() = vec![("dev".into(), dev), ("web".into(), web)];
     let runs = || pixel.state(&world.hub)["machines"][0]["workspaces"][0]["runs"].clone();
     until("the phone sees what runs", || runs() == json!([{"box": "dev", "run": dev.hex()}, {"box": "web", "run": web.hex()}]));
-    let (status, body) = pixel.stop(&world.hub, MACHINE, "acme", &[dev]);
+    let (status, body) = pixel.stop(&world.hub, MACHINE, "acme", &[("dev", dev)]);
     assert_eq!(status, 202);
     let n = body["n"].as_u64().unwrap();
     assert_eq!(world.said(&pixel, n), "stopped");
     assert_eq!(world.keeper("acme").boxes.runs(), vec![("web".to_string(), web)]);
     let sent = pixel.state(&world.hub)["sent"].as_array().unwrap().iter().find(|sent| sent["n"] == n).unwrap().clone();
-    assert_eq!((sent["kind"].as_str(), sent["ws"].as_str(), sent["runs"].clone()), (Some("stop"), Some("acme"), json!([dev.hex()])));
+    assert_eq!((sent["kind"].as_str(), sent["ws"].as_str(), sent["runs"].clone()), (Some("stop"), Some("acme"), json!([{"box": "dev", "run": dev.hex()}])));
     // Sent again, it stops nothing new.
-    let (_, body) = pixel.stop(&world.hub, MACHINE, "acme", &[dev]);
+    let (_, body) = pixel.stop(&world.hub, MACHINE, "acme", &[("dev", dev)]);
     assert_eq!(world.said(&pixel, body["n"].as_u64().unwrap()), "none");
     // From a device not trusted here, or with another's signature: nothing stops.
-    let (_, body) = tablet.stop(&world.hub, MACHINE, "acme", &[web]);
+    let (_, body) = tablet.stop(&world.hub, MACHINE, "acme", &[("web", web)]);
     assert_eq!(world.said(&tablet, body["n"].as_u64().unwrap()), "refused");
-    let forged = json!({"machine": MACHINE, "ws": "acme", "runs": [web.hex()], "signature": hex(&tablet.sign(&wire::stop_bytes(MACHINE, "acme", &[web])))});
+    let named = vec![("web".to_string(), web)];
+    let forged = json!({"machine": MACHINE, "ws": "acme", "runs": [{"box": "web", "run": web.hex()}], "signature": hex(&tablet.sign(&wire::stop_bytes(MACHINE, "acme", &named)))});
     assert_eq!(world.hub.call("POST", "/v1/stop", Some(&pixel.token), Some(&forged)), (403, json!({"error": "bad-signature"})));
+    // A body whose box isn't the one signed is refused at the hub.
+    let swapped = json!({"machine": MACHINE, "ws": "acme", "runs": [{"box": "dev", "run": web.hex()}], "signature": hex(&pixel.sign(&wire::stop_bytes(MACHINE, "acme", &named)))});
+    assert_eq!(world.hub.call("POST", "/v1/stop", Some(&pixel.token), Some(&swapped)), (403, json!({"error": "bad-signature"})));
     // A stop signed for another machine's name stops nothing here.
-    let other = pixel.sign(&wire::stop_bytes("server-2", "acme", &[web]));
-    let line = Records::Stop { ws: WsName::parse("acme").unwrap(), device: "pixel".into(), runs: vec![web], signature: other };
+    let other = pixel.sign(&wire::stop_bytes("server-2", "acme", &named));
+    let line = Records::Stop { ws: WsName::parse("acme").unwrap(), device: "pixel".into(), runs: named.clone(), signature: other };
     assert_eq!(keep::tell(&world.keeper("acme").socket, &line, LONG), Some(Told::Refused));
     // A workspace outside the phone's is gone at the hub.
-    assert_eq!(pixel.stop(&world.hub, MACHINE, "beta", &[web]).0, 410);
+    assert_eq!(pixel.stop(&world.hub, MACHINE, "beta", &[("web", web)]).0, 410);
     assert_eq!(world.keeper("acme").boxes.runs(), vec![("web".to_string(), web)]);
+}
+
+#[test]
+fn a_stop_that_names_a_run_with_another_box_leaves_that_run() {
+    let mut world = World::new();
+    world.open("acme", limits());
+    let pixel = world.hub.pair_phone("pixel", &["acme"]);
+    world.trust(&pixel, &["acme"]);
+    let (dev, prod) = (RunId([1; 8]), RunId([2; 8]));
+    *world.keeper("acme").boxes.0.lock().unwrap() = vec![("dev".into(), dev), ("prod".into(), prod)];
+    until("the phone sees what runs", || pixel.state(&world.hub)["machines"][0]["workspaces"][0]["runs"].as_array().unwrap().len() == 2);
+    // A hub that showed prod's run as a box named scratch gets a stop of "scratch" signed: prod runs
+    // on, and the machine says so. dev, named with its own box, is stopped.
+    let (status, body) = pixel.stop(&world.hub, MACHINE, "acme", &[("dev", dev), ("scratch", prod)]);
+    assert_eq!(status, 202);
+    assert_eq!(world.said(&pixel, body["n"].as_u64().unwrap()), "wrong-box");
+    assert_eq!(world.keeper("acme").boxes.runs(), vec![("prod".to_string(), prod)]);
+    // Named alone with another box, nothing is stopped.
+    let (_, body) = pixel.stop(&world.hub, MACHINE, "acme", &[("dev", prod)]);
+    assert_eq!(world.said(&pixel, body["n"].as_u64().unwrap()), "wrong-box");
+    assert_eq!(world.keeper("acme").boxes.runs(), vec![("prod".to_string(), prod)]);
+    // Named with its own box, it is.
+    let (_, body) = pixel.stop(&world.hub, MACHINE, "acme", &[("prod", prod)]);
+    assert_eq!(world.said(&pixel, body["n"].as_u64().unwrap()), "stopped");
+    assert!(world.keeper("acme").boxes.runs().is_empty());
 }
 
 #[test]
@@ -529,7 +558,8 @@ fn stop_all_stops_every_run_on_a_machine() {
     let state = phone.state(&world.hub);
     let mut sent = Vec::new();
     for ws in state["machines"][0]["workspaces"].as_array().unwrap() {
-        let runs: Vec<RunId> = ws["runs"].as_array().unwrap().iter().map(|run| RunId::parse(run["run"].as_str().unwrap()).unwrap()).collect();
+        let runs: Vec<(&str, RunId)> =
+            ws["runs"].as_array().unwrap().iter().map(|run| (run["box"].as_str().unwrap(), RunId::parse(run["run"].as_str().unwrap()).unwrap())).collect();
         let (status, body) = phone.stop(&world.hub, MACHINE, ws["name"].as_str().unwrap(), &runs);
         assert_eq!(status, 202);
         sent.push(body["n"].as_u64().unwrap());
@@ -789,7 +819,7 @@ fn a_slow_stop_holds_up_no_answer() {
     until("the phone sees what runs", || pixel.state(&world.hub)["machines"][0]["workspaces"][0]["runs"] == json!([{"box": "dev", "run": dev.hex()}]));
     let raised = world.keeper("acme").raise("web");
     let record = world.shown(&pixel);
-    let (status, body) = pixel.stop(&world.hub, MACHINE, "acme", &[dev]);
+    let (status, body) = pixel.stop(&world.hub, MACHINE, "acme", &[("dev", dev)]);
     assert_eq!(status, 202);
     let stop = body["n"].as_u64().unwrap();
     let state = || pixel.state(&world.hub)["sent"].as_array().unwrap().iter().find(|sent| sent["n"] == stop).map(|sent| sent["state"].as_str().unwrap().to_string());
@@ -812,7 +842,7 @@ fn a_stop_the_link_handled_as_it_stopped_keeps_its_word() {
     *world.keeper("acme").boxes.0.lock().unwrap() = vec![("dev".into(), dev)];
     *world.keeper("acme").boxes.1.lock().unwrap() = Duration::from_millis(1500);
     until("the phone sees what runs", || pixel.state(&world.hub)["machines"][0]["workspaces"][0]["runs"] == json!([{"box": "dev", "run": dev.hex()}]));
-    let (_, body) = pixel.stop(&world.hub, MACHINE, "acme", &[dev]);
+    let (_, body) = pixel.stop(&world.hub, MACHINE, "acme", &[("dev", dev)]);
     let n = body["n"].as_u64().unwrap();
     let state = || pixel.state(&world.hub)["sent"].as_array().unwrap().iter().find(|sent| sent["n"] == n).map(|sent| sent["state"].as_str().unwrap().to_string());
     until("the link takes the stop", || state().as_deref() == Some("taken"));
@@ -826,15 +856,17 @@ fn a_stop_the_link_handled_as_it_stopped_keeps_its_word() {
     // started again: it waits for the first, and is said the same.
     let web = RunId([2; 8]);
     *world.keeper("acme").boxes.0.lock().unwrap() = vec![("web".into(), web)];
-    let line = Records::Stop { ws: WsName::parse("acme").unwrap(), device: "pixel".into(), runs: vec![web], signature: pixel.sign(&wire::stop_bytes(MACHINE, "acme", &[web])) };
+    let named = vec![("web".to_string(), web)];
+    let line = Records::Stop { ws: WsName::parse("acme").unwrap(), device: "pixel".into(), runs: named.clone(), signature: pixel.sign(&wire::stop_bytes(MACHINE, "acme", &named)) };
     let socket = world.keeper("acme").socket.clone();
     let first = {
         let (socket, line) = (socket.clone(), line.clone());
         thread::spawn(move || keep::tell(&socket, &line, LONG))
     };
     thread::sleep(Duration::from_millis(300));
-    assert_eq!(keep::tell(&socket, &line, LONG), Some(Told::Stopped(1)));
-    assert_eq!(first.join().unwrap(), Some(Told::Stopped(1)));
+    let stopped = Some(Told::Stopped { stopped: 1, wrong_box: 0 });
+    assert_eq!(keep::tell(&socket, &line, LONG), stopped);
+    assert_eq!(first.join().unwrap(), stopped);
 }
 
 #[test]
@@ -861,7 +893,7 @@ fn a_workspace_opened_before_the_join_takes_signed_stops_once_joined() {
     let dev = RunId([1; 8]);
     *world.keeper("acme").boxes.0.lock().unwrap() = vec![("dev".into(), dev)];
     until("the phone sees what runs", || pixel.state(&world.hub)["machines"][0]["workspaces"][0]["runs"] == json!([{"box": "dev", "run": dev.hex()}]));
-    let (_, body) = pixel.stop(&world.hub, MACHINE, "acme", &[dev]);
+    let (_, body) = pixel.stop(&world.hub, MACHINE, "acme", &[("dev", dev)]);
     assert_eq!(world.said(&pixel, body["n"].as_u64().unwrap()), "stopped");
     assert!(world.keeper("acme").boxes.runs().is_empty());
     // A request raised from now on names server-1 and reaches the phone; the one raised before

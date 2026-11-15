@@ -628,12 +628,36 @@ fn a_signed_answer_or_stop_handed_over_again_is_told_what_it_came_to() {
     let again = Records::Signed { ws: acme.clone(), device: "pixel".into(), yes: true, id: record.id, signature: signed(&pixel, &bytes, true) };
     assert_eq!(told(&desk, &trust, &boxes, &again), [Told::Gone]);
     // A stop likewise: the box it stopped is said stopped again; another signature stops nothing.
-    let stop = |signature: Vec<u8>| Records::Stop { ws: acme.clone(), device: "pixel".into(), runs: vec![RunId([1; 8])], signature };
-    let signature = pixel.sign(&crate::hub::wire::stop_bytes("mac-1", "acme", &[RunId([1; 8])])).unwrap();
-    assert_eq!(told(&desk, &trust, &boxes, &stop(signature.clone())), [Told::Stopped(1)]);
-    assert_eq!(told(&desk, &trust, &boxes, &stop(signature)), [Told::Stopped(1)]);
-    let other = pixel.sign(&crate::hub::wire::stop_bytes("mac-1", "acme", &[RunId([1; 8])])).unwrap();
-    assert_eq!(told(&desk, &trust, &boxes, &stop(other)), [Told::Stopped(0)]);
+    let named = vec![("dev".to_string(), RunId([1; 8]))];
+    let stop = |signature: Vec<u8>| Records::Stop { ws: acme.clone(), device: "pixel".into(), runs: named.clone(), signature };
+    let signature = pixel.sign(&crate::hub::wire::stop_bytes("mac-1", "acme", &named)).unwrap();
+    let stopped = |stopped| [Told::Stopped { stopped, wrong_box: 0 }];
+    assert_eq!(told(&desk, &trust, &boxes, &stop(signature.clone())), stopped(1));
+    assert_eq!(told(&desk, &trust, &boxes, &stop(signature)), stopped(1));
+    let other = pixel.sign(&crate::hub::wire::stop_bytes("mac-1", "acme", &named)).unwrap();
+    assert_eq!(told(&desk, &trust, &boxes, &stop(other)), stopped(0));
+}
+
+#[test]
+fn a_signed_stop_leaves_each_run_named_with_another_box() {
+    use rcgen::SigningKey;
+    let desk = desk(limits(), Script::with(vec![]));
+    let (pixel, trusted) = phone("pixel", &["acme"]);
+    let trust = |name: &str| (name == "pixel").then(|| trusted.clone());
+    let (dev, prod, web) = (RunId([1; 8]), RunId([2; 8]), RunId([3; 8]));
+    let boxes = Running(Mutex::new(vec![("dev".into(), dev), ("prod".into(), prod), ("web".into(), web)]));
+    let stop = |runs: &[(&str, RunId)]| {
+        let runs: Vec<(String, RunId)> = runs.iter().map(|(name, run)| (name.to_string(), *run)).collect();
+        let signature = pixel.sign(&crate::hub::wire::stop_bytes("mac-1", "acme", &runs)).unwrap();
+        stop_signed(&desk, &trust, &boxes, "pixel", &runs, &signature)
+    };
+    // prod's run named as dev's, and web's as a box that isn't there: both run on. dev, named with
+    // its own box, stops; a run that isn't there is passed over.
+    assert_eq!(stop(&[("dev", dev), ("dev", prod), ("scratch", web), ("dev", RunId([9; 8]))]), Some(Told::Stopped { stopped: 1, wrong_box: 2 }));
+    assert_eq!(boxes.runs(), vec![("prod".to_string(), prod), ("web".to_string(), web)]);
+    assert_eq!(stop(&[("web", prod)]), Some(Told::Stopped { stopped: 0, wrong_box: 1 }));
+    assert_eq!(stop(&[("prod", prod), ("web", web)]), Some(Told::Stopped { stopped: 2, wrong_box: 0 }));
+    assert!(boxes.runs().is_empty());
 }
 
 #[test]

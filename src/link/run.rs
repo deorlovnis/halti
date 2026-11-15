@@ -146,10 +146,11 @@ impl Listed {
     }
 }
 
-/// What a phone sent this machine, read whole from what the hub handed over.
+/// What a phone sent this machine, read whole from what the hub handed over: a signed answer, or
+/// a signed stop of runs, each with the box the phone named it with.
 enum Inbound {
     Answer { ws: WsName, device: String, id: Id, yes: bool, signature: Vec<u8> },
-    Stop { ws: WsName, device: String, runs: Vec<RunId>, signature: Vec<u8> },
+    Stop { ws: WsName, device: String, runs: Vec<(String, RunId)>, signature: Vec<u8> },
 }
 
 /// What came of the items the hub handed over, each known by its number and signature: a hub
@@ -676,8 +677,9 @@ impl Link<'_> {
             Inbound::Stop { ws, device, runs, signature } => {
                 let Some(socket) = self.keeper(&ws) else { return "unreached" };
                 match keep::tell(&socket, &Records::Stop { ws, device, runs, signature }, STOP_WAIT) {
-                    Some(Told::Stopped(0)) => "none",
-                    Some(Told::Stopped(_)) => "stopped",
+                    Some(Told::Stopped { wrong_box: 1.., .. }) => "wrong-box",
+                    Some(Told::Stopped { stopped: 0, .. }) => "none",
+                    Some(Told::Stopped { .. }) => "stopped",
                     Some(Told::Refused) => "refused",
                     _ => "unreached",
                 }
@@ -764,7 +766,8 @@ fn inbound(item: &Value) -> Result<Inbound, &'static str> {
         let (Some(id), Some(yes)) = (id, yes) else { return Err("malformed") };
         return Ok(Inbound::Answer { ws, device, id, yes, signature });
     }
-    let runs = item["runs"].as_array().and_then(|runs| runs.iter().map(|run| run.as_str().and_then(RunId::parse)).collect::<Option<Vec<_>>>());
+    let named = |run: &Value| Some((run["box"].as_str().filter(|name| crate::fields::is_name(name))?.to_string(), RunId::parse(run["run"].as_str()?)?));
+    let runs = item["runs"].as_array().and_then(|runs| runs.iter().map(named).collect::<Option<Vec<_>>>());
     let Some(runs) = runs.filter(|runs| !runs.is_empty() && runs.len() <= STOP_RUNS_MAX) else { return Err("malformed") };
     Ok(Inbound::Stop { ws, device, runs, signature })
 }

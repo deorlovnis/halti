@@ -889,23 +889,24 @@ fn a_signed_stop_stops_the_runs_it_names_and_only_those() {
         let runs = keep::runs(socket, &acme(), LONG).unwrap().unwrap();
         assert_eq!(runs.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["dev", "web"]);
         assert_ne!(runs[0].1, runs[1].1, "each run its own id");
-        let dev_run = runs[0].1;
-        let stop = |key: &rcgen::KeyPair, machine: &str, runs: Vec<RunId>| Records::Stop {
-            ws: acme(),
-            device: "pixel".into(),
-            signature: sign(key, &crate::hub::wire::stop_bytes(machine, "acme", &runs)),
-            runs,
+        let (dev_run, web_run) = (runs[0].1, runs[1].1);
+        let stop = |key: &rcgen::KeyPair, machine: &str, runs: Vec<(&str, RunId)>| {
+            let runs: Vec<(String, RunId)> = runs.into_iter().map(|(name, run)| (name.to_string(), run)).collect();
+            Records::Stop { ws: acme(), device: "pixel".into(), signature: sign(key, &crate::hub::wire::stop_bytes(machine, "acme", &runs)), runs }
         };
+        let stopped = |stopped, wrong_box| Some(Told::Stopped { stopped, wrong_box });
         // Another key, or signed for another machine's name: nothing stops.
-        assert_eq!(keep::tell(socket, &stop(&stranger, "mac-1", vec![dev_run]), LONG), Some(Told::Refused));
-        assert_eq!(keep::tell(socket, &stop(&pixel, "mac-2", vec![dev_run]), LONG), Some(Told::Refused));
+        assert_eq!(keep::tell(socket, &stop(&stranger, "mac-1", vec![("dev", dev_run)]), LONG), Some(Told::Refused));
+        assert_eq!(keep::tell(socket, &stop(&pixel, "mac-2", vec![("dev", dev_run)]), LONG), Some(Told::Refused));
+        // web's run named as dev's: web runs on.
+        assert_eq!(keep::tell(socket, &stop(&pixel, "mac-1", vec![("dev", web_run)]), LONG), stopped(0, 1));
         assert_eq!(bench.fake.up(), BTreeSet::from([dev.clone(), web.clone()]));
         // Signed: the box of that run is put away, and its session told.
-        assert_eq!(keep::tell(socket, &stop(&pixel, "mac-1", vec![dev_run, RunId([9; 8])]), LONG), Some(Told::Stopped(1)));
+        assert_eq!(keep::tell(socket, &stop(&pixel, "mac-1", vec![("dev", dev_run), ("dev", RunId([9; 8]))]), LONG), stopped(1, 0));
         assert_eq!(said_on(&mut dev_session), Some(Reply::Stopped));
         assert_eq!(bench.fake.up(), BTreeSet::from([web.clone()]));
         // Sent again, it stops nothing new, and a later run of dev isn't the one it named.
-        assert_eq!(keep::tell(socket, &stop(&pixel, "mac-1", vec![dev_run]), LONG), Some(Told::Stopped(0)));
+        assert_eq!(keep::tell(socket, &stop(&pixel, "mac-1", vec![("dev", dev_run)]), LONG), stopped(0, 0));
         assert!(matches!(ask(socket, Request::Close(acme())), Some(Reply::Closed(1))));
     });
     assert_eq!(code.unwrap(), 0);

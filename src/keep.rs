@@ -28,20 +28,23 @@
 //!         | "halti-keep/2 answer " WS " " ("yes" | "no") " " DIGEST "\n"
 //!         | "halti-keep/2 runs " WS "\n"                      the boxes that run, by run id
 //!         | "halti-keep/2 signed " WS " " DEVICE " " ("yes" | "no") " " ID " " SIGNATURE "\n"
-//!         | "halti-keep/2 stop " WS " " DEVICE " " RUN *("," RUN) " " SIGNATURE "\n"
+//!         | "halti-keep/2 stop " WS " " DEVICE " " BOX ":" RUN *("," BOX ":" RUN) " " SIGNATURE "\n"
 //! reply   = *("halti-keep/2 request " HEX "\n") "halti-keep/2 end\n"
 //!         | *("halti-keep/2 run " BOX " " RUN "\n") "halti-keep/2 end\n"
 //!         | "halti-keep/2 " ("approved" | "denied" | "gone" | "declined" | "busy" | "refused"
 //!                           | "other") "\n"
-//!         | "halti-keep/2 stopped " COUNT "\n"
+//!         | "halti-keep/2 stopped " COUNT " " COUNT "\n"
 //! ```
 //!
-//! A request line is held to 1,024 bytes; a reply line may be as long as a record makes it. An
+//! A request line is held to 2,048 bytes; a reply line may be as long as a record makes it. An
 //! answer names its request by the 64 hex characters of `requests::answer_digest`: the record it
 //! was shown and the decision. A signed answer names it by its 32 hex characters of id, and a
-//! stop names up to 32 runs by their 16; SIGNATURE is a device's, in hex, which the open workspace
-//! checks against the devices this machine trusts (`requests::Desk::answer_signed`). `refused` is
-//! a signed answer or stop that doesn't count. Still no passphrase, key or value crosses.
+//! stop names up to 32 runs, each by the box the phone named it with and its 16; SIGNATURE is a
+//! device's, in hex, which the open workspace checks against the devices this machine trusts
+//! (`requests::Desk::answer_signed`). `refused` is a signed answer or stop that doesn't count.
+//! `stopped` says how many boxes the stop put away, then how many of the runs it named run here in
+//! another box than the one named with them, which it left running. Still no passphrase, key or
+//! value crosses.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -70,7 +73,7 @@ pub const LINE_MAX: usize = 128;
 /// The longest line that answers a request about requests: one record, in hex.
 const RECORD_LINE_MAX: usize = 8192;
 /// The longest line that asks about requests: a signed stop of the most runs.
-pub const RECORDS_REQUEST_MAX: usize = 1024;
+pub const RECORDS_REQUEST_MAX: usize = 2048;
 /// The most runs one stop names.
 pub const STOP_RUNS_MAX: usize = 32;
 /// How long the open workspace waits for a request's line.
@@ -298,8 +301,8 @@ pub enum Records {
     Runs(WsName),
     /// A device's signed answer to the request with this id.
     Signed { ws: WsName, device: String, yes: bool, id: Id, signature: Vec<u8> },
-    /// A device's signed stop of these runs.
-    Stop { ws: WsName, device: String, runs: Vec<RunId>, signature: Vec<u8> },
+    /// A device's signed stop of these runs, each with the box the device named it with.
+    Stop { ws: WsName, device: String, runs: Vec<(String, RunId)>, signature: Vec<u8> },
 }
 
 /// A device's signature as a line carries it: 1 to 72 bytes.
@@ -323,7 +326,7 @@ impl Records {
             Records::Runs(ws) => format!("{RECORDS} runs {ws}\n"),
             Records::Signed { ws, device, yes, id, signature } => format!("{RECORDS} signed {ws} {device} {} {} {}\n", word(*yes), id.hex(), util::hex(signature)),
             Records::Stop { ws, device, runs, signature } => {
-                let runs: Vec<String> = runs.iter().map(RunId::hex).collect();
+                let runs: Vec<String> = runs.iter().map(|(name, run)| format!("{name}:{}", run.hex())).collect();
                 format!("{RECORDS} stop {ws} {device} {} {}\n", runs.join(","), util::hex(signature))
             }
         }
@@ -349,7 +352,11 @@ impl Records {
                 signature: signature(sig)?,
             }),
             ["stop", ws, name, runs, sig] => {
-                let runs = runs.split(',').map(RunId::parse).collect::<Option<Vec<RunId>>>()?;
+                let run = |named: &str| {
+                    let (name, run) = named.split_once(':')?;
+                    Some((device(name)?, RunId::parse(run)?))
+                };
+                let runs = runs.split(',').map(run).collect::<Option<Vec<_>>>()?;
                 if runs.len() > STOP_RUNS_MAX {
                     return None;
                 }
@@ -379,8 +386,12 @@ pub enum Told {
     Busy,
     /// A signed answer or stop that doesn't count: nothing was done.
     Refused,
-    /// A signed stop, and how many of the boxes it named were stopped.
-    Stopped(u32),
+    /// A signed stop: how many of the boxes it named were stopped, and how many of its runs run
+    /// here in another box than the one named with them, and were not.
+    Stopped {
+        stopped: u32,
+        wrong_box: u32,
+    },
     /// The request named another workspace: nothing was done.
     Other,
 }
@@ -397,7 +408,7 @@ impl Told {
             Told::Declined => "declined".into(),
             Told::Busy => "busy".into(),
             Told::Refused => "refused".into(),
-            Told::Stopped(count) => format!("stopped {count}"),
+            Told::Stopped { stopped, wrong_box } => format!("stopped {stopped} {wrong_box}"),
             Told::Other => "other".into(),
         };
         format!("{RECORDS} {words}\n")
@@ -407,6 +418,7 @@ impl Told {
     /// isn't hex.
     pub fn parse(line: &str) -> Option<Told> {
         let words: Vec<&str> = line.strip_prefix(RECORDS)?.strip_prefix(' ')?.split(' ').collect();
+        let count = |text: &str| text.parse::<u32>().ok().filter(|_| text.len() <= 9 && text.bytes().all(|b| b.is_ascii_digit()));
         Some(match words[..] {
             ["request", record] => Told::Request(util::unhex(record).filter(|bytes| !bytes.is_empty())?),
             ["run", name, run] => {
@@ -420,7 +432,7 @@ impl Told {
             ["declined"] => Told::Declined,
             ["busy"] => Told::Busy,
             ["refused"] => Told::Refused,
-            ["stopped", count] if count.len() <= 9 && count.bytes().all(|b| b.is_ascii_digit()) => Told::Stopped(count.parse().ok()?),
+            ["stopped", stopped, wrong_box] => Told::Stopped { stopped: count(stopped)?, wrong_box: count(wrong_box)? },
             ["other"] => Told::Other,
             _ => return None,
         })
@@ -711,7 +723,7 @@ mod tests {
     fn a_signed_answer_or_stop_reads_only_as_what_was_written() {
         let longest = WsName::parse(&"w".repeat(32)).unwrap();
         let signed = Records::Signed { ws: acme(), device: "pixel".into(), yes: true, id: Id([0xab; 16]), signature: vec![0x30; 72] };
-        let stop = Records::Stop { ws: longest.clone(), device: "d".repeat(32), runs: vec![RunId([1; 8]); STOP_RUNS_MAX], signature: vec![0x30; 72] };
+        let stop = Records::Stop { ws: longest.clone(), device: "d".repeat(32), runs: vec![("b".repeat(32), RunId([1; 8])); STOP_RUNS_MAX], signature: vec![0x30; 72] };
         let no = Records::Signed { ws: acme(), device: "pixel".into(), yes: false, id: Id([0; 16]), signature: vec![1] };
         for records in [Records::Runs(acme()), signed.clone(), no, stop.clone()] {
             let line = records.line();
@@ -719,9 +731,11 @@ mod tests {
         }
         assert_eq!(Records::Runs(acme()).line(), "halti-keep/2 runs acme\n");
         assert_eq!(signed.line(), format!("halti-keep/2 signed acme pixel yes {} {}\n", "ab".repeat(16), "30".repeat(72)));
+        let two = Records::Stop { ws: acme(), device: "pixel".into(), runs: vec![("dev".into(), RunId([1; 8])), ("web".into(), RunId([2; 8]))], signature: vec![0x30] };
+        assert_eq!(two.line(), "halti-keep/2 stop acme pixel dev:0101010101010101,web:0202020202020202 30\n");
         // The longest stop fits a line about requests.
         assert!(stop.line().len() <= RECORDS_REQUEST_MAX, "{}", stop.line().len());
-        let runs = |n: usize| vec!["0101010101010101"; n].join(",");
+        let runs = |n: usize| vec!["dev:0101010101010101"; n].join(",");
         for line in [
             format!("halti-keep/2 signed acme pixel maybe {} 30", "ab".repeat(16)),
             format!("halti-keep/2 signed acme Pixel yes {} 30", "ab".repeat(16)),
@@ -730,17 +744,29 @@ mod tests {
             format!("halti-keep/2 signed acme pixel yes {} {}", "ab".repeat(16), "30".repeat(73)),
             format!("halti-keep/2 stop acme pixel {} 30", runs(STOP_RUNS_MAX + 1)),
             "halti-keep/2 stop acme pixel  30".to_string(),
-            "halti-keep/2 stop acme pixel 01010101010101 30".to_string(),
+            "halti-keep/2 stop acme pixel dev:01010101010101 30".to_string(),
+            "halti-keep/2 stop acme pixel 0101010101010101 30".to_string(),
+            "halti-keep/2 stop acme pixel :0101010101010101 30".to_string(),
+            "halti-keep/2 stop acme pixel Dev:0101010101010101 30".to_string(),
+            "halti-keep/2 stop acme pixel dev:0101010101010101:x 30".to_string(),
+            "halti-keep/2 stop acme pixel dev:0101010101010101, 30".to_string(),
             "halti-keep/2 runs acme extra".to_string(),
         ] {
             assert_eq!(Records::parse(&line), None, "{line}");
         }
-        for told in [Told::Run("dev".into(), RunId([2; 8])), Told::Refused, Told::Stopped(0), Told::Stopped(3)] {
+        for told in [Told::Run("dev".into(), RunId([2; 8])), Told::Refused, Told::Stopped { stopped: 0, wrong_box: 0 }, Told::Stopped { stopped: 3, wrong_box: 1 }] {
             let line = told.line();
             assert_eq!(Told::parse(line.strip_suffix('\n').unwrap()), Some(told), "{line}");
         }
         assert_eq!(Told::Run("dev".into(), RunId([2; 8])).line(), "halti-keep/2 run dev 0202020202020202\n");
-        for line in ["halti-keep/2 run Dev 0202020202020202", "halti-keep/2 run dev 02", "halti-keep/2 stopped -1", "halti-keep/2 stopped 1e3"] {
+        for line in [
+            "halti-keep/2 run Dev 0202020202020202",
+            "halti-keep/2 run dev 02",
+            "halti-keep/2 stopped -1 0",
+            "halti-keep/2 stopped 1e3 0",
+            "halti-keep/2 stopped 1",
+            "halti-keep/2 stopped 1 -1",
+        ] {
             assert_eq!(Told::parse(line), None, "{line}");
         }
     }

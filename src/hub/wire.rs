@@ -221,13 +221,25 @@
 //! signed: `200 {}`. It closes the remote copy for every phone and nothing else: the machine still
 //! waits, and is answered there or expires. Any phone that may see the request can do it.
 //!
-//! **Stopping runs.** The app signs, after fingerprint or PIN, the fields `halti-stop-v1`, the
-//! machine's name, the workspace, then each run id (8) as a field of its own, in the order sent.
-//! `POST /v1/stop`, body `{"machine": "server-1", "ws": "acme", "runs": ["<8 bytes>", ...],
-//! "signature": "<DER>"}`, 1 to 32 runs: `202 {"n": 8}`. The machine stops each of those runs it has
-//! and passes over the rest, so a stop sent again stops nothing new. "Stop all" is one stop for
-//! each workspace the machine shows, naming every run it shows there. A stop is `sent, not
-//! confirmed` until `GET /v1/state` gives its word.
+//! **Stopping runs.** The app signs, after fingerprint or PIN, these fields, in this order and
+//! nothing else:
+//!
+//! | Field | Bytes |
+//! |---|---|
+//! | label | `halti-stop-v1` |
+//! | machine | the machine's name at the hub |
+//! | ws | the workspace's name |
+//! | box | the first run's box, a name as a device's is, as `GET /v1/state` listed it with that run |
+//! | run | the first run's id (8) |
+//!
+//! then a box and a run for each further run, in the order sent: 1 to 32 runs, so 5 to 67 fields.
+//! The app signs only runs it showed, each with the box it showed it under. Then `POST /v1/stop`,
+//! body `{"machine": "server-1", "ws": "acme", "runs": [{"box": "dev", "run": "<8 bytes>"}, ...],
+//! "signature": "<DER>"}`, the same runs and boxes in the same order: `202 {"n": 8}`. The machine stops each of those runs it has under the box
+//! named with it. It doesn't stop one it has under another box, and says so (`wrong-box` below);
+//! one it doesn't have it passes over, so a stop sent again stops nothing new. "Stop all" is one
+//! stop for each workspace the machine shows, naming every run it shows there. A stop is `sent,
+//! not confirmed` until `GET /v1/state` gives its word.
 //!
 //! **State.** `GET /v1/state`, no body: `200`
 //!
@@ -238,8 +250,8 @@
 //!                                "runs": [{"box": "dev", "run": "<8 bytes>"}]}]}],
 //!  "sent": [{"n": 7, "kind": "answer", "machine": "server-1", "ws": "acme", "id": "<16 bytes>",
 //!            "state": "approved", "at": "<time>"},
-//!           {"n": 8, "kind": "stop", "machine": "server-1", "ws": "acme", "runs": ["<8 bytes>"],
-//!            "state": "stopped", "at": "<time>"}]}
+//!           {"n": 8, "kind": "stop", "machine": "server-1", "ws": "acme",
+//!            "runs": [{"box": "dev", "run": "<8 bytes>"}], "state": "stopped", "at": "<time>"}]}
 //! ```
 //!
 //! - `machines`: each machine whose last report says it trusts this phone, for workspaces of the
@@ -255,8 +267,11 @@
 //!   is `queued` (the machine hasn't taken it), `taken` (it has, and said nothing yet), or the
 //!   machine's word: for an answer `approved`, `denied`, `gone` (no such request waits there: it
 //!   was answered, expired, or withdrawn) or `refused` (not signed by a device trusted there for
-//!   that workspace, over that request); for a stop `stopped`, `none` (no run named runs there) or
-//!   `refused`; for either `unreached` (that workspace isn't open there), `malformed` or `unknown`.
+//!   that workspace, over that request); for a stop `stopped` (it stopped at least one run named,
+//!   and every run named that runs there was named with its box), `none` (no run named runs
+//!   there), `wrong-box` (at least one run named runs there under another box: none of those was
+//!   stopped, and each of the others that runs there under the box named was), or `refused` (not
+//!   signed by a device trusted there for that workspace, over those fields); for either `unreached` (that workspace isn't open there), `malformed` or `unknown`.
 //!   The hub can lie about all of it; the machine's own word reaches the phone only through it.
 //!
 //! # What a machine does
@@ -298,8 +313,8 @@
 //! ```json
 //! {"n": 7, "kind": "answer", "device": "pixel", "ws": "acme", "id": "<16 bytes>",
 //!  "decision": "yes", "signature": "<DER>"}
-//! {"n": 8, "kind": "stop", "device": "pixel", "ws": "acme", "runs": ["<8 bytes>"],
-//!  "signature": "<DER>"}
+//! {"n": 8, "kind": "stop", "device": "pixel", "ws": "acme",
+//!  "runs": [{"box": "dev", "run": "<8 bytes>"}], "signature": "<DER>"}
 //! ```
 //!
 //! The link calls again at once; when the hub can't be reached it waits, longer each time, up to a
@@ -439,10 +454,12 @@ pub fn pair_bytes(pin: &[u8; 32], request: &PairRequest) -> Vec<u8> {
 }
 
 /// What a phone signs to stop runs of a workspace on a machine: the label, the machine, the
-/// workspace, then each run's 8 bytes as a field of its own.
-pub fn stop_bytes(machine: &str, ws: &str, runs: &[RunId]) -> Vec<u8> {
+/// workspace, then for each run the name of the box it was shown under and its 8 bytes, each a field
+/// of its own.
+pub fn stop_bytes(machine: &str, ws: &str, runs: &[(String, RunId)]) -> Vec<u8> {
     let mut bytes = fields::join(&[STOP_LABEL.as_bytes(), machine.as_bytes(), ws.as_bytes()]);
-    for run in runs {
+    for (box_name, run) in runs {
+        fields::push(&mut bytes, box_name.as_bytes());
         fields::push(&mut bytes, &run.0);
     }
     bytes
@@ -830,9 +847,10 @@ mod tests {
     // A second key and its known answers, made the same way: a stop, and a machine code.
     const OPENSSL_KEY: &str = "3059301306072a8648ce3d020106082a8648ce3d03010703420004ad474f6ad6407053a2fdb194da78b401e1c5768d31d9db888c3996aeeecc3747d9\
         4a1ea3f9aa90bc2e5cdec1617c9a4738cf570e9c62843d0fe5ce95a75e198d";
-    const STOP_BYTES: &str = "000d68616c74692d73746f702d763100056d61632d31000461636d650008010203040506070800081112131415161718";
-    const STOP_SIGNATURE: &str = "3046022100d1a8b69b3d485fd331d0e8bfe8dbf206f34b35226508a20c917c62bbd96bad0c022100a7cf41a3965caa22561de31e7f9bc3f1a9d1883eb454c356\
-        cb10b11ff5d3e5cb";
+    const STOP_BYTES: &str = "000d68616c74692d73746f702d763100056d61632d31000461636d65000364657600080102030405060708000377656200081112131415161718";
+    const STOP_SHA256: &str = "63205eeef68b4432afcf5f1a58566a5fe4221b3021cd4b4722a60e01dfabf40e";
+    const STOP_SIGNATURE: &str = "3046022100eb21a20a20400be8e43b514218b4d39811d52e7209e79836d380ff9d9d6539910221008413713fb277e89f631e0767e1019bafacea1eebaf01a443\
+        8933390dc01f8c1e";
     const MACHINE_CODE: &str = "0813 369a 1400 9098 7602";
     const OPENSSL_FINGERPRINT: &str = "ca72 9ca9 e915 a0f0 5614";
 
@@ -840,20 +858,27 @@ mod tests {
         util::unhex(text).unwrap()
     }
 
-    fn runs() -> [RunId; 2] {
-        [RunId([1, 2, 3, 4, 5, 6, 7, 8]), RunId([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18])]
+    /// Two runs and the boxes they were shown under: dev's 01 to 08, web's 11 to 18.
+    fn runs() -> [(String, RunId); 2] {
+        [("dev".into(), RunId([1, 2, 3, 4, 5, 6, 7, 8])), ("web".into(), RunId([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]))]
     }
 
     #[test]
-    fn a_stop_is_signed_over_the_machine_the_workspace_and_each_run() {
+    fn a_stop_is_signed_over_the_machine_the_workspace_and_each_run_with_its_box() {
         assert_eq!(hex(&stop_bytes("mac-1", "acme", &runs())), STOP_BYTES);
+        assert_eq!(hex(&Sha256::digest(bytes(STOP_BYTES))), STOP_SHA256);
         let key = DeviceKey::from_spki(&bytes(OPENSSL_KEY)).unwrap();
         assert_eq!(key.verify(&stop_bytes("mac-1", "acme", &runs()), &bytes(STOP_SIGNATURE)), Ok(()));
-        // Another machine, workspace, run or order is another stop.
+        // Another machine, workspace, run, order, or box named with a run is another stop.
         let [first, second] = runs();
-        for other in
-            [stop_bytes("mac-2", "acme", &runs()), stop_bytes("mac-1", "beta", &runs()), stop_bytes("mac-1", "acme", &[first]), stop_bytes("mac-1", "acme", &[second, first])]
-        {
+        let swapped = [(second.0.clone(), first.1), (first.0.clone(), second.1)];
+        for other in [
+            stop_bytes("mac-2", "acme", &runs()),
+            stop_bytes("mac-1", "beta", &runs()),
+            stop_bytes("mac-1", "acme", std::slice::from_ref(&first)),
+            stop_bytes("mac-1", "acme", &[second, first]),
+            stop_bytes("mac-1", "acme", &swapped),
+        ] {
             assert!(key.verify(&other, &bytes(STOP_SIGNATURE)).is_err());
         }
     }
