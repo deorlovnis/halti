@@ -1472,3 +1472,34 @@ fn a_phone_is_shown_the_last_64_it_sent_each_machine() {
     let sent: Vec<u64> = view["sent"].as_array().unwrap().iter().map(|sent| sent["n"].as_u64().unwrap()).collect();
     assert_eq!(sent, (65..=128).collect::<Vec<u64>>());
 }
+
+#[test]
+fn what_a_phone_sent_stays_listed_with_the_machine_s_word_whatever_other_phones_send() {
+    let mut relay = relay::Relay::default();
+    let now = Timestamp::now();
+    let stop = || relay::What::Stop { ws: "acme".into(), runs: vec![("dev".into(), crate::requests::RunId([1; 8]))], signature: vec![0x30] };
+    // pixel's stop is taken and said stopped; its run leaves the machine's report.
+    let n = relay.queue("server-1", "pixel", stop(), now).unwrap();
+    relay.take("server-1", &[], now);
+    relay.take("server-1", &[(n, "stopped".to_string())], now);
+    let reported = relay::Reported { link: [5; 16], workspaces: Vec::new(), trusted: Vec::new(), ids: Vec::new() };
+    relay.report("server-1", reported, now);
+    // Then another phone sends that machine more than the hub keeps for one phone, all said done.
+    for _ in 0..3 {
+        for _ in 0..relay::ITEMS_MAX {
+            relay.queue("server-1", "tablet", stop(), now).unwrap();
+        }
+        let done: Vec<(u64, String)> = relay.take("server-1", &[], now).iter().map(|item| (item.n, "none".to_string())).collect();
+        relay.take("server-1", &done, now);
+    }
+    let view = relay.view("pixel", &acme(), &|_| Some((Vec::new(), None)), now);
+    let sent: Vec<(u64, &str)> = view["sent"].as_array().unwrap().iter().map(|sent| (sent["n"].as_u64().unwrap(), sent["state"].as_str().unwrap())).collect();
+    assert_eq!(sent, [(n, "stopped")]);
+    // The other phone sees its own last 64.
+    let view = relay.view("tablet", &acme(), &|_| Some((Vec::new(), None)), now);
+    assert_eq!(view["sent"].as_array().unwrap().len(), 64);
+    // An hour after it was sent, it goes.
+    let later = now + jiff::SignedDuration::from_hours(1);
+    let view = relay.view("pixel", &acme(), &|_| Some((Vec::new(), None)), later);
+    assert_eq!(view["sent"], json!([]));
+}

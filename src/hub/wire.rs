@@ -235,11 +235,19 @@
 //! then a box and a run for each further run, in the order sent: 1 to 32 runs, so 5 to 67 fields.
 //! The app signs only runs it showed, each with the box it showed it under. Then `POST /v1/stop`,
 //! body `{"machine": "server-1", "ws": "acme", "runs": [{"box": "dev", "run": "<8 bytes>"}, ...],
-//! "signature": "<DER>"}`, the same runs and boxes in the same order: `202 {"n": 8}`. The machine stops each of those runs it has under the box
-//! named with it. It doesn't stop one it has under another box, and says so (`wrong-box` below);
-//! one it doesn't have it passes over, so a stop sent again stops nothing new. "Stop all" is one
-//! stop for each workspace the machine shows, naming every run it shows there. A stop is `sent,
-//! not confirmed` until `GET /v1/state` gives its word.
+//! "signature": "<DER>"}`, the same runs and boxes in the same order: `202 {"n": 8}`. The machine
+//! stops each of those runs it has under the box named with it. It doesn't stop one it has under
+//! another box, and says so (`wrong-box` below); one it doesn't have it passes over, so a stop sent
+//! again stops nothing new. "Stop all" is one stop for each workspace the machine shows, naming
+//! every run it shows there.
+//!
+//! **Confirming a stop.** A stop is `sent, not confirmed` until its entry in `sent` of
+//! `GET /v1/state` (below), found by its `n`, holds the machine's word: that entry is the only
+//! confirmation. A run the machine stopped leaves its `runs` as soon as the run ends, in the
+//! machine's next report, which may reach the hub before the word or after it; and a run that ends
+//! by itself leaves the same way. So the app never takes a run no longer listed as a stop
+//! confirmed, nor a run still listed as one refused. The entry stays after the run is gone, for as
+//! long as `sent` says.
 //!
 //! **State.** `GET /v1/state`, no body: `200`
 //!
@@ -263,15 +271,18 @@
 //!   used from two places, or null. `reported` is the hub's time of its last report; one older than
 //!   a minute is not reporting. `since` changes when the machine's link starts again: a restart.
 //!   `workspaces` are those of `ws` it reports, open or closed, each with the runs of its boxes.
-//! - `sent`: what this phone sent in the last hour, at most 64 for each machine, by `n`. `state`
-//!   is `queued` (the machine hasn't taken it), `taken` (it has, and said nothing yet), or the
-//!   machine's word: for an answer `approved`, `denied`, `gone` (no such request waits there: it
-//!   was answered, expired, or withdrawn) or `refused` (not signed by a device trusted there for
-//!   that workspace, over that request); for a stop `stopped` (it stopped at least one run named,
-//!   and every run named that runs there was named with its box), `none` (no run named runs
-//!   there), `wrong-box` (at least one run named runs there under another box: none of those was
-//!   stopped, and each of the others that runs there under the box named was), or `refused` (not
-//!   signed by a device trusted there for that workspace, over those fields); for either `unreached` (that workspace isn't open there), `malformed` or `unknown`.
+//! - `sent`: what this phone sent each machine in the last hour by the hub's clock, the last 64 for
+//!   each machine, by `n`. What other phones send never pushes an entry out; a hub restart forgets
+//!   them all, and a stop then not confirmed may be sent again. `state` is `queued` (the machine
+//!   hasn't taken it), `taken` (it has, and said nothing yet), or the machine's word: for an answer
+//!   `approved`, `denied`, `gone` (no such request waits there: it was answered, expired, or
+//!   withdrawn) or `refused` (not signed by a device trusted there for that workspace, over that
+//!   request); for a stop `stopped` (it stopped at least one of the runs named, and named every one
+//!   that runs there with its box), `none` (no run named runs there), `wrong-box` (at least one run
+//!   named runs there under another box: none of those was stopped, and each of the others that
+//!   runs there under the box named with it was), or `refused` (not signed by a device trusted
+//!   there for that workspace, over those fields); for either `unreached` (that workspace isn't
+//!   open there), `malformed` or `unknown`.
 //!   The hub can lie about all of it; the machine's own word reaches the phone only through it.
 //!
 //! # What a machine does

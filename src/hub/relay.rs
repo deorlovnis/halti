@@ -23,8 +23,8 @@ use crate::util::hex;
 pub const REQUESTS_MAX: usize = 50;
 /// The most answers and stops that wait for one machine to take them.
 pub const ITEMS_MAX: usize = 64;
-/// How many of what phones sent one machine are kept once taken, for the phones to see what came
-/// of them, and for how long at most.
+/// How many of what each phone sent one machine are kept once taken, for the phone to see what
+/// came of them, and for how long at most. What one phone sends never pushes out another's.
 const DONE_MAX: usize = 64;
 const DONE_LIFE: SignedDuration = SignedDuration::from_hours(1);
 /// How long past its expiry a request is still held: a machine's clock and the hub's may differ by
@@ -135,9 +135,16 @@ impl Mailbox {
         }
         self.expired.retain(|_, until| now < *until);
         self.done.retain(|item| now.duration_since(item.at) < DONE_LIFE);
-        while self.done.len() > DONE_MAX {
-            self.done.pop_front();
+        // Each phone's oldest go first, until it has DONE_MAX.
+        let mut held: HashMap<String, usize> = HashMap::new();
+        for item in &self.done {
+            *held.entry(item.from.clone()).or_default() += 1;
         }
+        self.done.retain(|item| {
+            let left = held.get_mut(&item.from).expect("counted above");
+            *left -= 1;
+            *left < DONE_MAX
+        });
     }
 }
 
