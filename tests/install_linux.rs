@@ -166,8 +166,9 @@ fn sudo_without_a_password_is_said_once_and_plainly() {
     assert!(!text(&out.stderr).contains("breaks out of a box"), "{}", text(&out.stderr));
 }
 
-/// A group that gives root without a password (docker's, lxd's, incus-admin's, disk's) is said
-/// once, naming each, and the install goes on; a group whose name only begins the same is none.
+/// A group that gives root without a password (docker's, lxd's, incus-admin's, libvirt's,
+/// libvirtd's, disk's) is said once, naming each, and the install goes on; a group whose name only
+/// begins the same is none.
 #[test]
 fn a_group_that_gives_root_is_said_once_and_plainly() {
     let repo = Repo::new();
@@ -179,7 +180,7 @@ fn a_group_that_gives_root_is_said_once_and_plainly() {
         assert!(repo.sudo_log().contains("/usr/local/bin/halti"), "installed all the same: {}", repo.sudo_log());
         text(&out.stderr)
     };
-    for none in ["tester", "tester kvm sudo", "tester dockerish my-disk"] {
+    for none in ["tester", "tester kvm sudo", "tester dockerish my-disk libvirt-qemu"] {
         assert!(!said(none).contains("gives root"), "{none}");
     }
     let stderr = said("tester docker kvm disk");
@@ -187,7 +188,7 @@ fn a_group_that_gives_root_is_said_once_and_plainly() {
         "warning: tester is in a group that gives root without a password (docker, disk), so any program running as tester is root here; see README \"On a Linux server\"";
     assert!(stderr.lines().any(|l| l == warning), "{stderr}");
     assert_eq!(stderr.matches("gives root").count(), 1, "{stderr}");
-    for group in ["lxd", "incus-admin"] {
+    for group in ["lxd", "incus-admin", "libvirt", "libvirtd"] {
         assert!(said(&format!("tester {group}")).contains(&format!("without a password ({group}),")), "{group}");
     }
 }

@@ -52,7 +52,7 @@ and where boxes can run (x86-64, $kvm, Linux 6.8 or newer), also owned by root:
   $lib/images/$agent/<sha256>.img, the agent image built with podman and made a disk
 would say whether this server can run boxes, and if not, why
 would warn if sudo runs without your password, if you are in a group that gives root without one
-  (docker, lxd, incus-admin or disk), or if swap that isn't encrypted is on
+  (docker, lxd, incus-admin, libvirt, libvirtd or disk), or if swap that isn't encrypted is on
 the installed halti keeps its own, and no others:
   files in $config
   files in $store, and workspaces in its ws folder unless your settings name another
@@ -114,9 +114,10 @@ sudo_asks=yes
 if sudo -n -k true 2>/dev/null; then sudo_asks=no; fi
 
 # The groups the system lists for this user (one added since the last login among them) that give
-# root with no password: docker, lxd and incus-admin start a container with / mounted in it, and
-# disk writes the disk under the system.
-root_groups=$(id -Gn "$user" 2>/dev/null | tr ' ' '\n' | grep -xE 'docker|lxd|incus-admin|disk' | paste -sd, - | sed 's/,/, /g')
+# root with no password: docker, lxd and incus-admin start a container with / mounted in it,
+# libvirt (libvirtd on older Debian and Ubuntu) a VM given the system's own disk, and disk writes
+# the disk under the system.
+root_groups=$(id -Gn "$user" 2>/dev/null | tr ' ' '\n' | grep -xE 'docker|lxd|incus-admin|libvirt|libvirtd|disk' | paste -sd, - | sed 's/,/, /g')
 
 # Whether a block device (its kernel name, as dm-1) is dm-crypt, or is mapped straight onto one, as
 # LVM on LUKS is.
