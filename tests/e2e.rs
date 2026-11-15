@@ -1808,8 +1808,9 @@ fn a_run_and_a_stop_of_an_open_workspace_say_each_answer_in_their_own_words() {
         ("busy", "box acme/dev is being opened or closed: try again in a moment"),
         ("other", "acme's record names another workspace, which is open. nothing was done"),
         ("started", "acme is being opened or closed: try again in a moment"),
-        // It doesn't run the box: stopped here, as when it isn't open, and nothing runs.
-        ("idle", "box acme/dev isn't running"),
+        // It doesn't run the box: stopped here, as when it isn't open, and nothing runs. There is
+        // no box acme/dev here, so that is what is said, as a run says it.
+        ("idle", "there is no box acme/dev. make one with: halti ws box new acme/dev"),
     ];
     for (answer, error) in stop {
         let out = ask(&["ws", "stop", "acme/dev"], answer, "halti-keep/1 stop acme dev\n");
@@ -3390,10 +3391,12 @@ fn ws_box_needs_kvm() {
     let env = Env::new();
     assert!(ws(&env, PASSPHRASE, &["ws", "new", "acme"]).status.success());
     let boxes = [&["ws", "box", "new", "acme/dev"][..], &["ws", "run", "acme/dev"]];
-    // Stopping needs neither KVM nor the VM program: with none running, that is what is said.
+    // Stopping needs neither KVM nor the VM program: with none running, and no box made, that is
+    // what is said.
     let stop = |kvm: &Path| {
         let out = env.ws_box_command(PASSPHRASE, "true").env("HALTI_TEST_KVM", kvm).args(["ws", "stop", "acme/dev"]).output().unwrap();
-        assert!(!out.status.success() && stderr(&out) == "halti: box acme/dev isn't running\n" && asked(&out) == 0, "ws stop: {}", stderr(&out));
+        let none = "halti: there is no box acme/dev. make one with: halti ws box new acme/dev\n";
+        assert!(!out.status.success() && stderr(&out) == none && asked(&out) == 0, "ws stop: {}", stderr(&out));
     };
     // A server halti pins no VM program for says that, whatever KVM is there.
     let arm = (!cfg!(target_arch = "x86_64")).then_some("halti: boxes can't run on this server: halti pins a VM program for x86-64 servers only\n");

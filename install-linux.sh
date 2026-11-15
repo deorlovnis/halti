@@ -10,9 +10,9 @@
 # sha256. Each is checked once root has its own copy, which root makes from what your shell reads:
 # root opens no file of yours. It then says whether this server can run boxes, and if not, why.
 #
-# It ends with a warning for each of two things that undo what root ownership gives: sudo that
-# asks no password, and swap that isn't encrypted. Neither stops the install. See README "On a
-# Linux server".
+# It ends with a warning for each of three things that undo what root ownership gives: sudo that
+# asks no password, a group that gives root without one (docker's, say), and swap that isn't
+# encrypted. None stops the install. See README "On a Linux server".
 set -eu
 cd "$(dirname "$0")"
 
@@ -51,7 +51,8 @@ and where boxes can run (x86-64, $kvm, Linux 6.8 or newer), also owned by root:
   $lib/cloud-hypervisor and $lib/images/bzImage, downloaded and checked against src/vmm.rs's pins
   $lib/images/$agent/<sha256>.img, the agent image built with podman and made a disk
 would say whether this server can run boxes, and if not, why
-would warn if sudo runs without your password, or if swap that isn't encrypted is on
+would warn if sudo runs without your password, if you are in a group that gives root without one
+  (docker, lxd, incus-admin, libvirt, libvirtd or disk), or if swap that isn't encrypted is on
 the installed halti keeps its own, and no others:
   files in $config
   files in $store, and workspaces in its ws folder unless your settings name another
@@ -111,6 +112,12 @@ fi
 # run anything as root without asking.
 sudo_asks=yes
 if sudo -n -k true 2>/dev/null; then sudo_asks=no; fi
+
+# The groups the system lists for this user (one added since the last login among them) that give
+# root with no password: docker, lxd and incus-admin start a container with / mounted in it,
+# libvirt (libvirtd on older Debian and Ubuntu) a VM given the system's own disk, and disk writes
+# the disk under the system.
+root_groups=$(id -Gn "$user" 2>/dev/null | tr ' ' '\n' | grep -xE 'docker|lxd|incus-admin|libvirt|libvirtd|disk' | paste -sd, - | sed 's/,/, /g')
 
 # Whether a block device (its kernel name, as dm-1) is dm-crypt, or is mapped straight onto one, as
 # LVM on LUKS is.
@@ -257,6 +264,9 @@ fi
 
 if [ "$sudo_asks" = no ]; then
   echo "warning: $user can use sudo without a password, so any program running as $user is root here; see README \"On a Linux server\"" >&2
+fi
+if [ -n "$root_groups" ]; then
+  echo "warning: $user is in a group that gives root without a password ($root_groups), so any program running as $user is root here; see README \"On a Linux server\"" >&2
 fi
 swap=$(clear_swap | paste -sd, - | sed 's/,/, /g')
 if [ -n "$swap" ]; then

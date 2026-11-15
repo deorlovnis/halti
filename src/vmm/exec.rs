@@ -240,7 +240,8 @@ fn read_answers(stream: &UnixStream, sink: Sink) -> Result<ExitStatus> {
             }
         }
         match frame {
-            // a reader that went away (halti's own output closed) doesn't stop the command
+            // a reader that went away (halti's own output closed) doesn't stop the command here: a
+            // run looks for that itself, and ends the command as a hang-up (`run::output_gone`)
             (OUTPUT, bytes) => {
                 let _ = sink.out.write_all(&bytes).and_then(|()| sink.out.flush());
             }

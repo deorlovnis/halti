@@ -82,6 +82,12 @@ fn no_box(shown: &str) -> anyhow::Error {
     anyhow!("there is no box {shown}. make one with: halti ws box new {shown}")
 }
 
+/// Whether there is a box `found`: its policy file, its store, or the copy of its policy kept when
+/// it was approved.
+fn there(found: &Found) -> Result<bool> {
+    Ok(found.files.read(&found.box_name)?.is_some() || found.layout.bundle(&found.box_name).exists() || found.files.approved_copy(&found.box_name)?.is_some())
+}
+
 fn exists(shown: &str) -> anyhow::Error {
     anyhow!("box {shown} exists already. change it with: halti ws box edit {shown}")
 }
@@ -359,9 +365,19 @@ fn macs_store(folder: &Path, box_name: &str) -> bool {
     names::STORES.iter().filter(|end| **end != names::STORE).any(|end| folder.join(format!("{box_name}{end}")).exists())
 }
 
+/// Removes the folder of box `box_name`'s VM sockets (`Layout::vm_sockets`), which a stop leaves
+/// with its word in it until the next start: once the box is gone, nothing starts it again. Not
+/// while its VM runs; where there is no engine, none does.
+fn forget_vm_sockets(layout: &Layout, box_name: &str, vms: Option<&dyn Vms>) {
+    if vms.is_none_or(|vms| !vms.running(&layout.vm(box_name))) {
+        let _ = fs::remove_dir_all(layout.vm_sockets(box_name));
+    }
+}
+
 /// `halti ws box rm WS/BOX [--type]`: with the box stopped, one approval as `[workspace.approval] rm`
 /// says, which drops its key and its approval from the workspace; then its leftover VMs are
-/// stopped, its store shredded, and what its runs left removed. Its policy file stays.
+/// stopped, its store shredded, and what its runs left removed, its VM's sockets folder too. Its
+/// policy file stays.
 pub fn rm(target_text: &str, type_it: bool) -> Result<()> {
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
@@ -376,10 +392,10 @@ pub fn rm(target_text: &str, type_it: bool) -> Result<()> {
 fn rm_with(here: &Here, found: &Found, vms: Option<&dyn Vms>, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
     let (box_name, shown) = (found.box_name.as_str(), found.shown.as_str());
     let bundle = found.layout.bundle(box_name);
-    let has_file = found.files.read(box_name)?.is_some();
-    if !has_file && !bundle.exists() && found.files.approved_copy(box_name)?.is_none() {
+    if !there(found)? {
         return Err(no_box(shown));
     }
+    let has_file = found.files.read(box_name)?.is_some();
     found.layout.prepare()?;
     let Some(_held) = boxes::store::lock(&found.layout.lock(box_name))? else { return Err(running(shown)) };
     let way = Way { world: way.world, copies: way.copies, means: way.means, detail: Some(box_name.to_string()) };
@@ -400,6 +416,7 @@ fn rm_with(here: &Here, found: &Found, vms: Option<&dyn Vms>, way: &Way<'_>, typ
     for file in [console.clone(), console.with_extension("console.log"), found.layout.ready(box_name)] {
         let _ = fs::remove_file(file);
     }
+    forget_vm_sockets(&found.layout, box_name, vms);
     if found.files.forget_approved(box_name).is_err() {
         said.notes.push(format!("the approved copy of box {shown} couldn't be removed. remove {}", found.files.copy_path(box_name).display()));
     }
@@ -524,7 +541,8 @@ const LET_GO_EVERY: Duration = Duration::from_millis(250);
 /// the box; once it says it did, the box's lock is waited for here all the same, never taken, and
 /// nothing is stopped: a start that comes after the word is another run's. Otherwise, or if it
 /// doesn't run the box, the box is stopped as `stop_box` does. Stopping needs nothing a start
-/// needs: a box runs on after KVM is closed to this terminal, or the VM program is replaced.
+/// needs: a box runs on after KVM is closed to this terminal, or the VM program is replaced. One
+/// that didn't run is said not to be running, or, if there is no such box, that there is none.
 pub fn stop(target_text: &str) -> Result<()> {
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
@@ -532,19 +550,26 @@ pub fn stop(target_text: &str) -> Result<()> {
     let here = Here::at(&settings.workspaces.path);
     let found = find(&here, &name, box_name)?;
     let kept = Kept::of(&here, found.id)?;
-    if kept.held() && keep::stop(&kept, &name, box_name)? == keep::Stopped::Said {
+    println!("{}", stop_with(&kept, &found, vms)?);
+    Ok(())
+}
+
+fn stop_with(kept: &Kept, found: &Found, vms: &dyn Vms) -> Result<String> {
+    let (name, box_name) = (&found.name, found.box_name.as_str());
+    if kept.held() && keep::stop(kept, name, box_name)? == keep::Stopped::Said {
         if !let_go(&found.layout.lock(box_name)) {
             bail!("box {} is being opened or closed: try again in a moment", found.shown);
         }
-        println!("stopped box {}", found.shown);
-        return Ok(());
+        return Ok(format!("stopped box {}", found.shown));
     }
     let (was_running, _) = stop_box(&found.layout, box_name, vms)?;
     if !was_running {
+        if !there(found)? {
+            return Err(no_box(&found.shown));
+        }
         bail!("box {} isn't running", found.shown);
     }
-    println!("stopped box {}", found.shown);
-    Ok(())
+    Ok(format!("stopped box {}", found.shown))
 }
 
 /// Stops box `box_name`'s VM. The halti that runs it then puts it away; once it lets go of the
@@ -690,7 +715,8 @@ pub(super) fn clear(here: &Here, id: WsId) -> Result<()> {
 }
 
 /// The VMs a workspace's boxes could have left running, found before it is deleted and stopped once
-/// it is gone: both VMs of each box with a policy file, where there is an engine.
+/// it is gone: both VMs of each box with a policy file, where there is an engine. Then the folders
+/// of its boxes' VM sockets go, each box's, with a policy file or not.
 pub(super) struct Leftovers {
     vms: Option<&'static dyn Vms>,
     layout: Option<Layout>,
@@ -699,22 +725,26 @@ pub(super) struct Leftovers {
 
 impl Leftovers {
     pub(super) fn of(here: &Here, name: &WsName, settings: &Settings) -> Leftovers {
-        let none = Leftovers { vms: None, layout: None, names: Vec::new() };
-        let (Ok(vms), Some(id)) = (boxes::vms(settings), here.id_of(name)) else { return none };
+        let Some(id) = here.id_of(name) else { return Leftovers { vms: None, layout: None, names: Vec::new() } };
         let names = PolicyFiles::boxes(&here.root, id).names().unwrap_or_default();
-        Leftovers { vms: Some(vms), layout: Layout::workspace(&boxes_dir(&here.root, id), id).ok(), names }
+        Leftovers { vms: boxes::vms(settings).ok(), layout: Layout::workspace(&boxes_dir(&here.root, id), id).ok(), names }
     }
 
     pub(super) fn stop(&self) {
-        let (Some(vms), Some(layout)) = (self.vms, &self.layout) else { return };
-        for box_name in &self.names {
-            for vm in [layout.vm(box_name), layout.browser_vm(box_name)] {
-                if vms.running(&vm)
-                    && let Err(error) = vms.stop(&vm)
-                {
-                    eprintln!("halti: stopping {vm}: {error:#}");
+        let Some(layout) = &self.layout else { return };
+        if let Some(vms) = self.vms {
+            for box_name in &self.names {
+                for vm in [layout.vm(box_name), layout.browser_vm(box_name)] {
+                    if vms.running(&vm)
+                        && let Err(error) = vms.stop(&vm)
+                    {
+                        eprintln!("halti: stopping {vm}: {error:#}");
+                    }
                 }
             }
+        }
+        for box_name in layout.vm_sockets_ids() {
+            forget_vm_sockets(layout, &box_name, self.vms.map(|vms| vms as &dyn Vms));
         }
     }
 }
@@ -961,11 +991,18 @@ mod tests {
         open_for(&here, &found, &way_to_run, "not started", "ws run acme/scratch", &not_typed).unwrap();
         assert_eq!(world.calls(), ["touch id: [DEV, not protected] open workspace acme to run box scratch"]);
 
+        // What a stop of its VM left on Linux: the VM's sockets folder, with the word that the stop
+        // was asked in it.
+        found.layout.prepare().unwrap();
+        let sockets = found.layout.vm_sockets("scratch");
+        fs::create_dir(&sockets).unwrap();
+        fs::write(sockets.join("stopping"), "").unwrap();
         let said = rm_with(&here, &found, None, &way(Means::TouchId), &not_typed).unwrap();
         assert_eq!(said.out[0], "deleted box acme/scratch: its key and its store");
         assert_eq!(world.calls(), ["touch id: [DEV, not protected] remove box scratch from workspace acme"]);
         assert_eq!(found.files.approved_copy("scratch").unwrap(), None, "its approved copy goes with it");
         assert!(found.files.read("scratch").unwrap().is_some(), "its policy stays");
+        assert!(!sockets.exists(), "its VM's sockets folder goes with it");
 
         // A no makes nothing, and says how to type the passphrase instead.
         let no = Fake::answering(false, false);
@@ -999,6 +1036,35 @@ mod tests {
         assert!(next.join("in-the-way").exists(), "it failed after the store was made");
         assert!(!found.layout.bundle("dev").exists(), "the store is shredded");
         assert_eq!(found.files.approved_copy("dev").unwrap(), None);
+    }
+
+    /// Once a workspace is deleted, the folders of its boxes' VM sockets go, each box's, with a
+    /// policy file or not (one removed before this was done left its folder); another
+    /// workspace's stay.
+    #[test]
+    fn a_deleted_workspace_leaves_no_vm_sockets_folder() {
+        let dir = TempDir::new("halti-ws-vm-sockets").unwrap();
+        let here = Here::at(&dir.0.join("ws"));
+        let acme = WsName::parse("acme").unwrap();
+        new_with(&here, &acme, &TtyPassphrase::new(false).answering(ACME), &OneCopy(Cell::new(None))).unwrap();
+        let found = find(&here, &acme, "dev").unwrap();
+        found.files.create("dev", SCRATCH).unwrap();
+        found.layout.prepare().unwrap();
+        let other = Layout::workspace(&dir.0.join("other"), WsId::from_bytes(crate::util::random::<16>())).unwrap();
+        let folders = [found.layout.vm_sockets("dev"), found.layout.vm_sockets("gone"), other.vm_sockets("dev")];
+        for folder in &folders {
+            fs::create_dir(folder).unwrap();
+            fs::write(folder.join("stopping"), "").unwrap();
+        }
+        let mut ids = found.layout.vm_sockets_ids();
+        ids.sort();
+        assert_eq!(ids, ["dev", "gone"]);
+
+        let layout = Layout::workspace(&boxes_dir(&here.root, found.id), found.id).unwrap();
+        Leftovers { vms: None, layout: Some(layout), names: vec!["dev".to_string()] }.stop();
+        assert!(!folders[0].exists() && !folders[1].exists());
+        assert!(folders[2].join("stopping").exists(), "another workspace's stays");
+        fs::remove_dir_all(&folders[2]).unwrap();
     }
 
     /// On Linux a box's store is its disk and halti's folder beside it. A workspace that holds one,
@@ -1118,6 +1184,72 @@ mod tests {
         assert_eq!(refused(&kept), Some((No::Store, "box acme/kept has no store. make one with: halti ws box new acme/kept".to_string())));
         kept.files.create("broken", "run = 1\n").unwrap();
         assert_eq!(refused(&find(&here, &acme, "broken").unwrap()).unwrap().0, No::Failed);
+    }
+
+    /// An engine where no VM runs, and nothing may be started.
+    struct NoneRun;
+
+    impl Vms for NoneRun {
+        fn available(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn running(&self, _name: &str) -> bool {
+            false
+        }
+
+        fn run(&self, _spec: &engine::VmSpec) -> Result<()> {
+            panic!("a stop starts nothing")
+        }
+
+        fn stop(&self, _name: &str) -> Result<()> {
+            panic!("nothing runs to stop")
+        }
+
+        fn exec(&self, _name: &str, _env: &[(String, String)], _cmd: &[String], _tty: bool) -> Result<std::process::ExitStatus> {
+            panic!("a stop runs nothing")
+        }
+
+        fn install_ca(&self, _name: &str, _pem: &str) -> Result<()> {
+            panic!("a stop runs nothing")
+        }
+
+        fn start_docker(&self, _name: &str) -> Result<()> {
+            panic!("a stop runs nothing")
+        }
+
+        fn image_digest(&self, _reference: &str) -> Result<String> {
+            panic!("a stop looks up no image")
+        }
+
+        fn takes_disk(&self) -> bool {
+            false
+        }
+
+        fn pipe(&self, _name: &str, _cmd: &[String], _input: &[u8]) -> Result<Vec<u8>> {
+            panic!("a stop runs nothing")
+        }
+    }
+
+    /// A stop of a box that doesn't run says so; of a box there is no trace of, that there is no
+    /// such box, as `ws run` says it.
+    #[test]
+    fn a_stop_tells_a_box_that_isn_t_running_from_one_that_isn_t_there() {
+        let dir = TempDir::new("halti-ws-box-stop").unwrap();
+        let here = Here::at(&dir.0.join("ws"));
+        let acme = WsName::parse("acme").unwrap();
+        new_with(&here, &acme, &TtyPassphrase::new(false).answering(ACME), &OneCopy(Cell::new(None))).unwrap();
+        let found = find(&here, &acme, "nope").unwrap();
+        let kept = Kept::of(&here, found.id).unwrap();
+        let said = |found: &Found| stop_with(&kept, found, &NoneRun).unwrap_err().to_string();
+        assert_eq!(said(&found), "there is no box acme/nope. make one with: halti ws box new acme/nope");
+        let dev = find(&here, &acme, "dev").unwrap();
+        dev.files.create("dev", SCRATCH).unwrap();
+        assert_eq!(said(&dev), "box acme/dev isn't running");
+        // Its policy file gone, the copy kept when it was approved is a trace of it too.
+        let old = find(&here, &acme, "old").unwrap();
+        old.files.keep_approved("old", SCRATCH.as_bytes()).unwrap();
+        assert_eq!(said(&old), "box acme/old isn't running");
     }
 
     #[test]

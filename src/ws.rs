@@ -359,7 +359,8 @@ pub fn names_in(root: &Path) -> Vec<String> {
 /// fully created, a delete cut short, or its pin removed) goes with no approval: its record and its
 /// files go, its key file among them (the passphrase key is nowhere else), and any stored items are
 /// left, which with the key gone nothing can open. A workspace with a box's store, or a box that
-/// runs, is refused before anything is asked; VMs its boxes left running are stopped once it is gone.
+/// runs, is refused before anything is asked; VMs its boxes left running are stopped once it is gone,
+/// and the folders of their sockets removed.
 pub fn delete(name: &str, type_it: bool) -> Result<()> {
     let name = WsName::parse(name)?;
     let settings = config::settings();

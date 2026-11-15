@@ -191,6 +191,15 @@ impl Layout {
         self.sockets.join(format!("{}{}", self.named(id), names::VM_SOCKETS))
     }
 
+    /// The ids of the boxes whose VM has a sockets folder here (`vm_sockets`), each of them a box of
+    /// this workspace: the folders named with its tag. Today's boxes have none.
+    pub fn vm_sockets_ids(&self) -> Vec<String> {
+        let Names::Workspace { tag } = &self.names else { return Vec::new() };
+        let prefix = format!("{tag}-");
+        let files = fs::read_dir(&self.sockets).into_iter().flatten().flatten().filter_map(|entry| entry.file_name().into_string().ok());
+        files.filter_map(|file| file.strip_prefix(&prefix)?.strip_suffix(names::VM_SOCKETS).map(str::to_string)).collect()
+    }
+
     /// The socket the door dials for a box whose engine starts its VMs itself: the VM's vsock
     /// device, in its sockets folder.
     pub fn vm_door_socket(&self, id: &str) -> PathBuf {
