@@ -22,6 +22,7 @@ pub mod anchor;
 pub mod boxkey;
 pub mod contract;
 pub mod crypto;
+pub mod device;
 pub mod directory;
 pub mod holder;
 pub mod ids;

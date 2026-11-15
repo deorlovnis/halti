@@ -1,7 +1,7 @@
 //! Small helpers shared by several commands.
 
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,7 +14,33 @@ use crate::legacy;
 use crate::names;
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    hex(&Sha256::digest(bytes))
+}
+
+/// Lowercase hex.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Lowercase hex back to bytes, of any length; None for anything else.
+pub fn unhex(text: &str) -> Option<Vec<u8>> {
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let text = text.as_bytes();
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    text.chunks(2).map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?)).collect()
+}
+
+/// N bytes from the system's random source.
+pub fn random<const N: usize>() -> [u8; N] {
+    let mut bytes = [0; N];
+    fs::File::open("/dev/urandom").and_then(|mut source| source.read_exact(&mut bytes)).expect("reading /dev/urandom");
+    bytes
 }
 
 /// A line on stdout that may go nowhere: once the terminal is closed, a write fails, and
@@ -220,6 +246,18 @@ mod tests {
         // The user's name comes from the same entry, whatever the environment says.
         let name = super::user_name().unwrap();
         assert!(!name.is_empty() && !name.contains(['/', '\0', '\n']), "{name:?}");
+    }
+
+    #[test]
+    fn hex_reads_back_only_as_written() {
+        assert_eq!(super::hex(&[0, 0xab, 0xff]), "00abff");
+        assert_eq!(super::unhex("00abff"), Some(vec![0, 0xab, 0xff]));
+        assert_eq!(super::unhex(""), Some(vec![]));
+        for bad in ["0", "00AB", "0g", "+1", " 1"] {
+            assert_eq!(super::unhex(bad), None, "{bad}");
+        }
+        assert_eq!(super::sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_ne!(super::random::<16>(), super::random::<16>());
     }
 
     #[test]

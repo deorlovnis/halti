@@ -191,6 +191,30 @@ ssh server halti close acme
 - Without KVM, or before your user may use it, `ws box new` and a `ws run` that would start the box say so before anything is asked. `ws stop`, and a `ws run` that joins a box that runs, need neither KVM nor the VM program, so a box can be stopped from a terminal that can't start one.
 - A second terminal joins a box only once its start is done; until then it says to try again. A box whose VM ends under its command with no stop asked (killed, or out of memory) says so, and where its console is.
 
+## Hub
+
+The **hub** is a listener that a phone app and your machines reach, to carry what agents ask for and your answers between them. It keeps a table of who may use it: names, public keys and the SHA-256 of each token. It holds no key of any workspace and nothing that can say yes. This version has the hub, its pairing and its tokens; the machines' side (`halti hub join`, which `halti pair --machine` names, and the link it starts) and the app are not in it yet, so nothing reaches a workspace through the hub.
+
+On a Linux server it runs as a user of its own, which can open no workspace, under the service unit in `service/halti-hub.service`, which confines it (no new privileges, no capabilities, the system read-only but for its own folder, no home folders, its own `/tmp`):
+
+```sh
+sudo useradd --system --home-dir /var/lib/halti-hub --shell /usr/sbin/nologin halti-hub
+sudo cp service/halti-hub.service /etc/systemd/system/    # put the address in ExecStart first
+sudo systemctl enable --now halti-hub
+sudo -u halti-hub halti pair --name pixel --ws acme,beta   # a QR code for the app, then asks y/N
+sudo -u halti-hub halti pair --machine server-1            # a line for the machine, then asks y/N
+sudo -u halti-hub halti devices                            # each phone and machine: workspaces, fingerprint, token, last seen
+sudo -u halti-hub halti revoke pixel                       # its token stops working at once
+```
+
+- `halti hub serve --listen ADDR` has no default address. Put it on a private network (WireGuard, Tailscale) where you have one: an address the internet may reach is warned about. Ports 53, 80 and 443 are refused, since a box's door connects to those. When phones and machines reach it by another address (a name, or a listener on `0.0.0.0`), give that with `--address HOST:PORT`. On a Mac it runs in a terminal; there is no launchd file yet.
+- It speaks TLS 1.3 only, with a key it makes at its first start, `~/.config/halti/hub/tls-key.pem` of its user. Phones and machines trust that key alone, by its SHA-256, which they learn from the pairing string. A new key means pairing everything again. Keep the key out of backups.
+- `halti pair` prints a pairing string, good once for 2 minutes. When the app uses it, the terminal shows the phone's fingerprint and asks whether the app shows the same; for a machine it asks whether `halti hub join` said `joined` there. Only after `y` does the new token work. If the phone or the machine never got that far, someone else used the code: answer `N` and check `halti devices`. A name is one phone's or one machine's; revoke it to pair it again.
+- A token works for 30 days. A phone renews its own with its key's signature, and still can until day 90; then its row is deleted, which is a revoke. A machine renews its own from day 10 to day 30, and after that is paired again. The token a renewal replaced works until the new one is first used, for at most 24 hours. Any token a machine had, used after it stopped working, marks the machine `token conflict`: its token was used from two places. `halti revoke` it and pair it again; until the revoke, its name can't be paired.
+- It keeps nothing of what passes and writes no request header. Its table is `~/.config/halti/hub/table.json` of its user; pairings under way and the renewal nonces used are in memory only. If it can't write the table, a pairing or a renewal is refused, and `halti revoke` says that its revoke holds only until the hub restarts.
+- Limits: 64 connections at once and 8 from one address, a whole request within 10 seconds, a head of 8 KiB and a body of 4 KiB.
+- What the app and machines send, byte for byte, is in `src/hub/wire.rs`.
+
 ## Settings
 
 halti needs no settings file. `halti config` makes `~/.config/halti/config.toml` from its template the first time and opens it in `$EDITOR`:

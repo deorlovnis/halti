@@ -49,7 +49,7 @@ use halti_core::boxkey::check_box;
 use halti_core::ids::WsName;
 use halti_core::item::ItemKey;
 
-use crate::requests;
+use crate::util;
 
 /// The first word of every line.
 const VERSION: &str = "halti-keep/1";
@@ -292,7 +292,7 @@ impl Records {
     pub fn line(&self) -> String {
         match self {
             Records::List(ws) => format!("{RECORDS} list {ws}\n"),
-            Records::Answer(ws, yes, digest) => format!("{RECORDS} answer {ws} {} {}\n", if *yes { "yes" } else { "no" }, requests::hex(digest)),
+            Records::Answer(ws, yes, digest) => format!("{RECORDS} answer {ws} {} {}\n", if *yes { "yes" } else { "no" }, util::hex(digest)),
         }
     }
 
@@ -302,7 +302,7 @@ impl Records {
         match words[..] {
             ["list", ws] => Some(Records::List(WsName::parse(ws).ok()?)),
             ["answer", ws, decision @ ("yes" | "no"), digest] => {
-                let digest = requests::unhex(digest)?.try_into().ok()?;
+                let digest = util::unhex(digest)?.try_into().ok()?;
                 Some(Records::Answer(WsName::parse(ws).ok()?, decision == "yes", digest))
             }
             _ => None,
@@ -332,7 +332,7 @@ pub enum Told {
 impl Told {
     pub fn line(&self) -> String {
         let words = match self {
-            Told::Request(record) => format!("request {}", requests::hex(record)),
+            Told::Request(record) => format!("request {}", util::hex(record)),
             Told::End => "end".into(),
             Told::Approved => "approved".into(),
             Told::Denied => "denied".into(),
@@ -349,7 +349,7 @@ impl Told {
     pub fn parse(line: &str) -> Option<Told> {
         let words: Vec<&str> = line.strip_prefix(RECORDS)?.strip_prefix(' ')?.split(' ').collect();
         Some(match words[..] {
-            ["request", record] => Told::Request(requests::unhex(record).filter(|bytes| !bytes.is_empty())?),
+            ["request", record] => Told::Request(util::unhex(record).filter(|bytes| !bytes.is_empty())?),
             ["end"] => Told::End,
             ["approved"] => Told::Approved,
             ["denied"] => Told::Denied,
@@ -365,11 +365,11 @@ impl Told {
 /// Reads one line of printable ASCII, at most `LINE_MAX` bytes with its newline, within `wait`,
 /// and nothing after it. None for a longer, slower or other line, or a connection that ends first.
 pub fn read_line(stream: &mut UnixStream, wait: Duration) -> Option<String> {
-    read_line_of(stream, wait, LINE_MAX)
+    read_line_up_to(stream, wait, LINE_MAX)
 }
 
-/// As `read_line`, for a line of at most `max` bytes with its newline.
-fn read_line_of(stream: &mut UnixStream, wait: Duration, max: usize) -> Option<String> {
+/// As `read_line`, for lines of at most `max` bytes with their newline.
+pub fn read_line_up_to(stream: &mut UnixStream, wait: Duration, max: usize) -> Option<String> {
     let deadline = Instant::now() + wait;
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
@@ -508,7 +508,7 @@ pub fn list(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<Vec<u
     write_line(&mut stream, &Records::List(ws.clone()).line()).ok()?;
     let mut records = Vec::new();
     loop {
-        match Told::parse(&read_line_of(&mut stream, wait, RECORD_LINE_MAX)?)? {
+        match Told::parse(&read_line_up_to(&mut stream, wait, RECORD_LINE_MAX)?)? {
             Told::Request(record) => records.push(record),
             Told::End => return Some(Ok(records)),
             other => return Some(Err(other)),

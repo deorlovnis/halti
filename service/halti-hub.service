@@ -1,0 +1,57 @@
+# The hub as a service on a Linux server: `halti hub serve` as a user of its own, which can open no
+# workspace, with the system's confinement around it. Its files are in its home,
+# /var/lib/halti-hub, which systemd makes and gives to it.
+#
+# Make the user once:
+#   sudo useradd --system --home-dir /var/lib/halti-hub --shell /usr/sbin/nologin halti-hub
+# Put the address to listen on in ExecStart (no default; not port 53, 80 or 443), then:
+#   sudo cp service/halti-hub.service /etc/systemd/system/ && sudo systemctl enable --now halti-hub
+# Pair, list and revoke as that user, on the server:
+#   sudo -u halti-hub halti pair --name pixel --ws acme
+#   sudo -u halti-hub halti devices
+
+[Unit]
+Description=halti hub: carries requests between phones and machines; holds no workspace key
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=halti-hub
+Group=halti-hub
+ExecStart=/usr/local/bin/halti hub serve --listen 10.0.0.5:8443
+Restart=on-failure
+RestartSec=5
+
+# Its one writable place: /var/lib/halti-hub, open to it alone.
+StateDirectory=halti-hub
+StateDirectoryMode=0700
+UMask=0077
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

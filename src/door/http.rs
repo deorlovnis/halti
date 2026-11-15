@@ -1,4 +1,4 @@
-//! Just enough HTTP/1.1 for the door's two listeners: reading a request head and body, and
+//! Just enough HTTP/1.1 for the door's two listeners and the hub's: reading a request head and body, and
 //! writing small responses. The guest's connection is the only peer, so nothing here aims to
 //! be a general server; anything unusual is refused.
 

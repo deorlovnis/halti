@@ -19,16 +19,15 @@
 //! expiry   seconds since 1970 by this machine's clock, 8 bytes big-endian
 //! ```
 //!
-//! Names follow one rule: 1 to 32 bytes of a-z, 0-9, `-` and `_`. A record that breaks any of
-//! this, or has bytes after its last field, is refused whole.
+//! Names follow one rule (`fields::is_name`): 1 to 32 bytes of a-z, 0-9, `-` and `_`, starting
+//! with a letter or a digit. A record that breaks any of this, or has bytes after its last field, is
+//! refused whole.
 //!
 //! An answer names the bytes it was shown: it is the SHA-256 of the record followed by one more
 //! field, `yes` or `no` (`answer_digest`). The open workspace rebuilds that from its own record, so
 //! an answer counts only for the request it was shown, once, before it expires.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,12 +35,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-use crate::util::say;
+use crate::fields::{self, NAME_MAX};
+use crate::util::{hex, random, say};
 
 /// The first field of every request.
 pub const LABEL: &str = "halti-approval-v1";
-/// The longest name in a record.
-pub const NAME_MAX: usize = 32;
 /// The longest action in a record.
 pub const ACTION_MAX: usize = 1024;
 /// What ends an action that was cut.
@@ -66,17 +64,17 @@ pub struct Limits {
 
 pub const LIMITS: Limits = Limits { wait: Duration::from_secs(120), per_box: 3, per_desk: 50, strikes: 3, rest: Duration::from_secs(300) };
 
-/// Whether `name` may stand in a record: 1 to 32 bytes of a-z, 0-9, `-` and `_`.
+/// Whether `name` may stand in a record (`fields::is_name`).
 pub fn check_name(name: &str) -> Result<()> {
-    let fits = (1..=NAME_MAX).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
-    if !fits {
-        bail!("{name:?} isn't a name a record takes: 1 to 32 of a-z, 0-9, - and _");
+    if !fields::is_name(name) {
+        bail!("{name:?} isn't a name a record takes: 1 to 32 of a-z, 0-9, - and _, starting with a letter or digit");
     }
     Ok(())
 }
 
 /// This machine's name, as records give it: its host name up to the first dot, lower case, every
-/// character the name rule doesn't take made `-`, cut at 32 bytes. `machine` if nothing is left.
+/// character the name rule doesn't take made `-`, without the `-` and `_` it would start with, cut
+/// at 32 bytes. `machine` if nothing is left.
 pub fn machine_name() -> String {
     let mut buf = [0u8; 256];
     let got = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
@@ -86,28 +84,14 @@ pub fn machine_name() -> String {
 
 fn machine_from(host: &str) -> String {
     let short = host.split('.').next().unwrap_or("");
-    let name: String =
-        short.chars().map(|c| c.to_ascii_lowercase()).map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' { c } else { '-' }).take(NAME_MAX).collect();
+    let name: String = short
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' { c } else { '-' })
+        .skip_while(|c| *c == '-' || *c == '_')
+        .take(NAME_MAX)
+        .collect();
     if name.is_empty() { "machine".to_string() } else { name }
-}
-
-/// Lower-case hex.
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Lower-case hex back to bytes; None for anything else.
-pub fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) || !text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-        return None;
-    }
-    (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok()).collect()
-}
-
-fn random<const N: usize>() -> [u8; N] {
-    let mut bytes = [0u8; N];
-    File::open("/dev/urandom").and_then(|mut source| source.read_exact(&mut bytes)).expect("reading /dev/urandom");
-    bytes
 }
 
 /// A request's id: 16 random bytes this machine drew.
@@ -203,8 +187,7 @@ impl Record {
         if !printable(self.action.as_bytes()) || self.action.is_empty() || self.action.len() > ACTION_MAX {
             bail!("an action is 1 to {ACTION_MAX} bytes of printable ASCII");
         }
-        let mut bytes = Vec::new();
-        let fields: [&[u8]; 9] = [
+        Ok(fields::join(&[
             LABEL.as_bytes(),
             self.machine.as_bytes(),
             self.ws.as_bytes(),
@@ -214,11 +197,7 @@ impl Record {
             self.action.as_bytes(),
             &self.id.0,
             &self.expiry.to_be_bytes(),
-        ];
-        for field in fields {
-            push_field(&mut bytes, field);
-        }
-        Ok(bytes)
+        ]))
     }
 
     /// The record these bytes are, or None if they are not one in every field.
@@ -262,17 +241,11 @@ fn printable(bytes: &[u8]) -> bool {
     bytes.iter().all(|b| (0x20..0x7f).contains(b))
 }
 
-fn push_field(bytes: &mut Vec<u8>, field: &[u8]) {
-    let length = u16::try_from(field.len()).expect("every field is short");
-    bytes.extend_from_slice(&length.to_be_bytes());
-    bytes.extend_from_slice(field);
-}
-
 /// What an answer to `record` says: the SHA-256 of the record's bytes followed by the decision as
 /// one more field: what an answer from anywhere else would sign.
 pub fn answer_digest(record: &[u8], yes: bool) -> [u8; 32] {
     let mut bytes = record.to_vec();
-    push_field(&mut bytes, if yes { b"yes" } else { b"no" });
+    fields::push(&mut bytes, if yes { b"yes" } else { b"no" });
     Sha256::digest(&bytes).into()
 }
 

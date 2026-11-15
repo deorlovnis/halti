@@ -22,6 +22,8 @@ mod config;
 mod door;
 mod engine;
 mod fetch;
+mod fields;
+mod hub;
 mod index;
 mod keep;
 mod keychain;
@@ -216,6 +218,30 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<RequestsCmd>,
     },
+    /// The hub: a listener that phones and machines reach, holding no workspace key
+    Hub {
+        #[command(subcommand)]
+        action: HubCmd,
+    },
+    /// Pair a phone (--name and --ws) or a machine (--machine) with the hub running here, as the hub's user; asks y/N at the terminal
+    #[command(after_help = "Prints a pairing string, good once for 2 minutes, and a QR code of it for a phone. \
+                            Once it is used, the terminal asks whether the phone's fingerprint is the one shown here, or whether the machine said joined. \
+                            Only after y does the new token work.")]
+    Pair {
+        /// The phone's name: a-z, 0-9, - and _
+        #[arg(long, value_name = "NAME", conflicts_with = "machine", requires = "ws", required_unless_present = "machine")]
+        name: Option<String>,
+        /// The workspaces the phone may see, e.g. acme,beta
+        #[arg(long, value_name = "WS", value_delimiter = ',', conflicts_with = "machine")]
+        ws: Vec<String>,
+        /// Pair a machine of this name instead
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// List the phones and machines paired with the hub running here: workspaces, fingerprint, token, last seen (as the hub's user)
+    Devices,
+    /// Revoke a phone or a machine at the hub running here: its token stops working at once (as the hub's user)
+    Revoke { name: String },
     /// How this binary was built: whether it has the test hooks, its target, and where it keeps its files
     #[command(name = "build-info", hide = true)]
     BuildInfo,
@@ -336,6 +362,20 @@ enum RequestsCmd {
     Deny {
         /// The request's id as halti requests lists it, or enough of its start
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum HubCmd {
+    /// Run the hub, as its own user: TLS on ADDR, its key made at the first start (keeps running)
+    #[command(after_help = "ADDR is an IP address and a port, e.g. 10.0.0.5:8443; there is no default, and an address the internet may reach is warned about. \
+                            Ports 53, 80 and 443 are refused. --address names where phones and machines reach the hub when that differs, e.g. hub.example:8443.")]
+    Serve {
+        #[arg(long, value_name = "ADDR")]
+        listen: String,
+        /// Where phones and machines reach the hub, as HOST:PORT [default: the listen address]
+        #[arg(long, value_name = "HOST:PORT")]
+        address: Option<String>,
     },
 }
 
@@ -942,6 +982,8 @@ fn cmd_run(resources: Vec<String>, command: Vec<String>) -> Result<u8> {
 fn source_for(cmd: &Cmd) -> Option<source::Source> {
     match cmd {
         Cmd::Ws { .. } | Cmd::Open { .. } | Cmd::Close { .. } | Cmd::Requests { .. } | Cmd::Config { .. } | Cmd::BuildInfo => None,
+        // The hub keeps no secret: it holds public keys and the hashes of tokens.
+        Cmd::Hub { .. } | Cmd::Pair { .. } | Cmd::Devices | Cmd::Revoke { .. } => None,
         #[cfg(all(halti_dev, target_os = "linux"))]
         Cmd::SandboxInit { .. } => None,
         Cmd::Set { .. }
@@ -1070,6 +1112,10 @@ fn run() -> ExitCode {
             Some(RequestsCmd::Approve { id }) => ws::requests::answer(&id, true),
             Some(RequestsCmd::Deny { id }) => ws::requests::answer(&id, false),
         }),
+        Cmd::Hub { action: HubCmd::Serve { listen, address } } => ok(hub::serve(&listen, address.as_deref())),
+        Cmd::Pair { name, ws, machine } => ok(hub::pair(name.as_deref(), machine.as_deref(), &ws)),
+        Cmd::Devices => ok(hub::devices()),
+        Cmd::Revoke { name } => ok(hub::revoke(&name)),
         Cmd::BuildInfo => {
             cmd_build_info();
             Ok(0)
