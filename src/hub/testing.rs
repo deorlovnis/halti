@@ -2,6 +2,7 @@
 //! unreachable and restarted at the same address, with a clock the tests move, and a phone that
 //! speaks its wire as the app would.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -31,10 +32,11 @@ impl Clock for Hands {
 }
 
 /// Forwards connections to the hub it points at, or closes them at once when it points nowhere.
+/// Each connection is held until both its directions end, so a restart can cut those still open.
 struct Proxy {
     address: String,
     target: Arc<Mutex<Option<String>>>,
-    open: Arc<Mutex<Vec<TcpStream>>>,
+    open: Arc<Mutex<HashMap<u64, [TcpStream; 2]>>>,
 }
 
 impl Proxy {
@@ -42,23 +44,25 @@ impl Proxy {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let target: Arc<Mutex<Option<String>>> = Arc::default();
-        let open: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
+        let open: Arc<Mutex<HashMap<u64, [TcpStream; 2]>>> = Arc::default();
         let (to, held) = (target.clone(), open.clone());
         thread::spawn(move || {
-            for client in listener.incoming().flatten() {
+            for (n, client) in listener.incoming().flatten().enumerate() {
                 let Some(target) = locked(&to).clone() else { continue };
                 let Ok(upstream) = TcpStream::connect(&target) else { continue };
-                {
-                    let mut held = locked(&held);
-                    held.push(client.try_clone().unwrap());
-                    held.push(upstream.try_clone().unwrap());
-                }
-                for (mut from, mut into) in [(client.try_clone().unwrap(), upstream.try_clone().unwrap()), (upstream, client)] {
-                    thread::spawn(move || {
-                        let _ = io::copy(&mut from, &mut into);
-                        let _ = into.shutdown(Shutdown::Write);
-                    });
-                }
+                let (Ok(client_in), Ok(upstream_out), Ok(client_out), Ok(upstream_in)) = (client.try_clone(), upstream.try_clone(), client.try_clone(), upstream.try_clone())
+                else {
+                    continue;
+                };
+                let id = n as u64;
+                locked(&held).insert(id, [client, upstream]);
+                let held = held.clone();
+                thread::spawn(move || {
+                    let back = thread::spawn(move || copy(upstream_in, client_out));
+                    copy(client_in, upstream_out);
+                    let _ = back.join();
+                    locked(&held).remove(&id);
+                });
             }
         });
         Proxy { address, target, open }
@@ -67,10 +71,17 @@ impl Proxy {
     /// Points it at `target`, or nowhere; every connection open through it is cut.
     fn point(&self, target: Option<String>) {
         *locked(&self.target) = target;
-        for stream in locked(&self.open).drain(..) {
-            let _ = stream.shutdown(Shutdown::Both);
+        for [client, upstream] in locked(&self.open).values() {
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = upstream.shutdown(Shutdown::Both);
         }
     }
+}
+
+/// Copies one direction until it ends, then ends it at the other side.
+fn copy(mut from: TcpStream, mut into: TcpStream) {
+    let _ = io::copy(&mut from, &mut into);
+    let _ = into.shutdown(Shutdown::Write);
 }
 
 /// A hub in this process.
