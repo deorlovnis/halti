@@ -397,6 +397,20 @@ fn info_and_ls_show_the_approved_rules() {
 }
 
 #[test]
+fn a_listing_whose_reader_has_gone_ends_quietly() {
+    let env = Env::new();
+    env.store("app", "token", TOKEN);
+    for args in [&["build-info"][..], &["ls"], &["ws", "ls"]] {
+        // Its reader closed before halti starts, so the first line fails, as `| head -1` makes the next.
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let out = env.command().args(args).stdout(writer).output().unwrap();
+        assert_eq!(stderr(&out), "", "{args:?}");
+        assert_eq!(out.status.code(), Some(141), "{args:?}: the status a shell gives a command a closed pipe stopped");
+    }
+}
+
+#[test]
 fn policy_edit_shows_a_diff_against_the_approved_version() {
     let env = Env::new();
     env.policy("app", "[run]\nmode = \"ask\"\n");

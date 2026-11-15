@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{env, fs, process};
+use std::{env, fs, panic, process, thread};
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -22,6 +22,29 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 pub fn say(line: &str) {
     let mut out = io::stdout().lock();
     let _ = writeln!(out, "{line}").and_then(|_| out.flush());
+}
+
+/// Runs halti's `command`, ending it as other tools end when the reader of their output goes away
+/// early (`halti ws ls | head -1`): with no message, and the status a shell gives a command a closed
+/// pipe stopped. `println!` panics then, so the panic is caught here. Any other panic, a write
+/// error that is not a closed pipe, and a closed stdout in another thread report as before.
+pub fn quiet_closed_stdout(command: impl FnOnce() -> process::ExitCode + panic::UnwindSafe) -> process::ExitCode {
+    let report = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if !(thread::current().name() == Some("main") && info.payload_as_str().is_some_and(closed_stdout)) {
+            report(info);
+        }
+    }));
+    match panic::catch_unwind(command) {
+        Ok(code) => code,
+        Err(payload) if payload.downcast_ref::<String>().is_some_and(|m| closed_stdout(m)) => process::ExitCode::from(128 + libc::SIGPIPE as u8),
+        Err(payload) => panic::resume_unwind(payload),
+    }
+}
+
+/// Whether a panic is `println!`'s when stdout's reader has gone.
+fn closed_stdout(message: &str) -> bool {
+    message == format!("failed printing to stdout: {}", io::Error::from_raw_os_error(libc::EPIPE))
 }
 
 /// `halti: LINE` on stderr, as `say` writes stdout.
