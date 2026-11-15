@@ -43,6 +43,11 @@ fn files_of(disk: &Path) -> PathBuf {
 /// the folder of halti's files. A folder left there without a disk belongs to no store, and goes
 /// first. A store that fails half way is removed.
 pub fn create(layout: &Layout, disk: &Path, _key: &str) -> Result<()> {
+    create_with(layout, disk, MKFS.iter().map(Path::new).find(|p| p.is_file()).unwrap_or(Path::new("mkfs.ext4")))
+}
+
+/// `create`, running the mkfs.ext4 at `mkfs_at`.
+fn create_with(layout: &Layout, disk: &Path, mkfs_at: &Path) -> Result<()> {
     layout.prepare()?;
     if fs::symlink_metadata(disk).is_ok() {
         bail!("{} already exists", disk.display());
@@ -51,7 +56,7 @@ pub fn create(layout: &Layout, disk: &Path, _key: &str) -> Result<()> {
     let file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(disk).with_context(|| format!("creating {}", disk.display()))?;
     let sized = file.set_len(SIZE).with_context(|| format!("sizing {}", disk.display()));
     drop(file);
-    let made = sized.and_then(|()| mkfs(disk)).and_then(|()| own_files(disk).map(drop));
+    let made = sized.and_then(|()| mkfs(mkfs_at, disk)).and_then(|()| own_files(disk).map(drop));
     if made.is_err() {
         let _ = shred(disk);
     }
@@ -61,8 +66,7 @@ pub fn create(layout: &Layout, disk: &Path, _key: &str) -> Result<()> {
 /// An empty ext4 file system in the file `disk`, written in place: what mkfs.ext4 doesn't write
 /// stays a hole in the file. It needs no terminal, and starts in a process group of its own, so
 /// Ctrl-C reaches halti alone.
-fn mkfs(disk: &Path) -> Result<()> {
-    let program = MKFS.iter().map(Path::new).find(|p| p.is_file()).unwrap_or(Path::new("mkfs.ext4"));
+fn mkfs(program: &Path, disk: &Path) -> Result<()> {
     let out = Command::new(program)
         .process_group(0)
         .args(["-q", "-F", "-m", "0", "-E", "root_owner=0:0,lazy_itable_init=1,lazy_journal_init=1"])
@@ -221,6 +225,50 @@ mod tests {
         open.shred_on_close();
         drop(open);
         assert!(!temp.exists() && !files_of(&temp).exists());
+    }
+
+    #[test]
+    fn a_store_that_fails_half_way_is_removed() {
+        let dir = TempDir::new("halti-disk-failed").unwrap();
+        let layout = Layout::under(&dir.0).unwrap();
+        let disk = layout.bundle("dev");
+        let gone = |disk: &Path| fs::symlink_metadata(disk).is_err() && fs::symlink_metadata(files_of(disk)).is_err();
+        // mkfs.ext4 fails, or isn't there.
+        assert!(create_with(&layout, &disk, Path::new("false")).unwrap_err().to_string().starts_with("mkfs.ext4"));
+        assert!(gone(&disk));
+        assert!(create_with(&layout, &disk, &dir.0.join("none")).unwrap_err().to_string().starts_with("running"));
+        assert!(gone(&disk));
+        // mkfs.ext4 works, but halti's folder can't be made: a link left in its place is refused,
+        // and goes with the disk, and what it points at stays.
+        fs::create_dir_all(dir.0.join("elsewhere")).unwrap();
+        let made = |disk: &Path| {
+            fs::write(disk.with_file_name("run.sh"), format!("#!/bin/sh\nln -s {} {}\n", dir.0.join("elsewhere").display(), files_of(disk).display())).unwrap();
+            fs::set_permissions(disk.with_file_name("run.sh"), fs::Permissions::from_mode(0o700)).unwrap();
+            create_with(&layout, disk, &disk.with_file_name("run.sh"))
+        };
+        assert!(made(&disk).is_err());
+        assert!(gone(&disk) && dir.0.join("elsewhere").is_dir());
+        // And one that works leaves both.
+        create_with(&layout, &disk, Path::new("true")).unwrap();
+        assert!(disk.is_file() && files_of(&disk).join("log").is_dir());
+    }
+
+    /// The disk goes last: a store whose folder can't be removed keeps its disk, and is still found.
+    #[test]
+    fn shredding_keeps_the_disk_until_the_folder_is_gone() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root removes it anyway
+        }
+        let dir = TempDir::new("halti-disk-shred-order").unwrap();
+        let disk = by_hand(&dir.0, "dev");
+        let log = files_of(&disk).join("log");
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o500)).unwrap();
+        let shredded = shred(&disk);
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(shredded.is_err());
+        assert!(disk.is_file());
+        shred(&disk).unwrap();
+        assert!(!disk.exists() && !files_of(&disk).exists());
     }
 
     #[test]

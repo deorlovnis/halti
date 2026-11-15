@@ -58,9 +58,13 @@ pub const WS_DIR: &str = "ws";
 
 /// The end of the name of a box's store in its boxes folder, `<box>.sparsebundle` on a Mac and
 /// `<box>.img` (the box's disk) on Linux, and in the temp/ folder there of a run that keeps
-/// nothing. Everything that looks for stores reads it here: a store it would miss is one that
-/// `ws delete` removes with the folder.
+/// nothing: the one this system makes and opens.
 pub const STORE: &str = if cfg!(target_os = "linux") { ".img" } else { ".sparsebundle" };
+
+/// Every ending that marks a box's store, this system's and the other's. A workspaces folder can be
+/// copied or shared between a Mac and a Linux server, so what checks for stores before removing a
+/// folder (`ws delete`) counts both: a store it would miss is one that is removed with the folder.
+pub const STORES: [&str; 2] = [".sparsebundle", ".img"];
 
 /// On Linux, the end of the name of the folder beside a box's disk that holds halti's own files for
 /// the box, `<box>.d`: its door log, its CA sealed with the box key, and its sealed sessions.
@@ -191,14 +195,16 @@ mod tests {
         assert_eq!(CA_CERT, "/usr/local/share/ca-certificates/halti-box.crt");
     }
 
-    /// A store this system makes is found by its own ending, never the other system's: a Mac keeps
-    /// its stores as it always has, and a Linux box's disk and its folder never end the same.
+    /// A store this system makes has its own ending, never the other system's: a Mac keeps its
+    /// stores as it always has. Both endings count as stores, and a Linux box's disk and its folder
+    /// never end the same.
     #[test]
     fn a_store_has_one_ending_per_system() {
         let (here, other) = if cfg!(target_os = "linux") { (".img", ".sparsebundle") } else { (".sparsebundle", ".img") };
         assert_eq!(STORE, here);
         assert_ne!(STORE, other);
+        assert!(STORES.contains(&here) && STORES.contains(&other));
         assert_eq!(STORE_FILES, ".d");
-        assert!(!STORE_FILES.ends_with(STORE) && !STORE.ends_with(STORE_FILES));
+        assert!(STORES.iter().all(|end| !STORE_FILES.ends_with(end) && !end.ends_with(STORE_FILES)));
     }
 }
