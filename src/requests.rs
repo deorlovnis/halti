@@ -759,8 +759,13 @@ pub fn stop_signed(desk: &Desk, trust: Trust, boxes: &dyn Runs, device: &str, ru
     let trusted = trust(device).filter(|trusted| trusted.ws.contains(&desk.ws))?;
     trusted.key.verify(&crate::hub::wire::stop_bytes(&(desk.machine)(), &desk.ws, runs), signature).ok()?;
     let count = boxes.stop(runs);
-    say(&format!("a stop signed by {} named {} runs of {}: stopped {count}", trusted.name, runs.len(), desk.ws));
+    say(&format!("a stop signed by {} named {} of {}: stopped {count}", trusted.name, runs_named(runs.len()), desk.ws));
     Some(count)
+}
+
+/// `1 run`, `2 runs`.
+fn runs_named(runs: usize) -> String {
+    if runs == 1 { "1 run".to_string() } else { format!("{runs} runs") }
 }
 
 /// What the open workspace whose desk this is answers to `records`, which name it: the lines of

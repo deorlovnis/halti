@@ -635,3 +635,10 @@ fn a_signed_answer_or_stop_handed_over_again_is_told_what_it_came_to() {
     let other = pixel.sign(&crate::hub::wire::stop_bytes("mac-1", "acme", &[RunId([1; 8])])).unwrap();
     assert_eq!(told(&desk, &trust, &boxes, &stop(other)), [Told::Stopped(0)]);
 }
+
+#[test]
+fn a_stop_says_run_for_one_and_runs_for_more() {
+    assert_eq!(runs_named(1), "1 run");
+    assert_eq!(runs_named(2), "2 runs");
+    assert_eq!(runs_named(32), "32 runs");
+}
