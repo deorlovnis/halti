@@ -323,6 +323,8 @@ pub enum Told {
     Gone,
     /// The prompt asked before a yes said no, or could not be shown.
     Declined,
+    /// That prompt already asks about another yes to the same request: nothing was done.
+    Busy,
     /// The request named another workspace: nothing was done.
     Other,
 }
@@ -336,6 +338,7 @@ impl Told {
             Told::Denied => "denied".into(),
             Told::Gone => "gone".into(),
             Told::Declined => "declined".into(),
+            Told::Busy => "busy".into(),
             Told::Other => "other".into(),
         };
         format!("{RECORDS} {words}\n")
@@ -352,6 +355,7 @@ impl Told {
             ["denied"] => Told::Denied,
             ["gone"] => Told::Gone,
             ["declined"] => Told::Declined,
+            ["busy"] => Told::Busy,
             ["other"] => Told::Other,
             _ => return None,
         })
@@ -595,7 +599,7 @@ mod tests {
         assert_eq!(Records::Answer(acme(), true, digest).line(), format!("halti-keep/2 answer acme yes {}\n", "ab".repeat(32)));
         // An answer fits a line of a request, with the longest name.
         assert_eq!(Records::Answer(longest, true, digest).line().len(), 122);
-        for told in [Told::Request(vec![0, 1, 0xff]), Told::End, Told::Approved, Told::Denied, Told::Gone, Told::Declined, Told::Other] {
+        for told in [Told::Request(vec![0, 1, 0xff]), Told::End, Told::Approved, Told::Denied, Told::Gone, Told::Declined, Told::Busy, Told::Other] {
             let line = told.line();
             assert_eq!(Told::parse(line.strip_suffix('\n').unwrap()), Some(told), "{line}");
         }

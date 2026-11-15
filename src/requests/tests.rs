@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::*;
 
@@ -163,14 +163,19 @@ enum Step {
     Say(Prompted),
     /// Waits until it is withdrawn, then says nothing.
     UntilWithdrawn,
+    /// Waits until the flag is set, then says this.
+    After(Arc<AtomicBool>, Prompted),
 }
 
-/// The prompt here, scripted: each question takes the next step, and is noted.
+/// The prompt here, scripted: each question takes the next step, and is noted. It counts the
+/// questions that are up at once, as the real one's windows would be.
 #[derive(Default)]
 struct Script {
     steps: Mutex<VecDeque<Step>>,
     asked: Mutex<Vec<String>>,
-    withdrawn: AtomicBool,
+    withdrawn: AtomicUsize,
+    up: AtomicUsize,
+    most_up: AtomicUsize,
 }
 
 impl Script {
@@ -181,20 +186,40 @@ impl Script {
     fn asked(&self) -> Vec<String> {
         self.asked.lock().unwrap().clone()
     }
+
+    /// How many questions were withdrawn.
+    fn withdrawn(&self) -> usize {
+        self.withdrawn.load(Ordering::SeqCst)
+    }
+
+    /// The most questions that were up at once.
+    fn most_up(&self) -> usize {
+        self.most_up.load(Ordering::SeqCst)
+    }
 }
 
 impl Prompt for Script {
     fn ask(&self, reason: &str, withdrawn: &dyn Fn() -> bool) -> Prompted {
         self.asked.lock().unwrap().push(reason.to_string());
-        match self.steps.lock().unwrap().pop_front() {
+        let up = self.up.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most_up.fetch_max(up, Ordering::SeqCst);
+        // The step is taken before it waits, so nothing here keeps a second question waiting.
+        let step = self.steps.lock().unwrap().pop_front();
+        let said = match step {
             Some(Step::Say(said)) => said,
             Some(Step::UntilWithdrawn) => {
                 until(withdrawn);
-                self.withdrawn.store(true, Ordering::SeqCst);
+                self.withdrawn.fetch_add(1, Ordering::SeqCst);
                 Prompted::Unshown
             }
+            Some(Step::After(go, said)) => {
+                until(|| go.load(Ordering::SeqCst));
+                said
+            }
             None => panic!("asked more than the script says: {reason}"),
-        }
+        };
+        self.up.fetch_sub(1, Ordering::SeqCst);
+        said
     }
 }
 
@@ -238,7 +263,7 @@ fn a_request_raised_is_listed_as_its_record_and_the_first_answer_wins() {
     assert_eq!((record.machine.as_str(), record.ws.as_str(), record.box_name.as_str(), record.run, record.kind), ("mac-1", "acme", "dev", RunId([7; 8]), Kind::Write));
     assert_eq!(record.action, POST);
     let left = record.expiry - now_secs();
-    assert!((19..=20).contains(&left), "it expires by this machine's clock: {left}");
+    assert!((20..=21).contains(&left), "it expires by this machine's clock, never sooner than its wait: {left}");
     // A digest of another decision, or of other bytes, names no request.
     assert_eq!(desk.answer_here(true, &answer_digest(&bytes, false)), Here::Gone);
     assert_eq!(desk.answer_here(true, &[0; 32]), Here::Gone);
@@ -259,7 +284,7 @@ fn a_denial_from_another_terminal_counts_at_once() {
     assert_eq!(desk.answer_here(false, &answer_digest(&bytes, false)), Here::Denied);
     assert_eq!(raised.join().unwrap().came, Came::No(By::Local));
     // The prompt here was withdrawn, and nothing more was asked for a no.
-    until(|| script.withdrawn.load(Ordering::SeqCst));
+    until(|| script.withdrawn() > 0);
     assert_eq!(script.asked(), [format!("let box acme/dev send {POST}")]);
 }
 
@@ -270,31 +295,91 @@ fn the_prompt_here_answers_and_is_withdrawn_when_another_terminal_does() {
         let desk = desk(limits(), Script::with(vec![Step::Say(said)]));
         assert_eq!(raising(&desk, "dev", true).join().unwrap().came, came);
     }
-    // A yes from another terminal takes it down, and asks it again first, naming the terminal.
+    // A yes from another terminal takes it down, and asks it again first, naming the terminal:
+    // only once the first is down, so two are never up at once.
     let script = Script::with(vec![Step::UntilWithdrawn, Step::Say(Prompted::Yes)]);
     let desk = desk(limits(), script.clone());
     let raised = raising(&desk, "dev", true);
     let (_, bytes) = the_one(&desk);
     until(|| script.asked().len() == 1);
     assert_eq!(desk.answer_here(true, &answer_digest(&bytes, true)), Here::Approved);
-    assert!(script.withdrawn.load(Ordering::SeqCst), "the first prompt went before the second was asked");
+    assert_eq!(script.withdrawn(), 1);
+    assert_eq!(script.most_up(), 1, "the first prompt went before the second was asked");
     assert_eq!(raised.join().unwrap().came, Came::Yes(By::Local));
     assert_eq!(script.asked(), [format!("let box acme/dev send {POST}"), format!("let box acme/dev send {POST}, as answered in another terminal")]);
 }
 
 #[test]
-fn a_yes_the_prompt_here_doesnt_confirm_leaves_the_request_waiting() {
+fn a_yes_the_prompt_here_doesnt_confirm_leaves_the_request_waiting_and_its_prompt_back() {
     for refused in [Prompted::No, Prompted::Unshown] {
-        let script = Script::with(vec![Step::UntilWithdrawn, Step::Say(refused)]);
+        let script = Script::with(vec![Step::UntilWithdrawn, Step::Say(refused), Step::UntilWithdrawn]);
         let desk = desk(limits(), script.clone());
         let raised = raising(&desk, "dev", true);
-        let (_, bytes) = the_one(&desk);
+        let (record, bytes) = the_one(&desk);
         until(|| script.asked().len() == 1);
         assert_eq!(desk.answer_here(true, &answer_digest(&bytes, true)), Here::Declined);
         assert_eq!(desk.records(), std::slice::from_ref(&bytes), "it still waits");
+        // The prompt where the box runs is asked again, and stays up.
+        until(|| script.asked().len() == 3);
+        assert!(!desk.withdrawn(record.id));
         assert_eq!(desk.answer_here(false, &answer_digest(&bytes, false)), Here::Denied);
         assert_eq!(raised.join().unwrap().came, Came::No(By::Local));
+        until(|| script.withdrawn() == 2);
+        let box_runs = format!("let box acme/dev send {POST}");
+        assert_eq!(script.asked(), [box_runs.clone(), format!("{box_runs}, as answered in another terminal"), box_runs]);
+        assert_eq!(script.most_up(), 1);
     }
+}
+
+#[test]
+fn one_yes_from_another_terminal_is_asked_about_at_a_time() {
+    let go = Arc::new(AtomicBool::new(false));
+    let script = Script::with(vec![Step::UntilWithdrawn, Step::After(go.clone(), Prompted::No), Step::UntilWithdrawn]);
+    let desk = desk(limits(), script.clone());
+    let raised = raising(&desk, "dev", true);
+    let (_, bytes) = the_one(&desk);
+    until(|| script.asked().len() == 1);
+    let first = {
+        let (desk, bytes) = (desk.clone(), bytes.clone());
+        thread::spawn(move || desk.answer_here(true, &answer_digest(&bytes, true)))
+    };
+    until(|| script.asked().len() == 2);
+    // While the prompt here asks about one yes, another is refused at once and asks nothing.
+    for _ in 0..5 {
+        assert_eq!(desk.answer_here(true, &answer_digest(&bytes, true)), Here::Busy);
+    }
+    assert_eq!(script.asked().len(), 2);
+    go.store(true, Ordering::SeqCst);
+    assert_eq!(first.join().unwrap(), Here::Declined);
+    until(|| script.asked().len() == 3);
+    // A no still counts at once.
+    assert_eq!(desk.answer_here(false, &answer_digest(&bytes, false)), Here::Denied);
+    assert_eq!(raised.join().unwrap().came, Came::No(By::Local));
+    assert_eq!(script.most_up(), 1);
+}
+
+#[test]
+fn a_yes_whose_request_closes_while_the_prompt_here_asks_is_gone() {
+    let script = Script::with(vec![Step::UntilWithdrawn, Step::UntilWithdrawn]);
+    let desk = desk(Limits { wait: Duration::from_millis(800), ..LIMITS }, script.clone());
+    let raised = raising(&desk, "dev", true);
+    let (_, bytes) = the_one(&desk);
+    until(|| script.asked().len() == 1);
+    assert_eq!(desk.answer_here(true, &answer_digest(&bytes, true)), Here::Gone);
+    assert_eq!(raised.join().unwrap().came, Came::Expired);
+    assert_eq!(script.asked().len(), 2, "the prompt where the box runs isn't asked again");
+}
+
+#[test]
+fn a_request_past_its_records_expiry_is_closed_whatever_the_wait_says() {
+    let desk = desk(limits(), Script::with(vec![]));
+    let raised = raising(&desk, "dev", false);
+    let (_, bytes) = the_one(&desk);
+    // As after a sleep: the machine's clock passed the expiry, the clock the wait is timed by didn't.
+    desk.table().waiting[0].record.expiry = now_secs() - 1;
+    assert!(desk.records().is_empty());
+    assert_eq!(desk.answer_here(true, &answer_digest(&bytes, true)), Here::Gone);
+    assert_eq!(raised.join().unwrap().came, Came::Expired);
 }
 
 #[test]
@@ -319,7 +404,7 @@ fn a_request_nobody_answers_expires_as_a_no() {
     assert!(raised.id.is_some() && raised.came == Came::Expired, "{raised:?}");
     assert!(started.elapsed() >= Duration::from_millis(400));
     // The prompt here went with it, and an answer after it finds nothing.
-    until(|| script.withdrawn.load(Ordering::SeqCst));
+    until(|| script.withdrawn() > 0);
     assert!(desk.records().is_empty());
     assert_eq!(desk.answer_here(true, &answer_digest(&bytes, true)), Here::Gone);
 }
@@ -340,11 +425,11 @@ fn a_box_has_three_requests_waiting_at_most_and_the_desk_fifty() {
         assert_eq!(raised.join().unwrap().came, Came::No(By::Local));
     }
     assert_eq!(web.join().unwrap().came, Came::No(By::Local));
-    // The desk's own limit counts every box's.
+    // The desk's own limit counts every box's, and says it is the workspace's.
     let desk = Desk::new("mac-1".into(), "acme".into(), Limits { per_desk: 2, ..limits() }, Script::with(vec![]));
     let waiting = [raising(&desk, "dev", false), raising(&desk, "web", false)];
     until(|| desk.records().len() == 2);
-    assert_eq!(desk.asker("api", RunId([7; 8])).raise(POST, false, &|| false).came, Came::Full);
+    assert_eq!(desk.asker("api", RunId([7; 8])).raise(POST, false, &|| false).came, Came::WorkspaceFull);
     desk.close();
     for raised in waiting {
         assert_eq!(raised.join().unwrap().came, Came::Withdrawn);
@@ -391,7 +476,7 @@ fn a_request_is_withdrawn_when_its_box_stops_or_the_workspace_closes() {
     let (_, bytes) = the_one(&desk);
     stopped.store(true, Ordering::SeqCst);
     assert_eq!(raised.join().unwrap().came, Came::Withdrawn);
-    until(|| script.withdrawn.load(Ordering::SeqCst));
+    until(|| script.withdrawn() > 0);
     assert_eq!(desk.answer_here(true, &answer_digest(&bytes, true)), Here::Gone);
     // Closing withdraws what waits, and from then on nothing is raised.
     let raised = raising(&desk, "dev", false);

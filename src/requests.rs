@@ -281,6 +281,13 @@ pub fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs())
 }
 
+/// The expiry of a request that waits `wait` from now: the next whole second after it, so the
+/// record never says less than its wait.
+fn expiry_after(wait: Duration) -> u64 {
+    let end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default() + wait;
+    end.as_secs() + u64::from(end.subsec_nanos() > 0)
+}
+
 /// Who answered a request.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum By {
@@ -306,8 +313,10 @@ pub enum Came {
     Expired,
     /// The box stopped, or the workspace closed, while it waited.
     Withdrawn,
-    /// Never raised: the box, or the workspace, has as many waiting as it may.
+    /// Never raised: the box has as many waiting as it may.
     Full,
+    /// Never raised: the open workspace has as many waiting as it may, of all its boxes.
+    WorkspaceFull,
     /// Never raised: the box's last requests were refused or not answered, so it rests.
     Resting,
 }
@@ -352,6 +361,8 @@ pub enum Here {
     Gone,
     /// The prompt asked before a yes said no, or could not be shown.
     Declined,
+    /// The prompt here already asks about a yes from another terminal for this request.
+    Busy,
 }
 
 /// One request that waits.
@@ -363,8 +374,19 @@ struct Waiting {
     /// same prompt before a yes from another terminal counts.
     confirm: bool,
     answer: Option<(bool, By)>,
-    /// Another terminal is answering it: the prompt where the box runs is withdrawn.
+    /// Another terminal's yes is being confirmed: the prompt where the box runs is withdrawn.
     taken: bool,
+    /// The prompt where the box runs is up, or not yet taken down.
+    prompting: bool,
+}
+
+impl Waiting {
+    /// Whether it can no longer be answered: answered, or past its time. Both clocks count: the
+    /// one a wait is timed by stops while the machine sleeps, and the record's expiry is the
+    /// machine's own clock.
+    fn closed(&self, now: Instant) -> bool {
+        self.answer.is_some() || now >= self.deadline || SystemTime::now() >= UNIX_EPOCH + Duration::from_secs(self.record.expiry)
+    }
 }
 
 /// The run of denials and unanswered requests of one box.
@@ -409,7 +431,7 @@ impl Desk {
     /// The bytes of every request that waits and may still be answered.
     pub fn records(&self) -> Vec<Vec<u8>> {
         let now = Instant::now();
-        self.table().waiting.iter().filter(|waiting| waiting.answer.is_none() && now < waiting.deadline).map(|waiting| waiting.bytes.clone()).collect()
+        self.table().waiting.iter().filter(|waiting| !waiting.closed(now)).map(|waiting| waiting.bytes.clone()).collect()
     }
 
     /// Withdraws every request, and raises none from now on: the workspace is closing.
@@ -424,7 +446,7 @@ impl Desk {
         let mut table = self.table();
         let now = Instant::now();
         let Some(waiting) = table.waiting.iter_mut().find(|waiting| waiting.record.id == id) else { return false };
-        if waiting.answer.is_some() || now >= waiting.deadline {
+        if waiting.closed(now) {
             return false;
         }
         waiting.answer = Some((yes, by));
@@ -436,7 +458,7 @@ impl Desk {
     /// Whether request `id` no longer needs an answer: answered, expired, or gone.
     fn settled(&self, id: Id) -> bool {
         let now = Instant::now();
-        !self.table().waiting.iter().any(|waiting| waiting.record.id == id && waiting.answer.is_none() && now < waiting.deadline)
+        !self.table().waiting.iter().any(|waiting| waiting.record.id == id && !waiting.closed(now))
     }
 
     /// Whether the prompt where the box runs should go: the request is settled, or another
@@ -445,14 +467,37 @@ impl Desk {
         self.settled(id) || self.table().waiting.iter().any(|waiting| waiting.record.id == id && waiting.taken)
     }
 
+    /// Asks the prompt where the box runs about request `id`, on a thread of its own, until it is
+    /// withdrawn; what it says settles the request.
+    fn prompt_where_box_runs(self: &Arc<Self>, id: Id, reason: String) {
+        let desk = self.clone();
+        thread::spawn(move || {
+            match desk.prompt.ask(&reason, &|| desk.withdrawn(id)) {
+                Prompted::Yes => {
+                    desk.settle(id, true, By::Local);
+                }
+                Prompted::No => {
+                    desk.settle(id, false, By::Local);
+                }
+                Prompted::Unshown => {}
+            }
+            if let Some(waiting) = desk.table().waiting.iter_mut().find(|waiting| waiting.record.id == id) {
+                waiting.prompting = false;
+            }
+            desk.changed.notify_all();
+        });
+    }
+
     /// An answer from another terminal, to the request whose bytes and this decision make `digest`.
-    /// A no counts at once. A yes counts at once where nothing confirms it here (Linux); on a Mac
-    /// the prompt where the box runs is withdrawn, and the same prompt asks first.
-    pub fn answer_here(&self, yes: bool, digest: &[u8; 32]) -> Here {
+    /// A no counts at once. A yes counts at once where nothing confirms it here (Linux). On a Mac
+    /// the prompt where the box runs is taken down, and once it is, the same prompt asks here
+    /// first; only one such yes is asked about at a time. If it isn't given, the prompt where the
+    /// box runs comes back.
+    pub fn answer_here(self: &Arc<Self>, yes: bool, digest: &[u8; 32]) -> Here {
         let mut table = self.table();
         let now = Instant::now();
         let Some(waiting) = table.waiting.iter_mut().find(|waiting| answer_digest(&waiting.bytes, yes) == *digest) else { return Here::Gone };
-        if waiting.answer.is_some() || now >= waiting.deadline {
+        if waiting.closed(now) {
             return Here::Gone;
         }
         let id = waiting.record.id;
@@ -464,15 +509,36 @@ impl Desk {
                 (true, false) => Here::Denied,
             };
         }
-        waiting.taken = true;
-        let reason = format!("let box {} send {}, as answered in another terminal", waiting.record.shown(), waiting.record.action);
-        drop(table);
-        self.changed.notify_all();
-        match self.prompt.ask(&reason, &|| self.settled(id)) {
-            Prompted::Yes if self.settle(id, true, By::Local) => Here::Approved,
-            Prompted::Yes => Here::Gone,
-            Prompted::No | Prompted::Unshown => Here::Declined,
+        if waiting.taken {
+            return Here::Busy;
         }
+        waiting.taken = true;
+        let shown = format!("let box {} send {}", waiting.record.shown(), waiting.record.action);
+        self.changed.notify_all();
+        // Two prompts are never up at once: this one waits for the other to be taken down.
+        loop {
+            let Some(waiting) = table.waiting.iter().find(|waiting| waiting.record.id == id) else { return Here::Gone };
+            if waiting.closed(Instant::now()) {
+                return Here::Gone;
+            }
+            if !waiting.prompting {
+                break;
+            }
+            table = self.changed.wait_timeout(table, LOOK_EVERY).unwrap_or_else(PoisonError::into_inner).0;
+        }
+        drop(table);
+        let said = self.prompt.ask(&format!("{shown}, as answered in another terminal"), &|| self.settled(id));
+        if said == Prompted::Yes && self.settle(id, true, By::Local) {
+            return Here::Approved;
+        }
+        let mut table = self.table();
+        let now = Instant::now();
+        let Some(waiting) = table.waiting.iter_mut().find(|waiting| waiting.record.id == id && !waiting.closed(now)) else { return Here::Gone };
+        waiting.taken = false;
+        waiting.prompting = true;
+        drop(table);
+        self.prompt_where_box_runs(id, shown);
+        Here::Declined
     }
 
     /// Raises a request for box `box_name`'s run `run` to do `action`, and waits for what it comes
@@ -488,9 +554,11 @@ impl Desk {
         if table.strikes.get(box_name).and_then(|strikes| strikes.until).is_some_and(|until| now < until) {
             return not(Came::Resting);
         }
-        let of_box = table.waiting.iter().filter(|waiting| waiting.record.box_name == box_name).count();
-        if of_box >= self.limits.per_box || table.waiting.len() >= self.limits.per_desk {
+        if table.waiting.iter().filter(|waiting| waiting.record.box_name == box_name).count() >= self.limits.per_box {
             return not(Came::Full);
+        }
+        if table.waiting.len() >= self.limits.per_desk {
+            return not(Came::WorkspaceFull);
         }
         let record = Record {
             machine: self.machine.clone(),
@@ -500,26 +568,16 @@ impl Desk {
             kind: Kind::Write,
             action: action.to_string(),
             id: Id::random(),
-            expiry: now_secs() + self.limits.wait.as_secs(),
+            expiry: expiry_after(self.limits.wait),
         };
         let Ok(bytes) = record.encode() else { return not(Came::Withdrawn) };
         let (id, shown) = (record.id, record.shown());
         say(&format!("request {}: box {shown} asks to send {action}. answer it with: halti requests approve {0}, or deny {0}", id.short()));
-        let reason = format!("let box {shown} send {action}");
-        table.waiting.push(Waiting { record, bytes, deadline: now + self.limits.wait, confirm, answer: None, taken: false });
+        table.waiting.push(Waiting { record, bytes, deadline: now + self.limits.wait, confirm, answer: None, taken: false, prompting: confirm });
         drop(table);
         self.changed.notify_all();
         if confirm {
-            let desk = self.clone();
-            thread::spawn(move || match desk.prompt.ask(&reason, &|| desk.withdrawn(id)) {
-                Prompted::Yes => {
-                    desk.settle(id, true, By::Local);
-                }
-                Prompted::No => {
-                    desk.settle(id, false, By::Local);
-                }
-                Prompted::Unshown => {}
-            });
+            self.prompt_where_box_runs(id, format!("let box {shown} send {action}"));
         }
         let came = self.wait_for(id, stopped);
         self.after(box_name, came);
@@ -537,7 +595,7 @@ impl Desk {
                 Some((true, by)) => break Came::Yes(by),
                 Some((false, by)) => break Came::No(by),
                 None if closed || stopped() => break Came::Withdrawn,
-                None if Instant::now() >= waiting.deadline => break Came::Expired,
+                None if waiting.closed(Instant::now()) => break Came::Expired,
                 None => {}
             }
             table = self.changed.wait_timeout(table, LOOK_EVERY).unwrap_or_else(PoisonError::into_inner).0;
@@ -561,7 +619,7 @@ impl Desk {
                     strikes.until = Some(Instant::now() + self.limits.rest);
                 }
             }
-            Came::Withdrawn | Came::Full | Came::Resting => {}
+            Came::Withdrawn | Came::Full | Came::WorkspaceFull | Came::Resting => {}
         }
     }
 }
@@ -573,7 +631,7 @@ fn said(came: Came) -> String {
         Came::No(by) => format!("denied ({})", by.word()),
         Came::Expired => "not answered in time, so refused".to_string(),
         Came::Withdrawn => "withdrawn: its box stopped, or the workspace is closing".to_string(),
-        Came::Full | Came::Resting => "refused".to_string(),
+        Came::Full | Came::WorkspaceFull | Came::Resting => "refused".to_string(),
     }
 }
 

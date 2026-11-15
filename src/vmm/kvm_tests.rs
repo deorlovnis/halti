@@ -172,6 +172,22 @@ fn a_box_boots_runs_as_the_agent_and_as_root_and_keeps_its_disk_across_a_stop() 
     assert!(!dials.contains(": connected"), "{dials}");
     assert!(dials.ends_with("nothing ran\n"), "{dials}");
 
+    // halti isn't in the box, and an open workspace's socket, made beside the VM's own folder as
+    // the keeper makes it, isn't there to dial at its path: no folder of the server's is mounted.
+    let keeper_path = engine.sockets.join("acme.keep.sock");
+    let keeper = std::os::unix::net::UnixListener::bind(&keeper_path).unwrap();
+    keeper.set_nonblocking(true).unwrap();
+    let dial = format!(
+        "import socket\ns = socket.socket(socket.AF_UNIX)\ntry:\n    s.connect(\"{}\")\n    print(\"reached\")\nexcept Exception as e:\n    print(\"unreached\", type(e).__name__)\n",
+        keeper_path.display()
+    );
+    let tried = sh(&engine, &name, false, &format!("command -v halti || echo no halti; python3 -c '{dial}'"));
+    println!("halti, and the keeper's socket, from inside the box: {}", tried.trim().replace('\n', " | "));
+    assert_eq!(tried, "no halti\nunreached FileNotFoundError\n");
+    assert!(keeper.accept().is_err(), "nothing reached the keeper's socket");
+    drop(keeper);
+    fs::remove_file(&keeper_path).unwrap();
+
     // A write to the box's disk, with no sync of its own: the stop must keep it.
     sh(&engine, &name, false, "echo kept > /home/agent/kept.txt && echo kept > /work/kept.txt");
     let stopping = Instant::now();

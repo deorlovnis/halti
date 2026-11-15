@@ -364,6 +364,7 @@ fn came_to(raised: Raised, shown: &str, method: &str, url: &str, limits: request
         Came::Expired => no("asked:no", format!(": nobody answered within {} seconds", limits.wait.as_secs()), None),
         Came::Withdrawn => no("asked:no", ": the box is stopping".into(), None),
         Came::Full => no("blocked:requests", format!(": box {shown} has {} requests waiting already", limits.per_box), None),
+        Came::WorkspaceFull => no("blocked:requests", format!(": box {shown}'s workspace has {} requests waiting already", limits.per_desk), None),
         Came::Resting => no(
             "blocked:requests",
             format!(": box {shown}'s last {} requests were refused or not answered, so its writes that ask are refused for {} minutes", limits.strikes, limits.rest.as_secs() / 60),

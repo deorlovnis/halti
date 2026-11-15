@@ -87,7 +87,8 @@ fn line(record: &Record, width: usize, now: u64) -> String {
     format!("{}  {:<width$}  {}  {left}s left", record.id.short(), record.shown(), record.action)
 }
 
-/// `halti requests approve ID` and `deny ID`: the one request whose id starts with `typed`.
+/// `halti requests approve ID` and `deny ID`: the one request whose id starts with `typed`, at
+/// least the 8 characters the list shows.
 pub fn answer(typed: &str, yes: bool) -> Result<()> {
     if !io::stdin().is_terminal() {
         bail!("halti requests answers only at a terminal");
@@ -101,16 +102,18 @@ pub fn answer(typed: &str, yes: bool) -> Result<()> {
         Some(Told::Denied) => println!("denied {short}: {what}"),
         Some(Told::Gone) => bail!("request {short} no longer waits: it was answered, or it expired"),
         Some(Told::Declined) => bail!("request {short} wasn't approved: Touch ID, asked where {ws} is open, wasn't given"),
+        Some(Told::Busy) => bail!("request {short} wasn't approved: Touch ID asks about another approval of it where {ws} is open"),
         _ => bail!("{ws} didn't answer: try again in a moment"),
     }
     Ok(())
 }
 
-/// The one request whose id starts with `typed`: 4 to 32 hex characters.
+/// The one request whose id starts with `typed`: 8 to 32 hex characters. Fewer than the list
+/// shows could name a newer request than the one that was read.
 fn pick<'a>(found: &'a [Found], typed: &str) -> Result<&'a Found> {
     let typed = typed.to_ascii_lowercase();
-    if !(4..=32).contains(&typed.len()) || !typed.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("a request's id is 4 to 32 of 0-9 and a-f, as halti requests lists it");
+    if !(8..=32).contains(&typed.len()) || !typed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("a request's id is 8 to 32 of 0-9 and a-f, as halti requests lists it");
     }
     let matching: Vec<&Found> = found.iter().filter(|found| found.record.id.hex().starts_with(&typed)).collect();
     match matching[..] {
@@ -143,18 +146,20 @@ mod tests {
     #[test]
     fn a_request_is_picked_by_the_start_of_its_id() {
         let mut one = [0x1a; 16];
-        one[3] = 0x01;
+        one[5] = 0x01;
         let mut two = [0x1a; 16];
-        two[3] = 0x02;
+        two[5] = 0x02;
         let found = [found(one), found(two)];
-        assert_eq!(pick(&found, "1a1a1a01").unwrap().record.id, Id(one));
-        assert_eq!(pick(&found, "1A1A1A02").unwrap().record.id, Id(two), "either case");
+        assert_eq!(pick(&found, "1a1a1a1a1a01").unwrap().record.id, Id(one));
+        assert_eq!(pick(&found, "1A1A1A1A1A02").unwrap().record.id, Id(two), "either case");
         assert_eq!(pick(&found, &Id(two).hex()).unwrap().record.id, Id(two), "the whole id");
         let said = |typed: &str| pick(&found, typed).err().unwrap().to_string();
-        assert_eq!(said("1a1a1a"), "more than one request starts with 1a1a1a: give more of its id");
-        assert_eq!(said("1a1a1a03"), "no request 1a1a1a03 waits. list them with: halti requests");
-        for typed in ["1a1", "1a1a1a0g", &"1".repeat(33), "", "../1a1a"] {
-            assert_eq!(said(typed), "a request's id is 4 to 32 of 0-9 and a-f, as halti requests lists it", "{typed}");
+        assert_eq!(said("1a1a1a1a"), "more than one request starts with 1a1a1a1a: give more of its id");
+        assert_eq!(said("1a1a1a1a1a03"), "no request 1a1a1a1a1a03 waits. list them with: halti requests");
+        // Fewer than the 8 characters the list shows is refused, even where one request starts so.
+        assert_eq!(pick(&found[..1], "1a1a").err().unwrap().to_string(), "a request's id is 8 to 32 of 0-9 and a-f, as halti requests lists it");
+        for typed in ["1a1a", "1a1a1a1", "1a1a1a0g", &"1".repeat(33), "", "../1a1a1a"] {
+            assert_eq!(said(typed), "a request's id is 8 to 32 of 0-9 and a-f, as halti requests lists it", "{typed}");
         }
     }
 

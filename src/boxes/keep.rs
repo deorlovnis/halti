@@ -329,6 +329,7 @@ impl<'a> Keeper<'a> {
                     Here::Denied => Told::Denied,
                     Here::Gone => Told::Gone,
                     Here::Declined => Told::Declined,
+                    Here::Busy => Told::Busy,
                 };
                 let _ = keep::write_line(stream, &told.line());
             }
