@@ -82,6 +82,12 @@ fn no_box(shown: &str) -> anyhow::Error {
     anyhow!("there is no box {shown}. make one with: halti ws box new {shown}")
 }
 
+/// Whether there is a box `found`: its policy file, its store, or the copy of its policy kept when
+/// it was approved.
+fn there(found: &Found) -> Result<bool> {
+    Ok(found.files.read(&found.box_name)?.is_some() || found.layout.bundle(&found.box_name).exists() || found.files.approved_copy(&found.box_name)?.is_some())
+}
+
 fn exists(shown: &str) -> anyhow::Error {
     anyhow!("box {shown} exists already. change it with: halti ws box edit {shown}")
 }
@@ -386,10 +392,10 @@ pub fn rm(target_text: &str, type_it: bool) -> Result<()> {
 fn rm_with(here: &Here, found: &Found, vms: Option<&dyn Vms>, way: &Way<'_>, typing: &dyn Fn() -> TtyPassphrase) -> Result<Said> {
     let (box_name, shown) = (found.box_name.as_str(), found.shown.as_str());
     let bundle = found.layout.bundle(box_name);
-    let has_file = found.files.read(box_name)?.is_some();
-    if !has_file && !bundle.exists() && found.files.approved_copy(box_name)?.is_none() {
+    if !there(found)? {
         return Err(no_box(shown));
     }
+    let has_file = found.files.read(box_name)?.is_some();
     found.layout.prepare()?;
     let Some(_held) = boxes::store::lock(&found.layout.lock(box_name))? else { return Err(running(shown)) };
     let way = Way { world: way.world, copies: way.copies, means: way.means, detail: Some(box_name.to_string()) };
@@ -535,7 +541,8 @@ const LET_GO_EVERY: Duration = Duration::from_millis(250);
 /// the box; once it says it did, the box's lock is waited for here all the same, never taken, and
 /// nothing is stopped: a start that comes after the word is another run's. Otherwise, or if it
 /// doesn't run the box, the box is stopped as `stop_box` does. Stopping needs nothing a start
-/// needs: a box runs on after KVM is closed to this terminal, or the VM program is replaced.
+/// needs: a box runs on after KVM is closed to this terminal, or the VM program is replaced. One
+/// that didn't run is said not to be running, or, if there is no such box, that there is none.
 pub fn stop(target_text: &str) -> Result<()> {
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
@@ -543,19 +550,26 @@ pub fn stop(target_text: &str) -> Result<()> {
     let here = Here::at(&settings.workspaces.path);
     let found = find(&here, &name, box_name)?;
     let kept = Kept::of(&here, found.id)?;
-    if kept.held() && keep::stop(&kept, &name, box_name)? == keep::Stopped::Said {
+    println!("{}", stop_with(&kept, &found, vms)?);
+    Ok(())
+}
+
+fn stop_with(kept: &Kept, found: &Found, vms: &dyn Vms) -> Result<String> {
+    let (name, box_name) = (&found.name, found.box_name.as_str());
+    if kept.held() && keep::stop(kept, name, box_name)? == keep::Stopped::Said {
         if !let_go(&found.layout.lock(box_name)) {
             bail!("box {} is being opened or closed: try again in a moment", found.shown);
         }
-        println!("stopped box {}", found.shown);
-        return Ok(());
+        return Ok(format!("stopped box {}", found.shown));
     }
     let (was_running, _) = stop_box(&found.layout, box_name, vms)?;
     if !was_running {
+        if !there(found)? {
+            return Err(no_box(&found.shown));
+        }
         bail!("box {} isn't running", found.shown);
     }
-    println!("stopped box {}", found.shown);
-    Ok(())
+    Ok(format!("stopped box {}", found.shown))
 }
 
 /// Stops box `box_name`'s VM. The halti that runs it then puts it away; once it lets go of the
@@ -1170,6 +1184,72 @@ mod tests {
         assert_eq!(refused(&kept), Some((No::Store, "box acme/kept has no store. make one with: halti ws box new acme/kept".to_string())));
         kept.files.create("broken", "run = 1\n").unwrap();
         assert_eq!(refused(&find(&here, &acme, "broken").unwrap()).unwrap().0, No::Failed);
+    }
+
+    /// An engine where no VM runs, and nothing may be started.
+    struct NoneRun;
+
+    impl Vms for NoneRun {
+        fn available(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn running(&self, _name: &str) -> bool {
+            false
+        }
+
+        fn run(&self, _spec: &engine::VmSpec) -> Result<()> {
+            panic!("a stop starts nothing")
+        }
+
+        fn stop(&self, _name: &str) -> Result<()> {
+            panic!("nothing runs to stop")
+        }
+
+        fn exec(&self, _name: &str, _env: &[(String, String)], _cmd: &[String], _tty: bool) -> Result<std::process::ExitStatus> {
+            panic!("a stop runs nothing")
+        }
+
+        fn install_ca(&self, _name: &str, _pem: &str) -> Result<()> {
+            panic!("a stop runs nothing")
+        }
+
+        fn start_docker(&self, _name: &str) -> Result<()> {
+            panic!("a stop runs nothing")
+        }
+
+        fn image_digest(&self, _reference: &str) -> Result<String> {
+            panic!("a stop looks up no image")
+        }
+
+        fn takes_disk(&self) -> bool {
+            false
+        }
+
+        fn pipe(&self, _name: &str, _cmd: &[String], _input: &[u8]) -> Result<Vec<u8>> {
+            panic!("a stop runs nothing")
+        }
+    }
+
+    /// A stop of a box that doesn't run says so; of a box there is no trace of, that there is no
+    /// such box, as `ws run` says it.
+    #[test]
+    fn a_stop_tells_a_box_that_isn_t_running_from_one_that_isn_t_there() {
+        let dir = TempDir::new("halti-ws-box-stop").unwrap();
+        let here = Here::at(&dir.0.join("ws"));
+        let acme = WsName::parse("acme").unwrap();
+        new_with(&here, &acme, &TtyPassphrase::new(false).answering(ACME), &OneCopy(Cell::new(None))).unwrap();
+        let found = find(&here, &acme, "nope").unwrap();
+        let kept = Kept::of(&here, found.id).unwrap();
+        let said = |found: &Found| stop_with(&kept, found, &NoneRun).unwrap_err().to_string();
+        assert_eq!(said(&found), "there is no box acme/nope. make one with: halti ws box new acme/nope");
+        let dev = find(&here, &acme, "dev").unwrap();
+        dev.files.create("dev", SCRATCH).unwrap();
+        assert_eq!(said(&dev), "box acme/dev isn't running");
+        // Its policy file gone, the copy kept when it was approved is a trace of it too.
+        let old = find(&here, &acme, "old").unwrap();
+        old.files.keep_approved("old", SCRATCH.as_bytes()).unwrap();
+        assert_eq!(said(&old), "box acme/old isn't running");
     }
 
     #[test]
