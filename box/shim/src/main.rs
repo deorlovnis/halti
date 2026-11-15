@@ -12,6 +12,11 @@
 //! - `mcp`:   `LOCAL_SOCK`, which the shim's `mcp` command (halti's MCP server over stdio) dials
 //!
 //! After that line the bytes go both ways until both sides are done (half-close aware).
+//!
+//! In a VM whose host dials in over vsock, `boot` is the VM's first process instead (see `boot`):
+//! it starts `serve --vsock`, where the door is a vsock port (`names::DOOR_PORT`) in place of the
+//! Unix socket, and the exec service (`exec`) listens on `names::EXEC_PORT`. Both serve only the
+//! host (`vsock::from_host`). Nothing starts these modes in a box that Apple's `container` runs.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -22,7 +27,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use std::{env, fs, process, thread};
 
+// Used by `serve --vsock` and `boot`, which only Linux builds; tested on every system.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod boot;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod exec;
 mod names;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod vsock;
 
 const RUN_DIR: &str = names::RUN_DIR;
 const DOOR_SOCK: &str = names::DOOR_SOCKET;
@@ -40,11 +52,15 @@ fn main() {
     let result = match args[..] {
         ["serve"] => serve(PROXY_ADDR),
         ["serve", "--bridges"] => serve(PROXY_ALL),
+        ["serve", "--vsock"] => serve_vsock(PROXY_ADDR),
+        ["serve", "--vsock", "--bridges"] => serve_vsock(PROXY_ALL),
+        ["boot"] => boot::main(false),
+        ["boot", "--bridges"] => boot::main(true),
         ["mcp"] => UnixStream::connect(LOCAL_SOCK)
             .map_err(|e| io::Error::new(e.kind(), format!("connecting to {LOCAL_SOCK}: {e}")))
             .and_then(|sock| relay(sock, io::stdin(), io::stdout())),
         _ => {
-            eprintln!("usage: {} serve [--bridges] | mcp", names::SHIM);
+            eprintln!("usage: {} serve [--vsock] [--bridges] | boot [--bridges] | mcp", names::SHIM);
             process::exit(2);
         }
     };
@@ -54,10 +70,11 @@ fn main() {
     }
 }
 
-/// A byte stream that can be duplicated and half-closed, TCP or Unix.
+/// A byte stream that can be duplicated and half-closed: TCP, Unix or vsock.
 trait Conn: Read + Write + Send + Sized + 'static {
     fn dup(&self) -> io::Result<Self>;
     fn shut(&self, how: Shutdown) -> io::Result<()>;
+    fn nonblocking(&self, on: bool) -> io::Result<()>;
 }
 
 impl Conn for TcpStream {
@@ -66,6 +83,9 @@ impl Conn for TcpStream {
     }
     fn shut(&self, how: Shutdown) -> io::Result<()> {
         self.shutdown(how)
+    }
+    fn nonblocking(&self, on: bool) -> io::Result<()> {
+        self.set_nonblocking(on)
     }
 }
 
@@ -76,28 +96,52 @@ impl Conn for UnixStream {
     fn shut(&self, how: Shutdown) -> io::Result<()> {
         self.shutdown(how)
     }
+    fn nonblocking(&self, on: bool) -> io::Result<()> {
+        self.set_nonblocking(on)
+    }
 }
 
-/// The idle connections the Mac has dialed in, waiting for a client.
-#[derive(Default)]
-struct Pool {
-    idle: Mutex<VecDeque<UnixStream>>,
+impl Conn for vsock::Stream {
+    fn dup(&self) -> io::Result<Self> {
+        self.try_clone()
+    }
+    fn shut(&self, how: Shutdown) -> io::Result<()> {
+        self.shutdown(how)
+    }
+    fn nonblocking(&self, on: bool) -> io::Result<()> {
+        self.set_nonblocking(on)
+    }
+}
+
+/// The idle connections the Mac has dialed in, waiting for a client. `H` is a Unix stream when
+/// the door dials the published socket, a vsock stream when it dials the door's port.
+struct Pool<H> {
+    idle: Mutex<VecDeque<H>>,
     arrived: Condvar,
 }
 
-impl Pool {
-    fn put(&self, host: UnixStream) {
+impl<H> Default for Pool<H> {
+    fn default() -> Self {
+        Self { idle: Mutex::default(), arrived: Condvar::default() }
+    }
+}
+
+impl<H: Conn> Pool<H> {
+    fn put(&self, host: H) {
         self.idle.lock().unwrap_or_else(|e| e.into_inner()).push_back(host);
         self.arrived.notify_one();
     }
 
     /// The oldest idle connection that is still open, waiting for one if there is none.
-    fn take(&self) -> UnixStream {
+    fn take(&self) -> H {
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             match idle.pop_front() {
-                Some(host) if still_open(&host) => return host,
-                Some(_) => {}
+                Some(mut host) => {
+                    if still_open(&mut host) {
+                        return host;
+                    }
+                }
                 None => idle = self.arrived.wait(idle).unwrap_or_else(|e| e.into_inner()),
             }
         }
@@ -106,13 +150,13 @@ impl Pool {
 
 /// An idle connection has nothing to read; end-of-file, or data nobody asked for, means the Mac
 /// side is gone or confused (and the connection is dropped, so a byte consumed here is no loss).
-fn still_open(mut host: &UnixStream) -> bool {
+fn still_open<H: Conn>(host: &mut H) -> bool {
     let mut byte = [0u8];
-    if host.set_nonblocking(true).is_err() {
+    if host.nonblocking(true).is_err() {
         return false;
     }
     let idle = matches!(host.read(&mut byte), Err(e) if e.kind() == io::ErrorKind::WouldBlock);
-    idle && host.set_nonblocking(false).is_ok()
+    idle && host.nonblocking(false).is_ok()
 }
 
 /// Copy `from` to `to` until `from` ends. A clean end is passed on as a half-close, so the other
@@ -136,7 +180,7 @@ fn bridge<A: Conn, B: Conn>(a: A, b: B) -> io::Result<()> {
 
 /// Pair one client with an idle connection from the Mac, tell the Mac which listener the client
 /// came to, and carry the bytes.
-fn serve_client<C: Conn>(client: C, kind: &str, pool: &Pool) -> io::Result<()> {
+fn serve_client<C: Conn, H: Conn>(client: C, kind: &str, pool: &Pool<H>) -> io::Result<()> {
     let host = loop {
         let mut host = pool.take();
         if host.write_all(format!("{kind}\n").as_bytes()).is_ok() {
@@ -147,7 +191,7 @@ fn serve_client<C: Conn>(client: C, kind: &str, pool: &Pool) -> io::Result<()> {
 }
 
 /// A thread per client, so one slow or broken client never holds up the rest.
-fn accept_loop<C: Conn>(incoming: impl Iterator<Item = io::Result<C>>, kind: &'static str, pool: Arc<Pool>) {
+fn accept_loop<C: Conn, H: Conn>(incoming: impl Iterator<Item = io::Result<C>>, kind: &'static str, pool: Arc<Pool<H>>) {
     for client in incoming {
         match client {
             Ok(client) => {
@@ -162,9 +206,16 @@ fn accept_loop<C: Conn>(incoming: impl Iterator<Item = io::Result<C>>, kind: &'s
     }
 }
 
+/// The door's connections over vsock: those from the host go into the pool, and any other is
+/// closed unread, so a program in the box can't pose as halti.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn door_hosts<H: Conn>(accepted: impl Iterator<Item = io::Result<(H, u32)>>, pool: Arc<Pool<H>>) {
+    collect_hosts(vsock::host_only(accepted), pool)
+}
+
 /// Everything the Mac dials in goes into the pool.
-fn collect_hosts(listener: UnixListener, pool: Arc<Pool>) {
-    for host in listener.incoming() {
+fn collect_hosts<H: Conn>(hosts: impl Iterator<Item = io::Result<H>>, pool: Arc<Pool<H>>) {
+    for host in hosts {
         match host {
             Ok(host) => pool.put(host),
             Err(_) => thread::sleep(Duration::from_millis(100)),
@@ -186,17 +237,42 @@ fn bind_tcp(addr: (&str, u16)) -> io::Result<TcpListener> {
 /// The init process of the VM: the listeners, and the pool the Mac fills. Returns only on a
 /// startup error; client trouble never ends it.
 fn serve(proxy: (&str, u16)) -> io::Result<()> {
-    fs::create_dir_all(RUN_DIR)?;
-    fs::set_permissions(RUN_DIR, fs::Permissions::from_mode(0o755))?;
-    let pool = Arc::new(Pool::default());
+    run_dir()?;
     // Only root may connect to the door socket: a program in the box must not pose as the Mac.
     let door = bind_unix(DOOR_SOCK, 0o600)?;
+    listen(move |pool| collect_hosts(std::iter::repeat_with(move || door.accept().map(|(host, _)| host)), pool), proxy)
+}
+
+/// `serve --vsock`, started by `boot`: the door is a vsock port, and the exec service listens on
+/// another. Both take connections from the host only (`door_hosts`, `exec::host_service`).
+#[cfg(target_os = "linux")]
+fn serve_vsock(proxy: (&str, u16)) -> io::Result<()> {
+    run_dir()?;
+    let door = vsock::Listener::bind(names::DOOR_PORT)?;
+    let exec = vsock::Listener::bind(names::EXEC_PORT)?;
+    thread::spawn(move || exec::host_service(exec.incoming(), Arc::new(exec::Users::guest())));
+    listen(move |pool| door_hosts(door.incoming(), pool), proxy)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn serve_vsock(_proxy: (&str, u16)) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "serve --vsock runs only in a Linux VM"))
+}
+
+fn run_dir() -> io::Result<()> {
+    fs::create_dir_all(RUN_DIR)?;
+    fs::set_permissions(RUN_DIR, fs::Permissions::from_mode(0o755))
+}
+
+/// The box's listeners, and the pool that `fill` fills with the door's connections.
+fn listen<H: Conn>(fill: impl FnOnce(Arc<Pool<H>>) + Send + 'static, proxy: (&str, u16)) -> io::Result<()> {
+    let pool = Arc::new(Pool::default());
     let local = bind_unix(LOCAL_SOCK, 0o666)?;
     let proxy = bind_tcp(proxy)?;
     let halti = bind_tcp(HALTI_ADDR)?;
 
     let p = pool.clone();
-    thread::spawn(move || collect_hosts(door, p));
+    thread::spawn(move || fill(p));
     let p = pool.clone();
     thread::spawn(move || accept_loop(local.incoming(), "mcp", p));
     let p = pool.clone();
@@ -380,5 +456,71 @@ mod tests {
         assert_eq!(rest, "");
         drop(server);
         handle.join().unwrap().unwrap();
+    }
+
+    /// The door's connections arrive as vsock streams in a VM that boots itself; the pool, the
+    /// check for gone hosts and the bridge work on them as on Unix streams. A Unix socket pair
+    /// stands in for the vsock socket, which only a VM has.
+    #[test]
+    fn the_pool_works_over_either_socket_type() {
+        use std::os::fd::OwnedFd;
+        let vsock = |s: UnixStream| vsock::Stream::from(OwnedFd::from(s));
+        let pool = Arc::new(Pool::<vsock::Stream>::default());
+        let (gone, gone_shim) = dialed();
+        drop(gone);
+        pool.put(vsock(gone_shim));
+        let (mac, shim_end) = dialed();
+        pool.put(vsock(shim_end));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let p = pool.clone();
+        thread::spawn(move || accept_loop(listener.incoming(), "proxy", p));
+        let mut program = TcpStream::connect(addr).unwrap();
+        program.write_all(b"request").unwrap();
+        program.shutdown(Shutdown::Write).unwrap();
+
+        let mut mac = mac;
+        let mut got = String::new();
+        mac.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "proxy\nrequest");
+        mac.write_all(b"response").unwrap();
+        mac.shutdown(Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        program.read_to_string(&mut reply).unwrap();
+        assert_eq!(reply, "response");
+
+        // and the hosts can come from any iterator of streams, as the vsock listener gives them
+        let (mut mac, shim_end) = dialed();
+        let p = pool.clone();
+        thread::spawn(move || collect_hosts(std::iter::once(Ok(vsock(shim_end))), p));
+        let (_program, client) = tcp_pair();
+        thread::spawn(move || serve_client(client, names::DOOR_KIND, &pool));
+        let mut line = [0u8; 6];
+        mac.read_exact(&mut line).unwrap();
+        assert_eq!(&line, b"halti\n");
+    }
+
+    /// Of the door's vsock connections, only the host's join the pool; one from inside the box is
+    /// closed unread.
+    #[test]
+    fn the_door_pools_only_the_host_s_connections() {
+        use std::os::fd::OwnedFd;
+        let pool = Arc::new(Pool::<vsock::Stream>::default());
+        let (mut inside, inside_shim) = dialed();
+        let (mut host, host_shim) = dialed();
+        inside.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let accepted = [(inside_shim, 3), (host_shim, vsock::HOST_CID)].map(|(s, peer)| Ok((vsock::Stream::from(OwnedFd::from(s)), peer)));
+        door_hosts(accepted.into_iter(), pool.clone());
+
+        let mut rest = Vec::new();
+        inside.read_to_end(&mut rest).expect("closed, not kept");
+        assert!(rest.is_empty(), "closed with nothing sent");
+        assert_eq!(pool.idle.lock().unwrap().len(), 1);
+        let (_program, client) = tcp_pair();
+        thread::spawn(move || serve_client(client, "proxy", &pool));
+        let mut line = [0u8; 6];
+        host.read_exact(&mut line).unwrap();
+        assert_eq!(&line, b"proxy\n");
     }
 }

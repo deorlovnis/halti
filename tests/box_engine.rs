@@ -164,6 +164,7 @@ fn host_and_shim_agree_on_the_guest_names() {
         (names::SHIM, names::DOOR_SOCKET, names::LOCAL_SOCKET, names::DOOR_KIND),
         (shim_names::SHIM, shim_names::DOOR_SOCKET, shim_names::LOCAL_SOCKET, shim_names::DOOR_KIND)
     );
+    assert_eq!((names::SHIM_PATH, names::DOOR_PORT, names::EXEC_PORT), (shim_names::SHIM_PATH, shim_names::DOOR_PORT, shim_names::EXEC_PORT));
 }
 
 #[test]

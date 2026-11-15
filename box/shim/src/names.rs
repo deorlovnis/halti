@@ -3,8 +3,11 @@
 //! and the host names them on the VM's command line, so a change here is a re-pin of every image.
 
 /// This binary's name (`[[bin]]` of the crate), the VM's entrypoint and the command of the MCP
-/// server in box homes. Installed as /usr/local/bin/halti-shim.
+/// server in box homes. Installed as `SHIM_PATH`.
 pub const SHIM: &str = "halti-shim";
+/// Where the images install the shim. `boot` starts the shim's `serve` from here.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const SHIM_PATH: &str = "/usr/local/bin/halti-shim";
 /// Where the sockets below live.
 pub const RUN_DIR: &str = "/run/halti";
 /// The socket the door on the Mac dials into (published by `container`).
@@ -13,6 +16,13 @@ pub const DOOR_SOCKET: &str = "/run/halti/door.sock";
 pub const LOCAL_SOCKET: &str = "/run/halti/local.sock";
 /// The kind line for connections to 127.0.0.2:80, which go to halti itself.
 pub const DOOR_KIND: &str = "halti";
+
+/// In a VM whose host dials in over vsock (`serve --vsock`): the port the door dials in place of
+/// `DOOR_SOCKET`, and the port of the exec service.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const DOOR_PORT: u32 = 7000;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const EXEC_PORT: u32 = 7001;
 
 #[cfg(test)]
 mod tests {
@@ -23,5 +33,7 @@ mod tests {
     fn the_guest_names_are_unchanged() {
         assert_eq!((SHIM, RUN_DIR), ("halti-shim", "/run/halti"));
         assert_eq!((DOOR_SOCKET, LOCAL_SOCKET, DOOR_KIND), ("/run/halti/door.sock", "/run/halti/local.sock", "halti"));
+        assert_eq!(SHIM_PATH, "/usr/local/bin/halti-shim");
+        assert_eq!((DOOR_PORT, EXEC_PORT), (7000, 7001));
     }
 }
