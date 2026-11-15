@@ -81,8 +81,9 @@ pub struct TestHub {
     pub pin: [u8; 32],
     pub clock: Arc<Hands>,
     proxy: Proxy,
-    /// The admin socket of the hub that runs now.
+    /// The admin socket of the hub that runs now, and where it listens.
     admin: Mutex<PathBuf>,
+    target: Mutex<Option<String>>,
     starts: Mutex<u32>,
     inbox_wait: Duration,
 }
@@ -98,6 +99,7 @@ impl TestHub {
             clock: Arc::new(Hands(Mutex::new(Timestamp::from_second(Timestamp::now().as_second()).unwrap()))),
             proxy: Proxy::new(),
             admin: Mutex::default(),
+            target: Mutex::default(),
             starts: Mutex::new(0),
             inbox_wait,
         };
@@ -124,17 +126,14 @@ impl TestHub {
         thread::spawn(move || admin::serve(for_admin, admin_listener));
         let config = server_config(&key).unwrap();
         thread::spawn(move || listen::run(for_listener, listener, config, Limits { request_wait: Duration::from_secs(5), ..Limits::HUB }));
+        *locked(&self.target) = Some(target.clone());
         self.proxy.point(Some(target));
     }
 
-    /// Makes the hub unreachable, or reachable again.
+    /// Makes the hub unreachable, or the same hub reachable again.
     pub fn reachable(&self, up: bool) {
-        let target = if up { locked(&self.proxy.target).clone() } else { None };
-        if up && target.is_none() {
-            self.restart();
-        } else if !up {
-            self.proxy.point(None);
-        }
+        let target = if up { locked(&self.target).clone() } else { None };
+        self.proxy.point(target);
     }
 
     pub fn now(&self) -> Timestamp {

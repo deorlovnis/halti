@@ -63,11 +63,10 @@ fn waiting() -> Result<(usize, Vec<Found>)> {
     Ok((open, found))
 }
 
-/// This machine's workspaces, each with the socket of its open workspace if its lock is held: what
-/// this machine's link asks. One whose files don't read is left out.
-pub fn workspaces() -> Vec<(WsName, Option<PathBuf>)> {
-    let settings = config::settings();
-    let here = Here::at(&settings.workspaces.path);
+/// The workspaces in the folder `root`, each with the socket of its open workspace if its lock is
+/// held: what this machine's link asks. One whose files don't read is left out.
+pub fn workspaces(root: &std::path::Path) -> Vec<(WsName, Option<PathBuf>)> {
+    let here = Here::at(root);
     let Ok(entries) = ws_list(&here.files, &here.anchor) else { return Vec::new() };
     entries
         .into_iter()

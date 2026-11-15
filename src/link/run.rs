@@ -399,8 +399,10 @@ impl Link<'_> {
         self.keep_trust(&devices, &look.trust);
         for id in missing {
             let Some((_, bytes)) = look.records.iter().find(|(record, _)| record.id.0 == id) else { continue };
+            // A request the hub won't hold (expired, or one more than it holds) waits here as before.
             match self.call("POST", "/v1/machine/request", Some(&json!({"record": hex(bytes)})), self.timing.call_wait) {
                 Ok(_) | Err(Failed::Refused(410, _)) => {}
+                Err(Failed::Refused(429, _)) => self.say_once("the hub holds as many of this machine's requests as it takes: the rest are answered here"),
                 Err(failed) => return Err(failed),
             }
         }

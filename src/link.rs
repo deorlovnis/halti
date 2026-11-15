@@ -68,22 +68,25 @@ pub fn warn_if_refused() {
     }
 }
 
-/// This machine's workspaces, as the link asks them.
-struct Machine;
+/// This machine's workspaces, in the folder the settings named as the link started.
+struct Machine {
+    root: PathBuf,
+}
 
 impl run::Local for Machine {
     fn workspaces(&self) -> Vec<(WsName, Option<PathBuf>)> {
-        crate::ws::requests::workspaces()
+        crate::ws::requests::workspaces(&self.root)
     }
 }
 
-/// `halti link`: runs until it is stopped.
+/// `halti link`: runs until it is stopped. The settings are read once, as it starts.
 pub fn serve() -> Result<()> {
     let folder = Folder::here();
     if folder.joined()?.is_none() {
         warn("this machine hasn't joined a hub yet: the link waits for halti hub join");
     }
-    run::run(&folder, &Machine, run::TIMING, &AtomicBool::new(false))
+    let machine = Machine { root: crate::config::settings().workspaces.path };
+    run::run(&folder, &machine, run::TIMING, &AtomicBool::new(false))
 }
 
 /// `halti hub join STRING`.

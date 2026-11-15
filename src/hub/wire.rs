@@ -21,11 +21,10 @@
 //! - The whole request, head and body, must arrive within 10 seconds of the connection. The head
 //!   (request line and headers) may be at most 8 KiB, the body at most 4 KiB (16 KiB for
 //!   `POST /v1/machine/state`), sent with `Content-Length` (chunked is read too, within the same
-//!   limit). A request that is slower, a
-//!   head that is longer or malformed, and a TLS handshake that fails get no reply: the connection
-//!   is closed. A head is malformed when its request line isn't exactly `METHOD TARGET
-//!   HTTP/VERSION`, one space between each, or a header line has no `:` or a name that isn't an
-//!   HTTP token. A body over its limit is answered `413 too-large`.
+//!   limit). A request that is slower, a head that is longer or malformed, and a TLS handshake that
+//!   fails get no reply: the connection is closed. A head is malformed when its request line isn't
+//!   exactly `METHOD TARGET HTTP/VERSION`, one space between each, or a header line has no `:` or a
+//!   name that isn't an HTTP token. A body over its limit is answered `413 too-large`.
 //! - At most 64 connections at once, and 8 from one address: an IPv4 address, or for IPv6 the first
 //!   64 bits of the address. An IPv4 address that reaches the hub as IPv6 (`::ffff:a.b.c.d`) counts
 //!   as itself. One more is closed as soon as it is accepted, before TLS.
@@ -124,7 +123,8 @@
 //!
 //! ```json
 //! {"kind": "device", "name": "pixel", "ws": ["acme", "beta"], "issued": "<time>",
-//!  "expires": "<time>", "renew_from": "<time>", "renewable_until": "<time>", "conflict": null}
+//!  "expires": "<time>", "renew_from": "<time>", "renewable_until": "<time>", "conflict": null,
+//!  "now": "<time>"}
 //! ```
 //!
 //! For a machine, `kind` is `machine`, `ws` is empty, and `conflict` is the time the hub marked
@@ -164,8 +164,8 @@
 //!   `409 conflict`. Only `halti revoke` on the hub clears the mark; until then a pairing of the
 //!   name is refused at the hub's terminal.
 //!
-//! `GET /v1/me` also has `"now"`: the hub's clock as it answered. A client that counts a token's
-//! days compares the other times with it, never with its own clock.
+//! `now` in `GET /v1/me` is the hub's clock as it answered. A client that counts a token's days
+//! compares the other times with it, never with its own clock.
 //!
 //! # A request's record
 //!
@@ -199,8 +199,9 @@
 //!
 //! **Requests.** `GET /v1/requests`, no body: `200 {"requests": [{"machine": "server-1",
 //! "record": "<bytes>"}]}`, every request that waits in the phone's workspaces, from every machine,
-//! in the order of the machines' names, then of the ids. A request leaves the list once its machine answered it, withdrew it or
-//! let it expire, and a minute after its expiry by the hub's clock at the latest.
+//! in the order of the machines' names, then of the ids. A request leaves the list once its machine
+//! answered it, withdrew it or let it expire, and a minute after its expiry by the hub's clock at
+//! the latest.
 //!
 //! **Answering one.** The app shows the record, asks for fingerprint or PIN, and signs with the
 //! signing key the record's bytes followed by one more field, `yes` or `no`: for a record `R`, the
@@ -218,7 +219,7 @@
 //!
 //! **Hiding one.** `POST /v1/hide`, body `{"machine": "server-1", "id": "<16 bytes>"}`, nothing
 //! signed: `200 {}`. It closes the remote copy for every phone and nothing else: the machine still
-//! waits, and is answered there or expires. Any token of the phone's workspaces can do it.
+//! waits, and is answered there or expires. Any phone that may see the request can do it.
 //!
 //! **Stopping runs.** The app signs, after fingerprint or PIN, the fields `halti-stop-v1`, the
 //! machine's name, the workspace, then each run id (8) as a field of its own, in the order sent.
