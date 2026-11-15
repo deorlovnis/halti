@@ -96,6 +96,10 @@ pub trait World: Sync {
     fn takes_disk(&self) -> bool;
     /// Run a command in the VM as the agent, bytes in and bytes out (`Vms::pipe`).
     fn pipe(&self, vm: &str, cmd: &[String], input: &[u8]) -> Result<Vec<u8>>;
+    /// Whether halti's own output has gone away (`output_gone`).
+    fn output_gone(&self) -> bool {
+        false
+    }
 }
 
 /// The real thing, as the settings say: the engine `[box] engine` picked, where `[box] keys` keeps
@@ -192,6 +196,10 @@ impl World for Real<'_> {
 
     fn pipe(&self, vm: &str, cmd: &[String], input: &[u8]) -> Result<Vec<u8>> {
         self.vms.pipe(vm, cmd, input)
+    }
+
+    fn output_gone(&self) -> bool {
+        output_gone()
     }
 }
 
@@ -538,7 +546,9 @@ impl Running<'_> {
     }
 
     /// Run `command` in the box as the agent, with the terminal if `tty`, until it ends. A stop
-    /// (`req.stop`) stops the agent's VM, which ends it; one asked already runs nothing.
+    /// (`req.stop`) stops the agent's VM, which ends it; one asked already runs nothing. halti's own
+    /// output going away (`World::output_gone`) is a stop too, as the hang-up it is: one that sent
+    /// no SIGHUP, as an ssh session with no terminal doesn't.
     pub fn work(&self, command: &[String], tty: bool) -> Result<ExitStatus> {
         let (world, vm, stopped, stop) = (self.world, self.vm.as_str(), &self.vm_stopped, self.req.stop);
         if stop.load(Ordering::SeqCst) {
@@ -549,6 +559,9 @@ impl Running<'_> {
         thread::scope(|scope| {
             scope.spawn(|| {
                 while !done.load(Ordering::SeqCst) {
+                    if world.output_gone() {
+                        stop.store(true, Ordering::SeqCst);
+                    }
                     if stop.load(Ordering::SeqCst) {
                         if !stopped.swap(true, Ordering::SeqCst) {
                             world.stop_vm(vm);
@@ -685,7 +698,8 @@ fn record_head(world: &dyn World, name: &str, shown: &str, mnt: &Path, log_key: 
 
 /// Join a workspace's box that another halti has open, from a second terminal: the engine only.
 /// Nothing is asked and nothing is looked up: the policy file must be the one the box opened with
-/// (`policy` is its bytes, read once), and how the model is reached is what the opener noted.
+/// (`policy` is its bytes, read once), and how the model is reached is what the opener noted. If
+/// halti's output goes away meanwhile, the command alone is hung up (`exec_marked`).
 #[allow(clippy::too_many_arguments)]
 pub fn join(layout: &Layout, vms: &dyn Vms, box_name: &str, shown: &str, mounts: &MountRule, policy: &[u8], command: Option<&[String]>, tty: bool) -> Result<u8> {
     let vm = layout.vm(box_name);
@@ -706,10 +720,44 @@ pub fn join(layout: &Layout, vms: &dyn Vms, box_name: &str, shown: &str, mounts:
         _ => return Err(busy()),
     };
     let command = guest_command(command.unwrap_or(&policy.run));
-    let status = vms.exec(&vm, &agent_env(&policy, bearer), &command, tty);
+    let status = exec_marked(vms, &vm, agent_env(&policy, bearer), &command, tty, &output_gone);
     // `container exec` shares the terminal and may leave it non-blocking.
     crate::util::blocking_stdio();
     exit_code(status.map_err(|e| ended(e, vms.takes_disk() && !vms.running(&vm), shown, &layout.console(box_name)))?)
+}
+
+/// The variable that marks the processes of one command a join runs: its children inherit it, and
+/// the box's other commands, a job in tmux among them, have marks of their own or none.
+const RUN_MARK: &str = "HALTI_RUN";
+
+/// Sends SIGHUP, as the agent, to each process in the box whose environment holds `$1`, one
+/// command's mark (`RUN_MARK=<hex>`). A process gone meanwhile is passed over.
+const HANG_UP: &str = "for p in /proc/[0-9]*; do grep -qzxF -e \"$1\" \"$p/environ\" 2>/dev/null && kill -HUP \"${p#/proc/}\" 2>/dev/null; done; exit 0";
+
+/// Run `command` in the VM `vm` as the agent, with `env` and a mark of its own (`RUN_MARK`). If
+/// halti's output goes away meanwhile (`gone`), the command's processes are sent SIGHUP in the box,
+/// as a closed terminal sends it: the command ends as SIGHUP ends it, and the box another halti
+/// runs, and the other commands in it, run on.
+fn exec_marked(vms: &dyn Vms, vm: &str, mut env: Vec<(String, String)>, command: &[String], tty: bool, gone: &(dyn Fn() -> bool + Sync)) -> Result<ExitStatus> {
+    let mark = crate::util::hex(&crate::util::random::<16>());
+    let marked = format!("{RUN_MARK}={mark}");
+    env.push((RUN_MARK.to_string(), mark));
+    let done = AtomicBool::new(false);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::SeqCst) {
+                if gone() {
+                    // Nobody reads what this says: the output it would go to is gone.
+                    let _ = vms.pipe(vm, &script(HANG_UP, &marked), b"");
+                    return;
+                }
+                thread::sleep(WATCH_EVERY);
+            }
+        });
+        let status = vms.exec(vm, &env, command, tty);
+        done.store(true, Ordering::SeqCst);
+        status
+    })
 }
 
 /// The box's CA, which only its VM trusts. A kept box has it sealed in its store (with a key
@@ -918,6 +966,29 @@ fn sweep_temp(layout: &Layout) -> Result<()> {
 
 // --- signals ---
 
+/// halti's own output: its standard output and error. Its input isn't: an input that ends (`ssh
+/// server halti ws run ... < /dev/null`, or a pipe whose writer is done) ends nothing.
+const OUTPUT: [i32; 2] = [1, 2];
+
+/// Whether halti's own output has gone away: a pipe or a socket whose reader has closed. That is
+/// the hang-up of an ssh session run with no terminal, which sends no SIGHUP, and of a reader such
+/// as `head` that is done. A file, /dev/null, a terminal that is still there and an output that
+/// isn't open never go away.
+pub fn output_gone() -> bool {
+    hung_up(&OUTPUT)
+}
+
+/// Whether one of `fds` is a stream whose reader has closed. Each is asked as for a write, since
+/// macOS says that a pipe's reader closed only then; nothing waits.
+fn hung_up(fds: &[i32]) -> bool {
+    fds.iter().any(|&fd| {
+        let mut poll = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        // SAFETY: poll(2) on one live pollfd, with no wait.
+        let n = unsafe { libc::poll(&mut poll, 1, 0) };
+        n > 0 && poll.revents & (libc::POLLHUP | libc::POLLERR) != 0
+    })
+}
+
 static SIGNALLED: AtomicBool = AtomicBool::new(false);
 
 /// Set once the process got SIGHUP, SIGINT or SIGTERM after `catch_signals`.
@@ -1038,6 +1109,11 @@ mod tests {
         breaks: bool,
         /// Where the box notes it is ready to join: whether it is there is noted at each call.
         ready_at: Option<PathBuf>,
+        /// halti's output, as `output_gone` asks it; none is never gone.
+        output: Option<i32>,
+        /// While it blocks, exec writes a line to `output` every few milliseconds, as a command
+        /// that prints as it goes.
+        streams: bool,
     }
 
     impl Fake {
@@ -1215,11 +1291,20 @@ mod tests {
             }
             if self.block {
                 while !seen.stopped {
-                    seen = self.wake.wait(seen).unwrap();
+                    if let (true, Some(fd)) = (self.streams, self.output) {
+                        // SAFETY: write(2) of a live buffer of the length given; a reader that has
+                        // gone fails it, which is ignored, as halti ignores it.
+                        let _ = unsafe { libc::write(fd, b"line\n".as_ptr().cast(), 5) };
+                    }
+                    seen = self.wake.wait_timeout(seen, Duration::from_millis(20)).unwrap().0;
                 }
                 return Ok(ExitStatus::from_raw(15));
             }
             Ok(ExitStatus::from_raw(0))
+        }
+
+        fn output_gone(&self) -> bool {
+            self.output.is_some_and(|fd| hung_up(&[fd]))
         }
 
         fn takes_disk(&self) -> bool {
@@ -2021,6 +2106,11 @@ mod tests {
         /// The VM ends under the command, with no stop asked.
         breaks: bool,
         gone: AtomicBool,
+        /// exec runs until the command is hung up (`HANG_UP`), then says it ended by SIGHUP.
+        blocks: bool,
+        hung_up: AtomicBool,
+        /// What `pipe` was asked to run.
+        piped: Mutex<Vec<Vec<String>>>,
     }
 
     impl Vms for Engine {
@@ -2051,6 +2141,12 @@ mod tests {
                 self.gone.store(true, Ordering::SeqCst);
                 bail!("the box closed the command's connection");
             }
+            if self.blocks {
+                while !self.hung_up.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                return Ok(ExitStatus::from_raw(libc::SIGHUP));
+            }
             Ok(ExitStatus::from_raw(0))
         }
 
@@ -2073,8 +2169,12 @@ mod tests {
             self.disk
         }
 
-        fn pipe(&self, _name: &str, _cmd: &[String], _input: &[u8]) -> Result<Vec<u8>> {
+        fn pipe(&self, _name: &str, cmd: &[String], _input: &[u8]) -> Result<Vec<u8>> {
             self.calls.lock().unwrap().push("pipe".into());
+            self.piped.lock().unwrap().push(cmd.to_vec());
+            if cmd.get(2).map(String::as_str) == Some(HANG_UP) {
+                self.hung_up.store(true, Ordering::SeqCst);
+            }
             Ok(Vec::new())
         }
     }
@@ -2386,6 +2486,147 @@ mod tests {
         let vms = Engine { breaks: true, ..Engine::default() };
         let error = join(&layout, &vms, "dev", "acme/dev", &MountRule::Workspace(vec![]), &text, None, false).unwrap_err().to_string();
         assert_eq!(error, "the box closed the command's connection");
+    }
+
+    /// A box that keeps nothing, as this system makes one: a Mac's store, or Linux's disk with the
+    /// box's folders in a folder here.
+    fn here(s: &Setup) -> (Fake, BoxPolicy) {
+        if cfg!(target_os = "linux") {
+            let (root, p) = on_disk(s);
+            (Fake { disk: Some(root), ..Fake::default() }, p)
+        } else {
+            (Fake::default(), policy(s, ""))
+        }
+    }
+
+    /// halti's output gone while the agent's command runs (an ssh session with no terminal that
+    /// ended, which sends no SIGHUP) stops the box as a SIGHUP does, within a moment: a command
+    /// that prints nothing, and one cut off while it prints. Until then the box runs on.
+    #[test]
+    fn a_run_whose_output_goes_away_stops_as_on_a_hang_up() {
+        use std::os::fd::AsRawFd;
+
+        for streams in [false, true] {
+            let s = setup();
+            let (made, p) = here(&s);
+            let (reader, writer) = std::io::pipe().unwrap();
+            let fake = Fake { block: true, streams, output: Some(writer.as_raw_fd()), ..made };
+            thread::scope(|scope| {
+                let ran = scope.spawn(|| run(&s.layout, &fake, &request(&s, &p, false)));
+                let began = Instant::now();
+                while !fake.calls().iter().any(|call| call == "exec") {
+                    assert!(began.elapsed() < Duration::from_secs(60), "the agent's command never ran: {:?}", fake.calls());
+                    thread::sleep(Duration::from_millis(10));
+                }
+                thread::sleep(Duration::from_millis(300));
+                assert!(!ran.is_finished() && !s.stop.load(Ordering::SeqCst), "streams {streams}: the box runs while its output is there");
+                drop(reader);
+                // The VM is stopped within a moment; putting the store away after may take longer.
+                let gone = Instant::now();
+                while !fake.seen.lock().unwrap().stopped {
+                    assert!(gone.elapsed() < Duration::from_secs(5), "streams {streams}: not stopped in {:?}", gone.elapsed());
+                    thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(ran.join().unwrap().unwrap(), 128 + 15, "the command ended with its box");
+            });
+            assert!(s.stop.load(Ordering::SeqCst), "as a signal's stop");
+            let calls = fake.calls();
+            assert_eq!(&calls[calls.len() - 2..], ["exec", "stop_vm"], "{calls:?}");
+            assert_put_away(&s);
+        }
+    }
+
+    /// halti's output going away is a hang-up: a pipe or a socket whose reader closed. Its input
+    /// ending is not (`ssh server halti ws run ... < /dev/null`, or a pipe whose writer is done):
+    /// it isn't looked at.
+    #[test]
+    fn only_the_output_going_away_is_a_hang_up() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        assert_eq!(OUTPUT, [1, 2], "standard output and error, not input");
+        let null = fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let (out, out_w) = std::io::pipe().unwrap();
+        let (err, err_w) = std::io::pipe().unwrap();
+        let gone = |fds: &[&dyn AsRawFd]| hung_up(&fds.iter().map(|fd| fd.as_raw_fd()).collect::<Vec<_>>());
+        assert!(!gone(&[&out_w, &err_w]), "both readers are there");
+        drop(out);
+        assert!(gone(&[&out_w, &err_w]), "the output's reader closed");
+        let (_out, out_w) = std::io::pipe().unwrap();
+        drop(err);
+        assert!(gone(&[&out_w, &err_w]), "the error's reader closed");
+
+        // A socket, as sshd's end can be.
+        let (theirs, ours) = UnixStream::pair().unwrap();
+        assert!(!gone(&[&ours, &null]));
+        drop(theirs);
+        assert!(gone(&[&ours, &null]));
+
+        // A file and /dev/null are never gone, and neither is a descriptor that isn't open.
+        let dir = TempDir::new("halti-output").unwrap();
+        let file = fs::File::create(dir.0.join("out")).unwrap();
+        assert!(!gone(&[&file, &null]));
+        assert!(!hung_up(&[-1]));
+    }
+
+    /// A command joined in a box whose halti's output goes away is sent SIGHUP in the box, by the
+    /// mark it alone runs under, and the join ends with it. While the output is there, nothing is
+    /// sent; and each command has a mark of its own.
+    #[test]
+    fn a_join_whose_output_goes_away_hangs_up_its_command_alone() {
+        let vms = Engine { blocks: true, ..Engine::default() };
+        let gone = AtomicBool::new(false);
+        let vm = "halti-wsbox-abcdef012345-dev";
+        let env = vec![("HOME".to_string(), "/home/agent".to_string())];
+        let command = ["sleep".to_string(), "300".to_string()];
+        thread::scope(|scope| {
+            let ran = scope.spawn(|| exec_marked(&vms, vm, env.clone(), &command, false, &|| gone.load(Ordering::SeqCst)));
+            thread::sleep(Duration::from_millis(300));
+            assert!(!ran.is_finished() && vms.piped.lock().unwrap().is_empty(), "nothing is hung up while the output is there");
+            gone.store(true, Ordering::SeqCst);
+            let at = Instant::now();
+            let status = ran.join().unwrap().unwrap();
+            assert!(at.elapsed() < Duration::from_secs(5), "{:?}", at.elapsed());
+            assert_eq!(status.signal(), Some(libc::SIGHUP));
+        });
+        let (ran_in, ran_with, ran) = vms.exec.lock().unwrap().clone().unwrap();
+        assert_eq!((ran_in.as_str(), &ran_with[..1], &ran[..]), (vm, &env[..], &command[..]));
+        let mark = ran_with.iter().find(|(name, _)| name == RUN_MARK).map(|(_, mark)| mark.clone()).expect("the command runs under a mark");
+        assert!(mark.len() == 32 && mark.bytes().all(|b| b.is_ascii_hexdigit()), "{mark}");
+        assert_eq!(*vms.piped.lock().unwrap(), [script(HANG_UP, &format!("{RUN_MARK}={mark}"))]);
+
+        let again = Engine::default();
+        exec_marked(&again, vm, env.clone(), &command, false, &|| false).unwrap();
+        let (_, with, _) = again.exec.lock().unwrap().clone().unwrap();
+        assert!(with.iter().any(|(name, other)| name == RUN_MARK && *other != mark), "{with:?}");
+        assert!(again.piped.lock().unwrap().is_empty());
+    }
+
+    /// The hang-up reaches each process whose environment holds the mark, and no other: not one
+    /// whose mark only begins the same.
+    #[test]
+    #[cfg_attr(not(target_os = "linux"), ignore = "reads /proc")]
+    fn the_hang_up_reaches_the_marked_processes_alone() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        // With SIGHUP's default action, whatever this test runs under (nohup ignores it, and an
+        // ignored signal stays ignored across exec).
+        let sleep = |mark: &str| {
+            let mut sleep = Command::new("sleep");
+            sleep.arg("30").env(RUN_MARK, mark);
+            // SAFETY: signal(2) is async-signal-safe.
+            unsafe { sleep.pre_exec(|| if libc::signal(libc::SIGHUP, libc::SIG_DFL) == libc::SIG_ERR { Err(std::io::Error::last_os_error()) } else { Ok(()) }) };
+            sleep.spawn().unwrap()
+        };
+        let (mut marked, mut other) = (sleep("ab12"), sleep("ab1"));
+        let hang_up = script(HANG_UP, &format!("{RUN_MARK}=ab12"));
+        let out = Command::new(&hang_up[0]).args(&hang_up[1..]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(marked.wait().unwrap().signal(), Some(libc::SIGHUP));
+        assert!(other.try_wait().unwrap().is_none(), "another mark runs on");
+        other.kill().unwrap();
+        other.wait().unwrap();
     }
 
     /// A box given its disk is joined only once its start is done: its home and its clones are

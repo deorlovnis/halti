@@ -71,6 +71,8 @@ const NOT_READ: &[&str] = &[
     "HALTI_LIB_DIR",
     // A refresh script's field (`HALTI_<FIELD>`), in a test's script.
     "HALTI_LOGIN",
+    // Set in the box for a command a join runs, as the mark a hang-up finds it by (`run::RUN_MARK`).
+    "HALTI_RUN",
 ];
 
 /// The `HALTI_` string literals release code may hold that aren't a `dev_var` name.
@@ -79,6 +81,8 @@ const OTHER_LITERALS: &[&str] = &[
     "\"HALTI_{suffix}\"",
     // engine::runner_command, refusing these in what is passed to the runner.
     "\"HALTI_RUNNER_DEBUG\"",
+    // run::RUN_MARK, set in the box, never read here.
+    "\"HALTI_RUN\"",
 ];
 
 /// Other variables release code reads directly, and why: each file's reads, as the text from
