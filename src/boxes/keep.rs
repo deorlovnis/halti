@@ -5,7 +5,10 @@
 //! ends, or when it is asked to.
 //!
 //! A write its boxes' policies say to ask about waits on its desk as a request (`crate::requests`),
-//! which the socket lists and answers in records, for `halti requests` in another terminal.
+//! which the socket lists and answers in records, for `halti requests` in another terminal. Each box
+//! that runs has a run id, drawn as it starts; this machine's link asks for them, and hands on a
+//! phone's signed answers and stops, which are checked here against the devices this machine
+//! trusts (`crate::link`).
 //!
 //! Closing is one order, whatever asked for it (`halti close`, Ctrl-C, a closed terminal, `kill`):
 //! from the first moment every start is refused (`busy`); every box is asked to stop and is put
@@ -32,7 +35,7 @@ use crate::approval::{Action, Means};
 use crate::config::Settings;
 use crate::engine::Vms;
 use crate::keep::{self, No, Records, Refused, Reply, Request, Told};
-use crate::requests::{self, Desk, Here, RunId};
+use crate::requests::{self, Desk, RunId, Runs, Trust};
 use crate::source;
 use crate::util::{say, sha256_hex, warn};
 
@@ -88,7 +91,8 @@ pub fn serve(keep: Keep) -> Result<u8> {
     let settings = keep.settings.clone();
     let world = keep.vms.map(|vms| run::Real { vms, keys: KeyStore::of(&settings), settings: &settings });
     let ready = |name: &str, shown: &str, checked: &Checked| super::ready(name, shown, &checked.text, checked.policy.keep, &settings);
-    let desk = Desk::new(requests::machine_name(), keep.name.to_string(), requests::LIMITS, Arc::new(requests::TouchId));
+    let desk = Desk::following(requests::machine_name, keep.name.to_string(), requests::LIMITS, Arc::new(requests::TouchId));
+    let trust = |name: &str| crate::link::trusted(name);
     let outside = Outside {
         world: world.as_ref().map(|world| world as &dyn World),
         vms: keep.vms,
@@ -97,6 +101,7 @@ pub fn serve(keep: Keep) -> Result<u8> {
         wipe: &|| source::current().close(),
         refused: &|| source::current().refused_reread(),
         desk: &desk,
+        trust: &trust,
     };
     serve_with(keep, &outside)
 }
@@ -117,6 +122,8 @@ struct Outside<'a> {
     refused: &'a (dyn Fn() -> bool + Sync),
     /// Where its boxes' writes that ask wait as requests.
     desk: &'a Arc<Desk>,
+    /// The devices this machine trusts, as a phone's signed answer or stop is checked against them.
+    trust: Trust<'a>,
 }
 
 fn serve_with(keep: Keep, outside: &Outside) -> Result<u8> {
@@ -149,6 +156,7 @@ fn serve_with(keep: Keep, outside: &Outside) -> Result<u8> {
         closers: Mutex::default(),
         done: AtomicBool::new(false),
         desk: outside.desk,
+        trust: outside.trust,
     };
     let held = thread::scope(|scope| {
         let keeper = &keeper;
@@ -202,6 +210,8 @@ struct Slot {
     /// Its `run::Request::stop`.
     stop: Arc<AtomicBool>,
     word: Option<Reply>,
+    /// Drawn as it starts: what its requests and a phone's stop name it by.
+    run: RunId,
 }
 
 #[derive(Default)]
@@ -249,6 +259,7 @@ struct Keeper<'a> {
     done: AtomicBool,
     /// The requests its boxes wait on.
     desk: &'a Arc<Desk>,
+    trust: Trust<'a>,
 }
 
 fn reply(stream: &mut UnixStream, reply: Reply) {
@@ -288,50 +299,37 @@ impl<'a> Keeper<'a> {
         }
     }
 
-    /// Reads one request and answers it. A start keeps the connection as a session.
+    /// Reads one request and answers it. A start keeps the connection as a session. Only a line
+    /// about requests may be longer than a line of names.
     fn answer<'scope>(&'scope self, scope: &'scope Scope<'scope, '_>, mut stream: UnixStream) {
-        let line = keep::read_line(&mut stream, keep::LINE_WAIT);
+        let line = keep::read_line_up_to(&mut stream, keep::LINE_WAIT, keep::RECORDS_REQUEST_MAX);
         self.waiting.fetch_sub(1, Ordering::SeqCst);
         let Some(line) = line else { return };
         if let Some(records) = Records::parse(&line) {
             return self.records(&mut stream, &records);
         }
+        if line.len() >= keep::LINE_MAX {
+            return;
+        }
         let answer = match Request::parse(&line) {
             None => Reply::Unsupported,
             Some(request) if request.ws() != self.name => Reply::Other,
             Some(Request::Start(_, name)) => return self.start(scope, stream, name),
-            Some(Request::Stop(_, name)) => self.stop(&name),
+            Some(Request::Stop(_, name)) => self.stop_box(&name, None),
             Some(Request::Close(_)) => return self.asked_to_close(stream),
             Some(Request::Ping(_)) => Reply::Open(self.running()),
         };
         reply(&mut stream, answer);
     }
 
-    /// The requests its boxes wait on: each record, or what came of an answer. An answer that asks
-    /// here first is answered once that is done.
+    /// The requests its boxes wait on: each record, or what came of an answer; the boxes that
+    /// run; a phone's signed answer or stop. An answer that asks here first is answered once that
+    /// is done.
     fn records(&self, stream: &mut UnixStream, records: &Records) {
-        if records.ws() != self.name {
-            let _ = keep::write_line(stream, &Told::Other.line());
-            return;
-        }
-        match records {
-            Records::List(_) => {
-                for record in self.desk.records() {
-                    if keep::write_line(stream, &Told::Request(record).line()).is_err() {
-                        return;
-                    }
-                }
-                let _ = keep::write_line(stream, &Told::End.line());
-            }
-            Records::Answer(_, yes, digest) => {
-                let told = match self.desk.answer_here(*yes, digest) {
-                    Here::Approved => Told::Approved,
-                    Here::Denied => Told::Denied,
-                    Here::Gone => Told::Gone,
-                    Here::Declined => Told::Declined,
-                    Here::Busy => Told::Busy,
-                };
-                let _ = keep::write_line(stream, &told.line());
+        let lines = if records.ws() != self.name { vec![Told::Other] } else { requests::told(self.desk, self.trust, self, records) };
+        for told in lines {
+            if keep::write_line(stream, &told.line()).is_err() {
+                return;
             }
         }
     }
@@ -368,9 +366,10 @@ impl<'a> Keeper<'a> {
                 table.next += 1;
                 let round = table.next;
                 let stop = Arc::new(AtomicBool::new(false));
-                table.boxes.insert(name.clone(), Slot { round, state: State::Starting, sessions: 1, stop: stop.clone(), word: None });
+                let run = RunId::random();
+                table.boxes.insert(name.clone(), Slot { round, state: State::Starting, sessions: 1, stop: stop.clone(), word: None, run });
                 let box_name = name.clone();
-                scope.spawn(move || self.run_box(&box_name, round, &stop));
+                scope.spawn(move || self.run_box(&box_name, round, run, &stop));
                 (round, true)
             }
         };
@@ -438,7 +437,7 @@ impl<'a> Keeper<'a> {
     /// One box, from its start to its end, on its own thread: checked, started, kept until it is
     /// asked to stop, its last session leaves or its VM is gone, then put away. A box whose VM went
     /// with no stop asked is said to have ended unexpectedly, not to have been stopped.
-    fn run_box(&self, name: &str, round: u64, stop: &AtomicBool) {
+    fn run_box(&self, name: &str, round: u64, run: RunId, stop: &AtomicBool) {
         let shown = format!("{}/{name}", self.name);
         let ready = self.world.ok_or_else(|| Refused::new(No::Engine, anyhow!("boxes can't run on this system: halti has no box engine for it"))).and_then(|world| {
             let checked = (self.check)(name)?;
@@ -464,7 +463,7 @@ impl<'a> Keeper<'a> {
             stop_with: format!("halti ws stop {shown}"),
             mounts: self.mounts.clone(),
             confirm: false,
-            requests: Some(self.desk.asker(name, RunId::random())),
+            requests: Some(self.desk.asker(name, run)),
         };
         match run::start(self.layout, world, &request) {
             Err(refused) => self.refused(name, round, &shown, stop, refused),
@@ -524,13 +523,14 @@ impl<'a> Keeper<'a> {
     }
 
     /// `stop`: the box is asked to stop, and answered once it is put away. It is stopping from
-    /// then on, so a start that comes after is `busy`.
-    fn stop(&self, name: &str) -> Reply {
+    /// then on, so a start that comes after is `busy`. With a `run`, only that run of the box is
+    /// stopped: a later run of it is `idle`.
+    fn stop_box(&self, name: &str, run: Option<RunId>) -> Reply {
         let mut table = self.table();
         if self.closing_in(&table) {
             return Reply::Busy;
         }
-        let Some(slot) = table.boxes.get_mut(name) else { return Reply::Idle };
+        let Some(slot) = table.boxes.get_mut(name).filter(|slot| run.is_none_or(|run| slot.run == run)) else { return Reply::Idle };
         if slot.state != State::Running {
             return Reply::Busy;
         }
@@ -577,6 +577,22 @@ impl<'a> Keeper<'a> {
             reply(&mut stream, Reply::Closed(stopped));
         }
         self.done.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Its boxes as a phone's stop names them.
+impl Runs for Keeper<'_> {
+    fn runs(&self) -> Vec<(String, RunId)> {
+        self.table().boxes.iter().filter(|(_, slot)| slot.state == State::Running).map(|(name, slot)| (name.clone(), slot.run)).collect()
+    }
+
+    /// Each box whose run is named is stopped as `stop` stops it, one after another, as long as
+    /// that run is still the box's: one whose run ended while another was put away may have
+    /// started again, with a run nobody named.
+    fn stop(&self, runs: &[RunId]) -> u32 {
+        let named: Vec<(String, RunId)> = self.runs().into_iter().filter(|(_, run)| runs.contains(run)).collect();
+        let stopped = named.iter().filter(|(name, run)| self.stop_box(name, Some(*run)) == Reply::Stopped).count();
+        u32::try_from(stopped).unwrap_or(u32::MAX)
     }
 }
 

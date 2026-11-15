@@ -1,9 +1,11 @@
 //! The hub's listener: TLS 1.3 over TCP, one HTTP/1.1 request per connection, with the limits
 //! `wire` states. A thread serves each connection; there are never more than `CONNECTIONS` of them.
+//! A machine's call for what phones sent it holds its thread while it waits (`super::INBOX_WAIT`).
 
 use std::collections::HashMap;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
+use std::sync::PoisonError;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,16 +13,24 @@ use std::time::{Duration, Instant};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::{Value, json};
 
-use super::table::Caller;
+use super::relay::{self, What};
+use super::table::{Caller, DeviceKeys};
 use super::wire::{self, Kind, Refused};
 use super::{Hub, locked};
 use crate::door::http;
+use crate::requests::answer_bytes;
 use crate::util;
+use halti_core::device::DeviceKey;
+use halti_core::ids::WsName;
 
 /// The longest request head.
 pub const HEAD_MAX: usize = 8 * 1024;
 /// The longest request body.
 pub const BODY_MAX: usize = 4 * 1024;
+/// The longest body of a machine's report of its state.
+pub const STATE_BODY_MAX: usize = 16 * 1024;
+/// The path of a machine's report of its state.
+const STATE_PATH: &str = "/v1/machine/state";
 /// How long a connection has to send its whole request, TLS handshake included.
 pub const REQUEST_WAIT: Duration = Duration::from_secs(10);
 /// How long the reply may take to be written.
@@ -148,9 +158,9 @@ fn connection(hub: &Hub, tcp: TcpStream, tls: Arc<ServerConfig>, request_wait: D
     let Ok(conn) = ServerConnection::new(tls) else { return };
     let mut stream = StreamOwned::new(conn, Timed { tcp, deadline: Instant::now() + request_wait });
     let request: Option<Result<(http::Head, Vec<u8>), Refused>> = {
-        let mut reader = BufReader::new((&mut stream).take((HEAD_MAX + BODY_MAX + 1024) as u64));
+        let mut reader = BufReader::new((&mut stream).take((HEAD_MAX + STATE_BODY_MAX + 1024) as u64));
         match http::read_head(&mut reader) {
-            Ok(Some(head)) if head_len(&head) <= HEAD_MAX && head.parts().is_some() => match http::read_body(&mut reader, &head, BODY_MAX) {
+            Ok(Some(head)) if head_len(&head) <= HEAD_MAX && head.parts().is_some() => match http::read_body(&mut reader, &head, body_max(&head)) {
                 Ok(body) => Some(Ok((head, body))),
                 Err(e) if e.kind() == io::ErrorKind::FileTooLarge => {
                     // What was sent is read first, as far as the limits go: closing with it unread
@@ -176,6 +186,14 @@ fn connection(hub: &Hub, tcp: TcpStream, tls: Arc<ServerConfig>, request_wait: D
     let _ = reply(&mut stream, status, &body);
 }
 
+/// The longest body this request may have: a machine's report may be longer than other calls'.
+fn body_max(head: &http::Head) -> usize {
+    match head.parts() {
+        Some((_, STATE_PATH, _)) => STATE_BODY_MAX,
+        _ => BODY_MAX,
+    }
+}
+
 /// The length of a head as it came, near enough: lines, their breaks and the blank line.
 fn head_len(head: &http::Head) -> usize {
     head.line.len() + 2 + head.headers.iter().map(|(name, value)| name.len() + value.len() + 4).sum::<usize>() + 2
@@ -199,7 +217,22 @@ fn reply(stream: &mut StreamOwned<ServerConnection, Timed>, status: u16, body: &
 }
 
 /// The paths the hub answers, and the method each takes.
-const PATHS: [(&str, &str); 5] = [("POST", "/v1/pair"), ("POST", "/v1/join"), ("GET", "/v1/me"), ("POST", "/v1/renew/nonce"), ("POST", "/v1/renew")];
+const PATHS: [(&str, &str); 14] = [
+    ("POST", "/v1/pair"),
+    ("POST", "/v1/join"),
+    ("GET", "/v1/me"),
+    ("POST", "/v1/renew/nonce"),
+    ("POST", "/v1/renew"),
+    ("GET", "/v1/requests"),
+    ("GET", "/v1/state"),
+    ("POST", "/v1/answer"),
+    ("POST", "/v1/stop"),
+    ("POST", "/v1/hide"),
+    ("POST", STATE_PATH),
+    ("POST", "/v1/machine/request"),
+    ("POST", "/v1/machine/inbox"),
+    ("POST", "/v1/machine/device"),
+];
 
 /// What a request gets: its status and body.
 fn route(hub: &Hub, method: &str, path: &str, authorization: Option<&str>, body: &[u8]) -> Result<(u16, Value), Refused> {
@@ -221,7 +254,31 @@ fn route(hub: &Hub, method: &str, path: &str, authorization: Option<&str>, body:
     match path {
         "/v1/me" => me(hub, &caller, body),
         "/v1/renew/nonce" => nonce(hub, &caller, body),
-        _ => renew(hub, &caller, body),
+        "/v1/renew" => renew(hub, &caller, body),
+        machine if machine.starts_with("/v1/machine/") => {
+            if caller.kind != Kind::Machine {
+                return Err(Refused::WrongKind);
+            }
+            match machine {
+                STATE_PATH => report(hub, &caller, body),
+                "/v1/machine/request" => post_request(hub, &caller, body),
+                "/v1/machine/inbox" => inbox(hub, &caller, body),
+                _ => device_keys(hub, body),
+            }
+        }
+        phone => {
+            if caller.kind != Kind::Device {
+                return Err(Refused::WrongKind);
+            }
+            let scope = hub.with_table(|table, _| table.row(&caller.name).map(|row| row.ws.clone())).ok_or(Refused::Unknown)?;
+            match phone {
+                "/v1/requests" => requests(hub, &scope, body),
+                "/v1/state" => state(hub, &caller, &scope, body),
+                "/v1/answer" => answer(hub, &caller, &scope, body),
+                "/v1/stop" => stop(hub, &caller, &scope, body),
+                _ => hide(hub, &scope, body),
+            }
+        }
     }
 }
 
@@ -252,6 +309,7 @@ fn me(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refused> 
             "renew_from": wire::time(row.renew_from()),
             "renewable_until": wire::time(row.renewable_until()),
             "conflict": row.conflict_since.map(wire::time),
+            "now": wire::time(hub.now()),
         }),
     ))
 }
@@ -277,4 +335,127 @@ fn renew(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refuse
         }
     };
     Ok((200, json!({"expires": wire::time(expires)})))
+}
+
+/// A phone's keys and workspaces, as a machine is told them.
+fn device_json(device: &DeviceKeys) -> Value {
+    json!({
+        "name": device.name,
+        "signing_key": util::hex(&device.signing),
+        "agreement_key": util::hex(&device.agreement),
+        "key_signature": util::hex(&device.binding),
+        "ws": device.ws,
+    })
+}
+
+/// A machine reports its state and the requests it holds: it is told the phones not revoked that
+/// see a workspace it trusts a phone for, and which of its requests the hub lacks.
+fn report(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refused> {
+    let reported = relay::report_body(body)?;
+    let now = hub.now();
+    let (missing, wanted) = {
+        let mut relay = locked(&hub.relay);
+        let missing = relay.report(&caller.name, reported, now);
+        (missing, relay.trusted_ws(&caller.name))
+    };
+    let devices: Vec<Value> = hub.with_table(|table, now| table.devices(now)).iter().filter(|device| device.ws.iter().any(|ws| wanted.contains(ws))).map(device_json).collect();
+    Ok((200, json!({"devices": devices, "missing": missing.iter().map(|id| util::hex(id)).collect::<Vec<_>>()})))
+}
+
+/// A machine posts a request's record.
+fn post_request(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refused> {
+    let (record, bytes) = relay::record_body(body)?;
+    locked(&hub.relay).post(&caller.name, record, bytes, hub.now())?;
+    Ok((200, json!({})))
+}
+
+/// A machine takes what phones sent it, saying first what came of what it took before. With
+/// nothing to take, the call waits until something comes or `inbox_wait` is over.
+fn inbox(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refused> {
+    let done = relay::done_body(body)?;
+    let deadline = Instant::now() + hub.inbox_wait;
+    let mut relay = locked(&hub.relay);
+    let mut items = relay.take(&caller.name, &done, hub.now());
+    while items.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        relay = hub.sent.wait_timeout(relay, left).unwrap_or_else(PoisonError::into_inner).0;
+        if relay.waiting(&caller.name) {
+            items = relay.take(&caller.name, &[], hub.now());
+        }
+    }
+    Ok((200, json!({"items": items.iter().map(relay::item_json).collect::<Vec<_>>()})))
+}
+
+/// A machine asks for a phone's keys and workspaces, to compare at `halti devices trust`.
+fn device_keys(hub: &Hub, body: &[u8]) -> Result<(u16, Value), Refused> {
+    let name = relay::name_body(body)?;
+    let device = hub.with_table(|table, now| table.device(&name, now)).ok_or(Refused::Gone)?;
+    Ok((200, device_json(&device)))
+}
+
+/// A phone lists the requests in its workspaces, from every machine.
+fn requests(hub: &Hub, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refused> {
+    wire::no_body(body)?;
+    let machines: Vec<String> = hub.with_table(|table, now| table.machines(now)).into_iter().map(|(name, _, _)| name).collect();
+    let held = locked(&hub.relay).requests(scope, &machines, hub.now());
+    let listed: Vec<Value> = held.iter().map(|(machine, record)| json!({"machine": machine, "record": util::hex(record)})).collect();
+    Ok((200, json!({"requests": listed})))
+}
+
+/// A phone sees the machines that trust it, as they reported, and what it sent them.
+fn state(hub: &Hub, caller: &Caller, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refused> {
+    wire::no_body(body)?;
+    let machines: HashMap<String, relay::MachineRow> = hub.with_table(|table, now| table.machines(now)).into_iter().map(|(name, key, conflict)| (name, (key, conflict))).collect();
+    let view = locked(&hub.relay).view(&caller.name, scope, &|name| machines.get(name).cloned(), hub.now());
+    Ok((200, view))
+}
+
+/// The signing key of the phone that calls.
+fn caller_key(hub: &Hub, caller: &Caller) -> Result<DeviceKey, Refused> {
+    let device = hub.with_table(|table, now| table.device(&caller.name, now)).ok_or(Refused::Unknown)?;
+    DeviceKey::from_spki(&device.signing).map_err(|_| Refused::Unknown)
+}
+
+/// Whether a machine of this name is paired.
+fn machine_known(hub: &Hub, name: &str) -> bool {
+    hub.with_table(|table, now| table.machines(now)).iter().any(|(machine, _, _)| machine == name)
+}
+
+/// A phone's signed answer to a request it may see. The signature is checked here only so that one
+/// that could never count is refused; the machine checks it again against its own trust list.
+fn answer(hub: &Hub, caller: &Caller, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refused> {
+    let (machine, id, yes, signature) = relay::answer_body(body)?;
+    if !machine_known(hub, &machine) {
+        return Err(Refused::Gone);
+    }
+    let (record, bytes) = locked(&hub.relay).record(&machine, id, scope, hub.now()).ok_or(Refused::Gone)?;
+    caller_key(hub, caller)?.verify(&answer_bytes(&bytes, yes), &signature).map_err(|_| Refused::BadSignature)?;
+    let n = locked(&hub.relay).queue(&machine, &caller.name, What::Answer { ws: record.ws, id, yes, signature }, hub.now())?;
+    hub.sent.notify_all();
+    Ok((202, json!({"n": n})))
+}
+
+/// A phone's signed stop of runs in a workspace it may see.
+fn stop(hub: &Hub, caller: &Caller, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refused> {
+    let relay::Stop { machine, ws, runs, signature } = relay::stop_body(body)?;
+    if !scope.contains(&ws) || !machine_known(hub, &machine) {
+        return Err(Refused::Gone);
+    }
+    caller_key(hub, caller)?.verify(&wire::stop_bytes(&machine, ws.as_str(), &runs), &signature).map_err(|_| Refused::BadSignature)?;
+    let n = locked(&hub.relay).queue(&machine, &caller.name, What::Stop { ws: ws.to_string(), runs, signature }, hub.now())?;
+    hub.sent.notify_all();
+    Ok((202, json!({"n": n})))
+}
+
+/// A phone closes the remote copy of a request, with its token alone.
+fn hide(hub: &Hub, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refused> {
+    let (machine, id) = relay::hide_body(body)?;
+    if !machine_known(hub, &machine) {
+        return Err(Refused::Gone);
+    }
+    locked(&hub.relay).hide(&machine, id, scope, hub.now())?;
+    Ok((200, json!({})))
 }

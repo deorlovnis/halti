@@ -60,7 +60,9 @@ fn start_in(dir: TempDir, limits: Limits, clock: Arc<Hands>) -> Running {
     let pin = pin_of(&key);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
-    let hub = Arc::new(Hub::open(&folder, &address, pin, clock.clone()).unwrap());
+    let mut hub = Hub::open(&folder, &address, pin, clock.clone()).unwrap();
+    hub.inbox_wait = INBOX_WAIT;
+    let hub = Arc::new(hub);
     let admin_socket = crate::keep::bind(&folder.join("admin.sock")).unwrap().unwrap();
     let (for_admin, for_listener) = (hub.clone(), hub.clone());
     thread::spawn(move || admin::serve(for_admin, admin_socket));
@@ -304,7 +306,7 @@ fn a_phone_is_paired_once_the_terminal_says_yes() {
         me,
         json!({
             "kind": "device", "name": "pixel", "ws": ["acme", "beta"], "issued": START, "expires": time(30 * DAY),
-            "renew_from": START, "renewable_until": time(90 * DAY), "conflict": null,
+            "renew_from": START, "renewable_until": time(90 * DAY), "conflict": null, "now": START,
         })
     );
     let row = hub.row("pixel");
@@ -1265,4 +1267,240 @@ fn days_left_count_a_part_of_a_day_whole() {
     assert_eq!(admin::token_text(&hub.row("pixel")), "token: 1 day left");
     hub.at(30 * DAY);
     assert!(matches!(hub.row("pixel").token, TokenState::Renewable { .. }));
+}
+
+// --- what the hub carries between machines and phones ---
+
+/// A request of `machine`'s, in workspace `ws`, good for two minutes by the real clock.
+fn record(machine: &str, ws: &str, id: u8) -> (crate::requests::Record, Vec<u8>) {
+    let record = crate::requests::Record {
+        machine: machine.into(),
+        ws: ws.into(),
+        box_name: "dev".into(),
+        run: crate::requests::RunId([1; 8]),
+        kind: crate::requests::Kind::Write,
+        action: "POST https://api.example.com/v1/x".into(),
+        id: crate::requests::Id([id; 16]),
+        expiry: crate::requests::now_secs() + 120,
+    };
+    let bytes = record.encode().unwrap();
+    (record, bytes)
+}
+
+/// A hub on the real clock, so a request's expiry by this machine's clock means what it says.
+fn start_now() -> Running {
+    let dir = TempDir::new("halti-hub").unwrap();
+    start_in(dir, Limits { request_wait: Duration::from_secs(5), ..Limits::HUB }, Arc::new(Hands(Mutex::new(Timestamp::from_second(Timestamp::now().as_second()).unwrap()))))
+}
+
+fn report(hub: &Running, machine: &Machine, trusted: Value, ids: &[[u8; 16]]) -> (u16, Value) {
+    let body = json!({"link": util::hex(&[5; 16]), "workspaces": [], "trusted": trusted, "requests": ids.iter().map(|id| util::hex(id)).collect::<Vec<_>>()});
+    hub.call("POST", "/v1/machine/state", Some(&machine.token), Some(&body))
+}
+
+#[test]
+fn a_machine_posts_requests_its_phones_list_and_the_hub_holds_fifty() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let other = paired_machine(&hub, "server-2");
+    let pixel = paired_phone(&hub, "pixel");
+    let (_, bytes) = record("server-1", "acme", 1);
+    let post = |token: &str, bytes: &[u8]| hub.call("POST", "/v1/machine/request", Some(token), Some(&json!({"record": util::hex(bytes)})));
+    assert_eq!(post(&server.token, &bytes), (200, json!({})));
+    assert_eq!(post(&server.token, &bytes), (200, json!({})), "one held already is left as it is");
+    // A record that names another machine, or isn't one; a phone's token at a machine's call.
+    assert_eq!(post(&other.token, &bytes), (403, error("other-machine")));
+    assert_eq!(post(&server.token, &bytes[..bytes.len() - 1]), (400, error("malformed")));
+    assert_eq!(post(&pixel.token, &bytes), (403, error("wrong-kind")));
+    // The phone sees it in its workspace, and not one of another workspace.
+    let (_, beta) = record("server-1", "beta", 2);
+    assert_eq!(post(&server.token, &beta).0, 200);
+    let (status, listed) = hub.call("GET", "/v1/requests", Some(&pixel.token), None);
+    assert_eq!((status, listed), (200, json!({"requests": [{"machine": "server-1", "record": util::hex(&bytes)}]})));
+    assert_eq!(hub.call("GET", "/v1/requests", Some(&server.token), None), (403, error("wrong-kind")));
+    // Fifty at most for one machine.
+    for id in 3..51 {
+        assert_eq!(post(&server.token, &record("server-1", "acme", id).1).0, 200, "{id}");
+    }
+    assert_eq!(post(&server.token, &record("server-1", "acme", 51).1), (429, error("full")));
+    // A report drops what the machine no longer holds, and names what the hub lacks.
+    let (status, reply) = report(&hub, &server, json!([]), &[[1; 16], [99; 16]]);
+    assert_eq!((status, &reply["missing"]), (200, &json!([util::hex(&[99; 16])])));
+    assert_eq!(hub.call("GET", "/v1/requests", Some(&pixel.token), None).1["requests"].as_array().unwrap().len(), 1);
+    assert_eq!(post(&server.token, &record("server-1", "acme", 51).1).0, 200, "room again");
+}
+
+#[test]
+fn a_report_gets_the_phones_that_see_its_workspaces_and_a_phone_the_machines_that_trust_it() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    let tablet = Phone::new();
+    let pairing = begin(&hub, device("tablet", &["beta"])).unwrap();
+    assert_eq!(hub.call("POST", "/v1/pair", None, Some(&tablet.pair_body(&pairing.invite, ""))).0, 202);
+    pairing.claimed();
+    assert_eq!(pairing.answer(true), Outcome::Paired);
+    // It trusts pixel for acme: the hub lists the phones that may see acme.
+    let (status, reply) = report(&hub, &server, json!([{"device": "pixel", "ws": ["acme"]}]), &[]);
+    assert_eq!(status, 200);
+    let devices = reply["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0]["name"], "pixel");
+    assert_eq!(devices[0]["signing_key"], util::hex(&pixel.signing_key()));
+    assert_eq!(devices[0]["ws"], json!(["acme"]));
+    // The machine asks for a phone's keys by name; one there isn't is gone.
+    let (status, keys) = hub.call("POST", "/v1/machine/device", Some(&server.token), Some(&json!({"name": "tablet"})));
+    assert_eq!((status, &keys["ws"]), (200, &json!(["beta"])));
+    assert_eq!(hub.call("POST", "/v1/machine/device", Some(&server.token), Some(&json!({"name": "nobody"}))), (410, error("gone")));
+    // pixel sees the machine, its key and the workspace it is trusted for; tablet sees nothing.
+    let (status, state) = hub.call("GET", "/v1/state", Some(&pixel.token), None);
+    assert_eq!(status, 200);
+    assert_eq!((&state["machines"][0]["name"], &state["machines"][0]["ws"], &state["machines"][0]["conflict"]), (&json!("server-1"), &json!(["acme"]), &Value::Null));
+    assert_eq!(state["machines"][0]["key"], util::hex(&server.key.subject_public_key_info()));
+    assert_eq!(hub.call("GET", "/v1/state", Some(&tablet.token), None).1, json!({"machines": [], "sent": []}));
+    // Revoked, the machine is gone from the phone's view.
+    assert!(admin::revoke_at(&hub.socket(), "server-1").unwrap());
+    assert_eq!(hub.call("GET", "/v1/state", Some(&pixel.token), None).1["machines"], json!([]));
+}
+
+#[test]
+fn a_report_may_be_longer_than_other_calls_and_no_longer_than_16_kib() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let names = |n: usize| {
+        (0..n)
+            .map(|i| json!({"name": format!("w{i}"), "open": true, "runs": (0..32).map(|r| json!({"box": format!("b{r}"), "run": util::hex(&[r as u8; 8])})).collect::<Vec<_>>()}))
+            .collect::<Vec<_>>()
+    };
+    let body = |n: usize| json!({"link": util::hex(&[5; 16]), "workspaces": names(n), "trusted": [], "requests": []});
+    assert!((4096..16 * 1024).contains(&body(4).to_string().len()));
+    assert_eq!(hub.call("POST", "/v1/machine/state", Some(&server.token), Some(&body(4))).0, 200);
+    assert!(body(16).to_string().len() > 16 * 1024);
+    assert_eq!(hub.call("POST", "/v1/machine/state", Some(&server.token), Some(&body(16))), (413, error("too-large")));
+    assert_eq!(hub.call("POST", "/v1/machine/request", Some(&server.token), Some(&json!({"record": "00".repeat(2100)}))), (413, error("too-large")));
+}
+
+#[test]
+fn a_machine_s_inbox_waits_for_what_a_phone_sends_and_keeps_it_until_done() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    let (_, bytes) = record("server-1", "acme", 1);
+    assert_eq!(hub.call("POST", "/v1/machine/request", Some(&server.token), Some(&json!({"record": util::hex(&bytes)}))).0, 200);
+    let inbox = |done: Value| hub.call("POST", "/v1/machine/inbox", Some(&server.token), Some(&json!({"done": done})));
+    // Nothing waits: the call ends empty once the hub's wait is over.
+    let started = std::time::Instant::now();
+    assert_eq!(inbox(json!([])), (200, json!({"items": []})));
+    assert!(started.elapsed() >= INBOX_WAIT - Duration::from_millis(50));
+    // A phone's signed answer wakes a call that waits.
+    let waiting = thread::scope(|scope| {
+        let waiting = scope.spawn(|| inbox(json!([])));
+        thread::sleep(Duration::from_millis(100));
+        let signature = pixel.sign(&crate::requests::answer_bytes(&bytes, true));
+        let body = json!({"machine": "server-1", "id": util::hex(&[1; 16]), "decision": "yes", "signature": util::hex(&signature)});
+        assert_eq!(hub.call("POST", "/v1/answer", Some(&pixel.token), Some(&body)), (202, json!({"n": 1})));
+        waiting.join().unwrap()
+    });
+    let item = &waiting.1["items"][0];
+    assert_eq!(
+        (item["n"].as_u64(), item["kind"].as_str(), item["device"].as_str(), item["ws"].as_str(), item["decision"].as_str()),
+        (Some(1), Some("answer"), Some("pixel"), Some("acme"), Some("yes"))
+    );
+    // Taken but not said done, it comes again; said done, it goes, and the phone sees the word.
+    assert_eq!(inbox(json!([])).1["items"].as_array().unwrap().len(), 1);
+    let sent = |phone: &Phone| hub.call("GET", "/v1/state", Some(&phone.token), None).1["sent"].clone();
+    assert_eq!(sent(&pixel)[0]["state"], "taken");
+    assert_eq!(inbox(json!([{"n": 1, "said": "approved"}])).1, json!({"items": []}));
+    assert_eq!(sent(&pixel)[0]["state"], "approved");
+    assert_eq!(inbox(json!([{"n": 1, "said": "Approved!"}])), (400, error("malformed")));
+}
+
+/// How long a machine's call for what phones sent it waits, in these tests.
+const INBOX_WAIT: Duration = Duration::from_millis(500);
+
+// --- the relay alone ---
+
+fn acme() -> Vec<halti_core::ids::WsName> {
+    vec![halti_core::ids::WsName::parse("acme").unwrap()]
+}
+
+#[test]
+fn a_phone_s_call_that_names_no_machine_the_hub_holds_leaves_nothing_held() {
+    let mut relay = relay::Relay::default();
+    let now = Timestamp::now();
+    for i in 0..100 {
+        let name = format!("nobody-{i}");
+        assert_eq!(relay.hide(&name, crate::requests::Id([0; 16]), &acme(), now), Err(wire::Refused::Gone));
+        assert!(relay.record(&name, crate::requests::Id([0; 16]), &acme(), now).is_none());
+    }
+    assert_eq!(relay.mailboxes(), 0);
+}
+
+#[test]
+fn a_request_the_hub_has_no_room_for_is_asked_for_once_it_has() {
+    let mut relay = relay::Relay::default();
+    let now = Timestamp::now();
+    let ids: Vec<[u8; 16]> = (1..=51).map(|id| [id; 16]).collect();
+    for id in 1..=51u8 {
+        let (record, bytes) = record("server-1", "acme", id);
+        assert_eq!(relay.post("server-1", record, bytes, now), if id == 51 { Err(wire::Refused::Full) } else { Ok(()) });
+    }
+    let reported = |ids: &[[u8; 16]]| relay::Reported { link: [5; 16], workspaces: Vec::new(), trusted: Vec::new(), ids: ids.to_vec() };
+    // Full: the one it couldn't take isn't asked for again at every report.
+    for _ in 0..3 {
+        assert_eq!(relay.report("server-1", reported(&ids), now), Vec::<[u8; 16]>::new());
+    }
+    // One answered at the machine makes room: the one that waits is asked for.
+    assert_eq!(relay.report("server-1", reported(&ids[1..]), now), vec![[51; 16]]);
+}
+
+#[test]
+fn a_phone_is_shown_the_last_64_it_sent_each_machine() {
+    let mut relay = relay::Relay::default();
+    let now = Timestamp::now();
+    let stop = || relay::What::Stop { ws: "acme".into(), runs: vec![("dev".into(), crate::requests::RunId([1; 8]))], signature: vec![0x30] };
+    // 64 sent, taken and said done; 64 more that wait.
+    for _ in 0..relay::ITEMS_MAX {
+        relay.queue("server-1", "pixel", stop(), now).unwrap();
+    }
+    let done: Vec<(u64, String)> = relay.take("server-1", &[], now).iter().map(|item| (item.n, "none".to_string())).collect();
+    relay.take("server-1", &done, now);
+    for _ in 0..relay::ITEMS_MAX {
+        relay.queue("server-1", "pixel", stop(), now).unwrap();
+    }
+    let view = relay.view("pixel", &acme(), &|_| Some((Vec::new(), None)), now);
+    let sent: Vec<u64> = view["sent"].as_array().unwrap().iter().map(|sent| sent["n"].as_u64().unwrap()).collect();
+    assert_eq!(sent, (65..=128).collect::<Vec<u64>>());
+}
+
+#[test]
+fn what_a_phone_sent_stays_listed_with_the_machine_s_word_whatever_other_phones_send() {
+    let mut relay = relay::Relay::default();
+    let now = Timestamp::now();
+    let stop = || relay::What::Stop { ws: "acme".into(), runs: vec![("dev".into(), crate::requests::RunId([1; 8]))], signature: vec![0x30] };
+    // pixel's stop is taken and said stopped; its run leaves the machine's report.
+    let n = relay.queue("server-1", "pixel", stop(), now).unwrap();
+    relay.take("server-1", &[], now);
+    relay.take("server-1", &[(n, "stopped".to_string())], now);
+    let reported = relay::Reported { link: [5; 16], workspaces: Vec::new(), trusted: Vec::new(), ids: Vec::new() };
+    relay.report("server-1", reported, now);
+    // Then another phone sends that machine more than the hub keeps for one phone, all said done.
+    for _ in 0..3 {
+        for _ in 0..relay::ITEMS_MAX {
+            relay.queue("server-1", "tablet", stop(), now).unwrap();
+        }
+        let done: Vec<(u64, String)> = relay.take("server-1", &[], now).iter().map(|item| (item.n, "none".to_string())).collect();
+        relay.take("server-1", &done, now);
+    }
+    let view = relay.view("pixel", &acme(), &|_| Some((Vec::new(), None)), now);
+    let sent: Vec<(u64, &str)> = view["sent"].as_array().unwrap().iter().map(|sent| (sent["n"].as_u64().unwrap(), sent["state"].as_str().unwrap())).collect();
+    assert_eq!(sent, [(n, "stopped")]);
+    // The other phone sees its own last 64, and the hub keeps no more of its than that.
+    let view = relay.view("tablet", &acme(), &|_| Some((Vec::new(), None)), now);
+    assert_eq!(view["sent"].as_array().unwrap().len(), 64);
+    assert_eq!(relay.kept("server-1"), 1 + 64);
+    // An hour after it was sent, it goes.
+    let later = now + jiff::SignedDuration::from_hours(1);
+    let view = relay.view("pixel", &acme(), &|_| Some((Vec::new(), None)), later);
+    assert_eq!(view["sent"], json!([]));
 }

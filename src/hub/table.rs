@@ -193,6 +193,17 @@ pub struct Listed {
     pub push_changed: Option<Timestamp>,
 }
 
+/// A paired phone's public keys and workspaces, as a machine is told them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceKeys {
+    pub name: String,
+    pub signing: Vec<u8>,
+    pub agreement: Vec<u8>,
+    /// The signing key's signature over the agreement key.
+    pub binding: Vec<u8>,
+    pub ws: Vec<WsName>,
+}
+
 /// Where a token is in its life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
@@ -523,6 +534,34 @@ impl Table {
             return Err(Refused::Malformed);
         }
         Ok(self.replace_token(&caller.name, hash, now))
+    }
+
+    /// The phone of this name: its keys and workspaces. A phone whose token has expired is still
+    /// one, until its row is deleted.
+    pub fn device(&mut self, name: &str, now: Timestamp) -> Option<DeviceKeys> {
+        self.purge(now);
+        let row = self.rows.get(name)?;
+        let Keys::Device { signing, agreement, binding } = &row.keys else { return None };
+        Some(DeviceKeys { name: row.name.clone(), signing: signing.clone(), agreement: agreement.clone(), binding: binding.clone(), ws: row.ws.clone() })
+    }
+
+    /// Every phone, as `device` gives it.
+    pub fn devices(&mut self, now: Timestamp) -> Vec<DeviceKeys> {
+        self.purge(now);
+        let names: Vec<String> = self.rows.values().filter(|row| row.kind() == Kind::Device).map(|row| row.name.clone()).collect();
+        names.iter().filter_map(|name| self.device(name, now)).collect()
+    }
+
+    /// Every machine: its name, its key, and since when it is marked `token conflict`.
+    pub fn machines(&mut self, now: Timestamp) -> Vec<(String, Vec<u8>, Option<Timestamp>)> {
+        self.purge(now);
+        self.rows
+            .values()
+            .filter_map(|row| match &row.keys {
+                Keys::Machine { key } => Some((row.name.clone(), key.clone(), row.conflict_since)),
+                Keys::Device { .. } => None,
+            })
+            .collect()
     }
 
     /// Every row, as `halti devices` shows it.

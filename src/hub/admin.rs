@@ -144,6 +144,10 @@ fn session(hub: &Hub, mut stream: UnixStream) {
         }
         Some(Request::Revoke(name)) => {
             let (found, written) = hub.with_table_written(|table, _| table.revoke(&name));
+            if found {
+                locked(&hub.relay).forget(&name);
+                hub.sent.notify_all();
+            }
             let word = match (found, written) {
                 (false, _) => "unknown",
                 (true, true) => "revoked",
@@ -393,9 +397,22 @@ pub fn token_text(row: &Listed) -> String {
     }
 }
 
-/// `halti devices`: every phone and machine paired with the hub.
+/// `halti devices`: every phone and machine paired with the hub running here, and the phones this
+/// machine trusts. Either may be missing; not both.
 pub fn devices() -> Result<()> {
-    let rows = list_at(&socket())?;
+    let trusted = crate::link::trusted_lines();
+    let rows = match list_at(&socket()) {
+        Ok(rows) => rows,
+        Err(_) if !trusted.is_empty() => {
+            say_trusted(&trusted);
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    if !trusted.is_empty() {
+        say_trusted(&trusted);
+        util::say("");
+    }
     if rows.is_empty() {
         util::say("nothing is paired (halti pair --name NAME --ws WS, or halti pair --machine NAME)");
         return Ok(());
@@ -409,6 +426,14 @@ pub fn devices() -> Result<()> {
         util::say(&format!("{:<20} {:<8} {ws:<24} {fingerprint:<25} {:<36} {seen:<17} {push}", row.name, row.kind.word(), token_text(row)));
     }
     Ok(())
+}
+
+/// The phones this machine trusts, as `halti devices` lists them.
+fn say_trusted(lines: &[String]) {
+    util::say(&format!("{:<20} {:<24} FINGERPRINT", "TRUSTED HERE", "WORKSPACES"));
+    for line in lines {
+        util::say(line);
+    }
 }
 
 /// Revokes the row at the hub at `socket`; whether there was one. A revoke the hub could not write

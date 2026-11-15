@@ -1,6 +1,7 @@
 //! What crosses the hub's listener: everything a phone app or a machine needs to talk to
 //! `halti hub serve`, written so that a client can be built from this text alone. Each signed byte
-//! string has a known answer in this file's tests.
+//! string has a known answer in this file's tests, but a request's record and the answer to it,
+//! whose are in `crate::requests`'s.
 //!
 //! # Transport
 //!
@@ -18,12 +19,12 @@
 //!   `Content-Type: application/json`, `Cache-Control: no-store` and a `Content-Length`, and the hub
 //!   closes the connection after it.
 //! - The whole request, head and body, must arrive within 10 seconds of the connection. The head
-//!   (request line and headers) may be at most 8 KiB, the body at most 4 KiB, sent with
-//!   `Content-Length` (chunked is read too, within the same limit). A request that is slower, a
-//!   head that is longer or malformed, and a TLS handshake that fails get no reply: the connection
-//!   is closed. A head is malformed when its request line isn't exactly `METHOD TARGET
-//!   HTTP/VERSION`, one space between each, or a header line has no `:` or a name that isn't an
-//!   HTTP token. A body over 4 KiB is answered `413 too-large`.
+//!   (request line and headers) may be at most 8 KiB, the body at most 4 KiB (16 KiB for
+//!   `POST /v1/machine/state`), sent with `Content-Length` (chunked is read too, within the same
+//!   limit). A request that is slower, a head that is longer or malformed, and a TLS handshake that
+//!   fails get no reply: the connection is closed. A head is malformed when its request line isn't
+//!   exactly `METHOD TARGET HTTP/VERSION`, one space between each, or a header line has no `:` or a
+//!   name that isn't an HTTP token. A body over its limit is answered `413 too-large`.
 //! - At most 64 connections at once, and 8 from one address: an IPv4 address, or for IPv6 the first
 //!   64 bits of the address. An IPv4 address that reaches the hub as IPv6 (`::ffff:a.b.c.d`) counts
 //!   as itself. One more is closed as soon as it is accepted, before TLS.
@@ -50,6 +51,13 @@
 //! - **A fingerprint** is the SHA-256 of a signing key's 91 bytes. People compare its first 10
 //!   bytes, shown as 5 groups of 4 lowercase hex characters with a space between:
 //!   `5a7a 78cc a4a0 f420 d9bc`.
+//! - **A request id** is 16 bytes a machine drew; **a run id** is 8 bytes a machine drew as a box
+//!   started. In JSON both are hex, as all bytes are.
+//! - **A machine code** is what people compare when a machine trusts a phone: the first 10 bytes of
+//!   the SHA-256 of the fields `halti-machine-code-v1`, the machine's name, the machine's key (91),
+//!   then each workspace the phone is trusted for there, sorted by their bytes, each once; shown as a
+//!   fingerprint is. Example: machine `server-1`, the key in this file's tests, workspaces `beta`
+//!   and `acme`: `0813 369a 1400 9098 7602`.
 //! - **A token** is the client's own: 32 bytes from a secure random source, written as lowercase hex
 //!   behind a prefix, `halti_dev_` for a phone and `halti_mach_` for a machine, so 74 or 75 ASCII
 //!   characters. It travels only in the header `Authorization: Bearer TOKEN`, never in a URL or a
@@ -115,7 +123,8 @@
 //!
 //! ```json
 //! {"kind": "device", "name": "pixel", "ws": ["acme", "beta"], "issued": "<time>",
-//!  "expires": "<time>", "renew_from": "<time>", "renewable_until": "<time>", "conflict": null}
+//!  "expires": "<time>", "renew_from": "<time>", "renewable_until": "<time>", "conflict": null,
+//!  "now": "<time>"}
 //! ```
 //!
 //! For a machine, `kind` is `machine`, `ws` is empty, and `conflict` is the time the hub marked
@@ -155,6 +164,185 @@
 //!   `409 conflict`. Only `halti revoke` on the hub clears the mark; until then a pairing of the
 //!   name is refused at the hub's terminal.
 //!
+//! `now` in `GET /v1/me` is the hub's clock as it answered. A client that counts a token's days
+//! compares the other times with it, never with its own clock.
+//!
+//! # A request's record
+//!
+//! A machine asks about a write as a **request**: one fixed byte string, its **record**, a run of
+//! fields as above, in this order and nothing else:
+//!
+//! | Field | Bytes |
+//! |---|---|
+//! | label | `halti-approval-v1` |
+//! | machine | the machine's name at the hub |
+//! | ws | the workspace's name |
+//! | box | the box's name, a name as a device's is |
+//! | run | the run id (8) |
+//! | kind | `write`, the only kind yet |
+//! | action | the method, a space and the URL, sensitive query values masked: 1 to 1,024 bytes of printable ASCII (0x20 to 0x7e), every other byte percent-encoded by the machine; it ends ` (cut)` where it was cut |
+//! | id | the request id (16) |
+//! | expiry | seconds since 1970 by the machine's clock, 8 bytes big-endian |
+//!
+//! A client reads a record whole or not at all: a field missing, of the wrong length or form, or a
+//! byte after the last, and it is not shown. It shows machine, workspace and box first, then the
+//! action, and never anything the record doesn't hold.
+//!
+//! # What a phone does
+//!
+//! Every call below takes a phone's token; a machine's gets `403 wrong-kind`. The hub shows a phone
+//! only what concerns its workspaces, the ones named at `halti pair`: a request, a run or a
+//! workspace outside them is never listed, and a call that names one gets `410 gone`.
+//!
+//! The app polls while it is open: `GET /v1/requests` and `GET /v1/state` every 3 seconds while a
+//! screen shows them, never more often than once a second; nothing while it is closed.
+//!
+//! **Requests.** `GET /v1/requests`, no body: `200 {"requests": [{"machine": "server-1",
+//! "record": "<bytes>"}]}`, every request that waits in the phone's workspaces, from every machine,
+//! in the order of the machines' names, then of the ids. A request leaves the list once its machine
+//! answered it, withdrew it or let it expire, and a minute after its expiry by the hub's clock at
+//! the latest.
+//!
+//! **Answering one.** The app shows the record, asks for fingerprint or PIN, and signs with the
+//! signing key the record's bytes followed by one more field, `yes` or `no`: for a record `R`, the
+//! bytes `R 0003 796573` to approve and `R 0002 6e6f` to deny. SHA-256 of those bytes is what the
+//! machine itself names an answer by. It signs only bytes it rebuilt from the record it displayed,
+//! never a hash it was handed. Then `POST /v1/answer`, body
+//! `{"machine": "server-1", "id": "<16 bytes>", "decision": "yes", "signature": "<DER>"}` (or
+//! `"no"`): `202 {"n": 7}`, the number of what it sent, for `GET /v1/state`. The hub checks the
+//! signature against the phone's key and refuses one that can't count (`403 bad-signature`), then
+//! holds it for the machine. A request the hub doesn't hold, or holds hidden, is `410 gone`. Only
+//! the machine decides: it checks the signature again, against the keys it was told to trust for
+//! that workspace (`halti devices trust`), and over its own record of that id, which must still
+//! wait. The first answer that counts wins, the machine's own or a phone's; any later one is `gone`
+//! there. A signed `no` is a refusal like one at the machine.
+//!
+//! **Hiding one.** `POST /v1/hide`, body `{"machine": "server-1", "id": "<16 bytes>"}`, nothing
+//! signed: `200 {}`. It closes the remote copy for every phone and nothing else: the machine still
+//! waits, and is answered there or expires. Any phone that may see the request can do it.
+//!
+//! **Stopping runs.** The app signs, after fingerprint or PIN, these fields, in this order and
+//! nothing else:
+//!
+//! | Field | Bytes |
+//! |---|---|
+//! | label | `halti-stop-v1` |
+//! | machine | the machine's name at the hub |
+//! | ws | the workspace's name |
+//! | box | the first run's box, a name as a device's is, as `GET /v1/state` listed it with that run |
+//! | run | the first run's id (8) |
+//!
+//! then a box and a run for each further run, in the order sent: 1 to 32 runs, so 5 to 67 fields.
+//! The app signs only runs it showed, each with the box it showed it under. Then `POST /v1/stop`,
+//! body `{"machine": "server-1", "ws": "acme", "runs": [{"box": "dev", "run": "<8 bytes>"}, ...],
+//! "signature": "<DER>"}`, the same runs and boxes in the same order: `202 {"n": 8}`. The machine
+//! stops each of those runs it has under the box named with it. It doesn't stop one it has under
+//! another box, and says so (`wrong-box` below); one it doesn't have it passes over, so a stop sent
+//! again stops nothing new. "Stop all" is one stop for each workspace the machine shows, naming
+//! every run it shows there.
+//!
+//! **Confirming a stop.** A stop is `sent, not confirmed` until its entry in `sent` of
+//! `GET /v1/state` (below), found by its `n`, holds the machine's word: that entry is the only
+//! confirmation. A run the machine stopped leaves its `runs` as soon as the run ends, in the
+//! machine's next report, which may reach the hub before the word or after it; and a run that ends
+//! by itself leaves the same way. So the app never takes a run no longer listed as a stop
+//! confirmed, nor a run still listed as one refused. The entry stays after the run is gone, for as
+//! long as `sent` says.
+//!
+//! **State.** `GET /v1/state`, no body: `200`
+//!
+//! ```json
+//! {"machines": [{"name": "server-1", "key": "<91 bytes>", "ws": ["acme"], "conflict": null,
+//!                "reported": "<time>", "since": "<time>",
+//!                "workspaces": [{"name": "acme", "open": true,
+//!                                "runs": [{"box": "dev", "run": "<8 bytes>"}]}]}],
+//!  "sent": [{"n": 7, "kind": "answer", "machine": "server-1", "ws": "acme", "id": "<16 bytes>",
+//!            "state": "approved", "at": "<time>"},
+//!           {"n": 8, "kind": "stop", "machine": "server-1", "ws": "acme",
+//!            "runs": [{"box": "dev", "run": "<8 bytes>"}], "state": "stopped", "at": "<time>"}]}
+//! ```
+//!
+//! - `machines`: each machine whose last report says it trusts this phone, for workspaces of the
+//!   phone's. `key` is the machine's key from its join; `ws` the workspaces it trusts the phone
+//!   for. The app computes the machine code from `name`, `key` and `ws` for its Machines screen, and
+//!   lists the machine as waiting to be compared until the person there taps "same". A machine that
+//!   is no longer listed was revoked or hasn't reported since the hub started: the app keeps what it
+//!   compared, and shows it as not reporting. `conflict` is the time the hub marked its token as
+//!   used from two places, or null. `reported` is the hub's time of its last report; one older than
+//!   a minute is not reporting. `since` changes when the machine's link starts again: a restart.
+//!   `workspaces` are those of `ws` it reports, open or closed, each with the runs of its boxes.
+//! - `sent`: what this phone sent each machine in the last hour by the hub's clock, the last 64 for
+//!   each machine, by `n`. What other phones send never pushes an entry out; a hub restart forgets
+//!   them all, and a stop then not confirmed may be sent again. `state` is `queued` (the machine
+//!   hasn't taken it), `taken` (it has, and said nothing yet), or the machine's word: for an answer
+//!   `approved`, `denied`, `gone` (no such request waits there: it was answered, expired, or
+//!   withdrawn) or `refused` (not signed by a device trusted there for that workspace, over that
+//!   request); for a stop `stopped` (it stopped at least one of the runs named, and named every one
+//!   that runs there with its box), `none` (no run named runs there), `wrong-box` (at least one run
+//!   named runs there under another box: none of those was stopped, and each of the others that
+//!   runs there under the box named with it was), or `refused` (not signed by a device trusted
+//!   there for that workspace, over those fields); for either `unreached` (that workspace isn't
+//!   open there), `malformed` or `unknown`.
+//!   The hub can lie about all of it; the machine's own word reaches the phone only through it.
+//!
+//! # What a machine does
+//!
+//! A machine's link holds its token; every call below takes it, and a phone's gets
+//! `403 wrong-kind`. The hub takes the machine's name from its token row.
+//!
+//! **Reporting.** `POST /v1/machine/state`, at most 16 KiB, when what it reports changed and at
+//! least every 20 seconds:
+//!
+//! ```json
+//! {"link": "<16 bytes>", "workspaces": [{"name": "acme", "open": true,
+//!                                        "runs": [{"box": "dev", "run": "<8 bytes>"}]}],
+//!  "trusted": [{"device": "pixel", "ws": ["acme"]}], "requests": ["<16 bytes>", ...]}
+//! ```
+//!
+//! `link` is drawn as the link starts. `workspaces` are those a trusted phone may see, at most 64,
+//! each with at most 32 runs; `trusted` the phones it trusts, at most 64; `requests` the ids of every
+//! request that waits in those workspaces, at most 256. A machine with more reports that many and
+//! answers the rest itself. `200 {"devices": [...], "missing": ["<16 bytes>", ...]}`. The hub drops
+//! each request of this machine's that isn't listed, and `missing` names those listed that it
+//! doesn't hold, as many as it has room for (50 in all): the link posts each of them. `devices`
+//! lists every phone not revoked whose workspaces meet those in `trusted`, as
+//! `POST /v1/machine/device` gives one. The link drops its trust in every phone that isn't on that
+//! list with the same keys; a list it can't read whole changes nothing. A phone whose token expired
+//! stays on it.
+//!
+//! **Posting a request.** `POST /v1/machine/request`, body `{"record": "<bytes>"}`: `200 {}`, also
+//! for one held already. A record that names another machine is `403 other-machine`; one past its
+//! expiry by more than a minute of the hub's clock is `410 gone`; one more than the hub holds for a
+//! machine, 50, is `429 full`.
+//!
+//! **Taking what phones sent.** `POST /v1/machine/inbox`, body `{"done": [{"n": 7, "said":
+//! "approved"}, ...]}`, at most 64, each word 1 to 16 of a-z and `-`: what came of what it took
+//! before. Those leave the hub's queue. Then the call waits until something is queued for this
+//! machine, at most 25 seconds, and answers `200 {"items": [...]}`, every item still queued,
+//! those taken before and not said done included, oldest first:
+//!
+//! ```json
+//! {"n": 7, "kind": "answer", "device": "pixel", "ws": "acme", "id": "<16 bytes>",
+//!  "decision": "yes", "signature": "<DER>"}
+//! {"n": 8, "kind": "stop", "device": "pixel", "ws": "acme",
+//!  "runs": [{"box": "dev", "run": "<8 bytes>"}], "signature": "<DER>"}
+//! ```
+//!
+//! The link calls again at once; when the hub can't be reached it waits, longer each time, up to a
+//! minute. An item of a kind it doesn't know is said `unknown` and nothing is done with it. At most
+//! 64 items wait for one machine; one more is `429 full` to the phone that sent it.
+//!
+//! **A phone's keys.** `POST /v1/machine/device`, body `{"name": "pixel"}`: `200 {"name": "pixel",
+//! "signing_key": "<91 bytes>", "agreement_key": "<91 bytes>", "key_signature": "<DER>", "ws":
+//! ["acme"]}`, or `410 gone`. `halti devices trust` shows the signing key's fingerprint to compare
+//! with the phone, and checks `key_signature`.
+//!
+//! **Its token.** From day 10 the link draws a new token, writes it down, then renews. If no reply
+//! comes, it calls `GET /v1/me` with the new token before anything else, and sends nothing with
+//! the old token until that call is answered: `200` means the renewal was made, `401 unknown` that
+//! it wasn't, and the old token is used again. A call that gets no reply is tried again, with the
+//! new token, since the hub may have seen it: the old token stops once the new one is first used.
+//!
 //! # Errors
 //!
 //! Every refusal is a status and the body `{"error": "<word>"}`; an expired phone token's also has
@@ -169,7 +357,8 @@
 //! | 401 | `expired` | Past day 30, for a call it no longer admits |
 //! | 401 | `replaced` | A phone's replaced token, sent to a renewal call |
 //! | 401 | `conflict` | A machine's replaced token (see Token conflict) |
-//! | 403 | `wrong-kind` | A machine's token at `/v1/renew/nonce`, which is a phone's |
+//! | 403 | `wrong-kind` | A machine's token at a phone's call (`/v1/renew/nonce` and those of "What a phone does"), or a phone's at a machine's |
+//! | 403 | `other-machine` | A machine's record that names another machine |
 //! | 403 | `bad-code` | The pairing code is unknown, used, past its 2 minutes, or of the other kind |
 //! | 403 | `bad-signature` | A signature does not verify |
 //! | 403 | `bad-nonce` | The nonce is unknown, used or past its 2 minutes |
@@ -177,10 +366,13 @@
 //! | 404 | `not-found` | No such path |
 //! | 405 | `method` | The path takes another method |
 //! | 409 | `conflict` | A renewal of a machine whose row is marked |
-//! | 413 | `too-large` | A body over 4 KiB |
+//! | 410 | `gone` | The request, machine or phone a call names isn't held: answered, withdrawn, expired, hidden, revoked, never there, or outside the phone's workspaces |
+//! | 413 | `too-large` | A body over its limit |
+//! | 429 | `full` | One request, or one answer or stop, more than the hub holds for that machine |
 //! | 503 | `unavailable` | A renewal the hub could not write down: nothing changed, and the token sent still works. Try again later |
 //!
-//! A client shows these words, never a body as text.
+//! Every word is 1 to 16 of a-z and `-`. A client shows these words, never a body as text, and
+//! shows nothing it got in place of a word that isn't one.
 
 use std::fmt;
 
@@ -190,6 +382,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::fields;
+use crate::requests::RunId;
 use crate::util::{self, hex};
 
 /// What the signing key signs to vouch for the agreement key.
@@ -198,6 +391,10 @@ pub const KEYS_LABEL: &str = "halti-device-keys-v1";
 pub const PAIR_LABEL: &str = "halti-pair-v1";
 /// What a phone signs to renew its token.
 pub const RENEW_LABEL: &str = "halti-renew-v1";
+/// What a phone signs to stop runs.
+pub const STOP_LABEL: &str = "halti-stop-v1";
+/// What a machine code is a hash of.
+pub const MACHINE_CODE_LABEL: &str = "halti-machine-code-v1";
 
 /// The first part of a pairing string.
 const INVITE: &str = "halti-pair/1";
@@ -265,6 +462,32 @@ pub struct PairRequest {
 /// What a phone signs to pair with the hub whose pin is `pin`.
 pub fn pair_bytes(pin: &[u8; 32], request: &PairRequest) -> Vec<u8> {
     fields::join(&[PAIR_LABEL.as_bytes(), pin, &request.code, &request.signing_key, &request.agreement_key, &request.key_signature, &request.token_hash, request.push.as_bytes()])
+}
+
+/// What a phone signs to stop runs of a workspace on a machine: the label, the machine, the
+/// workspace, then for each run the name of the box it was shown under and its 8 bytes, each a field
+/// of its own.
+pub fn stop_bytes(machine: &str, ws: &str, runs: &[(String, RunId)]) -> Vec<u8> {
+    let mut bytes = fields::join(&[STOP_LABEL.as_bytes(), machine.as_bytes(), ws.as_bytes()]);
+    for (box_name, run) in runs {
+        fields::push(&mut bytes, box_name.as_bytes());
+        fields::push(&mut bytes, &run.0);
+    }
+    bytes
+}
+
+/// The machine code people compare at `halti devices trust`: the first 10 bytes of the SHA-256 of
+/// the label, the machine's name, its key, then each workspace the device is trusted for there,
+/// in byte order, each once.
+pub fn machine_code(machine: &str, key: &[u8], ws: &[String]) -> String {
+    let mut ws: Vec<&str> = ws.iter().map(String::as_str).collect();
+    ws.sort_unstable();
+    ws.dedup();
+    let mut bytes = fields::join(&[MACHINE_CODE_LABEL.as_bytes(), machine.as_bytes(), key]);
+    for name in ws {
+        fields::push(&mut bytes, name.as_bytes());
+    }
+    groups(&Sha256::digest(&bytes)[..10])
 }
 
 /// What a phone signs to renew its token.
@@ -379,11 +602,11 @@ pub fn no_body(body: &[u8]) -> Result<(), Refused> {
     if body.is_empty() { Ok(()) } else { Err(Refused::Malformed) }
 }
 
-fn json<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, Refused> {
+pub(super) fn json<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, Refused> {
     serde_json::from_slice(body).map_err(|_| Refused::Malformed)
 }
 
-fn bytes<const N: usize>(text: &str) -> Result<[u8; N], Refused> {
+pub(super) fn bytes<const N: usize>(text: &str) -> Result<[u8; N], Refused> {
     unhex(text).ok_or(Refused::Malformed)
 }
 
@@ -391,7 +614,7 @@ fn key(text: &str) -> Result<Vec<u8>, Refused> {
     util::unhex(text).filter(|key| key.len() == KEY_LEN).ok_or(Refused::Malformed)
 }
 
-fn signature(text: &str) -> Result<Vec<u8>, Refused> {
+pub(super) fn signature(text: &str) -> Result<Vec<u8>, Refused> {
     util::unhex(text).filter(|sig| !sig.is_empty() && sig.len() <= device::SIGNATURE_MAX).ok_or(Refused::Malformed)
 }
 
@@ -415,6 +638,12 @@ pub fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
     util::unhex(text)?.try_into().ok()
 }
 
+/// Whether `text` is a word as the wire's replies and a machine's `said` give them: 1 to 16 of a-z
+/// and `-`. A client shows only such words from a hub.
+pub fn is_word(text: &str) -> bool {
+    (1..=16).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+}
+
 /// A device's or a machine's name: 1 to 32 of a-z, 0-9, `-` and `_`, starting with a letter or a
 /// digit (`fields::is_name`). Never echoed when refused.
 pub fn check_name(name: &str) -> Result<(), Refused> {
@@ -426,8 +655,12 @@ pub fn check_name(name: &str) -> Result<(), Refused> {
 
 /// The fingerprint people compare: the first 10 bytes of the key's SHA-256, as five groups of four.
 pub fn fingerprint(signing_key: &[u8]) -> String {
-    let digest = device::fingerprint(signing_key);
-    hex(&digest[..10]).as_bytes().chunks(4).map(|group| String::from_utf8_lossy(group).into_owned()).collect::<Vec<_>>().join(" ")
+    groups(&device::fingerprint(signing_key)[..10])
+}
+
+/// Bytes as lowercase hex in groups of four characters with a space between.
+fn groups(bytes: &[u8]) -> String {
+    hex(bytes).as_bytes().chunks(4).map(|group| String::from_utf8_lossy(group).into_owned()).collect::<Vec<_>>().join(" ")
 }
 
 /// What `halti pair` shows: where the hub is, its pin, and a code good once.
@@ -495,6 +728,13 @@ pub enum Refused {
     TooLarge,
     /// A renewal the hub could not write down, and so undid.
     Unwritten,
+    /// The request, machine or device a call names isn't held: answered, withdrawn, expired,
+    /// hidden, revoked, never there, or outside the caller's workspaces.
+    Gone,
+    /// A machine's record that names another machine.
+    OtherMachine,
+    /// As many as the hub holds of that kind for that machine.
+    Full,
 }
 
 impl Refused {
@@ -502,11 +742,13 @@ impl Refused {
         match self {
             Refused::Malformed => 400,
             Refused::NoToken | Refused::Unknown | Refused::Pending | Refused::Expired(_) | Refused::Replaced | Refused::Conflict => 401,
-            Refused::WrongKind | Refused::BadCode | Refused::BadSignature | Refused::BadNonce | Refused::TooEarly => 403,
+            Refused::WrongKind | Refused::BadCode | Refused::BadSignature | Refused::BadNonce | Refused::TooEarly | Refused::OtherMachine => 403,
             Refused::NotFound => 404,
             Refused::Method => 405,
             Refused::Marked => 409,
+            Refused::Gone => 410,
             Refused::TooLarge => 413,
+            Refused::Full => 429,
             Refused::Unwritten => 503,
         }
     }
@@ -529,6 +771,9 @@ impl Refused {
             Refused::Method => "method",
             Refused::TooLarge => "too-large",
             Refused::Unwritten => "unavailable",
+            Refused::Gone => "gone",
+            Refused::OtherMachine => "other-machine",
+            Refused::Full => "full",
         }
     }
 
@@ -610,8 +855,61 @@ mod tests {
     const RENEW_SIGNATURE: &str = "30460221009183ec133831d9bc303cc119e4324a3b2ad8ed43783ae159e9f3f4fea42c4d9c022100ed50f38b17b6000eec135be7c8e51b15a5d1c384b69006f6\
         415a59db25171210";
 
+    // A second key and its known answers, made the same way: a stop, and a machine code.
+    const OPENSSL_KEY: &str = "3059301306072a8648ce3d020106082a8648ce3d03010703420004ad474f6ad6407053a2fdb194da78b401e1c5768d31d9db888c3996aeeecc3747d9\
+        4a1ea3f9aa90bc2e5cdec1617c9a4738cf570e9c62843d0fe5ce95a75e198d";
+    const STOP_BYTES: &str = "000d68616c74692d73746f702d763100056d61632d31000461636d65000364657600080102030405060708000377656200081112131415161718";
+    const STOP_SHA256: &str = "63205eeef68b4432afcf5f1a58566a5fe4221b3021cd4b4722a60e01dfabf40e";
+    const STOP_SIGNATURE: &str = "3046022100eb21a20a20400be8e43b514218b4d39811d52e7209e79836d380ff9d9d6539910221008413713fb277e89f631e0767e1019bafacea1eebaf01a443\
+        8933390dc01f8c1e";
+    const MACHINE_CODE: &str = "0813 369a 1400 9098 7602";
+    const OPENSSL_FINGERPRINT: &str = "ca72 9ca9 e915 a0f0 5614";
+
     fn bytes(text: &str) -> Vec<u8> {
         util::unhex(text).unwrap()
+    }
+
+    /// Two runs and the boxes they were shown under: dev's 01 to 08, web's 11 to 18.
+    fn runs() -> [(String, RunId); 2] {
+        [("dev".into(), RunId([1, 2, 3, 4, 5, 6, 7, 8])), ("web".into(), RunId([0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]))]
+    }
+
+    #[test]
+    fn a_stop_is_signed_over_the_machine_the_workspace_and_each_run_with_its_box() {
+        assert_eq!(hex(&stop_bytes("mac-1", "acme", &runs())), STOP_BYTES);
+        assert_eq!(hex(&Sha256::digest(bytes(STOP_BYTES))), STOP_SHA256);
+        let key = DeviceKey::from_spki(&bytes(OPENSSL_KEY)).unwrap();
+        assert_eq!(key.verify(&stop_bytes("mac-1", "acme", &runs()), &bytes(STOP_SIGNATURE)), Ok(()));
+        // Another machine, workspace, run, order, or box named with a run is another stop.
+        let [first, second] = runs();
+        let swapped = [(second.0.clone(), first.1), (first.0.clone(), second.1)];
+        for other in [
+            stop_bytes("mac-2", "acme", &runs()),
+            stop_bytes("mac-1", "beta", &runs()),
+            stop_bytes("mac-1", "acme", std::slice::from_ref(&first)),
+            stop_bytes("mac-1", "acme", &[second, first]),
+            stop_bytes("mac-1", "acme", &swapped),
+        ] {
+            assert!(key.verify(&other, &bytes(STOP_SIGNATURE)).is_err());
+        }
+    }
+
+    #[test]
+    fn a_machine_code_covers_the_name_the_key_and_the_workspaces_in_order() {
+        let key = bytes(OPENSSL_KEY);
+        assert_eq!(fingerprint(&key), OPENSSL_FINGERPRINT);
+        assert_eq!(machine_code("server-1", &key, &["acme".into(), "beta".into()]), MACHINE_CODE);
+        // The order they were named in, and a name twice, change nothing.
+        assert_eq!(machine_code("server-1", &key, &["beta".into(), "acme".into(), "beta".into()]), MACHINE_CODE);
+        // Another name, key or set of workspaces is another code.
+        let other_key = bytes(SIGNING_KEY);
+        for other in [
+            machine_code("server-2", &key, &["acme".into(), "beta".into()]),
+            machine_code("server-1", &other_key, &["acme".into(), "beta".into()]),
+            machine_code("server-1", &key, &["acme".into()]),
+        ] {
+            assert_ne!(other, MACHINE_CODE);
+        }
     }
 
     fn request() -> PairRequest {
@@ -773,6 +1071,9 @@ mod tests {
             (Refused::Marked, 409, "conflict"),
             (Refused::TooLarge, 413, "too-large"),
             (Refused::Unwritten, 503, "unavailable"),
+            (Refused::Gone, 410, "gone"),
+            (Refused::OtherMachine, 403, "other-machine"),
+            (Refused::Full, 429, "full"),
         ];
         for (refused, status, word) in all {
             assert_eq!((refused.status(), refused.word()), (status, word));

@@ -21,18 +21,30 @@
 //! closed or a box stopped waits until its lock is free (see `ws::keep`).
 //!
 //! Beside those lines, a second version carries the requests the workspace's boxes wait on, as
-//! records (`crate::requests`), in hex:
+//! records (`crate::requests`), in hex, and what a phone sends through this machine's link:
 //!
 //! ```text
 //! request = "halti-keep/2 list " WS "\n"                      the requests that wait
 //!         | "halti-keep/2 answer " WS " " ("yes" | "no") " " DIGEST "\n"
+//!         | "halti-keep/2 runs " WS "\n"                      the boxes that run, by run id
+//!         | "halti-keep/2 signed " WS " " DEVICE " " ("yes" | "no") " " ID " " SIGNATURE "\n"
+//!         | "halti-keep/2 stop " WS " " DEVICE " " BOX ":" RUN *("," BOX ":" RUN) " " SIGNATURE "\n"
 //! reply   = *("halti-keep/2 request " HEX "\n") "halti-keep/2 end\n"
-//!         | "halti-keep/2 " ("approved" | "denied" | "gone" | "declined" | "other") "\n"
+//!         | *("halti-keep/2 run " BOX " " RUN "\n") "halti-keep/2 end\n"
+//!         | "halti-keep/2 " ("approved" | "denied" | "gone" | "declined" | "busy" | "refused"
+//!                           | "other") "\n"
+//!         | "halti-keep/2 stopped " COUNT " " COUNT "\n"
 //! ```
 //!
-//! A request line is held to the same 128 bytes; a reply line may be as long as a record makes it.
-//! An answer names its request by the 64 hex characters of `requests::answer_digest`: the record
-//! it was shown and the decision. Still no passphrase, key or value crosses.
+//! A request line is held to 2,048 bytes; a reply line may be as long as a record makes it. An
+//! answer names its request by the 64 hex characters of `requests::answer_digest`: the record it
+//! was shown and the decision. A signed answer names it by its 32 hex characters of id, and a
+//! stop names up to 32 runs, each by the box the phone named it with and its 16; SIGNATURE is a
+//! device's, in hex, which the open workspace checks against the devices this machine trusts
+//! (`requests::Desk::answer_signed`). `refused` is a signed answer or stop that doesn't count.
+//! `stopped` says how many boxes the stop put away, then how many of the runs it named run here in
+//! another box than the one named with them, which it left running. Still no passphrase, key or
+//! value crosses.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -49,6 +61,7 @@ use halti_core::boxkey::check_box;
 use halti_core::ids::WsName;
 use halti_core::item::ItemKey;
 
+use crate::requests::{Id, RunId};
 use crate::util;
 
 /// The first word of every line.
@@ -59,6 +72,10 @@ const RECORDS: &str = "halti-keep/2";
 pub const LINE_MAX: usize = 128;
 /// The longest line that answers a request about requests: one record, in hex.
 const RECORD_LINE_MAX: usize = 8192;
+/// The longest line that asks about requests: a signed stop of the most runs.
+pub const RECORDS_REQUEST_MAX: usize = 2048;
+/// The most runs one stop names.
+pub const STOP_RUNS_MAX: usize = 32;
 /// How long the open workspace waits for a request's line.
 pub const LINE_WAIT: Duration = Duration::from_secs(5);
 /// How long a client waits to be let in.
@@ -272,38 +289,78 @@ impl Reply {
     }
 }
 
-/// What a command asks of an open workspace about the requests its boxes wait on.
+/// What a command asks of an open workspace about the requests its boxes wait on, and what a
+/// phone sends it through the link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Records {
     /// Say every request that waits.
     List(WsName),
     /// Answer the request whose record, with this decision, makes this digest.
     Answer(WsName, bool, [u8; 32]),
+    /// Say every box that runs, with its run id.
+    Runs(WsName),
+    /// A device's signed answer to the request with this id.
+    Signed { ws: WsName, device: String, yes: bool, id: Id, signature: Vec<u8> },
+    /// A device's signed stop of these runs, each with the box the device named it with.
+    Stop { ws: WsName, device: String, runs: Vec<(String, RunId)>, signature: Vec<u8> },
+}
+
+/// A device's signature as a line carries it: 1 to 72 bytes.
+fn signature(text: &str) -> Option<Vec<u8>> {
+    util::unhex(text).filter(|bytes| (1..=halti_core::device::SIGNATURE_MAX).contains(&bytes.len()))
 }
 
 impl Records {
     /// The workspace it names.
     pub fn ws(&self) -> &WsName {
         match self {
-            Records::List(ws) | Records::Answer(ws, _, _) => ws,
+            Records::List(ws) | Records::Answer(ws, _, _) | Records::Runs(ws) | Records::Signed { ws, .. } | Records::Stop { ws, .. } => ws,
         }
     }
 
     pub fn line(&self) -> String {
+        let word = |yes: bool| if yes { "yes" } else { "no" };
         match self {
             Records::List(ws) => format!("{RECORDS} list {ws}\n"),
-            Records::Answer(ws, yes, digest) => format!("{RECORDS} answer {ws} {} {}\n", if *yes { "yes" } else { "no" }, util::hex(digest)),
+            Records::Answer(ws, yes, digest) => format!("{RECORDS} answer {ws} {} {}\n", word(*yes), util::hex(digest)),
+            Records::Runs(ws) => format!("{RECORDS} runs {ws}\n"),
+            Records::Signed { ws, device, yes, id, signature } => format!("{RECORDS} signed {ws} {device} {} {} {}\n", word(*yes), id.hex(), util::hex(signature)),
+            Records::Stop { ws, device, runs, signature } => {
+                let runs: Vec<String> = runs.iter().map(|(name, run)| format!("{name}:{}", run.hex())).collect();
+                format!("{RECORDS} stop {ws} {device} {} {}\n", runs.join(","), util::hex(signature))
+            }
         }
     }
 
-    /// A line without its newline. None for another version, verb or shape.
+    /// A line without its newline. None for another version, verb or shape, or a name that isn't
+    /// one.
     pub fn parse(line: &str) -> Option<Records> {
         let words: Vec<&str> = line.strip_prefix(RECORDS)?.strip_prefix(' ')?.split(' ').collect();
+        let device = |name: &str| crate::fields::is_name(name).then(|| name.to_string());
         match words[..] {
             ["list", ws] => Some(Records::List(WsName::parse(ws).ok()?)),
             ["answer", ws, decision @ ("yes" | "no"), digest] => {
                 let digest = util::unhex(digest)?.try_into().ok()?;
                 Some(Records::Answer(WsName::parse(ws).ok()?, decision == "yes", digest))
+            }
+            ["runs", ws] => Some(Records::Runs(WsName::parse(ws).ok()?)),
+            ["signed", ws, name, decision @ ("yes" | "no"), id, sig] => Some(Records::Signed {
+                ws: WsName::parse(ws).ok()?,
+                device: device(name)?,
+                yes: decision == "yes",
+                id: Id(util::unhex(id)?.try_into().ok()?),
+                signature: signature(sig)?,
+            }),
+            ["stop", ws, name, runs, sig] => {
+                let run = |named: &str| {
+                    let (name, run) = named.split_once(':')?;
+                    Some((device(name)?, RunId::parse(run)?))
+                };
+                let runs = runs.split(',').map(run).collect::<Option<Vec<_>>>()?;
+                if runs.len() > STOP_RUNS_MAX {
+                    return None;
+                }
+                Some(Records::Stop { ws: WsName::parse(ws).ok()?, device: device(name)?, runs, signature: signature(sig)? })
             }
             _ => None,
         }
@@ -315,7 +372,9 @@ impl Records {
 pub enum Told {
     /// One request that waits: its record.
     Request(Vec<u8>),
-    /// No more requests wait.
+    /// One box that runs, and its run.
+    Run(String, RunId),
+    /// No more requests wait, or no more boxes run.
     End,
     Approved,
     Denied,
@@ -325,6 +384,14 @@ pub enum Told {
     Declined,
     /// That prompt already asks about another yes to the same request: nothing was done.
     Busy,
+    /// A signed answer or stop that doesn't count: nothing was done.
+    Refused,
+    /// A signed stop: how many of the boxes it named were stopped, and how many of its runs run
+    /// here in another box than the one named with them, and were not.
+    Stopped {
+        stopped: u32,
+        wrong_box: u32,
+    },
     /// The request named another workspace: nothing was done.
     Other,
 }
@@ -333,12 +400,15 @@ impl Told {
     pub fn line(&self) -> String {
         let words = match self {
             Told::Request(record) => format!("request {}", util::hex(record)),
+            Told::Run(name, run) => format!("run {name} {}", run.hex()),
             Told::End => "end".into(),
             Told::Approved => "approved".into(),
             Told::Denied => "denied".into(),
             Told::Gone => "gone".into(),
             Told::Declined => "declined".into(),
             Told::Busy => "busy".into(),
+            Told::Refused => "refused".into(),
+            Told::Stopped { stopped, wrong_box } => format!("stopped {stopped} {wrong_box}"),
             Told::Other => "other".into(),
         };
         format!("{RECORDS} {words}\n")
@@ -348,14 +418,21 @@ impl Told {
     /// isn't hex.
     pub fn parse(line: &str) -> Option<Told> {
         let words: Vec<&str> = line.strip_prefix(RECORDS)?.strip_prefix(' ')?.split(' ').collect();
+        let count = |text: &str| text.parse::<u32>().ok().filter(|_| text.len() <= 9 && text.bytes().all(|b| b.is_ascii_digit()));
         Some(match words[..] {
             ["request", record] => Told::Request(util::unhex(record).filter(|bytes| !bytes.is_empty())?),
+            ["run", name, run] => {
+                check_box(name).ok()?;
+                Told::Run(name.to_string(), RunId::parse(run)?)
+            }
             ["end"] => Told::End,
             ["approved"] => Told::Approved,
             ["denied"] => Told::Denied,
             ["gone"] => Told::Gone,
             ["declined"] => Told::Declined,
             ["busy"] => Told::Busy,
+            ["refused"] => Told::Refused,
+            ["stopped", stopped, wrong_box] => Told::Stopped { stopped: count(stopped)?, wrong_box: count(wrong_box)? },
             ["other"] => Told::Other,
             _ => return None,
         })
@@ -519,9 +596,30 @@ pub fn list(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<Vec<u
 /// Answers a request of the open workspace `ws` at `path`: the one whose record, with `yes`, makes
 /// `digest`. What it says, or None if nothing answered within `wait`.
 pub fn answer(path: &Path, ws: &WsName, yes: bool, digest: [u8; 32], wait: Duration) -> Option<Told> {
+    tell(path, &Records::Answer(ws.clone(), yes, digest), wait)
+}
+
+/// Sends `records`, which one line answers, to the open workspace at `path`: what it says, or None
+/// if nothing answered within `wait`.
+pub fn tell(path: &Path, records: &Records, wait: Duration) -> Option<Told> {
     let mut stream = connect(path)?;
-    write_line(&mut stream, &Records::Answer(ws.clone(), yes, digest).line()).ok()?;
+    write_line(&mut stream, &records.line()).ok()?;
     Told::parse(&read_line(&mut stream, wait)?)
+}
+
+/// The boxes the open workspace `ws` at `path` runs, each with its run. None if nothing answered in
+/// time, or not as a list does; `Other` as an error word.
+pub fn runs(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<(String, RunId)>, Told>> {
+    let mut stream = connect(path)?;
+    write_line(&mut stream, &Records::Runs(ws.clone()).line()).ok()?;
+    let mut runs = Vec::new();
+    loop {
+        match Told::parse(&read_line(&mut stream, wait)?)? {
+            Told::Run(name, run) => runs.push((name, run)),
+            Told::End => return Some(Ok(runs)),
+            other => return Some(Err(other)),
+        }
+    }
 }
 
 /// Whether the other end has closed `stream` and nothing is left to read: looked at without waiting.
@@ -617,6 +715,58 @@ mod tests {
             assert_eq!(Records::parse(line), None, "{line}");
         }
         for line in ["halti-keep/2 request", "halti-keep/2 request ", "halti-keep/2 request 0g", "halti-keep/2 request 0001 x", "halti-keep/2 approved yes", "halti-keep/1 end"] {
+            assert_eq!(Told::parse(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_signed_answer_or_stop_reads_only_as_what_was_written() {
+        let longest = WsName::parse(&"w".repeat(32)).unwrap();
+        let signed = Records::Signed { ws: acme(), device: "pixel".into(), yes: true, id: Id([0xab; 16]), signature: vec![0x30; 72] };
+        let stop = Records::Stop { ws: longest.clone(), device: "d".repeat(32), runs: vec![("b".repeat(32), RunId([1; 8])); STOP_RUNS_MAX], signature: vec![0x30; 72] };
+        let no = Records::Signed { ws: acme(), device: "pixel".into(), yes: false, id: Id([0; 16]), signature: vec![1] };
+        for records in [Records::Runs(acme()), signed.clone(), no, stop.clone()] {
+            let line = records.line();
+            assert_eq!(Records::parse(line.strip_suffix('\n').unwrap()), Some(records), "{line}");
+        }
+        assert_eq!(Records::Runs(acme()).line(), "halti-keep/2 runs acme\n");
+        assert_eq!(signed.line(), format!("halti-keep/2 signed acme pixel yes {} {}\n", "ab".repeat(16), "30".repeat(72)));
+        let two = Records::Stop { ws: acme(), device: "pixel".into(), runs: vec![("dev".into(), RunId([1; 8])), ("web".into(), RunId([2; 8]))], signature: vec![0x30] };
+        assert_eq!(two.line(), "halti-keep/2 stop acme pixel dev:0101010101010101,web:0202020202020202 30\n");
+        // The longest stop fits a line about requests.
+        assert!(stop.line().len() <= RECORDS_REQUEST_MAX, "{}", stop.line().len());
+        let runs = |n: usize| vec!["dev:0101010101010101"; n].join(",");
+        for line in [
+            format!("halti-keep/2 signed acme pixel maybe {} 30", "ab".repeat(16)),
+            format!("halti-keep/2 signed acme Pixel yes {} 30", "ab".repeat(16)),
+            format!("halti-keep/2 signed acme pixel yes {} 30", "ab".repeat(15)),
+            format!("halti-keep/2 signed acme pixel yes {} ", "ab".repeat(16)),
+            format!("halti-keep/2 signed acme pixel yes {} {}", "ab".repeat(16), "30".repeat(73)),
+            format!("halti-keep/2 stop acme pixel {} 30", runs(STOP_RUNS_MAX + 1)),
+            "halti-keep/2 stop acme pixel  30".to_string(),
+            "halti-keep/2 stop acme pixel dev:01010101010101 30".to_string(),
+            "halti-keep/2 stop acme pixel 0101010101010101 30".to_string(),
+            "halti-keep/2 stop acme pixel :0101010101010101 30".to_string(),
+            "halti-keep/2 stop acme pixel Dev:0101010101010101 30".to_string(),
+            "halti-keep/2 stop acme pixel dev:0101010101010101:x 30".to_string(),
+            "halti-keep/2 stop acme pixel dev:0101010101010101, 30".to_string(),
+            "halti-keep/2 runs acme extra".to_string(),
+        ] {
+            assert_eq!(Records::parse(&line), None, "{line}");
+        }
+        for told in [Told::Run("dev".into(), RunId([2; 8])), Told::Refused, Told::Stopped { stopped: 0, wrong_box: 0 }, Told::Stopped { stopped: 3, wrong_box: 1 }] {
+            let line = told.line();
+            assert_eq!(Told::parse(line.strip_suffix('\n').unwrap()), Some(told), "{line}");
+        }
+        assert_eq!(Told::Run("dev".into(), RunId([2; 8])).line(), "halti-keep/2 run dev 0202020202020202\n");
+        for line in [
+            "halti-keep/2 run Dev 0202020202020202",
+            "halti-keep/2 run dev 02",
+            "halti-keep/2 stopped -1 0",
+            "halti-keep/2 stopped 1e3 0",
+            "halti-keep/2 stopped 1",
+            "halti-keep/2 stopped 1 -1",
+        ] {
             assert_eq!(Told::parse(line), None, "{line}");
         }
     }

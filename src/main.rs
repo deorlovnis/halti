@@ -31,6 +31,7 @@ mod keychain;
 #[allow(dead_code)]
 mod legacy;
 mod limits;
+mod link;
 mod mask;
 mod mcp;
 mod names;
@@ -238,8 +239,16 @@ enum Cmd {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
-    /// List the phones and machines paired with the hub running here: workspaces, fingerprint, token, last seen (as the hub's user)
-    Devices,
+    /// List the phones and machines paired with the hub running here (as the hub's user) and the phones this machine trusts; or trust or untrust a phone here
+    Devices {
+        #[command(subcommand)]
+        action: Option<DevicesCmd>,
+    },
+    /// Carry this machine's requests, state, answers and stops to and from its hub (keeps running; meant to run as a service)
+    #[command(
+        after_help = "It holds the machine token, and no key: an answer or a stop counts only if the open workspace it names finds it signed by a phone trusted there (halti devices trust)."
+    )]
+    Link,
     /// Revoke a phone or a machine at the hub running here: its token stops working at once (as the hub's user)
     Revoke { name: String },
     /// How this binary was built: whether it has the test hooks, its target, and where it keeps its files
@@ -366,6 +375,21 @@ enum RequestsCmd {
 }
 
 #[derive(Subcommand)]
+enum DevicesCmd {
+    /// Let a paired phone answer and stop here, for these workspaces: compares its fingerprint, then shows the machine code to compare on the phone
+    #[command(after_help = "The link must run: it fetches the phone's keys from the hub. Asks y/N at the terminal.")]
+    Trust {
+        /// The phone's name at the hub
+        name: String,
+        /// The workspaces it may answer for here, e.g. acme,beta
+        #[arg(long, value_name = "WS", value_delimiter = ',', required = true)]
+        ws: Vec<String>,
+    },
+    /// Stop trusting a phone here, at once; needs no hub
+    Untrust { name: String },
+}
+
+#[derive(Subcommand)]
 enum HubCmd {
     /// Run the hub, as its own user: TLS on ADDR, its key made at the first start (keeps running)
     #[command(after_help = "ADDR is an IP address and a port, e.g. 10.0.0.5:8443; there is no default, and an address the internet may reach is warned about. \
@@ -377,6 +401,13 @@ enum HubCmd {
         #[arg(long, value_name = "HOST:PORT")]
         address: Option<String>,
     },
+    /// Join this machine to a hub with the string halti pair --machine printed there; makes the machine key if there is none
+    Join {
+        /// halti-pair/1/machine/...
+        string: String,
+    },
+    /// Forget the hub: its pin, this machine's token and the machine key (the phones trusted here are kept)
+    Leave,
 }
 
 #[derive(Subcommand)]
@@ -983,7 +1014,9 @@ fn source_for(cmd: &Cmd) -> Option<source::Source> {
     match cmd {
         Cmd::Ws { .. } | Cmd::Open { .. } | Cmd::Close { .. } | Cmd::Requests { .. } | Cmd::Config { .. } | Cmd::BuildInfo => None,
         // The hub keeps no secret: it holds public keys and the hashes of tokens.
-        Cmd::Hub { .. } | Cmd::Pair { .. } | Cmd::Devices | Cmd::Revoke { .. } => None,
+        Cmd::Hub { .. } | Cmd::Pair { .. } | Cmd::Devices { .. } | Cmd::Revoke { .. } => None,
+        // The link holds the machine token and no secret of any workspace.
+        Cmd::Link => None,
         #[cfg(all(halti_dev, target_os = "linux"))]
         Cmd::SandboxInit { .. } => None,
         Cmd::Set { .. }
@@ -1113,8 +1146,13 @@ fn run() -> ExitCode {
             Some(RequestsCmd::Deny { id }) => ws::requests::answer(&id, false),
         }),
         Cmd::Hub { action: HubCmd::Serve { listen, address } } => ok(hub::serve(&listen, address.as_deref())),
+        Cmd::Hub { action: HubCmd::Join { string } } => ok(link::join(&string)),
+        Cmd::Hub { action: HubCmd::Leave } => ok(link::leave()),
         Cmd::Pair { name, ws, machine } => ok(hub::pair(name.as_deref(), machine.as_deref(), &ws)),
-        Cmd::Devices => ok(hub::devices()),
+        Cmd::Devices { action: None } => ok(hub::devices()),
+        Cmd::Devices { action: Some(DevicesCmd::Trust { name, ws }) } => ok(link::trust(&name, &ws)),
+        Cmd::Devices { action: Some(DevicesCmd::Untrust { name }) } => ok(link::untrust(&name)),
+        Cmd::Link => ok(link::serve()),
         Cmd::Revoke { name } => ok(hub::revoke(&name)),
         Cmd::BuildInfo => {
             cmd_build_info();
