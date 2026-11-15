@@ -24,8 +24,7 @@
 //! command line, not by asking its control socket, so one too busy to answer is still found, kept
 //! from a second start on the same disk, and stopped.
 //!
-//! Nothing names this engine yet: it is reached by its tests only.
-#![allow(dead_code)] // no setting or command picks this engine yet
+//! `[box] engine = "cloud-hypervisor"` picks it, Linux's only engine (`boxes::vms`).
 
 pub mod exec;
 
@@ -34,7 +33,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
@@ -69,8 +68,11 @@ const KERNEL: &str = "images/bzImage";
 const IMAGES: &str = "images";
 /// The VM's sockets in its folder: the vsock device, which the door and the exec client dial, and
 /// the VM program's control socket.
-const VSOCK: &str = "vsock.sock";
+const VSOCK: &str = store::VM_VSOCK;
 const API: &str = "api.sock";
+/// What a stop leaves in the VM's sockets folder, kept there until the next start: a stop was
+/// asked, so a command or a start it cut short ended as stopped, not as a box that broke.
+const STOPPING: &str = "stopping";
 
 /// How long an answer on the vsock device or the control socket may take.
 const ANSWER_WAIT: Duration = Duration::from_secs(5);
@@ -86,6 +88,8 @@ const MOST_CONSOLE: u64 = 16 << 20;
 const CONSOLE_EVERY: Duration = Duration::from_secs(1);
 /// How often a starting or stopping VM is looked at.
 const LOOK_EVERY: Duration = Duration::from_millis(100);
+/// How long a command whose connection broke waits to see whether its VM program is gone.
+const GONE_WAIT: Duration = Duration::from_secs(1);
 
 /// The VM programs this halti started, by VM name, so a stop can wait for its own child.
 static CHILDREN: Mutex<BTreeMap<String, Child>> = Mutex::new(BTreeMap::new());
@@ -136,11 +140,21 @@ impl CloudHypervisor {
             program: lib.join(PROGRAM),
             kernel: lib.join(KERNEL),
             images: lib.join(IMAGES),
-            kvm: "/dev/kvm".into(),
+            kvm: kvm_device(),
             sockets: store::sockets(uid).join(names::WS_SOCKETS),
             waits: Waits::REAL,
         }
     }
+}
+
+/// KVM's device. A debug build's tests name another file (`HALTI_TEST_KVM`), so a missing or a
+/// closed device is seen on a machine that has one.
+fn kvm_device() -> PathBuf {
+    #[cfg(halti_dev)]
+    if let Some(path) = crate::util::dev_var("HALTI_TEST_KVM") {
+        return path.into();
+    }
+    PathBuf::from("/dev/kvm")
 }
 
 /// A VM's own files, from its name.
@@ -181,9 +195,13 @@ impl CloudHypervisor {
         Ok(file)
     }
 
-    /// Fails unless KVM can be used and the VM program and kernel are the pinned ones, owned by
-    /// root.
+    /// Fails unless this is a server halti pins a VM program for, KVM can be used, and the VM
+    /// program and kernel are the pinned ones, owned by root. The processor is asked first: no
+    /// change to KVM makes a box run on another.
     fn ready(&self) -> Result<()> {
+        let Some(pins) = PINS else {
+            bail!("boxes can't run on this server: halti pins a VM program for x86-64 servers only");
+        };
         if let Err(e) = OpenOptions::new().read(true).write(true).open(&self.kvm) {
             match e.kind() {
                 io::ErrorKind::NotFound => bail!("boxes can't run on this server: it has no {}", self.kvm.display()),
@@ -194,9 +212,6 @@ impl CloudHypervisor {
                 _ => bail!("boxes can't run on this server: opening {}: {e}", self.kvm.display()),
             }
         }
-        let Some(pins) = PINS else {
-            bail!("boxes can't run on this server: halti pins a VM program for x86-64 servers only");
-        };
         pinned("the VM program", &self.program, pins.program)?;
         pinned("the box kernel", &self.kernel, pins.kernel)
     }
@@ -304,7 +319,7 @@ impl CloudHypervisor {
             }
             if fs::metadata(console).is_ok_and(|m| m.len() > MOST_CONSOLE) {
                 eprintln!("{name} wrote more than {} MiB to its console: stopping it", MOST_CONSOLE >> 20);
-                let _ = self.stop(name);
+                let _ = self.halt(name, false);
                 return;
             }
         }
@@ -317,7 +332,7 @@ impl CloudHypervisor {
         if self.alive(&spec.name, paths) {
             bail!("{} is running already", spec.name);
         }
-        clear_sockets(&paths.dir)?;
+        clear_sockets(&paths.dir, None)?;
         // Landlock's rule names the console, so it must be there before the start. What the VM
         // program itself says goes in a file beside it, which it never opens.
         let fresh = |path: &Path| OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(path).with_context(|| format!("making {}", path.display()));
@@ -340,7 +355,7 @@ impl CloudHypervisor {
             }
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                let _ = self.stop(&spec.name);
+                let _ = self.halt(&spec.name, false);
                 bail!("{} did not start in {} seconds. its console is in {}", spec.name, self.waits.start.as_secs(), console.display());
             }
             if dial(&paths.vsock, names::EXEC_PORT, left.min(ANSWER_WAIT)).is_ok() {
@@ -350,12 +365,55 @@ impl CloudHypervisor {
         }
     }
 
-    /// The VM program ended: reap it, and empty its sockets folder.
+    /// The VM program ended: reap it, and empty its sockets folder, but for the word that a stop
+    /// was asked, which the halti whose command or start it cut short reads after.
     fn put_away(&self, name: &str, paths: &Paths) {
         if let Some(mut child) = CHILDREN.lock().unwrap_or_else(|e| e.into_inner()).remove(name) {
             let _ = child.wait();
         }
-        let _ = clear_sockets(&paths.dir);
+        let _ = clear_sockets(&paths.dir, Some(STOPPING));
+    }
+
+    /// Ask the box to stop from inside and wait for it to power off; only then the VM program's
+    /// own stop, and last a kill. Fine if it is gone already. The request from inside has
+    /// `waits.ask` to be answered, whatever the box does with it; a box whose exec service can't
+    /// be dialed is not waited for. A stop someone `asked` for (not that of a start that timed
+    /// out, or of a box that floods its console) is noted first, for whoever runs a command in it.
+    fn halt(&self, name: &str, asked: bool) -> Result<()> {
+        let paths = self.paths(name)?;
+        if !self.alive(name, &paths) {
+            self.put_away(name, &paths);
+            return Ok(());
+        }
+        if asked {
+            let _ = OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(paths.dir.join(STOPPING));
+        }
+        let pid = self.pid(name, &paths);
+        let end = Instant::now() + self.waits.ask;
+        let reached = match dial(&paths.vsock, names::EXEC_PORT, self.waits.ask.min(ANSWER_WAIT)) {
+            Ok(stream) => {
+                // The command is stopped with the box, so its connection may end with no last
+                // frame.
+                let left = end.saturating_duration_since(Instant::now());
+                let _ = run_on(name, stream, true, &["sh".into(), "-c".into(), "kill -TERM 1".into()], &[], b"", left);
+                true
+            }
+            Err(_) => false,
+        };
+        if !(reached && self.ended(name, &paths, self.waits.stop)) {
+            let _ = ask(&paths.api, "PUT", "/api/v1/vmm.shutdown", ANSWER_WAIT);
+            if !self.ended(name, &paths, self.waits.halt) {
+                if let Some(pid) = pid {
+                    // SAFETY: kill(2) of the VM program found above.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                if !self.ended(name, &paths, self.waits.halt) {
+                    bail!("{name} is still running after it was killed");
+                }
+            }
+        }
+        self.put_away(name, &paths);
+        Ok(())
     }
 }
 
@@ -399,13 +457,18 @@ fn sha256_hex(file: &Path) -> Result<String> {
     Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Make a VM's sockets folder private to this user and empty it: a socket left by an earlier run,
-/// and any listener file a program put there for the box to dial (`vsock.sock_<port>`), go.
-fn clear_sockets(dir: &Path) -> Result<()> {
+/// Make a VM's sockets folder private to this user and empty it, but for the file `keep`: a socket
+/// left by an earlier run, and any listener file a program put there for the box to dial
+/// (`vsock.sock_<port>`), go.
+fn clear_sockets(dir: &Path, keep: Option<&str>) -> Result<()> {
     // SAFETY: getuid(2) can't fail.
     store::private_dir(dir, unsafe { libc::getuid() })?;
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let path = entry?.path();
+        let entry = entry?;
+        if keep.is_some_and(|keep| entry.file_name() == keep) {
+            continue;
+        }
+        let path = entry.path();
         fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
     }
     Ok(())
@@ -532,6 +595,12 @@ impl Vms for CloudHypervisor {
         self.ready()
     }
 
+    /// KVM, and the pinned VM program and kernel, before anything is asked: without them no box
+    /// starts, and a passphrase would be asked for nothing.
+    fn checked_first(&self) -> Result<()> {
+        self.ready()
+    }
+
     fn running(&self, name: &str) -> bool {
         self.paths(name).is_ok_and(|paths| self.alive(name, &paths))
     }
@@ -541,6 +610,9 @@ impl Vms for CloudHypervisor {
     /// ends without stopping it, the next start finds it by its command line.
     fn run(&self, spec: &VmSpec) -> Result<()> {
         let paths = self.paths(&spec.name)?;
+        // A stop of an earlier VM of this name (a leftover the start just stopped) is no stop of
+        // this one, whether it starts or is refused.
+        let _ = fs::remove_file(paths.dir.join(STOPPING));
         if spec.docker {
             bail!("Docker in a box doesn't run on a Linux server yet: set docker = false in the box policy");
         }
@@ -564,53 +636,32 @@ impl Vms for CloudHypervisor {
         self.start(spec, &image, disk, console, &paths)
     }
 
-    /// Ask the box to stop from inside and wait for it to power off; only then the VM program's
-    /// own stop, and last a kill. Fine if it is gone already. The request from inside has
-    /// `waits.ask` to be answered, whatever the box does with it; a box whose exec service can't
-    /// be dialed is not waited for.
+    /// Stop the box as `halt` does, noting first that the stop was asked.
     fn stop(&self, name: &str) -> Result<()> {
-        let paths = self.paths(name)?;
-        if !self.alive(name, &paths) {
-            self.put_away(name, &paths);
-            return Ok(());
-        }
-        let pid = self.pid(name, &paths);
-        let end = Instant::now() + self.waits.ask;
-        let asked = match dial(&paths.vsock, names::EXEC_PORT, self.waits.ask.min(ANSWER_WAIT)) {
-            Ok(stream) => {
-                // The command is stopped with the box, so its connection may end with no last
-                // frame.
-                let left = end.saturating_duration_since(Instant::now());
-                let _ = run_on(name, stream, true, &["sh".into(), "-c".into(), "kill -TERM 1".into()], &[], b"", left);
-                true
-            }
-            Err(_) => false,
-        };
-        if !(asked && self.ended(name, &paths, self.waits.stop)) {
-            let _ = ask(&paths.api, "PUT", "/api/v1/vmm.shutdown", ANSWER_WAIT);
-            if !self.ended(name, &paths, self.waits.halt) {
-                if let Some(pid) = pid {
-                    // SAFETY: kill(2) of the VM program found above.
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                }
-                if !self.ended(name, &paths, self.waits.halt) {
-                    bail!("{name} is still running after it was killed");
-                }
-            }
-        }
-        self.put_away(name, &paths);
-        Ok(())
+        self.halt(name, true)
+    }
+
+    /// Whether a stop was asked since the VM last started: its word in the VM's sockets folder.
+    fn stop_asked(&self, name: &str) -> bool {
+        self.paths(name).is_ok_and(|paths| paths.dir.join(STOPPING).exists())
     }
 
     /// Run a command as the agent, with the terminal if there is one. Its environment travels in
-    /// the request, not on a command line.
+    /// the request, not on a command line. A box stopped meanwhile (`ws stop`, a closed workspace)
+    /// ends the command with it, and its connection before it can say how: the command ended as
+    /// the stop's SIGTERM ends one, as it does on a Mac. A box whose VM program is gone with no
+    /// stop asked (killed, out of memory) broke, and that is said; so is any other failure, at once.
     fn exec(&self, name: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus> {
         let paths = self.paths(name)?;
         let stream = dial(&paths.vsock, names::EXEC_PORT, ANSWER_WAIT)?;
         let size = tty.then(|| exec::terminal_size(0).unwrap_or(exec::Size { rows: 24, cols: 80 }));
         let request = Request { root: false, tty: size, argv: cmd, env };
         let (mut out, mut err) = (io::stdout(), io::stderr());
-        exec::run(stream, &request, Input::Stdin, Sink { out: &mut out, err: &mut err, most: None }, None)
+        match exec::run(stream, &request, Input::Stdin, Sink { out: &mut out, err: &mut err, most: None }, None) {
+            Err(_) if self.stop_asked(name) => Ok(ExitStatus::from_raw(libc::SIGTERM)),
+            Err(_) if self.ended(name, &paths, GONE_WAIT) => bail!("{name} ended while its command ran, and no stop was asked"),
+            ran => ran,
+        }
     }
 
     fn install_ca(&self, name: &str, pem: &str) -> Result<()> {
@@ -869,7 +920,7 @@ mod tests {
         let _listener = UnixListener::bind(paths.dir.join("vsock.sock_9")).unwrap();
         fs::write(&paths.vsock, "").unwrap();
         fs::write(&paths.api, "").unwrap();
-        clear_sockets(&paths.dir).unwrap();
+        clear_sockets(&paths.dir, None).unwrap();
         assert_eq!(fs::read_dir(&paths.dir).unwrap().count(), 0);
         assert_eq!(fs::metadata(&paths.dir).unwrap().mode() & 0o777, 0o700);
 
@@ -982,6 +1033,71 @@ mod tests {
         assert!(!e.running(&name));
     }
 
+    /// The VM's exec port: each connection is answered, its request read, and then closed with no
+    /// last frame, as when a box is stopped under its command.
+    fn cut_off(vsock: &Path) {
+        let vsock = UnixListener::bind(vsock).unwrap();
+        thread::spawn(move || {
+            for mut s in vsock.incoming().flatten() {
+                let mut line = [0u8; 13];
+                let _ = s.read_exact(&mut line);
+                let _ = s.write_all(b"OK 7001\n");
+                let _ = exec::read_frame(&mut s);
+            }
+        });
+    }
+
+    /// A box that is stopped while the agent's command runs: the command ended as the stop's
+    /// SIGTERM ends one. A box that runs on and drops the connection, and one whose VM program
+    /// is gone with no stop asked, say so, and at once.
+    #[test]
+    fn a_command_of_a_box_that_is_stopped_ends_as_stopped() {
+        let (_dir, e, name, paths) = short("cut", Waits { stop: Duration::from_secs(20), halt: Duration::from_secs(20), ..quick(Duration::ZERO) });
+        cut_off(&paths.vsock);
+        let pid = child_vm(&name);
+        let cmd = ["true".to_string()];
+        // the box runs on: its end of the connection closed, or reset, is an error, said at once
+        let started = Instant::now();
+        let err = e.exec(&name, &[], &cmd, false).unwrap_err().to_string();
+        assert!(!err.contains("no stop was asked"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        // the VM program is gone, killed or out of memory, with no stop asked: it broke
+        // SAFETY: kill(2) of the stand-in started above.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let started = Instant::now();
+        let err = e.exec(&name, &[], &cmd, false).unwrap_err().to_string();
+        assert_eq!(err, format!("{name} ended while its command ran, and no stop was asked"));
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        // a stop was asked (its word is in the VM's folder): the command ended as stopped
+        fs::write(paths.dir.join(STOPPING), "").unwrap();
+        let status = e.exec(&name, &[], &cmd, false).unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
+    /// A stop that was asked leaves its word for the halti whose command or start it cut short,
+    /// until the next start; a start that timed out, or a box that floods its console, is not a
+    /// stop anyone asked for, and leaves none.
+    #[test]
+    fn a_stop_that_was_asked_is_said_until_the_next_start() {
+        let (dir, mut e, name, paths) = short("ask", quick(Duration::from_millis(300)));
+        cut_off(&paths.vsock);
+        child_vm(&name);
+        assert!(!e.stop_asked(&name));
+        let (got, _) = stop_within(&e, &name).expect("the stop ended");
+        got.unwrap();
+        assert!(e.stop_asked(&name));
+        assert_eq!(fs::read_dir(&paths.dir).unwrap().map(|f| f.unwrap().file_name()).collect::<Vec<_>>(), [STOPPING], "the sockets went, the word stays");
+        // the next start clears it, with the sockets
+        fake_program(&mut e, &dir.0, "exit 0");
+        let (got, _) = start(&e, &dir.0, &name, &paths);
+        assert!(got.unwrap_err().to_string().contains("did not start"));
+        assert!(!e.stop_asked(&name));
+        // halti's own stop of a box, not asked: no word
+        child_vm(&name);
+        e.halt(&name, false).unwrap();
+        assert!(!e.stop_asked(&name));
+    }
+
     /// A box that writes to its console without end is stopped once the file passes its limit.
     #[test]
     fn a_box_that_floods_its_console_is_stopped() {
@@ -1002,6 +1118,14 @@ mod tests {
     fn a_missing_kvm_says_so() {
         let dir = TempDir::new("halti-vmm-kvm").unwrap();
         let e = engine(&dir.0);
+        // A server halti pins no VM program for says that first: no change to KVM helps it.
+        if PINS.is_none() {
+            assert_eq!(e.ready().unwrap_err().to_string(), "boxes can't run on this server: halti pins a VM program for x86-64 servers only");
+            fs::write(&e.kvm, "").unwrap();
+            fs::set_permissions(&e.kvm, fs::Permissions::from_mode(0o000)).unwrap();
+            assert_eq!(e.ready().unwrap_err().to_string(), "boxes can't run on this server: halti pins a VM program for x86-64 servers only");
+            return;
+        }
         assert_eq!(e.ready().unwrap_err().to_string(), format!("boxes can't run on this server: it has no {}", e.kvm.display()));
         fs::write(&e.kvm, "").unwrap();
         fs::set_permissions(&e.kvm, fs::Permissions::from_mode(0o400)).unwrap();
@@ -1013,10 +1137,7 @@ mod tests {
         // with KVM, the VM program must be there, root's, and the pinned one
         fs::set_permissions(&e.kvm, fs::Permissions::from_mode(0o600)).unwrap();
         let err = e.ready().unwrap_err().to_string();
-        match PINS {
-            Some(_) => assert_eq!(err, "the VM program isn't installed at /lib/halti/cloud-hypervisor: run install-linux.sh"),
-            None => assert_eq!(err, "boxes can't run on this server: halti pins a VM program for x86-64 servers only"),
-        }
+        assert_eq!(err, "the VM program isn't installed at /lib/halti/cloud-hypervisor: run install-linux.sh");
     }
 
     #[test]
@@ -1089,6 +1210,14 @@ mod tests {
         assert!(refused(&|_| {}).contains("isn't there"), "no disk yet");
         // nothing was made for a refused start
         assert!(!e.paths(&good.name).unwrap().dir.exists());
+        // the stop of a leftover VM of the same name, which the start stopped first, is not this
+        // start's: a refusal says why it was refused
+        let dir_of = e.paths(&good.name).unwrap().dir;
+        fs::create_dir_all(&dir_of).unwrap();
+        fs::write(dir_of.join(STOPPING), "").unwrap();
+        assert!(e.stop_asked(&good.name));
+        assert!(refused(&|s| s.docker = true).starts_with("Docker in a box"));
+        assert!(!e.stop_asked(&good.name));
         assert!(!good.console.as_ref().unwrap().exists());
         assert!(e.takes_disk());
     }

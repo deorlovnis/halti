@@ -13,10 +13,15 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{env, fs};
 
-const UNAME: &str = "#!/bin/sh\ncase \"$1\" in -s) echo Linux ;; -m) echo x86_64 ;; *) echo Linux ;; esac\n";
+/// `uname -m` and `-r` answer as `UNAME_M` and `UNAME_R` say, else as an x86-64 server's would.
+const UNAME: &str = "#!/bin/sh\ncase \"$1\" in -s) echo Linux ;; -m) echo \"${UNAME_M:-x86_64}\" ;; -r) echo \"${UNAME_R:-6.8.0-1017-azure}\" ;; *) echo Linux ;; esac\n";
 const ID: &str = "#!/bin/sh\ncase \"$1\" in -u) echo 1000 ;; -un) echo tester ;; *) echo 'uid=1000(tester)' ;; esac\n";
-/// `sudo -n -k true` answers as `SUDO_NO_PASSWORD` says; anything else is written down.
-const SUDO: &str = "#!/bin/sh\nif [ \"$1\" = -n ]; then [ \"$SUDO_NO_PASSWORD\" = yes ]; exit; fi\necho \"$*\" >>\"$SUDO_LOG\"\n";
+/// `sudo -n -k true` answers as `SUDO_NO_PASSWORD` says; anything else is written down. With
+/// `SUDO_RUNS` set it is run too, as this user: but for what only root can do (a change of owner,
+/// an install of halti), which is only written down.
+const SUDO: &str = "#!/bin/sh\nif [ \"$1\" = -n ]; then [ \"$SUDO_NO_PASSWORD\" = yes ]; exit; fi\necho \"$*\" >>\"$SUDO_LOG\"\n\
+                    [ -n \"${SUDO_RUNS:-}\" ] || exit 0\ncase \"$*\" in *\" /usr/local/bin\"* | \"chown \"*) exit 0 ;; esac\n\
+                    if [ \"$1\" = install ]; then shift; exec install $(echo \"$*\" | sed 's/-o root -g root //'); fi\nexec \"$@\"\n";
 /// What `cargo build --release` leaves: a halti that says it has no test hooks.
 const CARGO: &str = "#!/bin/sh\nout=\"${CARGO_TARGET_DIR:-target}/release\"\nmkdir -p \"$out\"\nprintf '#!/bin/sh\\necho \"debug_assertions=false halti_dev=false\"\\n' >\"$out/halti\"\nchmod +x \"$out/halti\"\n";
 
@@ -74,6 +79,9 @@ impl Repo {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("SUDO_LOG", self.path("sudo.log"))
             .env("SUDO_NO_PASSWORD", if no_password { "yes" } else { "no" })
+            .env("HALTI_KVM_DEVICE", self.path("no-kvm"))
+            .env_remove("UNAME_M")
+            .env_remove("UNAME_R")
             .env_remove("CARGO_TARGET_DIR");
         for (k, v) in envs {
             cmd.env(k, v);
@@ -155,6 +163,143 @@ fn sudo_without_a_password_is_said_once_and_plainly() {
     let warning = "warning: tester can use sudo without a password, so any program running as tester is root here; see README \"On a Linux server\"";
     assert!(text(&out.stderr).lines().any(|l| l == warning), "{}", text(&out.stderr));
     assert!(!text(&out.stderr).contains("breaks out of a box"), "{}", text(&out.stderr));
+}
+
+/// Whether boxes can run here is said last, after halti is installed. Where they can't, nothing of
+/// theirs is downloaded, built or installed.
+#[test]
+fn whether_boxes_can_run_is_said_after_halti_is_installed() {
+    let repo = Repo::new();
+    repo.stamp(&repo.path("repo/target"), &repo.git(&["rev-parse", "HEAD"]));
+    let kvm = repo.path("kvm");
+    fs::write(&kvm, "").unwrap();
+    let said = |envs: &[(&str, &Path)]| {
+        let _ = fs::remove_file(repo.path("sudo.log"));
+        let out = repo.install(envs, false);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let lines: Vec<String> = text(&out.stdout).lines().map(String::from).collect();
+        assert_eq!(lines[lines.len() - 2], "installed /usr/local/bin/halti", "{lines:?}");
+        assert!(!repo.sudo_log().contains("/usr/local/lib/halti"), "nothing of the boxes': {}", repo.sudo_log());
+        lines.last().unwrap().clone()
+    };
+    let no_kvm = format!("this server can't run boxes: it has no {}. it needs a dedicated server, or a cloud server with nested virtualization", repo.path("no-kvm").display());
+    assert_eq!(said(&[]), no_kvm);
+    assert_eq!(said(&[("UNAME_M", Path::new("aarch64")), ("HALTI_KVM_DEVICE", &kvm)]), "this server can't run boxes: halti pins a VM program for x86-64 servers only");
+    assert_eq!(
+        said(&[("UNAME_R", Path::new("6.1.0-26-cloud-amd64")), ("HALTI_KVM_DEVICE", &kvm)]),
+        "this server can't run boxes: cloud-hypervisor needs Linux 6.8 or newer, and this is 6.1"
+    );
+}
+
+/// The VM program and the kernel are checked against the pins the engine checks them against, in
+/// src/vmm.rs, which the script reads; and the agent image is made a disk by box/to-disk.sh.
+#[test]
+fn what_boxes_run_on_is_pinned_where_the_engine_pins_it() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = fs::read_to_string(root.join("install-linux.sh")).unwrap();
+    let vmm = fs::read_to_string(root.join("src/vmm.rs")).unwrap();
+    for part in ["program", "kernel"] {
+        let pinned = vmm.split(&format!("{part}: \"")).nth(1).map(|rest| &rest[..64]).unwrap();
+        assert!(pinned.bytes().all(|b| b.is_ascii_hexdigit()), "{part}: {pinned}");
+    }
+    assert!(script.contains("grep -oE \"$1: \\\"[0-9a-f]{64}\\\"\" src/vmm.rs"), "the pins are read from src/vmm.rs");
+    assert!(script.contains("box/to-disk.sh \"$agent:install\" \"$work/agent.img\""));
+    // The versions the pins are of, as src/vmm.rs names them.
+    for version in ["v54.1", "ch-release-v7.2.8-20261009"] {
+        assert!(script.contains(&format!("/{version}/")) && vmm.contains(version), "{version}");
+    }
+}
+
+/// Made-up files of what boxes run on, which a stand-in curl serves, a stand-in vmm.rs pins, and
+/// stand-ins for podman and box/to-disk.sh build.
+const PROGRAM: &str = "a VM program\n";
+const KERNEL: &str = "a box kernel\n";
+const CURL: &str = "#!/bin/sh\ncase \"$4\" in *cloud-hypervisor-static) printf '%s' \"${PROGRAM_TEXT:-a VM program\n}\" ;; *bzImage*) printf 'a box kernel\\n' ;; esac >\"$3\"\n";
+const PODMAN: &str = "#!/bin/sh\necho \"$*\" >>\"$PODMAN_LOG\"\ncase \"$1 $2\" in\n  \"image inspect\") cat \"$PODMAN_LOG.id\" 2>/dev/null || exit 125 ;;\n  \"build \"*) echo \"id-$AGENT_DISK\" >\"$PODMAN_LOG.id\" ;;\nesac\n";
+const TO_DISK: &str = "#!/bin/sh\nprintf '%s\\n' \"$AGENT_DISK\" >\"$2\"\n";
+
+fn sha256(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What boxes run on is checked in root's own copy, which root makes from what this user's shell
+/// reads: root opens no file in the folder of this user's that the script works in, so nothing a
+/// program running as this user puts there in place of a file, a link to /etc/shadow say, is read
+/// as root. A file already there is kept only if it is root's and the pinned one. Earlier agent
+/// images are said, with the space they take. Needs Linux (GNU dd and stat); the stand-in sudo
+/// runs as this user, into a test folder.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "GNU dd and stat")]
+fn root_reads_nothing_of_the_user_s_and_checks_its_own_copy() {
+    let repo = Repo::new();
+    for (name, text) in [("curl", CURL), ("podman", PODMAN)] {
+        write_script(&repo.path("fakes").join(name), text);
+    }
+    fs::create_dir_all(repo.path("repo/src")).unwrap();
+    let pins = format!("const PINS: Option<Pins> =\n    Some(Pins {{ program: \"{}\", kernel: \"{}\" }});\n", sha256(PROGRAM), sha256(KERNEL));
+    fs::write(repo.path("repo/src/vmm.rs"), pins).unwrap();
+    write_script(&repo.path("repo/box/to-disk.sh"), TO_DISK);
+    fs::write(repo.path("repo/box/agent.Containerfile"), "FROM scratch\n").unwrap();
+    repo.git(&["add", "-A"]);
+    repo.git(&["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "commit", "-qm", "boxes"]);
+    repo.stamp(&repo.path("repo/target"), &repo.git(&["rev-parse", "HEAD"]));
+    let (kvm, lib) = (repo.path("kvm"), repo.path("lib"));
+    fs::write(&kvm, "").unwrap();
+    let install = |disk: &str, program: &str| {
+        let _ = fs::remove_file(repo.path("sudo.log"));
+        let envs: [(&str, &Path); 7] = [
+            ("HALTI_KVM_DEVICE", &kvm),
+            ("HALTI_LIB_DIR", &lib),
+            ("SUDO_RUNS", Path::new("1")),
+            ("PODMAN_LOG", &repo.path("podman.log")),
+            ("AGENT_DISK", Path::new(disk)),
+            ("PROGRAM_TEXT", Path::new(program)),
+            ("TMPDIR", &repo.path("elsewhere")),
+        ];
+        repo.install(&envs, false)
+    };
+
+    let out = install("agent disk one", PROGRAM);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let disk_one = sha256("agent disk one\n");
+    let said: Vec<String> = text(&out.stdout).lines().map(String::from).collect();
+    for line in [
+        format!("installed the VM program (sha256 {})", sha256(PROGRAM)),
+        format!("installed the box kernel (sha256 {})", sha256(KERNEL)),
+        format!("built the agent image halti-agent@sha256:{disk_one}"),
+        "this server can run boxes".to_string(),
+    ] {
+        assert!(said.contains(&line), "{line}: {said:?}");
+    }
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!((fs::read_to_string(lib.join("cloud-hypervisor")).unwrap(), mode(&lib.join("cloud-hypervisor"))), (PROGRAM.to_string(), 0o755));
+    assert_eq!((fs::read_to_string(lib.join("images/bzImage")).unwrap(), mode(&lib.join("images/bzImage"))), (KERNEL.to_string(), 0o644));
+    let image = lib.join(format!("images/halti-agent/{disk_one}.img"));
+    assert_eq!((fs::read_to_string(&image).unwrap(), mode(&image)), ("agent disk one\n".to_string(), 0o644), "named by the sha256 of root's copy");
+    let log = repo.sudo_log();
+    assert!(!log.contains(".install-boxes"), "root read a file of the user's folder: {log}");
+    let lib_text = lib.display().to_string();
+    for made in ["cloud-hypervisor.new", "images/bzImage.new", "images/halti-agent/install.new"] {
+        let dd = format!("dd of={lib_text}/{made} bs=1M conv=sparse status=none");
+        assert!(log.lines().any(|l| l == dd), "{dd}: {log}");
+        assert!(log.lines().any(|l| l == format!("chown root:root {lib_text}/{made}")), "{made}: {log}");
+    }
+
+    // The same files, there but this user's (as a hand copy leaves them): not root's, so made again.
+    let out = install("agent disk two", PROGRAM);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(repo.sudo_log().lines().any(|l| l.starts_with(&format!("dd of={lib_text}/cloud-hypervisor.new "))), "{}", repo.sudo_log());
+    // The earlier image stays, said once; the earlier build's image is untagged.
+    let note = format!("note: 1 earlier agent images are in {lib_text}/images/halti-agent, using ");
+    assert!(text(&out.stderr).lines().any(|l| l.starts_with(&note) && l.ends_with(" MB. remove each that no box policy pins, with sudo rm")), "{}", text(&out.stderr));
+    assert!(fs::read_to_string(repo.path("podman.log")).unwrap().lines().any(|l| l == "rmi id-agent disk one"));
+
+    // A download that isn't the pinned one: nothing of it is installed, nor left.
+    let out = install("agent disk two", "another program\n");
+    assert!(!out.status.success() && text(&out.stderr).contains("isn't the program halti pins"), "{}", text(&out.stderr));
+    assert_eq!(fs::read_to_string(lib.join("cloud-hypervisor")).unwrap(), PROGRAM);
+    assert!(!lib.join("cloud-hypervisor.new").exists());
 }
 
 #[test]

@@ -31,6 +31,7 @@ const DEV: &[&str] = &[
     "HALTI_INDEX",
     "HALTI_POLICY_DIR",
     "HALTI_BOX_DIR",
+    "HALTI_TEST_KVM",
     // Picks the engine the conformance suite runs against (not read yet).
     "HALTI_E2E_ENGINE",
 ];
@@ -65,6 +66,9 @@ const NOT_READ: &[&str] = &[
     "HALTI_RUNNER_DEBUG_NO_ROUTING",
     // Read by install.sh.
     "HALTI_SIGN_IDENTITY",
+    // Read by install-linux.sh: KVM's device, and where what boxes run on goes, which its tests name.
+    "HALTI_KVM_DEVICE",
+    "HALTI_LIB_DIR",
     // A refresh script's field (`HALTI_<FIELD>`), in a test's script.
     "HALTI_LOGIN",
 ];
@@ -724,6 +728,8 @@ const WS_BOX_ITEMS: &[&str] = &[
     "store::door_log(",
     "store::is_mounted(",
     "store::detach(",
+    "store::ENCRYPTED",
+    "store::at_rest_notes(",
     "run::sweep(",
     "keep::Keep",
     "keep::Checked",

@@ -71,6 +71,9 @@ pub fn open(typed: Option<&str>, type_it: bool) -> Result<Opened> {
         bail!("workspace {name} changed while it was opened: try again");
     }
     said.print();
+    for note in boxes::at_rest(&here, &name, id) {
+        println!("{note}");
+    }
     // The keys are wiped once it closes; this process lives as long as it is open.
     memory::release();
     let source = Source::workspace(name, reader, Reading::at(&here.root), settings);

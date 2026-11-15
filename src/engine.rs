@@ -137,11 +137,21 @@ pub struct VmSpec {
 pub trait Vms: Sync {
     /// The engine is installed and ready.
     fn available(&self) -> Result<()>;
+    /// What is checked before a person is asked anything for a box: that this machine can run it
+    /// at all. Apple's tool is asked once the box starts (`available`), as it always was.
+    fn checked_first(&self) -> Result<()> {
+        Ok(())
+    }
     fn running(&self, name: &str) -> bool;
     /// Start a VM, detached; it is removed when it stops.
     fn run(&self, spec: &VmSpec) -> Result<()>;
     /// Stop a VM; fine if it is gone already.
     fn stop(&self, name: &str) -> Result<()>;
+    /// Whether a stop of the VM was asked since it started, so a start or a command it cut short
+    /// ended as stopped. Apple's tool says how a stopped command ended itself.
+    fn stop_asked(&self, _name: &str) -> bool {
+        false
+    }
     /// Run a command in the VM as the agent. The environment holds no secrets (see `agent_env`).
     fn exec(&self, name: &str, env: &[(String, String)], cmd: &[String], tty: bool) -> Result<ExitStatus>;
     fn install_ca(&self, name: &str, pem: &str) -> Result<()>;

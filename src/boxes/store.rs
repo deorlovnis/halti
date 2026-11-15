@@ -44,6 +44,21 @@ const CA_FILE: &str = "door/ca.sealed";
 /// The longest Unix socket path macOS accepts (104 bytes, with the terminating NUL), as
 /// `engine::run` checks it.
 const SOCKET_PATH_MAX: usize = 103;
+/// Linux's: 108 bytes with the NUL.
+#[cfg(target_os = "linux")]
+const LINUX_SOCKET_PATH_MAX: usize = 107;
+/// What the VM program of an engine that starts its VMs itself (`vmm`) adds to the name of the
+/// socket the door dials, for a box that dials this machine's port: `_` and the port.
+#[cfg(target_os = "linux")]
+const LONGEST_PORT: &str = "_4294967295";
+
+/// The socket in a VM's own sockets folder (`Layout::vm_sockets`) that the door dials: the VM's
+/// vsock device.
+pub const VM_VSOCK: &str = "vsock.sock";
+
+/// Whether halti encrypts a box's store: on a Mac it does, with the box's key; on Linux the store
+/// is as safe at rest as the disk under it (`disk`).
+pub const ENCRYPTED: bool = !cfg!(target_os = "linux");
 
 /// Where a box's files live on the Mac. `real()` is the user's; `workspace()` a workspace's boxes';
 /// tests build their own.
@@ -172,9 +187,25 @@ impl Layout {
     /// The folder of the sockets of a VM that the box's engine starts itself (`vmm`): those of
     /// that VM alone, beside the agent's socket. Its name has a dot, which no box name has, so it
     /// is never another box's socket.
-    #[allow(dead_code)] // for an engine that starts its VMs itself
     pub fn vm_sockets(&self, id: &str) -> PathBuf {
         self.sockets.join(format!("{}{}", self.named(id), names::VM_SOCKETS))
+    }
+
+    /// The socket the door dials for a box whose engine starts its VMs itself: the VM's vsock
+    /// device, in its sockets folder.
+    pub fn vm_door_socket(&self, id: &str) -> PathBuf {
+        self.vm_sockets(id).join(VM_VSOCK)
+    }
+
+    /// What such a box's VM printed while it started: its kernel and its shim.
+    pub fn console(&self, id: &str) -> PathBuf {
+        self.open_dir().join(format!("{id}.console"))
+    }
+
+    /// For such a box, written once its start is done, so a second terminal joins only a box
+    /// whose home is written: the halti that opened it removes it as it puts the box away.
+    pub fn ready(&self, id: &str) -> PathBuf {
+        self.open_dir().join(format!("{id}.ready"))
     }
 
     /// The socket of the box's browser VM, next to the agent's. In a workspace its name has a dot,
@@ -210,11 +241,21 @@ impl Layout {
     }
 
     /// Fails unless both of the box's sockets fit the system's limit: checked before anything opens.
+    /// On Linux the socket a box's VM program makes beside the door's, with a port in its name,
+    /// must fit Linux's too.
     pub fn sockets_fit(&self, id: &str) -> Result<()> {
         for socket in [self.socket(id), self.browser_socket(id)] {
             let length = socket.as_os_str().len();
             if length > SOCKET_PATH_MAX {
                 bail!("socket path {} is too long ({length} bytes, macOS allows {SOCKET_PATH_MAX})", socket.display());
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if self.in_workspace() {
+            let socket = self.vm_door_socket(id);
+            let length = socket.as_os_str().len() + LONGEST_PORT.len();
+            if length > LINUX_SOCKET_PATH_MAX {
+                bail!("socket path {}{LONGEST_PORT} is too long ({length} bytes, Linux allows {LINUX_SOCKET_PATH_MAX})", socket.display());
             }
         }
         Ok(())
@@ -302,6 +343,20 @@ fn hdiutil(args: &[&std::ffi::OsStr], key: Option<&str>) -> Result<String> {
 
 #[cfg(target_os = "linux")]
 pub use disk::{Open, create, open, shred, usage};
+
+/// What is said, each line a note, about how what `what` names (`box acme/dev keeps`) is kept at
+/// rest in the workspace's folder `wsdir`, where halti doesn't encrypt it, and swap that isn't
+/// encrypted; with no `what`, the swap alone. Nothing on a Mac, whose stores and swap are
+/// encrypted.
+pub fn at_rest_notes(what: Option<&str>, wsdir: &Path) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    return disk::at_rest_notes(what, wsdir);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (what, wsdir);
+        Vec::new()
+    }
+}
 
 /// Create an empty encrypted store.
 #[cfg(not(target_os = "linux"))]
@@ -580,6 +635,100 @@ fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
+/// A folder as a tar stream (POSIX ustar, with a pax header for a long name or a large file), for
+/// a box whose disk only it reads, which unpacks it itself: the same files `copy_tree` copies, the
+/// same way. Links, sockets and devices are left out, never followed; modes are rw-r--r-- or
+/// rwxr-xr-x, owners root's, which an unpacking user that isn't root doesn't keep. Returns the
+/// stream and how many were left out.
+pub fn tar_tree(src: &Path) -> Result<(Vec<u8>, usize)> {
+    let meta = fs::symlink_metadata(src).with_context(|| format!("reading {}", src.display()))?;
+    if !meta.is_dir() {
+        bail!("{} isn't a folder", src.display());
+    }
+    let mut tar = Vec::new();
+    let mut skipped = 0;
+    tar_dir(src, "", &mut tar, &mut skipped)?;
+    // The end: two blocks of zeros.
+    tar.extend([0u8; 1024]);
+    Ok((tar, skipped))
+}
+
+fn tar_dir(src: &Path, rel: &str, tar: &mut Vec<u8>, skipped: &mut usize) -> Result<()> {
+    let mut entries: Vec<_> = fs::read_dir(src).with_context(|| format!("reading {}", src.display()))?.collect::<io::Result<_>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let from = entry.path();
+        let Some(name) = entry.file_name().to_str().map(|name| format!("{rel}{name}")) else {
+            *skipped += 1;
+            continue;
+        };
+        let meta = fs::symlink_metadata(&from)?;
+        let mtime = meta.mtime().max(0) as u64;
+        if meta.is_dir() {
+            tar_header(tar, &format!("{name}/"), 0o755, 0, mtime, b'5');
+            tar_dir(&from, &format!("{name}/"), tar, skipped)?;
+        } else if meta.is_file() {
+            let mut bytes = Vec::new();
+            File::open(&from).and_then(|mut file| file.read_to_end(&mut bytes)).with_context(|| format!("reading {}", from.display()))?;
+            let mode = if meta.mode() & 0o111 != 0 { 0o755 } else { 0o644 };
+            tar_header(tar, &name, mode, bytes.len() as u64, mtime, b'0');
+            tar.extend(&bytes);
+            tar.resize(tar.len().next_multiple_of(512), 0);
+        } else {
+            *skipped += 1;
+        }
+    }
+    Ok(())
+}
+
+/// One entry's header block, after a pax header where the name or the size doesn't fit ustar's.
+fn tar_header(tar: &mut Vec<u8>, name: &str, mode: u32, size: u64, mtime: u64, kind: u8) {
+    const MOST_SIZE: u64 = 0o77777777777;
+    let long = name.len() > 100;
+    if long || size > MOST_SIZE {
+        let mut records = String::new();
+        if long {
+            records += &pax_record("path", name);
+        }
+        if size > MOST_SIZE {
+            records += &pax_record("size", &size.to_string());
+        }
+        tar_block(tar, "pax", 0o644, records.len() as u64, mtime, b'x');
+        tar.extend(records.as_bytes());
+        tar.resize(tar.len().next_multiple_of(512), 0);
+    }
+    // A long name's first 100 bytes stand in for it, for a reader that has no pax.
+    tar_block(tar, name, mode, size.min(MOST_SIZE), mtime, kind);
+}
+
+/// A pax record, `<length> <key>=<value>\n`, whose length counts itself.
+fn pax_record(key: &str, value: &str) -> String {
+    let rest = format!(" {key}={value}\n");
+    let mut length = rest.len() + 1;
+    while length != rest.len() + length.to_string().len() {
+        length = rest.len() + length.to_string().len();
+    }
+    format!("{length}{rest}")
+}
+
+fn tar_block(tar: &mut Vec<u8>, name: &str, mode: u32, size: u64, mtime: u64, kind: u8) {
+    let mut block = [0u8; 512];
+    let put = |block: &mut [u8; 512], at: usize, bytes: &[u8]| block[at..at + bytes.len()].copy_from_slice(bytes);
+    let name = name.as_bytes();
+    put(&mut block, 0, &name[..name.len().min(100)]);
+    put(&mut block, 100, format!("{mode:07o}\0").as_bytes());
+    put(&mut block, 108, b"0000000\0");
+    put(&mut block, 116, b"0000000\0");
+    put(&mut block, 124, format!("{size:011o}\0").as_bytes());
+    put(&mut block, 136, format!("{:011o}\0", mtime.min(0o77777777777)).as_bytes());
+    put(&mut block, 148, b"        ");
+    block[156] = kind;
+    put(&mut block, 257, b"ustar\x0000");
+    let sum: u32 = block.iter().map(|b| u32::from(*b)).sum();
+    put(&mut block, 148, format!("{sum:06o}\0 ").as_bytes());
+    tar.extend(block);
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
@@ -617,6 +766,40 @@ mod tests {
         let one = copy_tree(&src.join("a.txt"), &dir.0.join("one.txt")).unwrap();
         assert_eq!(one.files, [PathBuf::from("one.txt")]);
         assert!(copy_tree(&src.join("a.txt"), &dir.0.join("one.txt")).is_err(), "never overwrites");
+    }
+
+    #[test]
+    fn a_tree_is_sent_as_tar_without_links() {
+        let dir = TempDir::new("halti-tar").unwrap();
+        let src = dir.0.join("src");
+        let long = format!("{}/{}", "d".repeat(80), "f".repeat(60));
+        fs::create_dir_all(src.join("sub/empty")).unwrap();
+        fs::create_dir_all(src.join(&long).parent().unwrap()).unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        fs::write(src.join("sub/run.sh"), "#!/bin/sh\n".repeat(100)).unwrap();
+        fs::set_permissions(src.join("sub/run.sh"), fs::Permissions::from_mode(0o4750)).unwrap();
+        fs::write(src.join(&long), "deep").unwrap();
+        fs::write(dir.0.join("secret"), "s3cret").unwrap();
+        symlink(dir.0.join("secret"), src.join("link")).unwrap();
+
+        let (tar, skipped) = tar_tree(&src).unwrap();
+        assert_eq!(skipped, 1, "the link");
+        assert_eq!(tar.len() % 512, 0);
+        let out = dir.0.join("out");
+        fs::create_dir(&out).unwrap();
+        let mut child = Command::new("tar").args(["-x", "-f", "-", "-C"]).arg(&out).stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(&tar).unwrap();
+        let done = child.wait_with_output().unwrap();
+        assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+        assert_eq!(fs::read_to_string(out.join("a.txt")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(out.join("sub/run.sh")).unwrap(), "#!/bin/sh\n".repeat(100));
+        assert_eq!(fs::read_to_string(out.join(&long)).unwrap(), "deep", "a name past 100 bytes");
+        assert!(out.join("sub/empty").is_dir() && !out.join("link").exists());
+        let mode = |p: &str| fs::metadata(out.join(p)).unwrap().mode() & 0o7777;
+        assert_eq!((mode("a.txt"), mode("sub/run.sh")), (0o644, 0o755));
+        assert!(tar_tree(&src.join("a.txt")).is_err() && tar_tree(&src.join("link")).is_err(), "a folder only");
+        assert_eq!(pax_record("path", "x"), "9 path=x\n", "the length counts itself");
+        assert_eq!(pax_record("path", &"y".repeat(95)), format!("105 path={}\n", "y".repeat(95)));
     }
 
     #[test]
@@ -731,7 +914,15 @@ mod tests {
             Layout::of_workspace(Path::new("/x/boxes"), sockets, 501, WsId::from_bytes([0x10; 16]))
         };
         assert_eq!(at(103).browser_socket("dev").as_os_str().len(), 103);
-        at(103).sockets_fit("dev").unwrap();
+        if cfg!(target_os = "linux") {
+            // On Linux the VM program's socket for a port, beside the door's, is longer still.
+            let vm = |length: usize| at(length - ("/101010101010-dev.vm/vsock.sock_4294967295".len() - "/101010101010-dev.browser.sock".len()));
+            vm(107).sockets_fit("dev").unwrap();
+            let error = vm(108).sockets_fit("dev").unwrap_err().to_string();
+            assert!(error.starts_with("socket path /sss") && error.ends_with("-dev.vm/vsock.sock_4294967295 is too long (108 bytes, Linux allows 107)"), "{error}");
+        } else {
+            at(103).sockets_fit("dev").unwrap();
+        }
         let error = at(104).sockets_fit("dev").unwrap_err().to_string();
         assert!(error.starts_with("socket path /sss") && error.ends_with(".browser.sock is too long (104 bytes, macOS allows 103)"), "{error}");
         // Today's are checked the same way.
