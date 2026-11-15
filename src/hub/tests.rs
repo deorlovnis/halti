@@ -1495,9 +1495,10 @@ fn what_a_phone_sent_stays_listed_with_the_machine_s_word_whatever_other_phones_
     let view = relay.view("pixel", &acme(), &|_| Some((Vec::new(), None)), now);
     let sent: Vec<(u64, &str)> = view["sent"].as_array().unwrap().iter().map(|sent| (sent["n"].as_u64().unwrap(), sent["state"].as_str().unwrap())).collect();
     assert_eq!(sent, [(n, "stopped")]);
-    // The other phone sees its own last 64.
+    // The other phone sees its own last 64, and the hub keeps no more of its than that.
     let view = relay.view("tablet", &acme(), &|_| Some((Vec::new(), None)), now);
     assert_eq!(view["sent"].as_array().unwrap().len(), 64);
+    assert_eq!(relay.kept("server-1"), 1 + 64);
     // An hour after it was sent, it goes.
     let later = now + jiff::SignedDuration::from_hours(1);
     let view = relay.view("pixel", &acme(), &|_| Some((Vec::new(), None)), later);

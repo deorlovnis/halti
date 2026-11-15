@@ -469,6 +469,12 @@ impl Relay {
         self.machines.len()
     }
 
+    /// How many items taken and answered the hub keeps for `machine`.
+    #[cfg(test)]
+    pub fn kept(&self, machine: &str) -> usize {
+        self.machines.get(machine).map_or(0, |mailbox| mailbox.done.len())
+    }
+
     /// Whether `machine` has items queued.
     pub fn waiting(&self, machine: &str) -> bool {
         self.machines.get(machine).is_some_and(|mailbox| !mailbox.items.is_empty())
