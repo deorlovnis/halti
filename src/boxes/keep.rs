@@ -436,7 +436,8 @@ impl<'a> Keeper<'a> {
     }
 
     /// One box, from its start to its end, on its own thread: checked, started, kept until it is
-    /// asked to stop, its last session leaves or its VM is gone, then put away.
+    /// asked to stop, its last session leaves or its VM is gone, then put away. A box whose VM went
+    /// with no stop asked is said to have ended unexpectedly, not to have been stopped.
     fn run_box(&self, name: &str, round: u64, stop: &AtomicBool) {
         let shown = format!("{}/{name}", self.name);
         let ready = self.world.ok_or_else(|| Refused::new(No::Engine, anyhow!("boxes can't run on this system: halti has no box engine for it"))).and_then(|world| {
@@ -472,9 +473,13 @@ impl<'a> Keeper<'a> {
                 self.set(name, round, State::Running);
                 say(&format!("started box {shown}"));
                 running.wait(&|| self.last_left(name, round));
+                let by_itself = running.ended_by_itself();
                 self.set(name, round, State::Stopping);
                 (*running).stop();
-                say(&format!("stopped box {shown}"));
+                match by_itself {
+                    Some(why) => warn(&why),
+                    None => say(&format!("stopped box {shown}")),
+                }
                 let mut table = self.table();
                 if table.has(name, round) {
                     table.boxes.remove(name);

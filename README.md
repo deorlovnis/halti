@@ -124,7 +124,7 @@ halti ws delete acme                       # the workspace and everything in it 
 
 ### An open workspace
 
-`halti open acme` asks as `[workspace.approval] open` says, says `acme is open in this terminal`, and stays: that process holds acme's keys until Ctrl-C, a closed terminal or `halti close acme` from another terminal closes it. The terminal says each time a box starts or stops, and why one wasn't started.
+`halti open acme` asks as `[workspace.approval] open` says, says `acme is open in this terminal`, and stays: that process holds acme's keys until Ctrl-C, a closed terminal or `halti close acme` from another terminal closes it. The terminal says each time a box starts or stops, that one ended unexpectedly when its VM went with no stop asked (killed, or out of memory), and why one wasn't started.
 
 - One terminal keeps a workspace open: a second `halti open acme`, and `halti ws delete acme`, are refused before anything is asked. `halti ws ls` shows `open` for a workspace that answers its socket within a second.
 - It listens on a socket only you can reach, `/tmp/halti-<uid>/ws/TAG.keep.sock`, which no box sees. Each line on it is a request or an answer of names only (a workspace, a box, a site, a count), or a record of a write that waits (below): no passphrase, key, value, policy or file path crosses it. A box started through it asks nothing, after the same checks as `halti ws run`, and stops when the last connection that started or joined it ends.

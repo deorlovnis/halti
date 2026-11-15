@@ -595,6 +595,16 @@ impl Running<'_> {
         }
     }
 
+    /// Once `wait` has returned: what to say of a box that ended by itself, its VM gone with no stop
+    /// asked of halti (killed, out of memory, stopped by hand), as a command in it says it
+    /// (`ended`). None for a box that was stopped, or that its last session left.
+    pub fn ended_by_itself(&self) -> Option<String> {
+        if self.req.stop.load(Ordering::SeqCst) || self.world.running(&self.vm) || self.world.stop_asked(&self.vm) {
+            return None;
+        }
+        Some(unexpectedly(&self.req.shown, self.console.as_deref()))
+    }
+
     /// Put the box away (see `put_away`).
     pub fn stop(self) {
         drop(self);
@@ -664,8 +674,16 @@ fn stopped_before_the_agent(shown: &str) -> anyhow::Error {
 /// what its VM printed is.
 fn ended(error: anyhow::Error, gone: bool, shown: &str, console: &Path) -> anyhow::Error {
     match gone {
-        true => anyhow!("box {shown} ended unexpectedly. what its VM printed is in {}", console.display()),
+        true => anyhow!(unexpectedly(shown, Some(console))),
         false => error,
+    }
+}
+
+/// That box `shown` ended with no stop asked, and where what its VM printed is, if it has a console.
+fn unexpectedly(shown: &str, console: Option<&Path>) -> String {
+    match console {
+        Some(console) => format!("box {shown} ended unexpectedly. what its VM printed is in {}", console.display()),
+        None => format!("box {shown} ended unexpectedly"),
     }
 }
 
@@ -2497,6 +2515,35 @@ mod tests {
         } else {
             (Fake::default(), policy(s, ""))
         }
+    }
+
+    /// A box an open workspace keeps, whose VM goes with no stop asked, ended by itself, and says
+    /// so as a command in it does; one stopped, one stopped from another terminal, and one its last
+    /// session left did not.
+    #[test]
+    fn a_box_whose_vm_goes_by_itself_ended_unexpectedly() {
+        let s = setup();
+        let (made, p) = here(&s);
+        let fake = made;
+        let req = request(&s, &p, false);
+        let Ok(Begun::Here(running)) = start(&s.layout, &fake, &req) else { panic!("the box didn't start") };
+        running.wait(&|| true);
+        assert_eq!(running.ended_by_itself(), None, "its last session left");
+        *fake.running.lock().unwrap() = false;
+        running.wait(&|| false);
+        let console = s.layout.console("r");
+        let said =
+            if cfg!(target_os = "linux") { format!("box r ended unexpectedly. what its VM printed is in {}", console.display()) } else { "box r ended unexpectedly".to_string() };
+        assert_eq!(running.ended_by_itself(), Some(said));
+        // Its stop was asked from another terminal (the word a Linux stop leaves): no surprise.
+        fake.cut.store(true, Ordering::SeqCst);
+        assert_eq!(running.ended_by_itself(), None);
+        fake.cut.store(false, Ordering::SeqCst);
+        // Nor when it was stopped here.
+        s.stop.store(true, Ordering::SeqCst);
+        assert_eq!(running.ended_by_itself(), None);
+        (*running).stop();
+        assert_put_away(&s);
     }
 
     /// halti's output gone while the agent's command runs (an ssh session with no terminal that
