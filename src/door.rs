@@ -21,7 +21,7 @@
 
 mod addr;
 mod gateway;
-mod http;
+pub(crate) mod http;
 pub mod inspect;
 mod page;
 mod proxy;

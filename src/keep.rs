@@ -365,11 +365,16 @@ impl Told {
 /// Reads one line of printable ASCII, at most `LINE_MAX` bytes with its newline, within `wait`,
 /// and nothing after it. None for a longer, slower or other line, or a connection that ends first.
 pub fn read_line(stream: &mut UnixStream, wait: Duration) -> Option<String> {
-    read_line_of(stream, wait, LINE_MAX)
+    read_line_up_to(stream, wait, LINE_MAX)
 }
 
 /// As `read_line`, for a line of at most `max` bytes with its newline.
 fn read_line_of(stream: &mut UnixStream, wait: Duration, max: usize) -> Option<String> {
+    read_line_up_to(stream, wait, max)
+}
+
+/// As `read_line`, for lines of at most `max` bytes with their newline.
+pub fn read_line_up_to(stream: &mut UnixStream, wait: Duration, max: usize) -> Option<String> {
     let deadline = Instant::now() + wait;
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
