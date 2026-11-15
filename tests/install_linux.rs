@@ -15,7 +15,8 @@ use std::{env, fs};
 
 /// `uname -m` and `-r` answer as `UNAME_M` and `UNAME_R` say, else as an x86-64 server's would.
 const UNAME: &str = "#!/bin/sh\ncase \"$1\" in -s) echo Linux ;; -m) echo \"${UNAME_M:-x86_64}\" ;; -r) echo \"${UNAME_R:-6.8.0-1017-azure}\" ;; *) echo Linux ;; esac\n";
-const ID: &str = "#!/bin/sh\ncase \"$1\" in -u) echo 1000 ;; -un) echo tester ;; *) echo 'uid=1000(tester)' ;; esac\n";
+/// `id -Gn tester` answers as `ID_GROUPS` says, else with the user's own group alone.
+const ID: &str = "#!/bin/sh\ncase \"$1\" in -u) echo 1000 ;; -un) echo tester ;; -Gn) echo \"${ID_GROUPS:-tester}\" ;; *) echo 'uid=1000(tester)' ;; esac\n";
 /// `sudo -n -k true` answers as `SUDO_NO_PASSWORD` says; anything else is written down. With
 /// `SUDO_RUNS` set it is run too, as this user: but for what only root can do (a change of owner,
 /// an install of halti), which is only written down.
@@ -163,6 +164,32 @@ fn sudo_without_a_password_is_said_once_and_plainly() {
     let warning = "warning: tester can use sudo without a password, so any program running as tester is root here; see README \"On a Linux server\"";
     assert!(text(&out.stderr).lines().any(|l| l == warning), "{}", text(&out.stderr));
     assert!(!text(&out.stderr).contains("breaks out of a box"), "{}", text(&out.stderr));
+}
+
+/// A group that gives root without a password (docker's, lxd's, incus-admin's, disk's) is said
+/// once, naming each, and the install goes on; a group whose name only begins the same is none.
+#[test]
+fn a_group_that_gives_root_is_said_once_and_plainly() {
+    let repo = Repo::new();
+    repo.stamp(&repo.path("repo/target"), &repo.git(&["rev-parse", "HEAD"]));
+    let said = |groups: &str| {
+        let _ = fs::remove_file(repo.path("sudo.log"));
+        let out = repo.install(&[("ID_GROUPS", Path::new(groups))], false);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        assert!(repo.sudo_log().contains("/usr/local/bin/halti"), "installed all the same: {}", repo.sudo_log());
+        text(&out.stderr)
+    };
+    for none in ["tester", "tester kvm sudo", "tester dockerish my-disk"] {
+        assert!(!said(none).contains("gives root"), "{none}");
+    }
+    let stderr = said("tester docker kvm disk");
+    let warning =
+        "warning: tester is in a group that gives root without a password (docker, disk), so any program running as tester is root here; see README \"On a Linux server\"";
+    assert!(stderr.lines().any(|l| l == warning), "{stderr}");
+    assert_eq!(stderr.matches("gives root").count(), 1, "{stderr}");
+    for group in ["lxd", "incus-admin"] {
+        assert!(said(&format!("tester {group}")).contains(&format!("without a password ({group}),")), "{group}");
+    }
 }
 
 /// Whether boxes can run here is said last, after halti is installed. Where they can't, nothing of
