@@ -44,7 +44,7 @@ use crate::engine::{self, Vms};
 use crate::keep::{No, Refused};
 use crate::source::Source;
 use crate::util::{sha256_hex, warn};
-use crate::{names, policy};
+use crate::{names, policy, requests};
 
 /// `acme/dev`: a workspace's name, then after the first `/` a box, each as core checks it.
 pub fn target(text: &str) -> Result<(WsName, &str)> {
@@ -454,7 +454,7 @@ pub enum Run {
 /// Otherwise its policy file is read once and checked, against the copy kept when it was approved
 /// too, and so are its store and its sockets; then the workspace is opened, as
 /// `[workspace.approval] open` says. `main` chooses it as the place and starts the box.
-pub fn run(target_text: &str, command: Vec<String>, type_it: bool) -> Result<Run> {
+pub fn run(target_text: &str, command: Vec<String>, type_it: bool, away: Option<u32>) -> Result<Run> {
     crate::link::warn_if_refused();
     let (name, box_name) = target(target_text)?;
     let settings = config::settings();
@@ -465,6 +465,9 @@ pub fn run(target_text: &str, command: Vec<String>, type_it: bool) -> Result<Run
     let rule = MountRule::workspace(&settings);
     let command = (!command.is_empty()).then_some(command);
     let kept = Kept::of(&here, found.id)?;
+    if away.is_some() && !kept.held() {
+        bail!("{name} isn't open, so box {} can't be marked away. open it first: halti open {name}", found.shown);
+    }
     if kept.held() {
         let session = match keep::start(&kept, &name, box_name)? {
             keep::Started::Elsewhere => None,
@@ -476,6 +479,13 @@ pub fn run(target_text: &str, command: Vec<String>, type_it: bool) -> Result<Run
                 Some(keep::Session::hold(stream, &found.name, &found.shown, Box::new(lost))?)
             }
         };
+        if away.is_some() {
+            // The box runs: a mark that can't be made is said, and the run goes on.
+            match mark_away(&kept, &found, away) {
+                Ok(said) => println!("{said}"),
+                Err(e) => warn(&format!("{e:#}")),
+            }
+        }
         let text = found.files.read(box_name)?.ok_or_else(|| no_box(&found.shown))?;
         let Found { box_name, shown, layout, .. } = found;
         let join = Box::new(boxes::Join { vms, layout, name: box_name, shown, text, mounts: rule, command });
@@ -533,6 +543,34 @@ fn open_for(here: &Here, found: &Found, way: &Way<'_>, what: &str, command: &str
         return Err(changed_while_opened(&found.name));
     }
     Ok(reader)
+}
+
+/// `halti ws away WS/BOX [--for D] | off`: asks nothing. Marks the run of the box that the open
+/// workspace runs now away for `secs`, or clears its mark with None: its requests wait longer for
+/// an answer, until the mark ends or the run does.
+pub fn away(target_text: &str, secs: Option<u32>) -> Result<()> {
+    let (name, box_name) = target(target_text)?;
+    let settings = config::settings();
+    let here = Here::at(&settings.workspaces.path);
+    let found = find(&here, &name, box_name)?;
+    let kept = Kept::of(&here, found.id)?;
+    println!("{}", mark_away(&kept, &found, secs)?);
+    Ok(())
+}
+
+/// Marks `found`'s run away through the open workspace `kept` found; what to say.
+fn mark_away(kept: &Kept, found: &Found, secs: Option<u32>) -> Result<String> {
+    let name = &found.name;
+    if !kept.held() {
+        bail!("{name} isn't open, so its boxes can't be marked away. open it first: halti open {name}");
+    }
+    Ok(match keep::away(kept, name, &found.box_name, secs)? {
+        Some(until) => {
+            let wait = requests::LIMITS.wait_of(Some(until), requests::now_secs());
+            format!("{} is away until {}. Its requests wait up to {} for an answer.", found.shown, requests::clock(until), requests::wait_said(wait))
+        }
+        None => format!("{} is no longer away. Its requests wait up to {} for an answer.", found.shown, requests::wait_said(requests::LIMITS.wait)),
+    })
 }
 
 /// How long a box another halti runs is waited for once it is stopped: 60 times this.

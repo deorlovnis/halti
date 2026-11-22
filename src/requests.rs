@@ -79,8 +79,7 @@ pub struct Limits {
     pub rest: Duration,
 }
 
-pub const LIMITS: Limits =
-    Limits { wait: Duration::from_secs(120), away_wait: Duration::from_secs(30 * 60), per_box: 3, per_desk: 50, strikes: 3, rest: Duration::from_secs(300) };
+pub const LIMITS: Limits = Limits { wait: Duration::from_secs(120), away_wait: Duration::from_secs(30 * 60), per_box: 3, per_desk: 50, strikes: 3, rest: Duration::from_secs(300) };
 
 impl Limits {
     /// How long a request raised at `now` waits, seconds since 1970, for a run whose away mark
@@ -92,6 +91,14 @@ impl Limits {
             _ => self.wait,
         }
     }
+}
+
+/// The time of day `secs`, seconds since 1970, falls at here: `22:10`.
+pub fn clock(secs: u64) -> String {
+    i64::try_from(secs)
+        .ok()
+        .and_then(|secs| jiff::Timestamp::from_second(secs).ok())
+        .map_or_else(|| "--:--".to_string(), |time| time.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string())
 }
 
 /// A wait as people read it: `120 seconds` up to two minutes, whole minutes above.
@@ -561,6 +568,7 @@ impl Desk {
     }
 
     /// When the away mark of run `run` ends, if it has one that hasn't.
+    #[cfg(test)]
     pub fn away_until(&self, run: RunId) -> Option<u64> {
         let now = now_secs();
         self.table().away.get(&run).copied().filter(|until| *until > now)

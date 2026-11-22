@@ -217,6 +217,20 @@ pub(super) fn stop(kept: &Kept, name: &WsName, box_name: &str) -> Result<Stopped
     }
 }
 
+/// Asks the open workspace `name`, which `kept` found, to mark the run of its box `box_name` away
+/// for `secs` seconds, or to clear its mark: when the mark ends, or None once it is cleared.
+pub(super) fn away(kept: &Kept, name: &WsName, box_name: &str, secs: Option<u32>) -> Result<Option<u64>> {
+    match keep::ask(&kept.socket(), &Request::Away(name.clone(), box_name.to_string(), secs), keep::LINE_WAIT) {
+        Some(Reply::Away(until)) => Ok(until),
+        Some(Reply::Idle) => Err(anyhow!("box {name}/{box_name} isn't running in the open workspace {name}")),
+        Some(Reply::Other) => Err(other(name)),
+        Some(Reply::Unsupported) => {
+            Err(anyhow!("{name} is open with an older halti, which can't mark a box away. close it and open it again: halti close {name}, then halti open {name}"))
+        }
+        _ => Err(opening(name)),
+    }
+}
+
 /// A session of a box an open workspace runs: the connection its start holds open while the agent
 /// works in the box. A thread watches it. The word that the box was put away ends the watch; the
 /// connection ending without it means the open workspace is gone, and its box with no door: the

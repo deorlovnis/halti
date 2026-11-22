@@ -213,7 +213,8 @@ enum Cmd {
         name: Option<String>,
     },
     /// List the writes the boxes of open workspaces wait on you to approve, or answer one (asks nothing here)
-    #[command(after_help = "A write a box's policy says to ask about waits up to 120 seconds, then is refused. \
+    #[command(after_help = "A write a box's policy says to ask about waits up to 120 seconds, then is refused; \
+                            30 minutes while its box is marked away (halti ws away). \
                             On a Mac the terminal where its workspace is open asks Touch ID before an approval counts.")]
     Requests {
         #[command(subcommand)]
@@ -497,6 +498,12 @@ enum WsCmd {
         /// Type the passphrase, whatever halti config says
         #[arg(long = "type")]
         type_it: bool,
+        /// Mark this run away once it runs, as halti ws away does (the workspace must be open)
+        #[arg(long)]
+        away: bool,
+        /// How long it is away, like 30m or 3h: 8h if left out, 24h at most
+        #[arg(long = "for", value_name = "DURATION", value_parser = parse_away_for, requires = "away")]
+        away_for: Option<u32>,
         #[arg(last = true, value_name = "CMD")]
         command: Vec<String>,
     },
@@ -505,7 +512,22 @@ enum WsCmd {
         #[arg(value_name = "WS/BOX", value_parser = parse_ws_box)]
         target: String,
     },
+    /// Mark the run of a box an open workspace runs away: its requests wait up to 30 minutes for an answer, not 120 seconds (asks nothing)
+    #[command(after_help = "The mark ends at its time, when the run ends, or with: halti ws away WS/BOX off")]
+    Away {
+        #[arg(value_name = "WS/BOX", value_parser = parse_ws_box)]
+        target: String,
+        /// `off` clears the mark
+        #[arg(value_parser = ["off"])]
+        off: Option<String>,
+        /// How long, like 30m or 3h: 8h if left out, 24h at most
+        #[arg(long = "for", value_name = "DURATION", value_parser = parse_away_for, conflicts_with = "off")]
+        away_for: Option<u32>,
+    },
 }
+
+/// How long an away mark lasts when no --for says.
+const AWAY_DEFAULT: u32 = 8 * 3600;
 
 #[derive(Subcommand)]
 enum WsBoxCmd {
@@ -614,6 +636,19 @@ fn parse_ws_box(s: &str) -> Result<String, String> {
         Ok(_) => Ok(s.to_string()),
         Err(_) => Err("use a workspace and a box, e.g. acme/dev".into()),
     }
+}
+
+/// `30m` or `3h`: a minute to a day, in seconds.
+fn parse_away_for(s: &str) -> Result<u32, String> {
+    let wrong = || "use minutes or hours, from 1m to 24h, e.g. 30m or 3h".to_string();
+    let (number, unit) = s.split_at(s.len().saturating_sub(1));
+    let per = match unit {
+        "m" => 60,
+        "h" => 3600,
+        _ => return Err(wrong()),
+    };
+    let secs = number.parse::<u32>().ok().filter(|_| !number.is_empty() && number.len() <= 5 && number.bytes().all(|b| b.is_ascii_digit())).and_then(|n| n.checked_mul(per));
+    secs.filter(|secs| (keep::AWAY_MIN..=keep::AWAY_MAX).contains(secs)).ok_or_else(wrong)
 }
 
 /// `acme`, or `acme/github`: a workspace, and maybe one of its resources.
@@ -1101,15 +1136,17 @@ fn run() -> ExitCode {
             BoxCmd::Sh { engine: _, tools, command } => sandbox::sh(tools, command),
         },
         Cmd::Config { show, default } => ok(config::command(show, default)),
-        Cmd::Ws { action: WsCmd::Run { target, type_it, command } } => match ws::boxes::run(&target, command, type_it) {
-            Ok(ws::boxes::Run::Join(join)) => boxes::join_in(*join),
-            Ok(ws::boxes::Run::Session { join, session }) => session.end(boxes::join_in(*join)),
-            Ok(ws::boxes::Run::Start { source, start }) => {
-                source::choose(*source).expect("ws run chose where secrets are kept once");
-                boxes::run_in(*start)
+        Cmd::Ws { action: WsCmd::Run { target, type_it, away, away_for, command } } => {
+            match ws::boxes::run(&target, command, type_it, away.then_some(away_for.unwrap_or(AWAY_DEFAULT))) {
+                Ok(ws::boxes::Run::Join(join)) => boxes::join_in(*join),
+                Ok(ws::boxes::Run::Session { join, session }) => session.end(boxes::join_in(*join)),
+                Ok(ws::boxes::Run::Start { source, start }) => {
+                    source::choose(*source).expect("ws run chose where secrets are kept once");
+                    boxes::run_in(*start)
+                }
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
-        },
+        }
         Cmd::Ws { action } => ok(match action {
             WsCmd::New { name, own, generate } => ws::new(&name, passphrase_choice(own, generate)),
             WsCmd::Set { target, field, type_it } => ws::set(&target, &field, type_it),
@@ -1130,6 +1167,7 @@ fn run() -> ExitCode {
                 WsBoxCmd::Log { target, last, type_it } => ws::boxes::log(&target, last, type_it),
             },
             WsCmd::Stop { target } => ws::boxes::stop(&target),
+            WsCmd::Away { target, off, away_for } => ws::boxes::away(&target, off.is_none().then_some(away_for.unwrap_or(AWAY_DEFAULT))),
             WsCmd::Run { .. } => unreachable!("ws run returns its command's exit code, above"),
         }),
         Cmd::Open { name, type_it } => match ws::keep::open(name.as_deref(), type_it) {
@@ -1173,6 +1211,14 @@ fn run() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_away_mark_lasts_a_minute_to_a_day() {
+        assert_eq!((parse_away_for("30m"), parse_away_for("3h"), parse_away_for("1m"), parse_away_for("24h")), (Ok(1800), Ok(10_800), Ok(60), Ok(86_400)));
+        for wrong in ["0m", "25h", "1441m", "3", "h", "-3h", "+3h", "3 h", "3H", "1.5h", "3d", "", "99999999h"] {
+            assert!(parse_away_for(wrong).is_err(), "{wrong}");
+        }
+    }
 
     #[test]
     fn the_verified_target_is_linux_on_this_build_s_processor() {

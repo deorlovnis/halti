@@ -318,6 +318,7 @@ impl<'a> Keeper<'a> {
             Some(Request::Stop(_, name)) => self.stop_box(&name, None),
             Some(Request::Close(_)) => return self.asked_to_close(stream),
             Some(Request::Ping(_)) => Reply::Open(self.running()),
+            Some(Request::Away(_, name, secs)) => self.away(&name, secs),
         };
         reply(&mut stream, answer);
     }
@@ -332,6 +333,21 @@ impl<'a> Keeper<'a> {
                 return;
             }
         }
+    }
+
+    /// `away`: marks the run of box `name` that runs now away for `secs`, or clears its mark. A
+    /// box that doesn't run, or is starting or stopping, has no run to mark.
+    fn away(&self, name: &str, secs: Option<u32>) -> Reply {
+        let table = self.table();
+        let Some(slot) = table.boxes.get(name).filter(|slot| slot.state == State::Running) else { return Reply::Idle };
+        let until = secs.map(|secs| requests::now_secs().saturating_add(u64::from(secs)));
+        self.desk.set_away(slot.run, until);
+        drop(table);
+        match until {
+            Some(until) => say(&format!("box {}/{name} is away until {}", self.name, requests::clock(until))),
+            None => say(&format!("box {}/{name} is no longer away", self.name)),
+        }
+        Reply::Away(until)
     }
 
     /// How many boxes run.
@@ -479,6 +495,8 @@ impl<'a> Keeper<'a> {
                     Some(why) => warn(&why),
                     None => say(&format!("stopped box {shown}")),
                 }
+                // Its mark goes with its run.
+                self.desk.set_away(run, None);
                 let mut table = self.table();
                 if table.has(name, round) {
                     table.boxes.remove(name);
