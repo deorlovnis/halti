@@ -806,7 +806,7 @@ fn a_request_is_listed_and_answered_on_the_socket_in_records() {
             assert_eq!(keep::list(socket, &globex, LONG), Some(Err(Told::Other)));
             assert_eq!(keep::answer(socket, &acme(), true, answer_digest(&bytes, false), LONG), Some(Told::Gone));
             assert_eq!(keep::answer(socket, &acme(), true, answer_digest(&bytes, true), LONG), Some(Told::Approved));
-            assert_eq!(raised.join().unwrap(), Raised { id: Some(record.id), came: Came::Yes(By::Local) });
+            assert_eq!(raised.join().unwrap(), Raised { id: Some(record.id), came: Came::Yes(By::Local), wait: requests::LIMITS.wait });
             // The first answer won: the second finds nothing.
             assert_eq!(keep::answer(socket, &acme(), false, answer_digest(&bytes, false), LONG), Some(Told::Gone));
             assert_eq!(keep::list(socket, &acme(), LONG), Some(Ok(Vec::new())));

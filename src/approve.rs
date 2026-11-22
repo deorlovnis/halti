@@ -8,6 +8,10 @@ use anyhow::{Result, bail};
 
 use crate::requests::Prompted;
 
+/// How long the Touch ID window of a request stays up before it is taken down: the request then
+/// waits on for an answer from elsewhere.
+pub const TOUCH_ID_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 thread_local! {
     /// How each prompt this thread asked was answered since its last `take_answers` (true:
     /// approved). Kept per thread: where several boxes run in one process, a call reads back only
@@ -105,7 +109,7 @@ fn ask_person_until(reason: &str, withdrawn: &dyn Fn() -> bool) -> Prompted {
     use objc2_local_authentication::{LAContext, LAPolicy};
 
     /// How long the window waits for an answer before it is taken down.
-    const TIMEOUT: Duration = Duration::from_secs(120);
+    const TIMEOUT: Duration = crate::approve::TOUCH_ID_WAIT;
     /// How often `withdrawn` is looked at.
     const LOOK_EVERY: Duration = Duration::from_millis(100);
     /// LocalAuthentication's codes for a failed try and for Cancel: the person's no.

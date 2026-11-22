@@ -270,7 +270,7 @@ fn a_request_raised_is_listed_as_its_record_and_the_first_answer_wins() {
     assert_eq!(desk.answer_here(true, &answer_digest(&bytes, true)), Here::Approved);
     // The second answer finds it settled.
     assert_eq!(desk.answer_here(false, &answer_digest(&bytes, false)), Here::Gone);
-    assert_eq!(raised.join().unwrap(), Raised { id: Some(record.id), came: Came::Yes(By::Local) });
+    assert_eq!(raised.join().unwrap(), Raised { id: Some(record.id), came: Came::Yes(By::Local), wait: limits().wait });
     assert!(desk.records().is_empty(), "it goes once it is answered");
 }
 
@@ -414,7 +414,7 @@ fn a_box_has_three_requests_waiting_at_most_and_the_desk_fifty() {
     let desk = desk(limits(), Script::with(vec![]));
     let waiting: Vec<_> = (0..3).map(|_| raising(&desk, "dev", false)).collect();
     until(|| desk.records().len() == 3);
-    assert_eq!(desk.asker("dev", RunId([7; 8])).raise(POST, false, &|| false), Raised { id: None, came: Came::Full });
+    assert_eq!(desk.asker("dev", RunId([7; 8])).raise(POST, false, &|| false), Raised { id: None, came: Came::Full, wait: limits().wait });
     // Another box still may.
     let web = raising(&desk, "web", false);
     until(|| desk.records().len() == 4);
@@ -458,7 +458,7 @@ fn after_three_refusals_in_a_row_a_box_rests() {
     // Three in a row, denied or not answered: refused at once, for a while, and only that box.
     assert_eq!((deny("dev"), expire("dev"), deny("dev")), (Came::No(By::Local), Came::Expired, Came::No(By::Local)));
     let rested = Instant::now();
-    assert_eq!(desk.asker("dev", RunId([7; 8])).raise(POST, false, &|| false), Raised { id: None, came: Came::Resting });
+    assert_eq!(desk.asker("dev", RunId([7; 8])).raise(POST, false, &|| false), Raised { id: None, came: Came::Resting, wait: Duration::from_millis(600) });
     assert_eq!(expire("web"), Came::Expired);
     while rested.elapsed() < rest {
         thread::sleep(Duration::from_millis(20));
@@ -483,7 +483,7 @@ fn a_request_is_withdrawn_when_its_box_stops_or_the_workspace_closes() {
     the_one(&desk);
     desk.close();
     assert_eq!(raised.join().unwrap().came, Came::Withdrawn);
-    assert_eq!(desk.asker("dev", RunId([7; 8])).raise(POST, false, &|| false), Raised { id: None, came: Came::Withdrawn });
+    assert_eq!(desk.asker("dev", RunId([7; 8])).raise(POST, false, &|| false), Raised { id: None, came: Came::Withdrawn, wait: limits().wait });
 }
 
 // --- answers from a phone ---
@@ -668,4 +668,75 @@ fn a_stop_says_run_for_one_and_runs_for_more() {
     assert_eq!(runs_named(1), "1 run");
     assert_eq!(runs_named(2), "2 runs");
     assert_eq!(runs_named(32), "32 runs");
+}
+
+// --- runs marked away ---
+
+#[test]
+fn the_wait_of_a_run_marked_away_is_the_long_one_cut_at_the_marks_end_and_never_short() {
+    let (wait, away) = (LIMITS.wait, LIMITS.away_wait);
+    assert_eq!((wait, away), (Duration::from_secs(120), Duration::from_secs(30 * 60)));
+    let now = 1_000_000;
+    assert_eq!(LIMITS.wait_of(None, now), wait, "no mark");
+    assert_eq!(LIMITS.wait_of(Some(now + 8 * 3600), now), away, "a mark of hours: the away wait");
+    assert_eq!(LIMITS.wait_of(Some(now + 600), now), Duration::from_secs(600), "a mark that ends sooner cuts it");
+    assert_eq!(LIMITS.wait_of(Some(now + 30), now), wait, "a mark nearly over still gives the usual wait");
+    assert_eq!(LIMITS.wait_of(Some(now), now), wait, "a mark at its end is over");
+    assert_eq!(LIMITS.wait_of(Some(now - 1), now), wait);
+    assert_eq!(LIMITS.wait_of(Some(u64::MAX), now), away);
+}
+
+#[test]
+fn a_request_of_a_run_marked_away_expires_late_and_other_runs_keep_the_usual_wait() {
+    let desk = desk(LIMITS, Script::with(vec![]));
+    let (away, other) = (RunId([7; 8]), RunId([8; 8]));
+    assert_eq!(desk.away_until(away), None);
+    desk.set_away(away, Some(now_secs() + 8 * 3600));
+    assert!(desk.away_until(away).is_some());
+    let expiry_of = |run: RunId| {
+        let asker = desk.asker("dev", run);
+        let raised = thread::spawn(move || asker.raise(POST, false, &|| false));
+        let (record, bytes) = the_one(&desk);
+        assert_eq!(desk.answer_here(true, &answer_digest(&bytes, true)), Here::Approved);
+        let raised = raised.join().unwrap();
+        (record.expiry.saturating_sub(now_secs()), raised.wait)
+    };
+    let (left, wait) = expiry_of(away);
+    assert!((30 * 60 - 2..=30 * 60 + 1).contains(&left), "{left}");
+    assert_eq!(wait, Duration::from_secs(30 * 60));
+    // Another run of the same box isn't marked.
+    let (left, wait) = expiry_of(other);
+    assert!((118..=121).contains(&left), "{left}");
+    assert_eq!(wait, LIMITS.wait);
+    // Cleared, the run waits as usual again.
+    desk.set_away(away, None);
+    assert_eq!(desk.away_until(away), None);
+    assert!((118..=121).contains(&expiry_of(away).0));
+    // A mark whose time has passed counts for nothing.
+    desk.set_away(away, Some(now_secs() - 1));
+    assert_eq!(desk.away_until(away), None);
+    assert!((118..=121).contains(&expiry_of(away).0));
+}
+
+#[test]
+fn clearing_the_mark_does_not_shorten_a_request_that_waits() {
+    let desk = desk(LIMITS, Script::with(vec![]));
+    let run = RunId([7; 8]);
+    desk.set_away(run, Some(now_secs() + 3600));
+    let raised = raising(&desk, "dev", false);
+    let (record, bytes) = the_one(&desk);
+    desk.set_away(run, None);
+    thread::sleep(Duration::from_millis(200));
+    let (again, _) = the_one(&desk);
+    assert_eq!(again.expiry, record.expiry, "the record, which a phone signs, is the same");
+    assert_eq!(desk.answer_here(true, &answer_digest(&bytes, true)), Here::Approved);
+    assert_eq!(raised.join().unwrap().came, Came::Yes(By::Local));
+}
+
+#[test]
+fn a_wait_is_said_in_seconds_up_to_two_minutes_and_in_minutes_above() {
+    assert_eq!(wait_said(Duration::from_secs(120)), "120 seconds");
+    assert_eq!(wait_said(Duration::from_secs(1)), "1 seconds");
+    assert_eq!(wait_said(Duration::from_secs(30 * 60)), "30 minutes");
+    assert_eq!(wait_said(Duration::from_secs(121)), "3 minutes");
 }

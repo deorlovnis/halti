@@ -19,13 +19,13 @@ use super::Here;
 use super::boxes::Kept;
 use crate::config;
 use crate::keep::{self, Told};
-use crate::requests::{self, Record, answer_digest, now_secs};
+use crate::requests::{Record, answer_digest, now_secs};
 use crate::util::warn;
 
 /// How long an open workspace has to list what waits.
 const LIST_WAIT: Duration = Duration::from_secs(5);
-/// How long it has to answer: on a Mac it asks Touch ID first, which waits as long as a request.
-const ANSWER_WAIT: Duration = Duration::from_secs(requests::LIMITS.wait.as_secs() + 30);
+/// How long it has to answer: on a Mac it asks Touch ID first, whose window stays up this long.
+const ANSWER_WAIT: Duration = Duration::from_secs(crate::approve::TOUCH_ID_WAIT.as_secs() + 30);
 
 /// A request that waits, as the open workspace sent it.
 struct Found {
@@ -101,7 +101,8 @@ pub fn list() -> Result<()> {
 /// it has left.
 fn line(record: &Record, width: usize, now: u64) -> String {
     let left = record.expiry.saturating_sub(now);
-    format!("{}  {:<width$}  {}  {left}s left", record.id.short(), record.shown(), record.action)
+    let left = if left > 120 { format!("{}m", left / 60) } else { format!("{left}s") };
+    format!("{}  {:<width$}  {}  {left} left", record.id.short(), record.shown(), record.action)
 }
 
 /// `halti requests approve ID` and `deny ID`: the one request whose id starts with `typed`, at
@@ -186,5 +187,9 @@ mod tests {
         let found = found([0xab; 16]);
         assert_eq!(line(&found.record, 10, 880), "abababab  acme/dev    POST https://api.example.com/v1/x  120s left");
         assert_eq!(line(&found.record, 0, 2_000), "abababab  acme/dev  POST https://api.example.com/v1/x  0s left", "an expired one has none");
+        // A request of a run marked away has minutes left.
+        let away = Record { expiry: 10_000, ..found.record.clone() };
+        assert_eq!(line(&away, 0, 10_000 - 28 * 60 - 30), "abababab  acme/dev  POST https://api.example.com/v1/x  28m left");
+        assert_eq!(line(&away, 0, 10_000 - 121), "abababab  acme/dev  POST https://api.example.com/v1/x  2m left");
     }
 }
