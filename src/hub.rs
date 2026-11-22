@@ -68,6 +68,8 @@ const ALPN: &[u8] = b"http/1.1";
 const DOOR_PORTS: [u16; 3] = [53, 80, 443];
 /// How long a machine's call for what phones sent it waits for something to come, at most.
 pub const INBOX_WAIT: Duration = Duration::from_secs(25);
+/// How long a phone's call to be told what waits is held, at most, when nothing changes.
+pub const WAIT_HOLD: Duration = Duration::from_secs(240);
 
 /// The time, as the hub counts days. Tests pass one they move by hand.
 pub trait Clock: Send + Sync {
@@ -100,6 +102,19 @@ pub struct Hub {
     sent: Condvar,
     /// How long a machine's call for what phones sent it waits; tests make it shorter.
     inbox_wait: Duration,
+    /// The phones' held calls to be told what waits.
+    waits: Mutex<Waits>,
+    /// Woken when what a phone may see could have changed, or a phone calls again.
+    stirred: Condvar,
+    /// How long such a call is held; tests make it shorter.
+    wait_hold: Duration,
+}
+
+/// Which held call of each phone is its newest, and how often the hub was stirred.
+#[derive(Default)]
+struct Waits {
+    newest: std::collections::HashMap<String, u64>,
+    stirs: u64,
 }
 
 /// The table's file.
@@ -140,11 +155,20 @@ impl Hub {
             relay: Mutex::default(),
             sent: Condvar::new(),
             inbox_wait: INBOX_WAIT,
+            waits: Mutex::default(),
+            stirred: Condvar::new(),
+            wait_hold: WAIT_HOLD,
         })
     }
 
     fn now(&self) -> Timestamp {
         self.clock.now()
+    }
+
+    /// Wakes the phones' held calls to look again.
+    fn stir(&self) {
+        locked(&self.waits).stirs += 1;
+        self.stirred.notify_all();
     }
 
     /// Runs `f` on the table at the hub's time, writes the rows down if they changed, and wakes

@@ -417,6 +417,17 @@ impl Relay {
         out
     }
 
+    /// The ids of the requests phones of `scope` may see, sorted.
+    pub fn ids(&mut self, scope: &[WsName], machines: &[String], now: Timestamp) -> Vec<[u8; 16]> {
+        let mut out = Vec::new();
+        for machine in machines {
+            let Some(mailbox) = self.held(machine, now) else { continue };
+            out.extend(mailbox.requests.iter().filter(|(_, held)| !held.hidden && in_scope(scope, &held.record.ws)).map(|(id, _)| *id));
+        }
+        out.sort();
+        out
+    }
+
     /// The record of request `id` on `machine`, if a phone of `scope` may answer it.
     pub fn record(&mut self, machine: &str, id: Id, scope: &[WsName], now: Timestamp) -> Option<(Record, Vec<u8>)> {
         let held = self.held(machine, now)?.requests.get(&id.0)?;

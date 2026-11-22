@@ -221,6 +221,25 @@
 //! signed: `200 {}`. It closes the remote copy for every phone and nothing else: the machine still
 //! waits, and is answered there or expires. Any phone that may see the request can do it.
 //!
+//! **Waiting, with the app closed.** `POST /v1/wait` is the one call that takes no token. It takes
+//! the phone's **wake credential** in the header `Authorization: Wake <64 hex>`: the SHA-256 of the
+//! fields `halti-wake-v1` and the hash of the phone's current token (32). The app computes it
+//! whenever it holds the token and keeps it apart, for a service that runs while the phone is
+//! locked; the hub computes it from the row. It works on this call alone, and this call takes
+//! nothing else: a token here gets `403 wrong-kind`, the credential anywhere else `401 no-token`.
+//! It works while the row is kept, its token expired or not; after a renewal only the new token's
+//! does; a machine has none. Example: the token `halti_dev_` then `0123456789abcdef` four times has
+//! the hash `b1b1a551...fa7272cc` and the wake credential `ab256275...38a624d5`, as this file's
+//! tests have them whole.
+//!
+//! The body is `{"seen": "<32 bytes>"}`: the SHA-256 of the ids the call was last answered with,
+//! each 16 bytes, sorted by their bytes and run together; `""` for none. The reply is
+//! `200 {"requests": ["<16 bytes>", ...]}`, the ids of the requests `GET /v1/requests` would list
+//! now, sorted by their bytes. It comes at once when those differ from `seen`; otherwise the hub
+//! holds the call until they do, or 240 seconds, and answers then. A phone has one such call at a
+//! time: a newer one ends the one before with the list as it is. The credential tells the hub's
+//! holder how many requests wait and when that changes; it reads, answers, hides or stops nothing.
+//!
 //! **Stopping runs.** The app signs, after fingerprint or PIN, these fields, in this order and
 //! nothing else:
 //!
@@ -351,13 +370,13 @@
 //! | Status | Word | When |
 //! |---|---|---|
 //! | 400 | `malformed` | The body isn't the JSON of that call: a field missing or unknown, bad hex, a wrong length, a bad name, a key not on the curve, a new token hash equal to one the row holds |
-//! | 401 | `no-token` | No `Authorization: Bearer` with a token of the right form |
-//! | 401 | `unknown` | No such token: never paired, refused at the terminal, revoked, deleted, a phone's replaced token after it stopped working, or a machine's 90 days after its issue |
+//! | 401 | `no-token` | No `Authorization: Bearer` with a token of the right form; at `/v1/wait`, no `Authorization: Wake` with a credential of the right form |
+//! | 401 | `unknown` | No such token or wake credential: never paired, refused at the terminal, revoked, deleted, a phone's replaced token after it stopped working, or a machine's 90 days after its issue |
 //! | 401 | `pending` | Paired, and nobody has answered at the hub's terminal yet |
 //! | 401 | `expired` | Past day 30, for a call it no longer admits |
 //! | 401 | `replaced` | A phone's replaced token, sent to a renewal call |
 //! | 401 | `conflict` | A machine's replaced token (see Token conflict) |
-//! | 403 | `wrong-kind` | A machine's token at a phone's call (`/v1/renew/nonce` and those of "What a phone does"), or a phone's at a machine's |
+//! | 403 | `wrong-kind` | A machine's token at a phone's call (`/v1/renew/nonce` and those of "What a phone does"), or a phone's at a machine's, or any token at `/v1/wait` |
 //! | 403 | `other-machine` | A machine's record that names another machine |
 //! | 403 | `bad-code` | The pairing code is unknown, used, past its 2 minutes, or of the other kind |
 //! | 403 | `bad-signature` | A signature does not verify |
@@ -395,6 +414,8 @@ pub const RENEW_LABEL: &str = "halti-renew-v1";
 pub const STOP_LABEL: &str = "halti-stop-v1";
 /// What a machine code is a hash of.
 pub const MACHINE_CODE_LABEL: &str = "halti-machine-code-v1";
+/// What a phone's wake credential is a hash of.
+pub const WAKE_LABEL: &str = "halti-wake-v1";
 
 /// The first part of a pairing string.
 const INVITE: &str = "halti-pair/1";
@@ -631,6 +652,36 @@ pub fn bearer(value: &str) -> Option<(Kind, [u8; 32])> {
     let digits = &token[kind.prefix().len()..];
     unhex::<32>(digits)?;
     Some((kind, token_hash(token)))
+}
+
+/// The wake credential of the token with this hash.
+pub fn wake_of(token_hash: &[u8; 32]) -> [u8; 32] {
+    Sha256::digest(fields::join(&[WAKE_LABEL.as_bytes(), token_hash])).into()
+}
+
+/// The wake credential in an `Authorization` header's value, if it is one: `Wake `, then 64
+/// lowercase hex characters.
+pub fn wake(value: &str) -> Option<[u8; 32]> {
+    unhex(value.strip_prefix("Wake ")?)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitBody {
+    seen: String,
+}
+
+/// What a waiting phone was last told: the hash of the ids, or None for none.
+pub fn wait_body(body: &[u8]) -> Result<Option<[u8; 32]>, Refused> {
+    let body: WaitBody = json(body)?;
+    if body.seen.is_empty() { Ok(None) } else { bytes(&body.seen).map(Some) }
+}
+
+/// The hash of these ids, sorted, as a waiting phone names what it was told; None for none.
+pub fn seen_of(ids: &[[u8; 16]]) -> Option<[u8; 32]> {
+    let mut sorted = ids.to_vec();
+    sorted.sort();
+    (!sorted.is_empty()).then(|| Sha256::digest(sorted.concat()).into())
 }
 
 /// Exactly `N` bytes from lowercase hex.
