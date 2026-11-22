@@ -247,3 +247,55 @@ fn a_site_s_records_of_mixed_sizes_are_read_whole() {
     tls.read_to_end(&mut got).unwrap();
     assert!(got == expected, "got {} bytes of {}", got.len(), expected.len());
 }
+
+/// What `look` saw, again and again, until it saw something other than nothing.
+fn looked(tls: &mut Tls, socket: &UnixStream) -> io::Result<Option<usize>> {
+    let mut buf = [0u8; 64];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match crate::door::inspect::read_without_waiting(tls, |now| socket.set_nonblocking(now), &mut buf) {
+            Ok(None) if std::time::Instant::now() < deadline => thread::sleep(std::time::Duration::from_millis(5)),
+            seen => return seen,
+        }
+    }
+}
+
+#[test]
+fn a_look_without_waiting_reads_what_came_and_sees_a_hang_up() {
+    let ca = Arc::new(BoxCa::generate("research").unwrap());
+    for close_notify in [false, true] {
+        let (server_end, client_end) = UnixStream::pair().unwrap();
+        let (door_ca, (sent, said)) = (ca.clone(), std::sync::mpsc::channel::<()>());
+        let server = thread::spawn(move || {
+            let socket = server_end.try_clone().unwrap();
+            let mut tls = accept(&door_ca, "example.com", server_end.try_clone().unwrap(), server_end).unwrap();
+            let mut buf = [0u8; 64];
+            // Nothing came: nothing is read, and nothing is lost.
+            assert_eq!(crate::door::inspect::read_without_waiting(&mut tls, |now| socket.set_nonblocking(now), &mut buf).unwrap(), None);
+            sent.send(()).unwrap();
+            assert_eq!(looked(&mut tls, &socket).unwrap(), Some(5));
+            // The socket waits again for the next read.
+            let n = tls.read(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"world");
+            sent.send(()).unwrap();
+            // A client that hangs up, with or without saying so, is seen gone.
+            assert!(matches!(looked(&mut tls, &socket), Ok(Some(0)) | Err(_)));
+        });
+        let name = ServerName::try_from("example.com".to_string()).unwrap();
+        let mut client = StreamOwned::new(ClientConnection::new(guest_config(&ca, &[b"http/1.1"]), name).unwrap(), client_end);
+        client.flush().unwrap();
+        said.recv().unwrap();
+        client.write_all(b"hello").unwrap();
+        client.flush().unwrap();
+        thread::sleep(std::time::Duration::from_millis(100));
+        client.write_all(b"world").unwrap();
+        client.flush().unwrap();
+        said.recv().unwrap();
+        if close_notify {
+            client.conn.send_close_notify();
+            client.flush().unwrap();
+        }
+        drop(client);
+        server.join().unwrap();
+    }
+}

@@ -18,6 +18,8 @@ use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::Duration;
 
+use super::inspect::Guest;
+
 use super::addr::{HTTPS_PORT, split_target};
 use super::http::{self, Head};
 use super::inspect::{self, Caller, Ctx};
@@ -29,6 +31,39 @@ use super::{Entry, Origin, Shared};
 const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a reconnect to a site that closed an idle connection may take.
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long the connection to the site made at CONNECT is used for the first request; one older
+/// than this, as after a request that waited for its answer, is dialed again first.
+const FIRST_FRESH: Duration = Duration::from_secs(30);
+
+/// The guest's side once its TLS is ended: the session, and its socket, which a look while a
+/// request waits sets not to wait, for that one read.
+struct GuestSide {
+    tls: tls::Tls,
+    socket: UnixStream,
+}
+
+impl Read for GuestSide {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.tls.read(buf)
+    }
+}
+
+impl Write for GuestSide {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.tls.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.tls.flush()
+    }
+}
+
+impl Guest for GuestSide {
+    fn read_now(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        let socket = &self.socket;
+        inspect::read_without_waiting(&mut self.tls, |now| socket.set_nonblocking(now), buf)
+    }
+}
 
 pub fn serve(sh: &Shared, mut reader: BufReader<UnixStream>, mut writer: UnixStream, origin: Origin) {
     let _ = writer.set_read_timeout(Some(HEAD_TIMEOUT));
@@ -76,17 +111,17 @@ pub fn serve(sh: &Shared, mut reader: BufReader<UnixStream>, mut writer: UnixStr
     match guest {
         Ok(guest) => {
             sh.log.write(&entry("allowed", 0, 0));
-            // The first request uses the connection made above; a reconnect dials the same vetted
-            // address again (never a fresh lookup) and verifies the site again.
-            let mut first = Some(site.clone());
-            let connect = || -> anyhow::Result<tls::Tls> {
-                if let Some(site) = first.take() {
-                    return Ok(site);
-                }
+            // The first request uses the connection made above while it is fresh; a reconnect
+            // dials the same vetted address again (never a fresh lookup) and verifies the site
+            // again.
+            let dial = || -> anyhow::Result<tls::Tls> {
                 let tcp = TcpStream::connect_timeout(&SocketAddr::new(ip, HTTPS_PORT), RECONNECT_TIMEOUT)?;
                 tls::connect(sh.net.tls(), &host, tcp)
             };
-            let (up, down) = inspect::serve(guest.clone(), connect, &Ctx { shared: sh, host: &host, caller: &caller });
+            let connect = inspect::first_while_fresh(site.clone(), FIRST_FRESH, dial);
+            let Ok(socket) = writer.try_clone() else { return };
+            let side = GuestSide { tls: guest.clone(), socket };
+            let (up, down) = inspect::serve(side, connect, &Ctx { shared: sh, host: &host, caller: &caller });
             let _ = guest.finish();
             let _ = site.finish();
             sh.log.write(&entry("closed", up, down));
