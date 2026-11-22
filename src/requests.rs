@@ -31,6 +31,11 @@
 //! trusts for the workspace: ECDSA over P-256 with SHA-256 hashes them to the same digest. The open
 //! workspace checks it against the trusted key and its own record (`Desk::answer_signed`); the
 //! first answer that counts wins, from here or from a phone.
+//!
+//! A run marked away (`halti ws away`, `Desk::set_away`) has its requests wait longer: up to
+//! `Limits::away_wait`, never past the mark's end, never less than `Limits::wait`. The wait is
+//! fixed as the request is raised, since its expiry is in the bytes a phone signs: clearing the
+//! mark doesn't shorten a request that waits already.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -62,6 +67,8 @@ const COUNTED_KEPT: usize = 64;
 pub struct Limits {
     /// How long a request waits for its answer.
     pub wait: Duration,
+    /// How long a request of a run marked away waits, at most.
+    pub away_wait: Duration,
     /// How many requests one box may have waiting.
     pub per_box: usize,
     /// How many requests the open workspace may have waiting, of all its boxes.
@@ -72,7 +79,33 @@ pub struct Limits {
     pub rest: Duration,
 }
 
-pub const LIMITS: Limits = Limits { wait: Duration::from_secs(120), per_box: 3, per_desk: 50, strikes: 3, rest: Duration::from_secs(300) };
+pub const LIMITS: Limits = Limits { wait: Duration::from_secs(120), away_wait: Duration::from_secs(30 * 60), per_box: 3, per_desk: 50, strikes: 3, rest: Duration::from_secs(300) };
+
+impl Limits {
+    /// How long a request raised at `now` waits, seconds since 1970, for a run whose away mark
+    /// ends at `away`: the away wait, cut at the mark's end but never below `wait`; `wait` if the
+    /// run isn't marked, or its mark is over.
+    pub fn wait_of(&self, away: Option<u64>, now: u64) -> Duration {
+        match away {
+            Some(until) if until > now => self.wait.max(self.away_wait.min(Duration::from_secs(until - now))),
+            _ => self.wait,
+        }
+    }
+}
+
+/// The time of day `secs`, seconds since 1970, falls at here: `22:10`.
+pub fn clock(secs: u64) -> String {
+    i64::try_from(secs)
+        .ok()
+        .and_then(|secs| jiff::Timestamp::from_second(secs).ok())
+        .map_or_else(|| "--:--".to_string(), |time| time.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M").to_string())
+}
+
+/// A wait as people read it: `120 seconds` up to two minutes, whole minutes above.
+pub fn wait_said(wait: Duration) -> String {
+    let secs = wait.as_secs();
+    if secs <= 120 { format!("{secs} seconds") } else { format!("{} minutes", secs.div_ceil(60)) }
+}
 
 /// Whether `name` may stand in a record (`fields::is_name`).
 pub fn check_name(name: &str) -> Result<()> {
@@ -133,7 +166,7 @@ impl Id {
 }
 
 /// A run's id: 8 random bytes drawn as its box started.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct RunId(pub [u8; 8]);
 
 impl RunId {
@@ -290,8 +323,8 @@ pub fn now_secs() -> u64 {
 /// The expiry of a request that waits `wait` from now: the next whole second after it, so the
 /// record never says less than its wait.
 fn expiry_after(wait: Duration) -> u64 {
-    let end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default() + wait;
-    end.as_secs() + u64::from(end.subsec_nanos() > 0)
+    let end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().saturating_add(wait);
+    end.as_secs().saturating_add(u64::from(end.subsec_nanos() > 0))
 }
 
 /// Who answered a request.
@@ -344,7 +377,7 @@ pub enum Came {
     No(By),
     /// Nobody answered before it expired.
     Expired,
-    /// The box stopped, or the workspace closed, while it waited.
+    /// The box stopped, its client gave up, or the workspace closed, while it waited.
     Withdrawn,
     /// Never raised: the box has as many waiting as it may.
     Full,
@@ -354,11 +387,13 @@ pub enum Came {
     Resting,
 }
 
-/// A request that was raised, or not: its id, if it got one, and what it came to.
+/// A request that was raised, or not: its id, if it got one, what it came to, and how long it
+/// could wait.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Raised {
     pub id: Option<Id>,
     pub came: Came,
+    pub wait: Duration,
 }
 
 /// What the prompt where the box runs said.
@@ -436,6 +471,8 @@ struct Strikes {
 struct Table {
     waiting: Vec<Waiting>,
     strikes: HashMap<String, Strikes>,
+    /// The runs marked away, and when each mark ends, seconds since 1970.
+    away: HashMap<RunId, u64>,
     closed: bool,
 }
 
@@ -516,6 +553,25 @@ impl Desk {
     pub fn records(&self) -> Vec<Vec<u8>> {
         let now = Instant::now();
         self.table().waiting.iter().filter(|waiting| !waiting.closed(now)).map(|waiting| waiting.bytes.clone()).collect()
+    }
+
+    /// Marks run `run` away until `until`, seconds since 1970, or clears its mark with None. A
+    /// request that waits already keeps its wait.
+    pub fn set_away(&self, run: RunId, until: Option<u64>) {
+        let now = now_secs();
+        let mut table = self.table();
+        table.away.retain(|_, until| *until > now);
+        match until {
+            Some(until) => table.away.insert(run, until),
+            None => table.away.remove(&run),
+        };
+    }
+
+    /// When the away mark of run `run` ends, if it has one that hasn't.
+    #[cfg(test)]
+    pub fn away_until(&self, run: RunId) -> Option<u64> {
+        let now = now_secs();
+        self.table().away.get(&run).copied().filter(|until| *until > now)
     }
 
     /// Withdraws every request, and raises none from now on: the workspace is closing.
@@ -651,7 +707,7 @@ impl Desk {
     /// to. With `confirm` the prompt here asks too, on a thread of its own, and is withdrawn once
     /// the request is settled. `stopped` says the box has stopped.
     fn raise(self: &Arc<Self>, box_name: &str, run: RunId, action: &str, confirm: bool, stopped: &dyn Fn() -> bool) -> Raised {
-        let not = |came| Raised { id: None, came };
+        let not = |came| Raised { id: None, came, wait: self.limits.wait };
         let mut table = self.table();
         if table.closed {
             return not(Came::Withdrawn);
@@ -666,6 +722,8 @@ impl Desk {
         if table.waiting.len() >= self.limits.per_desk {
             return not(Came::WorkspaceFull);
         }
+        let wait = self.limits.wait_of(table.away.get(&run).copied(), now_secs());
+        let Some(deadline) = now.checked_add(wait) else { return not(Came::Withdrawn) };
         let record = Record {
             machine: (self.machine)(),
             ws: self.ws.clone(),
@@ -674,12 +732,12 @@ impl Desk {
             kind: Kind::Write,
             action: action.to_string(),
             id: Id::random(),
-            expiry: expiry_after(self.limits.wait),
+            expiry: expiry_after(wait),
         };
         let Ok(bytes) = record.encode() else { return not(Came::Withdrawn) };
         let (id, shown) = (record.id, record.shown());
         say(&format!("request {}: box {shown} asks to send {action}. answer it with: halti requests approve {0}, or deny {0}", id.short()));
-        table.waiting.push(Waiting { record, bytes, deadline: now + self.limits.wait, confirm, answer: None, taken: false, prompting: confirm });
+        table.waiting.push(Waiting { record, bytes, deadline, confirm, answer: None, taken: false, prompting: confirm });
         drop(table);
         self.changed.notify_all();
         if confirm {
@@ -688,10 +746,11 @@ impl Desk {
         let came = self.wait_for(id, stopped);
         self.after(box_name, &came);
         say(&format!("request {}: {}", id.short(), said(&came)));
-        Raised { id: Some(id), came }
+        Raised { id: Some(id), came, wait }
     }
 
-    /// Waits until request `id` is settled, expires, or is withdrawn; then it goes.
+    /// Waits until request `id` is settled, expires, or is withdrawn; then it goes. `stopped` is
+    /// asked without the table held: it may look at a socket.
     fn wait_for(&self, id: Id, stopped: &dyn Fn() -> bool) -> Came {
         let mut table = self.table();
         let came = loop {
@@ -700,11 +759,19 @@ impl Desk {
             match &waiting.answer {
                 Some((true, by)) => break Came::Yes(by.clone()),
                 Some((false, by)) => break Came::No(by.clone()),
-                None if closed || stopped() => break Came::Withdrawn,
+                None if closed => break Came::Withdrawn,
                 None if waiting.closed(Instant::now()) => break Came::Expired,
                 None => {}
             }
-            table = self.changed.wait_timeout(table, LOOK_EVERY).unwrap_or_else(PoisonError::into_inner).0;
+            drop(table);
+            let stop = stopped();
+            table = self.table();
+            if stop && table.waiting.iter().any(|waiting| waiting.record.id == id && waiting.answer.is_none()) {
+                break Came::Withdrawn;
+            }
+            if !stop {
+                table = self.changed.wait_timeout(table, LOOK_EVERY).unwrap_or_else(PoisonError::into_inner).0;
+            }
         };
         table.waiting.retain(|waiting| waiting.record.id != id);
         drop(table);
@@ -736,7 +803,7 @@ fn said(came: &Came) -> String {
         Came::Yes(by) => format!("approved ({})", by.word()),
         Came::No(by) => format!("denied ({})", by.word()),
         Came::Expired => "not answered in time, so refused".to_string(),
-        Came::Withdrawn => "withdrawn: its box stopped, or the workspace is closing".to_string(),
+        Came::Withdrawn => "withdrawn: its box stopped, its client gave up, or the workspace is closing".to_string(),
         Came::Full | Came::WorkspaceFull | Came::Resting => "refused".to_string(),
     }
 }

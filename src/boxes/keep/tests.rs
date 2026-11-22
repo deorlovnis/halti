@@ -806,7 +806,7 @@ fn a_request_is_listed_and_answered_on_the_socket_in_records() {
             assert_eq!(keep::list(socket, &globex, LONG), Some(Err(Told::Other)));
             assert_eq!(keep::answer(socket, &acme(), true, answer_digest(&bytes, false), LONG), Some(Told::Gone));
             assert_eq!(keep::answer(socket, &acme(), true, answer_digest(&bytes, true), LONG), Some(Told::Approved));
-            assert_eq!(raised.join().unwrap(), Raised { id: Some(record.id), came: Came::Yes(By::Local) });
+            assert_eq!(raised.join().unwrap(), Raised { id: Some(record.id), came: Came::Yes(By::Local), wait: requests::LIMITS.wait });
             // The first answer won: the second finds nothing.
             assert_eq!(keep::answer(socket, &acme(), false, answer_digest(&bytes, false), LONG), Some(Told::Gone));
             assert_eq!(keep::list(socket, &acme(), LONG), Some(Ok(Vec::new())));
@@ -953,6 +953,33 @@ fn a_signed_stop_stops_the_runs_it_names_and_only_those() {
         // Sent again, it stops nothing new, and a later run of dev isn't the one it named.
         assert_eq!(keep::tell(socket, &stop(&pixel, "mac-1", vec![("dev", dev_run)]), LONG), stopped(0, 0));
         assert!(matches!(ask(socket, Request::Close(acme())), Some(Reply::Closed(1))));
+    });
+    assert_eq!(code.unwrap(), 0);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs hdiutil")]
+fn a_running_box_is_marked_away_and_its_mark_ends_with_its_run() {
+    let bench = Bench::new(Fake::default());
+    let code = bench.keeping(&[("dev", "")], true, |socket| {
+        // A box that doesn't run has no run to mark; another workspace's name does nothing.
+        assert_eq!(ask(socket, Request::Away(acme(), "dev".into(), Some(3600))), Some(Reply::Idle));
+        let globex = WsName::parse("globex").unwrap();
+        assert_eq!(ask(socket, Request::Away(globex, "dev".into(), Some(3600))), Some(Reply::Other));
+        let (said, session) = session(socket, "dev");
+        assert_eq!(said, Reply::Started);
+        let run = keep::runs(socket, &acme(), LONG).unwrap().unwrap().remove(0).1;
+        let Some(Reply::Away(Some(ends))) = ask(socket, Request::Away(acme(), "dev".into(), Some(3600))) else { panic!("not marked") };
+        assert!((3599..=3601).contains(&(ends - requests::now_secs())), "{ends}");
+        assert_eq!(bench.desk.away_until(run), Some(ends));
+        assert_eq!(ask(socket, Request::Away(acme(), "dev".into(), None)), Some(Reply::Away(None)));
+        assert_eq!(bench.desk.away_until(run), None);
+        // Marked again, it goes when the run ends.
+        assert!(matches!(ask(socket, Request::Away(acme(), "dev".into(), Some(600))), Some(Reply::Away(Some(_)))));
+        drop(session);
+        until(|| running(socket) == Some(Reply::Open(0)));
+        until(|| bench.desk.away_until(run).is_none());
+        assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
     });
     assert_eq!(code.unwrap(), 0);
 }

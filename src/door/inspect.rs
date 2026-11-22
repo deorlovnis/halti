@@ -25,13 +25,24 @@
 //!   site's `[browse]` rules, not the box's: `writes` and `allow_writes` instead of `[net]`.
 //!   No credentials are added to it, and its answer is not masked here (halti masks what the
 //!   runner reports): the session is in the browser already.
+//! - **A client that gives up.** While a request waits, the door looks at the guest's side every
+//!   time the request is looked at, and once more as it is approved, before anything goes to the
+//!   site. A client that has closed its side (or half-closed it: that is taken as gone too) ends
+//!   the request as withdrawn: nothing is sent and nothing is answered. What the client sends
+//!   meanwhile is its body, kept in order for when it goes on; once `LOOK_AHEAD` bytes of it wait,
+//!   the door stops looking, so a large upload whose client hangs up is not noticed during the wait.
+//!   The look at approval reads on, up to `RETRY_BODY` bytes, to see the end that comes behind such
+//!   a body. A client that hung up after sending more than that is not seen: its request is sent.
 //! - **The log:** one chained line per request, with the method and the masked URL, never
 //!   headers or bodies.
 //!
 //! The functions here work on any pair of streams, so tests run them over plain sockets.
 
+use std::cell::RefCell;
 use std::io::{self, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use url::Url;
@@ -106,13 +117,157 @@ pub(super) struct Ctx<'a> {
 /// site turns out to have closed the connection.
 pub(super) const RETRY_BODY: usize = 1024 * 1024;
 
+/// How much of what a guest sends while its request waits is read and kept: past this, the door
+/// stops looking whether the client is still there.
+pub(super) const LOOK_AHEAD: usize = 64 * 1024;
+
+/// The look as a request is approved reads on until nothing more has come for this long.
+const QUIET: Duration = Duration::from_millis(200);
+
+/// The guest's side of a connection, as the door reads it.
+pub(super) trait Guest: Read + Write {
+    /// What has arrived already, read into `buf` without waiting for more: None if nothing has,
+    /// `Some(0)` at the end of the stream.
+    fn read_now(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>>;
+}
+
+impl Guest for UnixStream {
+    fn read_now(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        let stream: &UnixStream = self;
+        read_without_waiting(&mut &*stream, |now| stream.set_nonblocking(now), buf)
+    }
+}
+
+/// Reads `stream` once with its socket made non-blocking by `set` for just that read.
+pub(super) fn read_without_waiting(stream: &mut impl Read, set: impl Fn(bool) -> io::Result<()>, buf: &mut [u8]) -> io::Result<Option<usize>> {
+    set(true)?;
+    let read = loop {
+        match stream.read(buf) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            read => break read,
+        }
+    };
+    // A socket left non-blocking would fail the reads and writes after: that is the end of it.
+    set(false)?;
+    match read {
+        Ok(n) => Ok(Some(n)),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The guest, with what was read from it while a request waited kept ahead of the rest of its
+/// stream: it is read first, in the order it came.
+pub(super) struct Watched<G> {
+    inner: G,
+    ahead: Vec<u8>,
+    /// How much of `ahead` was read already.
+    at: usize,
+    /// The client was seen gone.
+    gone: bool,
+}
+
+impl<G: Guest> Watched<G> {
+    fn new(inner: G) -> Self {
+        Watched { inner, ahead: Vec::new(), at: 0, gone: false }
+    }
+
+    /// Whether the client is still there, as looked while its request waits: reads what it sent
+    /// since, without waiting, and keeps it. Once `LOOK_AHEAD` bytes wait unread, it no longer
+    /// looks, and says yes.
+    fn there(&mut self) -> bool {
+        self.look(LOOK_AHEAD)
+    }
+
+    /// Whether the client is still there, as looked once its request is approved, before anything
+    /// goes to the site. A client that sent more than `LOOK_AHEAD` and hung up has its end behind
+    /// the rest of what it sent, which comes on as it is read: so this reads on, up to
+    /// `RETRY_BODY` waiting, until nothing more has come for `QUIET`. Past that it says yes.
+    fn still_there(&mut self) -> bool {
+        let mut last = Instant::now();
+        let mut came = false;
+        loop {
+            let had = self.ahead.len();
+            if !self.look(RETRY_BODY) {
+                return false;
+            }
+            if self.ahead.len() > had {
+                (last, came) = (Instant::now(), true);
+            }
+            if !came || self.ahead.len() - self.at >= RETRY_BODY || last.elapsed() >= QUIET {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Reads what the client sent, without waiting, while fewer than `limit` bytes wait unread.
+    /// Whether it is still there.
+    fn look(&mut self, limit: usize) -> bool {
+        let mut buf = [0u8; 16 * 1024];
+        while !self.gone {
+            let room = limit.saturating_sub(self.ahead.len() - self.at);
+            if room == 0 {
+                return true;
+            }
+            let take = room.min(buf.len());
+            match self.inner.read_now(&mut buf[..take]) {
+                Ok(None) => return true,
+                Ok(Some(0)) | Err(_) => self.gone = true,
+                Ok(Some(n)) => self.ahead.extend_from_slice(&buf[..n]),
+            }
+        }
+        false
+    }
+}
+
+impl<G: Read> Read for Watched<G> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.at < self.ahead.len() {
+            let n = buf.len().min(self.ahead.len() - self.at);
+            buf[..n].copy_from_slice(&self.ahead[self.at..self.at + n]);
+            self.at += n;
+            if self.at == self.ahead.len() {
+                self.ahead.clear();
+                self.at = 0;
+            }
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<G: Write> Write for Watched<G> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// What `serve` connects to the site with: `first`, the connection made as the guest's tunnel
+/// opened, while it is no older than `fresh`; after that, or once it was taken, `dial`. A first
+/// connection that sat unused longer (its request waited for an answer) may have been closed by
+/// the site meanwhile, and the first request on a connection is never sent again: so a new one is
+/// dialed instead, and the old one dropped.
+pub(super) fn first_while_fresh<U>(first: U, fresh: Duration, mut dial: impl FnMut() -> Result<U>) -> impl FnMut() -> Result<U> {
+    let made = Instant::now();
+    let mut first = Some(first);
+    move || match first.take() {
+        Some(first) if made.elapsed() <= fresh => Ok(first),
+        _ => dial(),
+    }
+}
+
 /// Serve requests from the guest (TLS already ended) until it closes. `connect` makes the
 /// connection to the site (verified TLS to the vetted address); it is called when the first
 /// request that is let through needs it, and again if the site has closed the connection by the
 /// time a later request uses it (see `call_site`). Returns the request body bytes sent up and the
 /// response body bytes received (before masking), over every request.
-pub(super) fn serve<G: Read + Write, U: Read + Write>(guest: G, mut connect: impl FnMut() -> Result<U>, ctx: &Ctx) -> (u64, u64) {
-    let mut guest = BufReader::new(guest);
+pub(super) fn serve<G: Guest, U: Read + Write>(guest: G, mut connect: impl FnMut() -> Result<U>, ctx: &Ctx) -> (u64, u64) {
+    let mut guest = BufReader::new(Watched::new(guest));
     let mut upstream: Option<BufReader<U>> = None;
     let mut counts = Counts::default();
     while !ctx.shared.stopped() {
@@ -302,9 +457,15 @@ enum Rules<'a> {
     Page(&'a page::Rules),
 }
 
+/// The decision of a request withdrawn because its client hung up while it waited: nothing is
+/// sent, to the site or to the client.
+const GAVE_UP: &str = "withdrawn:client gave up";
+
 /// What the request does at this host: `allowed`, or `asked:yes` after Touch ID or a request's
 /// yes, or why not. A write `[net]` asks about is `allowed` when `[box.approval] write` says none.
-fn decide(sh: &Shared, kind: Kind, rules: &Rules, method: &str, host: &str, target: &str, url: &str) -> Result<(&'static str, Asked), Refusal> {
+/// `there` says whether the client is still there; a request whose client is gone is withdrawn.
+#[allow(clippy::too_many_arguments)]
+fn decide(sh: &Shared, kind: Kind, rules: &Rules, method: &str, host: &str, target: &str, url: &str, there: &dyn Fn() -> bool) -> Result<(&'static str, Asked), Refusal> {
     if kind == Kind::Read {
         return Ok(("allowed", Asked::default()));
     }
@@ -336,8 +497,9 @@ fn decide(sh: &Shared, kind: Kind, rules: &Rules, method: &str, host: &str, targ
                     Rules::Net => means == Some(Means::TouchId),
                     Rules::Fetch(_) | Rules::Page(_) => Means::TouchId.on(OS),
                 };
-                let raised = asker.raise(&requests::action(method, url), confirm, &|| sh.stopped());
-                return came_to(raised, &sh.cfg.name, method, url, asker.limits());
+                let raised = asker.raise(&requests::action(method, url), confirm, &|| sh.stopped() || !there());
+                let gone = raised.came == Came::Withdrawn && !there();
+                return came_to(raised, &sh.cfg.name, method, url, asker.limits(), gone);
             }
             let asked = match rules {
                 Rules::Net => approval::ask_by(&approval::Real, means, Action::BoxWrite, &reason).map(drop),
@@ -355,7 +517,8 @@ fn decide(sh: &Shared, kind: Kind, rules: &Rules, method: &str, host: &str, targ
 }
 
 /// What a write that raised a request does, as the request came to; the agent is told why not.
-fn came_to(raised: Raised, shown: &str, method: &str, url: &str, limits: requests::Limits) -> Result<(&'static str, Asked), Refusal> {
+/// `gone`: it was withdrawn because its client hung up.
+fn came_to(raised: Raised, shown: &str, method: &str, url: &str, limits: requests::Limits, gone: bool) -> Result<(&'static str, Asked), Refusal> {
     let request = raised.id.map(|id| id.hex());
     let signed = |by: &By| match by {
         By::Device(signed) => Some(signed.clone()),
@@ -368,7 +531,8 @@ fn came_to(raised: Raised, shown: &str, method: &str, url: &str, limits: request
     match &raised.came {
         Came::Yes(by) => Ok(("asked:yes", Asked { request: request.clone(), by: Some(by.word()), signed: signed(by) })),
         Came::No(by) => no("asked:no", String::new(), Some(by)),
-        Came::Expired => no("asked:no", format!(": nobody answered within {} seconds", limits.wait.as_secs()), None),
+        Came::Expired => no("asked:no", format!(": nobody answered within {}", requests::wait_said(raised.wait)), None),
+        Came::Withdrawn if gone => no(GAVE_UP, String::new(), None),
         Came::Withdrawn => no("asked:no", ": the box is stopping".into(), None),
         Came::Full => no("blocked:requests", format!(": box {shown} has {} requests waiting already", limits.per_box), None),
         Came::WorkspaceFull => no("blocked:requests", format!(": box {shown}'s workspace has {} requests waiting already", limits.per_desk), None),
@@ -381,8 +545,8 @@ fn came_to(raised: Raised, shown: &str, method: &str, url: &str, limits: request
 }
 
 /// One request and its answer. `Ok(true)` if the connection can serve another.
-fn exchange<G: Read + Write, U: Read + Write>(
-    guest: &mut BufReader<G>,
+fn exchange<G: Guest, U: Read + Write>(
+    guest: &mut BufReader<Watched<G>>,
     upstream: &mut Option<BufReader<U>>,
     connect: &mut impl FnMut() -> Result<U>,
     ctx: &Ctx,
@@ -455,7 +619,20 @@ fn exchange<G: Read + Write, U: Read + Write>(
         (None, Some(site)) => Rules::Fetch(site),
         (None, None) => Rules::Net,
     };
-    let (decision, asked) = match decide(sh, kind, &rules, &method_shown, ctx.host, target, &url) {
+    let decided = {
+        let watched = RefCell::new(guest.get_mut());
+        decide(sh, kind, &rules, &method_shown, ctx.host, target, &url, &|| watched.borrow_mut().there())
+    };
+    let gave_up = |asked: &Asked, counts: &Counts| {
+        let line = entry(&method_shown, &url, None, GAVE_UP, counts);
+        sh.log.write(&Entry { request: asked.request.clone(), ..Entry::signed(asked.by.clone(), asked.signed.as_deref(), line) });
+        // Nobody is there to be answered.
+        Ok(false)
+    };
+    let (decision, asked) = match decided {
+        Err(r) if r.decision == GAVE_UP => return gave_up(&r.asked, counts),
+        // Approved, but the client hung up first: nothing goes to the site.
+        Ok(("asked:yes", asked)) if !guest.get_mut().still_there() => return gave_up(&asked, counts),
         Ok(decided) => decided,
         Err(r) => {
             sh.log.write(&Entry {

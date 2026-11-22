@@ -8,6 +8,10 @@ use anyhow::{Result, bail};
 
 use crate::requests::Prompted;
 
+/// How long the Touch ID window of a request stays up before it is taken down (the `TIMEOUT` of
+/// `ask_person_until`, which is frozen): the request then waits on for an answer from elsewhere.
+pub const TOUCH_ID_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 thread_local! {
     /// How each prompt this thread asked was answered since its last `take_answers` (true:
     /// approved). Kept per thread: where several boxes run in one process, a call reads back only

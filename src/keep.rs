@@ -7,8 +7,13 @@
 //!
 //! ```text
 //! request = "halti-keep/1 " VERB " " WS [" " BOX] "\n"      start WS BOX, stop WS BOX, close WS, ping WS
+//!         | "halti-keep/1 away " WS " " BOX " " (SECS | "off") "\n"
 //! reply   = "halti-keep/1 " WORD [" " ARG] "\n"
 //! ```
+//!
+//! `away` marks the run of the box that runs now away for SECS seconds (60 to 86400), or clears its
+//! mark: its requests wait longer for an answer (`crate::requests`). It is answered `away UNTIL`,
+//! seconds since 1970, or `away off`; `idle` if the box doesn't run.
 //!
 //! Every line is printable ASCII, at most 128 bytes with its newline, and names only: a workspace,
 //! a box, a site, a count. No passphrase, key, value, policy, path or command crosses, either way.
@@ -179,13 +184,19 @@ pub enum Request {
     Close(WsName),
     /// Say how many boxes run.
     Ping(WsName),
+    /// Mark the box's run away for this many seconds, or clear its mark.
+    Away(WsName, String, Option<u32>),
 }
+
+/// The shortest and the longest away mark, in seconds.
+pub const AWAY_MIN: u32 = 60;
+pub const AWAY_MAX: u32 = 24 * 3600;
 
 impl Request {
     /// The workspace it names.
     pub fn ws(&self) -> &WsName {
         match self {
-            Request::Start(ws, _) | Request::Stop(ws, _) | Request::Close(ws) | Request::Ping(ws) => ws,
+            Request::Start(ws, _) | Request::Stop(ws, _) | Request::Close(ws) | Request::Ping(ws) | Request::Away(ws, _, _) => ws,
         }
     }
 
@@ -195,6 +206,8 @@ impl Request {
             Request::Stop(ws, name) => format!("{VERSION} stop {ws} {name}\n"),
             Request::Close(ws) => format!("{VERSION} close {ws}\n"),
             Request::Ping(ws) => format!("{VERSION} ping {ws}\n"),
+            Request::Away(ws, name, Some(secs)) => format!("{VERSION} away {ws} {name} {secs}\n"),
+            Request::Away(ws, name, None) => format!("{VERSION} away {ws} {name} off\n"),
         }
     }
 
@@ -210,6 +223,15 @@ impl Request {
             }
             ["close", ws] => Some(Request::Close(WsName::parse(ws).ok()?)),
             ["ping", ws] => Some(Request::Ping(WsName::parse(ws).ok()?)),
+            ["away", ws, name, secs] => {
+                check_box(name).ok()?;
+                let secs = match secs {
+                    "off" => None,
+                    _ if secs.len() <= 5 && secs.bytes().all(|b| b.is_ascii_digit()) => Some(secs.parse().ok().filter(|secs| (AWAY_MIN..=AWAY_MAX).contains(secs))?),
+                    _ => return None,
+                };
+                Some(Request::Away(WsName::parse(ws).ok()?, name.to_string(), secs))
+            }
             _ => None,
         }
     }
@@ -238,6 +260,8 @@ pub enum Reply {
     Closed(u32),
     /// The workspace is open, and this many of its boxes run.
     Open(u32),
+    /// The box's run is marked away until then, seconds since 1970; or its mark is cleared.
+    Away(Option<u64>),
     /// The request named another workspace: nothing was done.
     Other,
     /// Another version, verb or shape.
@@ -259,6 +283,8 @@ impl Reply {
             Reply::Idle => "idle".to_string(),
             Reply::Closed(n) => format!("closed {n}"),
             Reply::Open(n) => format!("open {n}"),
+            Reply::Away(Some(until)) => format!("away {until}"),
+            Reply::Away(None) => "away off".to_string(),
             Reply::Other => "other".to_string(),
             Reply::Unsupported => "unsupported".to_string(),
         };
@@ -282,6 +308,8 @@ impl Reply {
             ["idle"] => Reply::Idle,
             ["closed", n] => Reply::Closed(count(n)?),
             ["open", n] => Reply::Open(count(n)?),
+            ["away", "off"] => Reply::Away(None),
+            ["away", until] if until.len() <= 19 && until.bytes().all(|b| b.is_ascii_digit()) => Reply::Away(Some(until.parse().ok()?)),
             ["other"] => Reply::Other,
             ["unsupported"] => Reply::Unsupported,
             _ => return None,
@@ -645,9 +673,16 @@ mod tests {
     #[test]
     fn a_request_reads_only_as_what_was_written() {
         let longest = WsName::parse(&"w".repeat(32)).unwrap();
-        for request in
-            [Request::Start(acme(), "dev".into()), Request::Stop(acme(), "dev".into()), Request::Close(acme()), Request::Ping(acme()), Request::Start(longest, "b".repeat(32))]
-        {
+        for request in [
+            Request::Start(acme(), "dev".into()),
+            Request::Stop(acme(), "dev".into()),
+            Request::Close(acme()),
+            Request::Ping(acme()),
+            Request::Start(longest.clone(), "b".repeat(32)),
+            Request::Away(acme(), "dev".into(), Some(AWAY_MIN)),
+            Request::Away(acme(), "dev".into(), None),
+            Request::Away(longest, "b".repeat(32), Some(AWAY_MAX)),
+        ] {
             let line = request.line();
             assert_eq!(Request::parse(line.strip_suffix('\n').unwrap()), Some(request), "{line}");
         }
@@ -669,6 +704,8 @@ mod tests {
             Reply::Idle,
             Reply::Closed(2),
             Reply::Open(0),
+            Reply::Away(Some(1_763_164_800)),
+            Reply::Away(None),
             Reply::Other,
             Reply::Unsupported,
         ] {
@@ -676,6 +713,18 @@ mod tests {
             assert_eq!(Reply::parse(line.strip_suffix('\n').unwrap()), Some(reply), "{line}");
         }
         assert_eq!(Request::Ping(acme()).line(), "halti-keep/1 ping acme\n");
+        assert_eq!(Request::Away(acme(), "dev".into(), Some(28_800)).line(), "halti-keep/1 away acme dev 28800\n");
+        // An away mark is a minute to a day, in plain digits.
+        for line in [
+            "halti-keep/1 away acme dev 59",
+            "halti-keep/1 away acme dev 86401",
+            "halti-keep/1 away acme dev +600",
+            "halti-keep/1 away acme dev 0600000",
+            "halti-keep/1 away acme dev",
+            "halti-keep/1 away acme Dev 600",
+        ] {
+            assert_eq!(Request::parse(line), None, "{line}");
+        }
         assert_eq!(Reply::No(No::Site("github".into())).line(), "halti-keep/1 no site github\n");
         // Anything else is nothing: a reply's site and count are checked before they are shown.
         for line in ["halti-keep/1 no site Git\x1b", "halti-keep/1 no site ../x", "halti-keep/1 closed -1", "halti-keep/1 open 1e3", "halti-keep/1 started ", "halti-keep/1 maybe"]
@@ -826,6 +875,9 @@ mod tests {
     fn the_longest_request_fits() {
         let longest = Request::Start(WsName::parse(&"w".repeat(32)).unwrap(), "b".repeat(32)).line();
         assert_eq!(longest.len(), 85);
+        let away = Request::Away(WsName::parse(&"w".repeat(32)).unwrap(), "b".repeat(32), Some(AWAY_MAX)).line();
+        assert_eq!(away.len(), 90);
+        assert!(Reply::Away(Some(u64::MAX)).line().len() <= LINE_MAX);
         // A site's name long enough to pass the limit is said as a failure.
         assert_eq!(Reply::No(No::Site("s".repeat(120))).line(), "halti-keep/1 no failed\n");
     }

@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 
 use super::addr::Net as Dial;
 use super::http::{self, Body, Head};
-use super::inspect::{Caller, Ctx, Net, RETRY_BODY, serve};
+use super::inspect::{Caller, Ctx, LOOK_AHEAD, Net, RETRY_BODY, first_while_fresh, serve};
 use super::{Config, Shared};
 use crate::approval::Means;
 use crate::chain::Chain;
@@ -169,6 +169,13 @@ struct Rig {
 
 impl Rig {
     fn new(shared: &Arc<Shared>, host: &str) -> Self {
+        Rig::with_first(shared, host, None)
+    }
+
+    /// With `first`, the door is handed a connection made before any request, as at CONNECT, to a
+    /// site that closes it once it has sat unused for `first.1`; the door uses it while it is no
+    /// older than `first.0`. Without, each connection is made as a request needs it.
+    fn with_first(shared: &Arc<Shared>, host: &str, first: Option<(Duration, Duration)>) -> Self {
         let (guest, door_guest) = UnixStream::pair().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (release, released) = mpsc::channel();
@@ -176,16 +183,15 @@ impl Rig {
         let (connects, unreachable) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
         // Each connection the door makes gets a site of its own; they all record into `seen`.
         let (record, count, down) = (seen.clone(), connects.clone(), unreachable.clone());
-        let connect = move || {
-            if down.load(Ordering::SeqCst) {
-                bail!("no route to the site");
-            }
+        let site = move |idle: Option<Duration>| {
             count.fetch_add(1, Ordering::SeqCst);
             let (door_upstream, site) = UnixStream::pair().unwrap();
             let (record, released) = (record.clone(), released.clone());
+            site.set_read_timeout(idle).unwrap();
             thread::spawn(move || {
                 let mut reader = BufReader::new(site.try_clone().unwrap());
                 let mut out = site;
+                // A site that times out an idle connection closes it.
                 while let Ok(Some(head)) = http::read_head(&mut reader) {
                     let framing = http::request_framing(&head).unwrap();
                     let mut body = Vec::new();
@@ -194,11 +200,26 @@ impl Rig {
                     record.lock().unwrap().push(seen.clone());
                     respond(&seen, &mut out, &released);
                 }
+                let _ = out.shutdown(Shutdown::Both);
             });
-            Ok(door_upstream)
+            door_upstream
+        };
+        let made = first.map(|(_, idle)| site(Some(idle)));
+        let dial = move || {
+            if down.load(Ordering::SeqCst) {
+                bail!("no route to the site");
+            }
+            Ok(site(None))
         };
         let (shared, host) = (shared.clone(), host.to_string());
-        let serving = thread::spawn(move || (serve(door_guest, connect, &Ctx { shared: &shared, host: &host, caller: &Caller::Agent }), approve::take_answers()));
+        let serving = thread::spawn(move || {
+            let ctx = Ctx { shared: &shared, host: &host, caller: &Caller::Agent };
+            let counted = match (made, first) {
+                (Some(made), Some((fresh, _))) => serve(door_guest, first_while_fresh(made, fresh, dial), &ctx),
+                _ => serve(door_guest, dial, &ctx),
+            };
+            (counted, approve::take_answers())
+        });
         guest.set_read_timeout(Some(WAIT)).unwrap();
         Self { guest: Conn { reader: BufReader::new(guest.try_clone().unwrap()), stream: guest, seen: Vec::new() }, seen, release, connects, unreachable, serving }
     }
@@ -1006,4 +1027,232 @@ fn a_write_when_the_workspace_has_as_many_waiting_as_it_may_says_it_is_the_works
     assert_eq!(waiting.join().unwrap().came, requests::Came::Withdrawn);
     let line = log_lines(&dir.0, "full").remove(0);
     assert_eq!((line["decision"].clone(), line["by"].clone(), line["request"].clone()), (json!("blocked:requests"), Value::Null, Value::Null));
+}
+
+// --- a client that gives up while its request waits ---
+
+/// Answers the next request that waits on `desk`, `after` it was raised.
+fn answering_after(desk: &Arc<Desk>, yes: bool, after: Duration) -> JoinHandle<String> {
+    let desk = desk.clone();
+    thread::spawn(move || {
+        let deadline = std::time::Instant::now() + WAIT;
+        let bytes = loop {
+            if let Some(bytes) = desk.records().pop() {
+                break bytes;
+            }
+            assert!(std::time::Instant::now() < deadline, "no request was raised");
+            thread::sleep(Duration::from_millis(10));
+        };
+        thread::sleep(after);
+        assert_eq!(desk.answer_here(yes, &answer_digest(&bytes, yes)), if yes { Here::Approved } else { Here::Denied });
+        Record::decode(&bytes).unwrap().id.hex()
+    })
+}
+
+/// Waits until `check` holds, for `WAIT` at most.
+fn until(check: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + WAIT;
+    while !check() {
+        assert!(std::time::Instant::now() < deadline, "it never happened");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `n` bytes in which a piece out of place, lost or sent twice shows.
+fn patterned(n: usize) -> Vec<u8> {
+    let mut x: u32 = 0x1234_5678;
+    (0..n)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            b'a' + (x >> 24) as u8 % 26
+        })
+        .collect()
+}
+
+#[test]
+fn a_client_that_hangs_up_while_its_request_waits_sends_nothing_and_costs_nothing() {
+    let dir = TempDir::new("halti-inspect-gave-up").unwrap();
+    let host = "web.example.com";
+    // One request a box at most, and one strike rests it for an hour: the next write shows both.
+    let limits = requests::Limits { per_box: 1, strikes: 1, rest: Duration::from_secs(3600), ..requests::LIMITS };
+    let desk = Desk::new("mac-1".into(), "acme".into(), limits, Arc::new(Saying(Prompted::Unshown)));
+    let sh = shared_raising(&dir.0, "gave-up", None, &desk);
+    let mut rig = Rig::new(&sh, host);
+    rig.guest.send(&request("POST", "/submit", host, &[], Some("data")));
+    until(|| desk.records().len() == 1);
+    rig.guest.stream.shutdown(Shutdown::Both).unwrap();
+    until(|| desk.records().is_empty());
+    let (seen, connects) = (rig.seen.clone(), rig.connects.clone());
+    rig.finish();
+    assert!(seen.lock().unwrap().is_empty(), "nothing reached the site");
+    assert_eq!(connects.load(Ordering::SeqCst), 0, "the site was never even dialed");
+    let line = log_lines(&dir.0, "gave-up").remove(0);
+    assert_eq!((line["decision"].clone(), line["status"].clone(), line["by"].clone()), (json!("withdrawn:client gave up"), Value::Null, Value::Null));
+    assert_eq!(line["request"].as_str().map(str::len), Some(32));
+
+    // No strike was counted and the box's one place is free: the next write waits and goes.
+    let yes = answering(&desk, true);
+    let mut rig = Rig::new(&sh, host);
+    let (reply, body) = rig.guest.post(host, "/submit", &[], "again");
+    assert_eq!((reply.status, body.as_str()), (200, "got again"));
+    yes.join().unwrap();
+    rig.finish();
+}
+
+/// The prompt where the box runs: it hangs up the client, then says yes.
+struct HangsUpThenYes(Mutex<Option<UnixStream>>);
+
+impl Prompt for HangsUpThenYes {
+    fn ask(&self, _reason: &str, _withdrawn: &dyn Fn() -> bool) -> Prompted {
+        // The door is asleep between its looks by then.
+        thread::sleep(Duration::from_millis(250));
+        if let Some(client) = self.0.lock().unwrap().take() {
+            client.shutdown(Shutdown::Both).unwrap();
+        }
+        Prompted::Yes
+    }
+}
+
+#[test]
+fn a_client_that_hangs_up_just_before_its_approval_sends_nothing() {
+    let dir = TempDir::new("halti-inspect-gave-up-approved").unwrap();
+    let host = "web.example.com";
+    let prompt = Arc::new(HangsUpThenYes(Mutex::new(None)));
+    let desk = Desk::new("mac-1".into(), "acme".into(), requests::LIMITS, prompt.clone());
+    let sh = shared_raising(&dir.0, "gave-up-approved", Some(Means::TouchId), &desk);
+    let mut rig = Rig::new(&sh, host);
+    *prompt.0.lock().unwrap() = Some(rig.guest.stream.try_clone().unwrap());
+    rig.guest.send(&request("POST", "/submit", host, &[], Some("data")));
+    until(|| desk.records().len() == 1);
+    until(|| desk.records().is_empty());
+    let (seen, connects) = (rig.seen.clone(), rig.connects.clone());
+    rig.finish();
+    assert!(seen.lock().unwrap().is_empty(), "nothing reached the site");
+    assert_eq!(connects.load(Ordering::SeqCst), 0);
+    let line = log_lines(&dir.0, "gave-up-approved").remove(0);
+    // It was approved, and the look made then found the client gone.
+    assert_eq!((line["decision"].clone(), line["by"].clone()), (json!("withdrawn:client gave up"), json!("local")));
+}
+
+#[test]
+fn a_client_that_sent_more_than_the_door_reads_ahead_and_hung_up_sends_nothing_when_approved() {
+    let dir = TempDir::new("halti-inspect-gave-up-big").unwrap();
+    let host = "web.example.com";
+    let desk = Desk::new("mac-1".into(), "acme".into(), requests::LIMITS, Arc::new(Saying(Prompted::Unshown)));
+    let sh = shared_raising(&dir.0, "gave-up-big", None, &desk);
+    let rig = Rig::new(&sh, host);
+    let body = patterned(LOOK_AHEAD + 20 * 1024);
+    // The client wrote it all and hung up. What the door has not read waits in the box's buffers
+    // and comes on as the door reads, its end last: this thread is those buffers.
+    let mut buffers = rig.guest.stream.try_clone().unwrap();
+    let sending = thread::spawn(move || {
+        buffers.write_all(format!("POST /upload HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes()).unwrap();
+        let _ = buffers.write_all(&body);
+        let _ = buffers.shutdown(Shutdown::Both);
+    });
+    let yes = answering_after(&desk, true, Duration::from_millis(600));
+    yes.join().unwrap();
+    sending.join().unwrap();
+    let (seen, connects) = (rig.seen.clone(), rig.connects.clone());
+    rig.finish();
+    assert!(seen.lock().unwrap().is_empty(), "nothing reached the site");
+    assert_eq!(connects.load(Ordering::SeqCst), 0);
+    let line = log_lines(&dir.0, "gave-up-big").remove(0);
+    assert_eq!(line["decision"], json!("withdrawn:client gave up"));
+}
+
+#[test]
+fn an_approved_write_arrives_whole_though_its_body_is_more_than_the_door_reads_ahead() {
+    let dir = TempDir::new("halti-inspect-big-body").unwrap();
+    let host = "web.example.com";
+    let desk = Desk::new("mac-1".into(), "acme".into(), requests::LIMITS, Arc::new(Saying(Prompted::Unshown)));
+    let sh = shared_raising(&dir.0, "big-body", None, &desk);
+    let mut rig = Rig::new(&sh, host);
+    // More than the look at approval reads too: the rest goes on as it comes.
+    let body = patterned(RETRY_BODY + 3 * LOOK_AHEAD + 123);
+    let yes = answering_after(&desk, true, Duration::from_millis(600));
+    // The client sends it all at once, as far as the socket takes it, while the request waits.
+    let mut client = rig.guest.stream.try_clone().unwrap();
+    let sent = body.clone();
+    let sending = thread::spawn(move || {
+        client.write_all(format!("POST /upload HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n", sent.len()).as_bytes()).unwrap();
+        client.write_all(&sent).unwrap();
+    });
+    let reply = rig.guest.head();
+    assert_eq!(reply.status, 404, "the site's own answer");
+    rig.guest.body(&reply);
+    sending.join().unwrap();
+    yes.join().unwrap();
+    let reached = rig.reached();
+    assert_eq!(reached.len(), 1);
+    assert!(reached[0].body == body, "the body arrived whole, in order, once: {} bytes of {}", reached[0].body.len(), body.len());
+    rig.finish();
+}
+
+#[test]
+fn a_body_sent_slowly_while_its_request_waits_arrives_whole() {
+    let dir = TempDir::new("halti-inspect-slow-body").unwrap();
+    let host = "web.example.com";
+    let desk = Desk::new("mac-1".into(), "acme".into(), requests::LIMITS, Arc::new(Saying(Prompted::Unshown)));
+    let sh = shared_raising(&dir.0, "slow-body", None, &desk);
+    let mut rig = Rig::new(&sh, host);
+    let body = patterned(40_000);
+    let yes = answering_after(&desk, true, Duration::from_millis(900));
+    rig.guest.send(&format!("POST /upload HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\n\r\n"));
+    // In pieces of every size, some before the answer and some after.
+    for piece in body.chunks(3_001) {
+        rig.guest.stream.write_all(format!("{:x}\r\n", piece.len()).as_bytes()).unwrap();
+        rig.guest.stream.write_all(piece).unwrap();
+        rig.guest.stream.write_all(b"\r\n").unwrap();
+        thread::sleep(Duration::from_millis(80));
+    }
+    rig.guest.send("0\r\n\r\n");
+    let reply = rig.guest.head();
+    assert_eq!(reply.status, 404);
+    rig.guest.body(&reply);
+    yes.join().unwrap();
+    let reached = rig.reached();
+    assert_eq!(reached.len(), 1);
+    assert!(reached[0].body == body, "the body arrived whole, in order, once: {} bytes of {}", reached[0].body.len(), body.len());
+    rig.finish();
+}
+
+// --- the site's connection, after a long wait ---
+
+#[test]
+fn a_first_connection_that_sat_unused_too_long_is_dialed_again() {
+    let dir = TempDir::new("halti-inspect-stale").unwrap();
+    let host = "web.example.com";
+    let desk = Desk::new("mac-1".into(), "acme".into(), requests::LIMITS, Arc::new(Saying(Prompted::Unshown)));
+    let sh = shared_raising(&dir.0, "stale", None, &desk);
+    // The site closes a connection unused for 200 ms; the request waits 500 ms for its answer.
+    let idle = Duration::from_millis(200);
+    let wait = Duration::from_millis(500);
+
+    // Used though it is older than that, the first connection is gone: the request fails.
+    let mut rig = Rig::with_first(&sh, host, Some((Duration::from_secs(60), idle)));
+    let yes = answering_after(&desk, true, wait);
+    let (reply, body) = rig.guest.post(host, "/submit", &[], "data");
+    assert_eq!(reply.status, 502, "{body}");
+    yes.join().unwrap();
+    assert_eq!(rig.connects(), 1);
+    rig.finish();
+
+    // Dropped once it is older than its time, a new one is dialed and the request goes.
+    let mut rig = Rig::with_first(&sh, host, Some((Duration::from_millis(100), idle)));
+    let yes = answering_after(&desk, true, wait);
+    let (reply, body) = rig.guest.post(host, "/submit", &[], "data");
+    assert_eq!((reply.status, body.as_str()), (200, "got data"));
+    yes.join().unwrap();
+    assert_eq!(rig.connects(), 2);
+    assert_eq!(rig.reached().len(), 1);
+    rig.finish();
+
+    // A request answered at once uses the first connection.
+    let mut rig = Rig::with_first(&sh, host, Some((Duration::from_secs(60), Duration::from_secs(60))));
+    let yes = answering(&desk, true);
+    assert_eq!(rig.guest.post(host, "/submit", &[], "data").0.status, 200);
+    yes.join().unwrap();
+    assert_eq!(rig.connects(), 1);
+    rig.finish();
 }
