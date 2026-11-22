@@ -31,6 +31,8 @@
 //!   the request as withdrawn: nothing is sent and nothing is answered. What the client sends
 //!   meanwhile is its body, kept in order for when it goes on; once `LOOK_AHEAD` bytes of it wait,
 //!   the door stops looking, so a large upload whose client hangs up is not noticed during the wait.
+//!   The look at approval reads on, up to `RETRY_BODY` bytes, to see the end that comes behind such
+//!   a body. A client that hung up after sending more than that is not seen: its request is sent.
 //! - **The log:** one chained line per request, with the method and the masked URL, never
 //!   headers or bodies.
 //!
@@ -119,6 +121,9 @@ pub(super) const RETRY_BODY: usize = 1024 * 1024;
 /// stops looking whether the client is still there.
 pub(super) const LOOK_AHEAD: usize = 64 * 1024;
 
+/// The look as a request is approved reads on until nothing more has come for this long.
+const QUIET: Duration = Duration::from_millis(200);
+
 /// The guest's side of a connection, as the door reads it.
 pub(super) trait Guest: Read + Write {
     /// What has arrived already, read into `buf` without waiting for more: None if nothing has,
@@ -167,12 +172,41 @@ impl<G: Guest> Watched<G> {
         Watched { inner, ahead: Vec::new(), at: 0, gone: false }
     }
 
-    /// Whether the client is still there: reads what it sent since, without waiting, and keeps
-    /// it. Once `LOOK_AHEAD` bytes wait unread, it no longer looks, and says yes.
+    /// Whether the client is still there, as looked while its request waits: reads what it sent
+    /// since, without waiting, and keeps it. Once `LOOK_AHEAD` bytes wait unread, it no longer
+    /// looks, and says yes.
     fn there(&mut self) -> bool {
+        self.look(LOOK_AHEAD)
+    }
+
+    /// Whether the client is still there, as looked once its request is approved, before anything
+    /// goes to the site. A client that sent more than `LOOK_AHEAD` and hung up has its end behind
+    /// the rest of what it sent, which comes on as it is read: so this reads on, up to
+    /// `RETRY_BODY` waiting, until nothing more has come for `QUIET`. Past that it says yes.
+    fn still_there(&mut self) -> bool {
+        let mut last = Instant::now();
+        let mut came = false;
+        loop {
+            let had = self.ahead.len();
+            if !self.look(RETRY_BODY) {
+                return false;
+            }
+            if self.ahead.len() > had {
+                (last, came) = (Instant::now(), true);
+            }
+            if !came || self.ahead.len() - self.at >= RETRY_BODY || last.elapsed() >= QUIET {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Reads what the client sent, without waiting, while fewer than `limit` bytes wait unread.
+    /// Whether it is still there.
+    fn look(&mut self, limit: usize) -> bool {
         let mut buf = [0u8; 16 * 1024];
         while !self.gone {
-            let room = LOOK_AHEAD.saturating_sub(self.ahead.len() - self.at);
+            let room = limit.saturating_sub(self.ahead.len() - self.at);
             if room == 0 {
                 return true;
             }
@@ -598,7 +632,7 @@ fn exchange<G: Guest, U: Read + Write>(
     let (decision, asked) = match decided {
         Err(r) if r.decision == GAVE_UP => return gave_up(&r.asked, counts),
         // Approved, but the client hung up first: nothing goes to the site.
-        Ok(("asked:yes", asked)) if !guest.get_mut().there() => return gave_up(&asked, counts),
+        Ok(("asked:yes", asked)) if !guest.get_mut().still_there() => return gave_up(&asked, counts),
         Ok(decided) => decided,
         Err(r) => {
             sh.log.write(&Entry {

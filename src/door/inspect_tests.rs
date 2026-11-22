@@ -1135,13 +1135,41 @@ fn a_client_that_hangs_up_just_before_its_approval_sends_nothing() {
 }
 
 #[test]
+fn a_client_that_sent_more_than_the_door_reads_ahead_and_hung_up_sends_nothing_when_approved() {
+    let dir = TempDir::new("halti-inspect-gave-up-big").unwrap();
+    let host = "web.example.com";
+    let desk = Desk::new("mac-1".into(), "acme".into(), requests::LIMITS, Arc::new(Saying(Prompted::Unshown)));
+    let sh = shared_raising(&dir.0, "gave-up-big", None, &desk);
+    let rig = Rig::new(&sh, host);
+    let body = patterned(LOOK_AHEAD + 20 * 1024);
+    // The client wrote it all and hung up. What the door has not read waits in the box's buffers
+    // and comes on as the door reads, its end last: this thread is those buffers.
+    let mut buffers = rig.guest.stream.try_clone().unwrap();
+    let sending = thread::spawn(move || {
+        buffers.write_all(format!("POST /upload HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes()).unwrap();
+        let _ = buffers.write_all(&body);
+        let _ = buffers.shutdown(Shutdown::Both);
+    });
+    let yes = answering_after(&desk, true, Duration::from_millis(600));
+    yes.join().unwrap();
+    sending.join().unwrap();
+    let (seen, connects) = (rig.seen.clone(), rig.connects.clone());
+    rig.finish();
+    assert!(seen.lock().unwrap().is_empty(), "nothing reached the site");
+    assert_eq!(connects.load(Ordering::SeqCst), 0);
+    let line = log_lines(&dir.0, "gave-up-big").remove(0);
+    assert_eq!(line["decision"], json!("withdrawn:client gave up"));
+}
+
+#[test]
 fn an_approved_write_arrives_whole_though_its_body_is_more_than_the_door_reads_ahead() {
     let dir = TempDir::new("halti-inspect-big-body").unwrap();
     let host = "web.example.com";
     let desk = Desk::new("mac-1".into(), "acme".into(), requests::LIMITS, Arc::new(Saying(Prompted::Unshown)));
     let sh = shared_raising(&dir.0, "big-body", None, &desk);
     let mut rig = Rig::new(&sh, host);
-    let body = patterned(5 * LOOK_AHEAD + 123);
+    // More than the look at approval reads too: the rest goes on as it comes.
+    let body = patterned(RETRY_BODY + 3 * LOOK_AHEAD + 123);
     let yes = answering_after(&desk, true, Duration::from_millis(600));
     // The client sends it all at once, as far as the socket takes it, while the request waits.
     let mut client = rig.guest.stream.try_clone().unwrap();
