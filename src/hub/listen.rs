@@ -31,6 +31,10 @@ pub const BODY_MAX: usize = 4 * 1024;
 pub const STATE_BODY_MAX: usize = 16 * 1024;
 /// The path of a machine's report of its state.
 const STATE_PATH: &str = "/v1/machine/state";
+/// The path of a phone's call to be told what waits: the one that takes a wake credential.
+const WAIT_PATH: &str = "/v1/wait";
+/// How often a held call looks again, at most this far apart.
+const WAIT_LOOK: Duration = Duration::from_secs(1);
 /// How long a connection has to send its whole request, TLS handshake included.
 pub const REQUEST_WAIT: Duration = Duration::from_secs(10);
 /// How long the reply may take to be written.
@@ -217,7 +221,7 @@ fn reply(stream: &mut StreamOwned<ServerConnection, Timed>, status: u16, body: &
 }
 
 /// The paths the hub answers, and the method each takes.
-const PATHS: [(&str, &str); 14] = [
+pub(super) const PATHS: [(&str, &str); 15] = [
     ("POST", "/v1/pair"),
     ("POST", "/v1/join"),
     ("GET", "/v1/me"),
@@ -228,6 +232,7 @@ const PATHS: [(&str, &str); 14] = [
     ("POST", "/v1/answer"),
     ("POST", "/v1/stop"),
     ("POST", "/v1/hide"),
+    ("POST", WAIT_PATH),
     ("POST", STATE_PATH),
     ("POST", "/v1/machine/request"),
     ("POST", "/v1/machine/inbox"),
@@ -246,6 +251,9 @@ fn route(hub: &Hub, method: &str, path: &str, authorization: Option<&str>, body:
     }
     if path == "/v1/join" {
         return join(hub, body);
+    }
+    if path == WAIT_PATH {
+        return wait(hub, authorization, body);
     }
     // Every other call has a token, checked before anything else.
     let (kind, hash) = authorization.and_then(wire::bearer).ok_or(Refused::NoToken)?;
@@ -358,6 +366,7 @@ fn report(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refus
         let missing = relay.report(&caller.name, reported, now);
         (missing, relay.trusted_ws(&caller.name))
     };
+    hub.stir();
     let devices: Vec<Value> = hub.with_table(|table, now| table.devices(now)).iter().filter(|device| device.ws.iter().any(|ws| wanted.contains(ws))).map(device_json).collect();
     Ok((200, json!({"devices": devices, "missing": missing.iter().map(|id| util::hex(id)).collect::<Vec<_>>()})))
 }
@@ -366,6 +375,7 @@ fn report(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refus
 fn post_request(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refused> {
     let (record, bytes) = relay::record_body(body)?;
     locked(&hub.relay).post(&caller.name, record, bytes, hub.now())?;
+    hub.stir();
     Ok((200, json!({})))
 }
 
@@ -457,5 +467,52 @@ fn hide(hub: &Hub, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refuse
         return Err(Refused::Gone);
     }
     locked(&hub.relay).hide(&machine, id, scope, hub.now())?;
+    hub.stir();
     Ok((200, json!({})))
+}
+
+/// A phone's call, with its wake credential alone, to be told the ids of the requests it may see:
+/// at once if they are not what it was last told, else once they change or `wait_hold` is over. A
+/// newer call of the same phone ends it, as does its row's revoking or renewal (`401 unknown`).
+fn wait(hub: &Hub, authorization: Option<&str>, body: &[u8]) -> Result<(u16, Value), Refused> {
+    if authorization.is_some_and(|value| value.starts_with("Bearer ")) {
+        return Err(Refused::WrongKind);
+    }
+    let wake = authorization.and_then(wire::wake).ok_or(Refused::NoToken)?;
+    let (name, _) = hub.with_table(|table, now| table.wake(&wake, now))?;
+    let seen = wire::wait_body(body)?;
+    let mine = {
+        let mut waits = locked(&hub.waits);
+        let newest = waits.newest.entry(name.clone()).or_default();
+        *newest += 1;
+        *newest
+    };
+    hub.stir();
+    let deadline = Instant::now() + hub.wait_hold;
+    let held = || -> Result<Vec<[u8; 16]>, Refused> {
+        loop {
+            let stirs = locked(&hub.waits).stirs;
+            let (scope, machines) = hub.with_table(|table, now| -> Result<_, Refused> {
+                let (_, scope) = table.wake(&wake, now)?;
+                Ok((scope, table.machines(now).into_iter().map(|(name, _, _)| name).collect::<Vec<_>>()))
+            })?;
+            let ids = locked(&hub.relay).ids(&scope, &machines, hub.now());
+            let left = deadline.saturating_duration_since(Instant::now());
+            let waits = locked(&hub.waits);
+            if wire::seen_of(&ids) != seen || left.is_zero() || waits.newest.get(&name) != Some(&mine) {
+                return Ok(ids);
+            }
+            if waits.stirs == stirs {
+                drop(hub.stirred.wait_timeout(waits, left.min(WAIT_LOOK)).unwrap_or_else(PoisonError::into_inner));
+            }
+        }
+    };
+    let ids = held();
+    {
+        let mut waits = locked(&hub.waits);
+        if waits.newest.get(&name) == Some(&mine) {
+            waits.newest.remove(&name);
+        }
+    }
+    Ok((200, json!({"requests": ids?.iter().map(|id| util::hex(id)).collect::<Vec<_>>()})))
 }

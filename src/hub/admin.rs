@@ -147,6 +147,7 @@ fn session(hub: &Hub, mut stream: UnixStream) {
             if found {
                 locked(&hub.relay).forget(&name);
                 hub.sent.notify_all();
+                hub.stir();
             }
             let word = match (found, written) {
                 (false, _) => "unknown",

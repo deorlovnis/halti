@@ -62,6 +62,7 @@ fn start_in(dir: TempDir, limits: Limits, clock: Arc<Hands>) -> Running {
     let address = listener.local_addr().unwrap().to_string();
     let mut hub = Hub::open(&folder, &address, pin, clock.clone()).unwrap();
     hub.inbox_wait = INBOX_WAIT;
+    hub.wait_hold = WAIT_HOLD;
     let hub = Arc::new(hub);
     let admin_socket = crate::keep::bind(&folder.join("admin.sock")).unwrap().unwrap();
     let (for_admin, for_listener) = (hub.clone(), hub.clone());
@@ -88,10 +89,15 @@ impl Running {
 
     /// One request, and its reply's status and body.
     fn call(&self, method: &str, path: &str, token: Option<&str>, body: Option<&Value>) -> (u16, Value) {
+        self.call_as(method, path, token.map(|token| format!("Bearer {token}")).as_deref(), body)
+    }
+
+    /// One request with this `Authorization` header, or none.
+    fn call_as(&self, method: &str, path: &str, authorization: Option<&str>, body: Option<&Value>) -> (u16, Value) {
         let body = body.map(Value::to_string).unwrap_or_default();
         let mut head = format!("{method} {path} HTTP/1.1\r\nHost: halti-hub\r\nContent-Length: {}\r\n", body.len());
-        if let Some(token) = token {
-            head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        if let Some(authorization) = authorization {
+            head.push_str(&format!("Authorization: {authorization}\r\n"));
         }
         head.push_str("\r\n");
         self.raw(&[head.as_bytes(), body.as_bytes()].concat()).expect("a reply")
@@ -1503,4 +1509,175 @@ fn what_a_phone_sent_stays_listed_with_the_machine_s_word_whatever_other_phones_
     let later = now + jiff::SignedDuration::from_hours(1);
     let view = relay.view("pixel", &acme(), &|_| Some((Vec::new(), None)), later);
     assert_eq!(view["sent"], json!([]));
+}
+
+// --- a phone that waits with its wake credential ---
+
+/// How long a phone's call to be told what waits is held, in these tests.
+const WAIT_HOLD: Duration = Duration::from_secs(3);
+
+/// The wake credential of this token.
+fn wake_of(token_: &str) -> String {
+    util::hex(&wire::wake_of(&wire::token_hash(token_)))
+}
+
+/// `POST /v1/wait` with this token's wake credential, told these ids last.
+fn wait(hub: &Running, token_: &str, seen: &[[u8; 16]]) -> (u16, Value) {
+    let seen = wire::seen_of(seen).map(|hash| util::hex(&hash)).unwrap_or_default();
+    hub.call_as("POST", "/v1/wait", Some(&format!("Wake {}", wake_of(token_))), Some(&json!({"seen": seen})))
+}
+
+fn ids(ids: &[[u8; 16]]) -> Value {
+    json!({"requests": ids.iter().map(|id| util::hex(id)).collect::<Vec<_>>()})
+}
+
+fn post(hub: &Running, machine: &Machine, ws: &str, id: u8) {
+    assert_eq!(hub.call("POST", "/v1/machine/request", Some(&machine.token), Some(&json!({"record": util::hex(&record("server-1", ws, id).1)}))).0, 200);
+}
+
+/// Runs `wait` in a thread, does `then` a moment later, and gives the reply and how long it took.
+fn held(wait: impl FnOnce() -> (u16, Value) + Send, then: impl FnOnce()) -> ((u16, Value), Duration) {
+    thread::scope(|scope| {
+        let started = std::time::Instant::now();
+        let waiting = scope.spawn(move || {
+            let reply = wait();
+            (reply, started.elapsed())
+        });
+        thread::sleep(Duration::from_millis(300));
+        assert!(!waiting.is_finished(), "the call is held");
+        then();
+        waiting.join().unwrap()
+    })
+}
+
+#[test]
+fn the_wake_credential_is_the_hash_both_sides_compute() {
+    let token_ = format!("halti_dev_{}", "0123456789abcdef".repeat(4));
+    let hash = wire::token_hash(&token_);
+    assert_eq!(util::hex(&hash), "b1b1a551220683336bdaf869e0f7c964ce459e90d56eb4942b1e12a0fa7272cc");
+    assert_eq!(wake_of(&token_), "ab25627581abf2c18bdf838fdd8cb8ec3f771a0b2281ff2930a2adbd38a624d5");
+    assert_eq!(util::hex(&wire::seen_of(&[[2; 16], [1; 16]]).unwrap()), util::hex(&Sha256::digest([[1u8; 16], [2; 16]].concat())));
+    assert_eq!(wire::seen_of(&[]), None);
+}
+
+#[test]
+fn a_wait_answers_at_once_when_the_phone_was_told_something_else_and_holds_otherwise() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    post(&hub, &server, "acme", 2);
+    post(&hub, &server, "acme", 1);
+    assert_eq!(wait(&hub, &pixel.token, &[]), (200, ids(&[[1; 16], [2; 16]])));
+    assert_eq!(wait(&hub, &pixel.token, &[[1; 16]]), (200, ids(&[[1; 16], [2; 16]])));
+    // Told them already: held for the whole hold, then answered with the same.
+    let started = std::time::Instant::now();
+    assert_eq!(wait(&hub, &pixel.token, &[[2; 16], [1; 16]]), (200, ids(&[[1; 16], [2; 16]])));
+    assert!(started.elapsed() >= WAIT_HOLD - Duration::from_millis(50));
+    // The body is checked.
+    let as_pixel = |body: Value| hub.call_as("POST", "/v1/wait", Some(&format!("Wake {}", wake_of(&pixel.token))), Some(&body));
+    assert_eq!(as_pixel(json!({"seen": "", "more": 1})), (400, error("malformed")));
+    assert_eq!(as_pixel(json!({"seen": "AB".repeat(32)})), (400, error("malformed")));
+    assert_eq!(as_pixel(json!({})), (400, error("malformed")));
+    assert_eq!(as_pixel(json!({"seen": "0".repeat(5000)})), (413, error("too-large")));
+}
+
+#[test]
+fn a_held_wait_ends_when_a_request_comes_leaves_is_hidden_or_expires() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    let quick = Duration::from_millis(2500);
+    // A new request.
+    let (reply, took) = held(|| wait(&hub, &pixel.token, &[]), || post(&hub, &server, "acme", 1));
+    assert_eq!((reply, took < quick), ((200, ids(&[[1; 16]])), true));
+    // A report that drops one.
+    post(&hub, &server, "acme", 2);
+    let (reply, took) = held(|| wait(&hub, &pixel.token, &[[1; 16], [2; 16]]), || assert_eq!(report(&hub, &server, json!([]), &[[2; 16]]).0, 200));
+    assert_eq!((reply, took < quick), ((200, ids(&[[2; 16]])), true));
+    // Hidden: and a hidden one is never listed.
+    let hide = || assert_eq!(hub.call("POST", "/v1/hide", Some(&pixel.token), Some(&json!({"machine": "server-1", "id": util::hex(&[2; 16])}))).0, 200);
+    let (reply, took) = held(|| wait(&hub, &pixel.token, &[[2; 16]]), hide);
+    assert_eq!((reply, took < quick), ((200, ids(&[])), true));
+    assert_eq!(wait(&hub, &pixel.token, &[[2; 16]]), (200, ids(&[])));
+    // Past its expiry by the hub's clock.
+    post(&hub, &server, "acme", 3);
+    let (reply, took) = held(|| wait(&hub, &pixel.token, &[[3; 16]]), || hub.advance(SignedDuration::from_secs(181)));
+    assert_eq!((reply, took < quick), ((200, ids(&[])), true));
+}
+
+#[test]
+fn a_wait_lists_only_the_phone_s_workspaces() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    let started = std::time::Instant::now();
+    let (reply, took) = held(
+        || wait(&hub, &pixel.token, &[]),
+        || {
+            post(&hub, &server, "beta", 9);
+            thread::sleep(Duration::from_millis(1200));
+            post(&hub, &server, "acme", 1);
+        },
+    );
+    // beta's request woke nothing: the call ended only at acme's, and lists only it.
+    assert_eq!(reply, (200, ids(&[[1; 16]])));
+    assert!(took >= Duration::from_millis(1400) && took < WAIT_HOLD, "{took:?} {:?}", started.elapsed());
+    assert_eq!(wait(&hub, &pixel.token, &[[9; 16]]), (200, ids(&[[1; 16]])));
+}
+
+#[test]
+fn a_newer_wait_of_the_same_phone_ends_the_older() {
+    let hub = start_now();
+    let pixel = paired_phone(&hub, "pixel");
+    let (reply, took) = held(|| wait(&hub, &pixel.token, &[]), || assert_eq!(wait(&hub, &pixel.token, &[[1; 16]]), (200, ids(&[]))));
+    assert_eq!((reply, took < Duration::from_secs(2)), ((200, ids(&[])), true));
+}
+
+#[test]
+fn the_wake_credential_works_at_the_wait_alone_and_no_token_works_there() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    let wake = format!("Wake {}", wake_of(&pixel.token));
+    let body = json!({"seen": "", "machine": "server-1", "id": util::hex(&[1; 16])});
+    for (method, path) in listen::PATHS {
+        if path == "/v1/wait" {
+            continue;
+        }
+        let (status, reply) = hub.call_as(method, path, Some(&wake), Some(&body));
+        let expected = if path == "/v1/pair" || path == "/v1/join" { (400, error("malformed")) } else { (401, error("no-token")) };
+        assert_eq!((status, reply), expected, "{path}");
+    }
+    let empty = Some(json!({"seen": ""}));
+    let at_wait = |authorization: Option<&str>| hub.call_as("POST", "/v1/wait", authorization, empty.as_ref());
+    for token_ in [&pixel.token, &server.token, &token(Kind::Device), &"halti_dev_x".to_string()] {
+        assert_eq!(at_wait(Some(&format!("Bearer {token_}"))), (403, error("wrong-kind")), "{token_}");
+    }
+    assert_eq!(at_wait(Some(&format!("Wake {}", pixel.token))), (401, error("no-token")));
+    assert_eq!(at_wait(Some(&wake.to_uppercase().replace("WAKE", "Wake"))), (401, error("no-token")));
+    assert_eq!(at_wait(Some(&format!("wake {}", wake_of(&pixel.token)))), (401, error("no-token")));
+    assert_eq!(at_wait(None), (401, error("no-token")));
+    // A machine has no wake credential; nor has a token never paired.
+    assert_eq!(at_wait(Some(&format!("Wake {}", wake_of(&server.token)))), (401, error("unknown")));
+    assert_eq!(at_wait(Some(&format!("Wake {}", wake_of(&token(Kind::Device))))), (401, error("unknown")));
+    assert_eq!(at_wait(Some(&format!("Wake {}", util::hex(&wire::token_hash(&pixel.token))))), (401, error("unknown")));
+}
+
+#[test]
+fn a_wake_credential_lives_with_its_token_s_row_and_stops_at_revoke_or_renewal() {
+    let hub = start();
+    let phone = paired_phone(&hub, "pixel");
+    // Expired but renewable: still told.
+    hub.at(31 * DAY);
+    assert_eq!(hub.call("GET", "/v1/me", Some(&phone.token), None).0, 401);
+    assert_eq!(wait(&hub, &phone.token, &[[1; 16]]), (200, ids(&[])));
+    // Renewed: the old credential stops, the new one works.
+    let (new, status, _) = renew_phone(&hub, &phone);
+    assert_eq!(status, 200);
+    assert_eq!(wait(&hub, &phone.token, &[[1; 16]]), (401, error("unknown")));
+    assert_eq!(wait(&hub, &new, &[[1; 16]]), (200, ids(&[])));
+    // Revoked: the held call ends, and the credential is refused.
+    let (reply, took) = held(|| wait(&hub, &new, &[]), || assert!(admin::revoke_at(&hub.socket(), "pixel").unwrap()));
+    assert_eq!((reply, took < Duration::from_secs(2)), ((401, error("unknown")), true));
+    assert_eq!(wait(&hub, &new, &[[1; 16]]), (401, error("unknown")));
 }

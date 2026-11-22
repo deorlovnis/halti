@@ -456,6 +456,18 @@ impl Table {
         Err(Refused::Unknown)
     }
 
+    /// The phone whose current token has this wake credential, and its workspaces. A row whose
+    /// token expired is found while it is kept; a machine's never.
+    pub fn wake(&mut self, wake: &[u8; 32], now: Timestamp) -> Result<(String, Vec<WsName>), Refused> {
+        self.purge(now);
+        // Every row is compared, so how long this takes says nothing of which matched.
+        let found =
+            self.rows.values().filter(|row| row.kind() == Kind::Device).fold(None, |found, row| if same(&wire::wake_of(&row.token.hash), wake) { Some(row) } else { found });
+        let (name, ws) = found.map(|row| (row.name.clone(), row.ws.clone())).ok_or(Refused::Unknown)?;
+        self.seen(&name, now);
+        Ok((name, ws))
+    }
+
     /// Notes that a row's token was used now. "Last seen" moves only when it is a while old, so
     /// what is written down is what the hub shows, to within that while.
     fn seen(&mut self, name: &str, now: Timestamp) {
