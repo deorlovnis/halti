@@ -36,7 +36,24 @@ fn note(approved: bool) {
     ANSWERS.with_borrow_mut(|answers| answers.push(approved));
 }
 
+/// How a test that has prompts open at the same time answers each, by its reason.
+#[cfg(test)]
+type ByReason = Box<dyn Fn(&str) -> bool + Send + Sync>;
+#[cfg(test)]
+static BY_REASON: std::sync::OnceLock<ByReason> = std::sync::OnceLock::new();
+
+/// From now on this test process answers each prompt as `answer` says for its reason (true:
+/// approved); once per process.
+#[cfg(test)]
+pub fn answer_by_reason(answer: impl Fn(&str) -> bool + Send + Sync + 'static) {
+    assert!(BY_REASON.set(Box::new(answer)).is_ok(), "prompts are answered by reason once per process");
+}
+
 fn prompt(reason: &str) -> Result<()> {
+    #[cfg(test)]
+    if let Some(answer) = BY_REASON.get() {
+        return if answer(reason) { Ok(()) } else { bail!("not approved: {reason}") };
+    }
     // Automated tests answer for the user. Release builds don't contain this.
     #[cfg(halti_dev)]
     if let Some(answer) = crate::util::dev_var("HALTI_TEST_APPROVE") {
