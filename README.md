@@ -6,7 +6,7 @@ Secrets are grouped by **resource**, one thing you sign in to (`github`, `aws`, 
 
 ## Install
 
-Requires macOS, Rust through rustup (`rust-toolchain.toml` pins the version, which rustup fetches), and Node.js for the sandboxed browser. For a Linux server, see On a Linux server.
+Requires macOS, Rust through rustup (`rust-toolchain.toml` pins the version, which rustup fetches; 1.91, Cargo.toml's `rust-version`, is the oldest that builds halti), and Node.js for the sandboxed browser. For a Linux server, see On a Linux server.
 
 ```sh
 git clone https://github.com/deorlovnis/halti.git ~/Git/halti

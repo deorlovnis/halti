@@ -4,7 +4,7 @@
 # install-linux.sh (and its dry run), box/to-disk.sh and macos-check.sh. Run before pushing
 # (`mise run check` runs this). When every step passes with no changes to the files, it writes the
 # commit it passed at to check-passed in the target folder: install-linux.sh installs only that
-# commit.
+# commit. On a Rust older than Cargo.toml's rust-version it stops at once, in one line.
 #
 # The release build's run with every test hook set and the escape tests need user namespaces. Where
 # the system restricts them (Ubuntu 24.04 does, through AppArmor), they are not run: check.sh ends
@@ -86,6 +86,38 @@ box_blocked() {
   case "$why" in AppArmor* | *"making the box's namespaces"* | *"writing /proc/self/"*) echo "$why" ;; esac
 }
 
+# Whether version A is older than B, part by part; a missing part is 0.
+older() {
+  local IFS=. a b i
+  read -r -a a <<<"$1"
+  read -r -a b <<<"$2"
+  for i in 0 1 2; do
+    if [ "${a[i]:-0}" != "${b[i]:-0}" ]; then
+      [ "${a[i]:-0}" -lt "${b[i]:-0}" ]
+      return
+    fi
+  done
+  return 1
+}
+
+# Fails, in one line, when the Rust here is older than Cargo.toml's rust-version. Cargo would say
+# so in several lines, and one older than the 2024 edition fails on the manifest instead.
+rust_new_enough() {
+  local floor have
+  floor="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+  if ! have="$("${RUSTC:-rustc}" --version 2>/dev/null)"; then
+    echo "check.sh: no rustc here; halti needs Rust $floor or newer (rust-toolchain.toml pins the one it passes with)" >&2
+    return 1
+  fi
+  have="${have#rustc }"
+  have="${have%% *}"
+  have="${have%%-*}"
+  if older "$have" "$floor"; then
+    echo "check.sh: Rust $have is older than $floor, the oldest that builds halti (rust-toolchain.toml pins the one it passes with)" >&2
+    return 1
+  fi
+}
+
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-3}"
 target="${CARGO_TARGET_DIR:-target}"
 # Absolute, since the release tests run the binary from other folders.
@@ -125,6 +157,7 @@ HOOK
     exit 2
     ;;
 esac
+rust_new_enough
 stamp="$target/check-passed"
 rm -f "$stamp"
 # What could not run here, with why: one line each.
