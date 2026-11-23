@@ -71,6 +71,19 @@ pub const INBOX_WAIT: Duration = Duration::from_secs(25);
 /// How long a phone's call to be told what waits is held, at most, when nothing changes.
 pub const WAIT_HOLD: Duration = Duration::from_secs(240);
 
+/// How often an agent's notice may end a phone's held call to be told what waits: once in `gap` for
+/// a phone, and in `window`, `per_box` times for one box and `per_machine` times for one machine.
+/// A request ends it at once, whatever these say.
+#[derive(Clone, Copy, Debug)]
+pub struct AgentLimits {
+    pub gap: Duration,
+    pub window: Duration,
+    pub per_box: usize,
+    pub per_machine: usize,
+}
+
+pub const AGENT_LIMITS: AgentLimits = AgentLimits { gap: Duration::from_secs(10), window: Duration::from_secs(3600), per_box: 6, per_machine: 20 };
+
 /// The time, as the hub counts days. Tests pass one they move by hand.
 pub trait Clock: Send + Sync {
     fn now(&self) -> Timestamp;
@@ -108,13 +121,17 @@ pub struct Hub {
     stirred: Condvar,
     /// How long such a call is held; tests make it shorter.
     wait_hold: Duration,
+    /// How often an agent's notice may end such a call; tests make them shorter.
+    agent_limits: AgentLimits,
 }
 
-/// Which held call of each phone is its newest, and how often the hub was stirred.
+/// Which held call of each phone is its newest, how often the hub was stirred, and each phone's
+/// wake-ups for agents' notices.
 #[derive(Default)]
 struct Waits {
     newest: std::collections::HashMap<String, u64>,
     stirs: u64,
+    agents: std::collections::HashMap<String, listen::Agents>,
 }
 
 /// The table's file.
@@ -158,6 +175,7 @@ impl Hub {
             waits: Mutex::default(),
             stirred: Condvar::new(),
             wait_hold: WAIT_HOLD,
+            agent_limits: AGENT_LIMITS,
         })
     }
 

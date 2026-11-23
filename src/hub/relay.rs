@@ -1,7 +1,8 @@
 //! What the hub carries between machines and phones, in memory only: each machine's last report of
-//! its state, the requests it posted, and what phones sent it, signed answers and stops, until its
-//! link has taken them and said what came of them. A restart loses all of it: a machine's link
-//! reports again, and is told which of its requests the hub lacks, so it posts them again.
+//! its state, the requests it posted, the notices that an agent waits (`crate::notices`), sealed
+//! to each phone, and what phones sent it, signed answers and stops, until its link has taken them
+//! and said what came of them. A restart loses all of it: a machine's link reports again, and is
+//! told which of its requests and notices the hub lacks, so it posts them again.
 //!
 //! Nothing here can say yes. An answer or a stop counts only at the machine, which checks the
 //! signature against its own trust list and its own record; the hub checks the signature too, but
@@ -16,11 +17,17 @@ use serde_json::{Value, json};
 
 use super::wire::{self, Refused};
 use crate::keep::STOP_RUNS_MAX;
+use crate::notices::Notice;
 use crate::requests::{Id, Record, RunId};
 use crate::util::hex;
 
 /// The most requests the hub holds for one machine.
 pub const REQUESTS_MAX: usize = 50;
+/// The most notices the hub holds for one machine, and the most one call of its link names.
+pub const NOTICES_MAX: usize = 50;
+/// The shortest and the longest sealed copy of a notice: the sealed text is empty, or the id.
+pub const SEALED_MIN: usize = 65 + 16;
+pub const SEALED_MAX: usize = 256;
 /// The most answers and stops that wait for one machine to take them.
 pub const ITEMS_MAX: usize = 64;
 /// How many of what each phone sent one machine are kept once taken, for the phone to see what
@@ -75,6 +82,26 @@ struct Held {
     hidden: bool,
 }
 
+/// A notice's sealed copies, each with the name of the phone it is sealed to.
+pub type Copies = Vec<(String, Vec<u8>)>;
+
+/// A notice a machine posted: its record, and a sealed copy for each phone it may go to.
+struct HeldNotice {
+    notice: Notice,
+    bytes: Vec<u8>,
+    sealed: Copies,
+}
+
+/// A notice as a held call of a phone tells it apart: its id, and the machine, workspace and box
+/// it is of.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NoticeKey {
+    pub id: [u8; 16],
+    pub machine: String,
+    pub ws: String,
+    pub box_name: String,
+}
+
 /// What a phone sent a machine.
 #[derive(Clone, Debug)]
 pub struct Item {
@@ -115,6 +142,8 @@ impl What {
 struct Mailbox {
     report: Option<Report>,
     requests: BTreeMap<[u8; 16], Held>,
+    /// The notices of its agents that wait, by id. None is ever dropped for its age.
+    notices: BTreeMap<[u8; 16], HeldNotice>,
     /// Requests dropped at their expiry, until this time.
     expired: HashMap<[u8; 16], Timestamp>,
     /// Waiting for the machine, oldest first.
@@ -254,6 +283,56 @@ pub fn record_body(body: &[u8]) -> Result<(Record, Vec<u8>), Refused> {
     let bytes = crate::util::unhex(&body.record).ok_or(Refused::Malformed)?;
     let record = Record::decode(&bytes).ok_or(Refused::Malformed)?;
     Ok((record, bytes))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoticesBody {
+    notices: Vec<String>,
+}
+
+/// The ids of the notices a machine's link says are open, from the body of its call.
+pub fn notices_body(body: &[u8]) -> Result<Vec<[u8; 16]>, Refused> {
+    let body: NoticesBody = wire::json(body)?;
+    if body.notices.len() > NOTICES_MAX {
+        return Err(Refused::Malformed);
+    }
+    body.notices.iter().map(|id| wire::bytes(id)).collect()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoticeBody {
+    record: String,
+    sealed: Vec<SealedBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedBody {
+    device: String,
+    sealed: String,
+}
+
+/// A notice a machine posts: its record, its bytes, and each phone's sealed copy, from the body of
+/// its call. Only the form is checked: the hub can open none of them.
+pub fn notice_body(body: &[u8]) -> Result<(Notice, Vec<u8>, Copies), Refused> {
+    let body: NoticeBody = wire::json(body)?;
+    let bytes = crate::util::unhex(&body.record).ok_or(Refused::Malformed)?;
+    let notice = Notice::decode(&bytes).ok_or(Refused::Malformed)?;
+    if body.sealed.is_empty() || body.sealed.len() > REPORT_MAX {
+        return Err(Refused::Malformed);
+    }
+    let mut sealed: Copies = Vec::new();
+    for copy in body.sealed {
+        let device = name(&copy.device)?;
+        let bytes = crate::util::unhex(&copy.sealed).filter(|bytes| (SEALED_MIN..=SEALED_MAX).contains(&bytes.len())).ok_or(Refused::Malformed)?;
+        if sealed.iter().any(|(named, _)| *named == device) {
+            return Err(Refused::Malformed);
+        }
+        sealed.push((device, bytes));
+    }
+    Ok((notice, bytes, sealed))
 }
 
 #[derive(Deserialize)]
@@ -403,6 +482,60 @@ impl Relay {
         }
         mailbox.requests.insert(record.id.0, Held { record, bytes, hidden: false });
         Ok(())
+    }
+
+    /// The notices a machine's link says are open: those it no longer names are closed, and the ids
+    /// it names that the hub lacks come back, as many as it has room for. The link posts those.
+    pub fn sync_notices(&mut self, machine: &str, ids: &[[u8; 16]], now: Timestamp) -> Vec<[u8; 16]> {
+        let mailbox = self.mailbox(machine, now);
+        mailbox.notices.retain(|id, _| ids.contains(id));
+        let room = NOTICES_MAX.saturating_sub(mailbox.notices.len());
+        ids.iter().filter(|id| !mailbox.notices.contains_key(*id)).take(room).copied().collect()
+    }
+
+    /// A notice a machine posts, with its sealed copies. One the hub holds already is left as it is.
+    pub fn post_notice(&mut self, machine: &str, notice: Notice, bytes: Vec<u8>, sealed: Copies, now: Timestamp) -> Result<(), Refused> {
+        if notice.machine != machine {
+            return Err(Refused::OtherMachine);
+        }
+        let mailbox = self.mailbox(machine, now);
+        if mailbox.notices.contains_key(&notice.id.0) {
+            return Ok(());
+        }
+        if mailbox.notices.len() >= NOTICES_MAX {
+            return Err(Refused::Full);
+        }
+        mailbox.notices.insert(notice.id.0, HeldNotice { notice, bytes, sealed });
+        Ok(())
+    }
+
+    /// The notices phone `device`, which sees `scope`, may see: each machine's name, the record and
+    /// the copy sealed to that phone. A notice with no copy for it is not its.
+    pub fn notices(&mut self, device: &str, scope: &[WsName], machines: &[String], now: Timestamp) -> Vec<(String, Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        for machine in machines {
+            let Some(mailbox) = self.held(machine, now) else { continue };
+            for held in mailbox.notices.values().filter(|held| in_scope(scope, &held.notice.ws)) {
+                if let Some((_, sealed)) = held.sealed.iter().find(|(named, _)| named == device) {
+                    out.push((machine.clone(), held.bytes.clone(), sealed.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The notices `notices` lists for that phone, as its held call tells them apart, by id.
+    pub fn notice_keys(&mut self, device: &str, scope: &[WsName], machines: &[String], now: Timestamp) -> Vec<NoticeKey> {
+        let mut out: Vec<NoticeKey> = self
+            .notices(device, scope, machines, now)
+            .into_iter()
+            .filter_map(|(machine, bytes, _)| {
+                let notice = Notice::decode(&bytes)?;
+                Some(NoticeKey { id: notice.id.0, machine, ws: notice.ws, box_name: notice.box_name })
+            })
+            .collect();
+        out.sort_by_key(|key| key.id);
+        out
     }
 
     /// The requests phones of `scope` may see: each machine's name and record.

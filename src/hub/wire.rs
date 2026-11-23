@@ -62,7 +62,7 @@
 //!   mode_auth with DHKEM(P-256, HKDF-SHA256), HKDF-SHA256 and AES-256-GCM, by the machine key to
 //!   the phone's agreement key, or by the agreement key to a key the machine made for one question.
 //!   The info, associated data and bytes are in `halti_core::sealed`; the known answers both sides
-//!   test against are in `tests/fixtures/sealed-text-vectors.json`. No call carries it yet.
+//!   test against are in `tests/fixtures/sealed-text-vectors.json`. A notice carries it (below).
 //! - **A token** is the client's own: 32 bytes from a secure random source, written as lowercase hex
 //!   behind a prefix, `halti_dev_` for a phone and `halti_mach_` for a machine, so 74 or 75 ASCII
 //!   characters. It travels only in the header `Authorization: Bearer TOKEN`, never in a URL or a
@@ -237,13 +237,56 @@
 //! the hash `b1b1a551...fa7272cc` and the wake credential `ab256275...38a624d5`, as this file's
 //! tests have them whole.
 //!
-//! The body is `{"seen": "<32 bytes>"}`: the SHA-256 of the ids the call was last answered with,
-//! each 16 bytes, sorted by their bytes and run together; `""` for none. The reply is
-//! `200 {"requests": ["<16 bytes>", ...]}`, the ids of the requests `GET /v1/requests` would list
-//! now, sorted by their bytes. It comes at once when those differ from `seen`; otherwise the hub
-//! holds the call until they do, or 240 seconds, and answers then. A phone has one such call at a
-//! time: a newer one ends the one before with the list as it is. The credential tells the hub's
-//! holder how many requests wait and when that changes; it reads, answers, hides or stops nothing.
+//! The body is `{"seen": "<32 bytes>", "notices_seen": "<32 bytes>"}`. `seen` is the SHA-256 of
+//! the request ids the call was last answered with, each 16 bytes, sorted by their bytes and run
+//! together; `""` for none. `notices_seen` is the same over the notice ids it was last answered
+//! with; an app that isn't told of notices leaves it out. A field the hub doesn't know is passed
+//! over. The reply is `200 {"requests": ["<16 bytes>", ...], "notices": ["<16 bytes>", ...]}`:
+//! the ids of the requests `GET /v1/requests` would list now, and of the notices `GET /v1/notices`
+//! would, each sorted by their bytes; `notices` only when the body had `notices_seen`.
+//!
+//! It comes at once when the requests differ from `seen`. When only the notices differ from
+//! `notices_seen`, it comes within the agents' limits: at most once in 10 seconds for a phone, and
+//! in an hour 6 times for one box and 20 for one machine, a box counting once for each answer that
+//! lists a notice of it that is new to the phone. A change that only closes notices counts only
+//! against the 10 seconds. A change the limits hold back is listed in the next answer, whatever
+//! ends the call. Otherwise the hub holds the call until one of those, or 240 seconds, and answers
+//! then. So the app keeps the two lists apart: a new request id raises the request notification, a
+//! new notice id the agent one ("halti: an agent is waiting for you"), and neither raises the other.
+//! A phone has one such call at a time: a newer one ends the one before with the lists as they are.
+//! The credential tells the hub's holder how many requests and notices wait and when that changes;
+//! it reads, answers, hides or stops nothing.
+//!
+//! **Notices.** A notice says that an agent in a box waits for its owner: `GET /v1/notices`, no
+//! body: `200 {"notices": [{"machine": "server-1", "record": "<bytes>", "sealed": "<bytes>"}]}`,
+//! every notice in the phone's workspaces that its machine sealed to this phone, from every
+//! machine, in the order of the machines' names, then of the ids. A notice leaves the list once
+//! its machine closed it: the agent went on, its run ended, or its workspace closed. It is never
+//! closed for its age. Nothing is answered from a notice; the app says where to answer: "The agent
+//! in acme/dev is waiting for you: permission prompt. Since 14:02. Answer at its terminal."
+//!
+//! The record is one fixed byte string, a run of fields as above, in this order and nothing else:
+//!
+//! | Field | Bytes |
+//! |---|---|
+//! | label | `halti-notice-v1` |
+//! | machine | the machine's name at the hub |
+//! | ws | the workspace's name |
+//! | box | the box's name, a name as a device's is |
+//! | run | the run id (8) |
+//! | session | the agent session's number in that run, from 1, 4 bytes big-endian |
+//! | kind | `permission-prompt`, `question`, `turn-ended` or `needs-input` |
+//! | id | 16 bytes the machine drew for this notice |
+//! | since | when the wait began: seconds since 1970 by the machine's clock, 8 bytes big-endian |
+//!
+//! No byte of it was chosen inside the box: the box can choose only whether there is a notice,
+//! when, and which of the four kinds. `sealed` is sealed text (above) by the machine key to this
+//! phone's agreement key, with the label `halti-sealed-notice-v1` and the record's bytes as the
+//! associated data; the plaintext is empty, so it is 81 bytes. The app reads the record whole or
+//! not at all, opens `sealed` under the key it compared for the machine the record names, and
+//! lists the notice only if it opens and the record's machine and workspace are ones that machine
+//! was compared for (`devices trust`). One the hub made up, or whose record it changed, does not
+//! open; the app counts such records as refused and shows nothing of them.
 //!
 //! **Stopping runs.** The app signs, after fingerprint or PIN, these fields, in this order and
 //! nothing else:
@@ -356,6 +399,16 @@
 //! minute. An item of a kind it doesn't know is said `unknown` and nothing is done with it. At most
 //! 64 items wait for one machine; one more is `429 full` to the phone that sent it.
 //!
+//! **Notices.** `POST /v1/machine/notices`, body `{"notices": ["<16 bytes>", ...]}`, at most 50:
+//! the ids of every notice that is open in the workspaces a trusted phone may see. The hub closes
+//! each of this machine's notices that isn't listed, and answers `200 {"missing": ["<16 bytes>",
+//! ...]}`, those listed that it doesn't hold, as many as it has room for (50 in all). The link
+//! posts each: `POST /v1/machine/notice`, body `{"record": "<bytes>", "sealed": [{"device":
+//! "pixel", "sealed": "<bytes>"}, ...]}`, a copy for each phone trusted for its workspace, 1 to 64,
+//! each 81 to 256 bytes: `200 {}`, also for one held already, which is left as it is. A record
+//! that names another machine is `403 other-machine`; one more than the hub holds, `429 full`. The
+//! link calls with each report, and when the notices change.
+//!
 //! **A phone's keys.** `POST /v1/machine/device`, body `{"name": "pixel"}`: `200 {"name": "pixel",
 //! "signing_key": "<91 bytes>", "agreement_key": "<91 bytes>", "key_signature": "<DER>", "ws":
 //! ["acme"]}`, or `410 gone`. `halti devices trust` shows the signing key's fingerprint to compare
@@ -382,7 +435,7 @@
 //! | 401 | `replaced` | A phone's replaced token, sent to a renewal call |
 //! | 401 | `conflict` | A machine's replaced token (see Token conflict) |
 //! | 403 | `wrong-kind` | A machine's token at a phone's call (`/v1/renew/nonce` and those of "What a phone does"), or a phone's at a machine's, or any token at `/v1/wait` |
-//! | 403 | `other-machine` | A machine's record that names another machine |
+//! | 403 | `other-machine` | A machine's record or notice that names another machine |
 //! | 403 | `bad-code` | The pairing code is unknown, used, past its 2 minutes, or of the other kind |
 //! | 403 | `bad-signature` | A signature does not verify |
 //! | 403 | `bad-nonce` | The nonce is unknown, used or past its 2 minutes |
@@ -392,7 +445,7 @@
 //! | 409 | `conflict` | A renewal of a machine whose row is marked |
 //! | 410 | `gone` | The request, machine or phone a call names isn't held: answered, withdrawn, expired, hidden, revoked, never there, or outside the phone's workspaces |
 //! | 413 | `too-large` | A body over its limit |
-//! | 429 | `full` | One request, or one answer or stop, more than the hub holds for that machine |
+//! | 429 | `full` | One request, notice, answer or stop more than the hub holds for that machine |
 //! | 503 | `unavailable` | A renewal the hub could not write down: nothing changed, and the token sent still works. Try again later |
 //!
 //! Every word is 1 to 16 of a-z and `-`. A client shows these words, never a body as text, and
@@ -670,16 +723,27 @@ pub fn wake(value: &str) -> Option<[u8; 32]> {
     unhex(value.strip_prefix("Wake ")?)
 }
 
+/// The body of `POST /v1/wait`. Fields it doesn't know are passed over, so an app newer or older
+/// than the hub still waits.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WaitBody {
     seen: String,
+    notices_seen: Option<String>,
 }
 
-/// What a waiting phone was last told: the hash of the ids, or None for none.
-pub fn wait_body(body: &[u8]) -> Result<Option<[u8; 32]>, Refused> {
+/// What a waiting phone was last told.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Seen {
+    /// The hash of the requests' ids, or None for none.
+    pub requests: Option<[u8; 32]>,
+    /// From an app that is told of notices: the hash of their ids, or None for none.
+    pub notices: Option<Option<[u8; 32]>>,
+}
+
+pub fn wait_body(body: &[u8]) -> Result<Seen, Refused> {
     let body: WaitBody = json(body)?;
-    if body.seen.is_empty() { Ok(None) } else { bytes(&body.seen).map(Some) }
+    let hash = |text: &str| if text.is_empty() { Ok(None) } else { bytes(text).map(Some) };
+    Ok(Seen { requests: hash(&body.seen)?, notices: body.notices_seen.as_deref().map(hash).transpose()? })
 }
 
 /// The hash of these ids, sorted, as a waiting phone names what it was told; None for none.

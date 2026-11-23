@@ -191,7 +191,6 @@ impl Notice {
     }
 
     /// The notice these bytes are, or None if they are not one in every field.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the hub is its first caller"))]
     pub fn decode(bytes: &[u8]) -> Option<Notice> {
         let [label, machine, ws, box_name, run, session, kind, id, since] = fields::split(bytes)?[..] else { return None };
         let name = |bytes: &[u8]| -> Option<String> {
