@@ -307,3 +307,28 @@ fn the_desk_sends_after_its_delay_at_once_when_away_and_nothing_once_closed() {
     ask(&web, b"question", b"t", b"");
     assert!(desk.notices().is_empty());
 }
+
+#[test]
+fn the_agent_image_runs_the_asker_from_its_managed_settings_with_a_short_timeout() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let settings: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{root}/box/claude-code/halti.json")).unwrap()).unwrap();
+    let hooks = settings["hooks"].as_object().unwrap();
+    let events: Vec<&str> = hooks.keys().map(String::as_str).collect();
+    let mut expected = ["Notification", "PermissionRequest", "PreToolUse", "PostToolUse", "PermissionDenied", "Stop", "UserPromptSubmit"];
+    expected.sort_unstable();
+    assert_eq!(events, expected);
+    for (event, matchers) in hooks {
+        let matchers = matchers.as_array().unwrap();
+        assert_eq!(matchers.len(), 1, "{event}");
+        let tool = ["PermissionRequest", "PreToolUse", "PostToolUse", "PermissionDenied"].contains(&event.as_str());
+        assert_eq!(matchers[0].get("matcher").and_then(|m| m.as_str()), tool.then_some("*"), "{event}: every tool");
+        let hook = &matchers[0]["hooks"];
+        assert_eq!(hook.as_array().unwrap().len(), 1, "{event}");
+        assert_eq!(hook[0]["type"], "command");
+        assert_eq!(hook[0]["command"], format!("{} ask", crate::names::SHIM_PATH));
+        // Every call is answered at once; with no timeout set, a hook would be killed only at 600 s.
+        assert!(hook[0]["timeout"].as_u64().is_some_and(|secs| (1..=30).contains(&secs)), "{event}");
+    }
+    let image = std::fs::read_to_string(format!("{root}/box/agent.Containerfile")).unwrap();
+    assert!(image.contains(&format!("COPY claude-code/halti.json {}\n", crate::names::MANAGED_SETTINGS)));
+}

@@ -95,6 +95,11 @@ pub const SHIM: &str = "halti-shim";
 #[allow(dead_code)]
 pub const SHIM_PATH: &str = "/usr/local/bin/halti-shim";
 
+/// Where the agent image puts Claude Code's managed settings, whose hooks run the shim's asker
+/// (`halti-shim ask`, see `crate::notices`). Containerfiles only; the file is box/claude-code/halti.json.
+#[allow(dead_code)]
+pub const MANAGED_SETTINGS: &str = "/etc/claude-code/managed-settings.d/halti.json";
+
 /// The socket in the VM that the door dials into, published with `--publish-socket` and compiled
 /// into the shim.
 pub const DOOR_SOCKET: &str = "/run/halti/door.sock";
