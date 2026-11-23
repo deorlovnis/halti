@@ -99,7 +99,7 @@ pub fn login(name: &str, only: Option<&str>, all: bool) -> Result<()> {
         None => format!("sign in to the sites of box {name} and keep their sessions in the box"),
     };
     let keys = KeyStore::of(&config::settings());
-    let ask = || approve::confirm(&reason);
+    let ask = || approve::confirm(&mut approve::Answers::default(), &reason);
     with_store(name, keys, ask, false, |mnt| {
         let sessions = Sessions::new(mnt, &keys.open_key(name)?, true);
         let sites = match named {

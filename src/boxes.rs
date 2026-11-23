@@ -916,7 +916,7 @@ fn with_store<T>(name: &str, keys: KeyStore, ask: impl FnOnce() -> Result<()>, r
 /// against its chain instead, and fails naming the first line that was changed or removed.
 pub fn log(name: &str, last: usize, verify: bool) -> Result<()> {
     let keys = KeyStore::of(&config::settings());
-    let ask = || approve::confirm(&format!("read the log of box {name}"));
+    let ask = || approve::confirm(&mut approve::Answers::default(), &format!("read the log of box {name}"));
     with_store(name, keys, ask, true, |mnt| {
         if verify {
             let chain = Chain::new(&store::door_log(mnt), log_key(&keys.open_key(name)?));
@@ -1020,7 +1020,7 @@ pub fn import(name: &str, from: &str) -> Result<()> {
     let src = expand_home(from);
     let file_name = src.file_name().map(|n| n.to_os_string()).ok_or_else(|| anyhow!("{from} isn't a file or folder"))?;
     let keys = KeyStore::of(&config::settings());
-    let ask = || approve::confirm(&format!("import {} into box {name}", src.display()));
+    let ask = || approve::confirm(&mut approve::Answers::default(), &format!("import {} into box {name}", src.display()));
     with_store(name, keys, ask, false, |mnt| {
         let log_key = log_key(&keys.open_key(name)?);
         let dst = mnt.join("work").join(&file_name);

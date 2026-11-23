@@ -28,7 +28,7 @@ use super::intercept_tests::{Guest, Shim, client, log_lines, wait_for};
 use super::tls::{BoxCa, trust_only};
 use super::{Config, Door, Tokens};
 use crate::util::TempDir;
-use crate::{approve, keychain, names, policy};
+use crate::{keychain, names, policy};
 
 const SECRET: &str = "tok-SECRET-0123456789-abcdef";
 const LOG_KEY: [u8; 32] = [5; 32];
@@ -139,7 +139,6 @@ fn scenario(dir: &Path, yes: bool) {
     let field = json!({ "fields": { "token": {} } });
     fs::write(dir.join("index.json"), json!({ "app": field }).to_string()).unwrap();
     policy::approve(&["app".into(), "loose".into(), "askme".into(), "fetchonly".into(), "outsider".into()]).unwrap();
-    approve::take_answers();
     // The policies are approved; from here Touch ID answers as this scenario says.
     // SAFETY: no other thread is running yet; the door's threads start later.
     unsafe { std::env::set_var("HALTI_TEST_APPROVE", if yes { "yes" } else { "no" }) };

@@ -2,8 +2,6 @@
 //! An agent can't answer this prompt, so it gates everything that loosens a policy or
 //! releases a value outside halti.
 
-use std::cell::RefCell;
-
 use anyhow::{Result, bail};
 
 use crate::requests::Prompted;
@@ -12,31 +10,61 @@ use crate::requests::Prompted;
 /// `ask_person_until`, which is frozen): the request then waits on for an answer from elsewhere.
 pub const TOUCH_ID_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-thread_local! {
-    /// How each prompt this thread asked was answered since its last `take_answers` (true:
-    /// approved). Kept per thread: where several boxes run in one process, a call reads back only
-    /// what it asked itself.
-    static ANSWERS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+/// The answers to one request's prompts, in order (true: approved). A request that is audited
+/// keeps its own and passes it to every `confirm` it causes, so each answer comes back to the
+/// request that asked and to no other: not another call's, a door's, or another box's in the same
+/// process. A prompt no log records is given a fresh one.
+#[derive(Default, Debug)]
+pub struct Answers(Vec<bool>);
+
+impl Answers {
+    pub fn all(&self) -> &[bool] {
+        &self.0
+    }
 }
 
-/// The answers to the prompts this thread asked so far, and forget them. The audit log reads what a
-/// call asked.
-pub fn take_answers() -> Vec<bool> {
-    ANSWERS.with_borrow_mut(std::mem::take)
-}
-
-/// Ask for confirmation; macOS shows it as "halti is trying to <reason>."
-pub fn confirm(reason: &str) -> Result<()> {
+/// Ask for confirmation for the request `answers` belongs to, and keep the answer there; macOS
+/// shows it as "halti is trying to <reason>."
+pub fn confirm(answers: &mut Answers, reason: &str) -> Result<()> {
     let result = prompt(reason);
-    note(result.is_ok());
+    #[cfg(test)]
+    SHOWN.lock().unwrap().push((reason.to_string(), result.is_ok()));
+    answers.0.push(result.is_ok());
     result
 }
 
-fn note(approved: bool) {
-    ANSWERS.with_borrow_mut(|answers| answers.push(approved));
+/// Every prompt this test process showed and no test has taken yet, with its answer: tests count
+/// the prompts a door raised by their reasons. Nothing outside tests has it.
+#[cfg(test)]
+static SHOWN: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// Takes the answers to the prompts shown so far whose reason starts with `about`, in order.
+#[cfg(test)]
+pub fn shown(about: &str) -> Vec<bool> {
+    let mut shown = SHOWN.lock().unwrap();
+    let (taken, kept) = std::mem::take(&mut *shown).into_iter().partition(|(reason, _)| reason.starts_with(about));
+    *shown = kept;
+    taken.into_iter().map(|(_, answer): (String, bool)| answer).collect()
+}
+
+/// How a test that has prompts open at the same time answers each, by its reason.
+#[cfg(test)]
+type ByReason = Box<dyn Fn(&str) -> bool + Send + Sync>;
+#[cfg(test)]
+static BY_REASON: std::sync::OnceLock<ByReason> = std::sync::OnceLock::new();
+
+/// From now on this test process answers each prompt as `answer` says for its reason (true:
+/// approved); once per process.
+#[cfg(test)]
+pub fn answer_by_reason(answer: impl Fn(&str) -> bool + Send + Sync + 'static) {
+    assert!(BY_REASON.set(Box::new(answer)).is_ok(), "prompts are answered by reason once per process");
 }
 
 fn prompt(reason: &str) -> Result<()> {
+    #[cfg(test)]
+    if let Some(answer) = BY_REASON.get() {
+        return if answer(reason) { Ok(()) } else { bail!("not approved: {reason}") };
+    }
     // Automated tests answer for the user. Release builds don't contain this.
     #[cfg(halti_dev)]
     if let Some(answer) = crate::util::dev_var("HALTI_TEST_APPROVE") {
@@ -143,24 +171,4 @@ fn ask_person_until(reason: &str, withdrawn: &dyn Fn() -> bool) -> Prompted {
 #[cfg(not(target_os = "macos"))]
 fn ask_person_until(_reason: &str, _withdrawn: &dyn Fn() -> bool) -> Prompted {
     Prompted::Unshown
-}
-
-#[cfg(test)]
-mod tests {
-    use std::thread;
-
-    use super::*;
-
-    #[test]
-    fn answers_are_kept_per_thread() {
-        take_answers();
-        note(true);
-        let other = thread::spawn(|| {
-            note(false);
-            take_answers()
-        });
-        assert_eq!(other.join().unwrap(), [false], "another thread reads only its own");
-        assert_eq!(take_answers(), [true]);
-        assert!(take_answers().is_empty());
-    }
 }

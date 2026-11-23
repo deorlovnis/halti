@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use ureq::http;
 
+use crate::approve::Answers;
 use crate::policy::{self, Approved, METHODS, Mode};
 use crate::source::Hint;
 use crate::{approve, source};
@@ -23,8 +24,9 @@ pub struct Request<'a> {
 }
 
 /// Make the request and describe the response as text. The caller masks it. `asking` is what a
-/// question about a write starts with: `box acme/dev: ` for a workspace's box, else empty.
-pub fn perform(res: &str, approved: &Approved, req: &Request, asking: &str) -> Result<String> {
+/// question about a write starts with: `box acme/dev: ` for a workspace's box, else empty; its
+/// answer is kept in `answers`, the request's own.
+pub fn perform(res: &str, approved: &Approved, req: &Request, asking: &str, answers: &mut Answers) -> Result<String> {
     let fetch = approved.policy.fetch.as_ref().ok_or_else(|| anyhow!("the policy for {res} allows no requests (no [fetch] section)"))?;
     let method = req.method.to_ascii_uppercase();
     if !METHODS.contains(&method.as_str()) {
@@ -34,7 +36,7 @@ pub fn perform(res: &str, approved: &Approved, req: &Request, asking: &str) -> R
     if !matches!(method.as_str(), "GET" | "HEAD") {
         match fetch.writes {
             Mode::Deny => bail!("the policy for {res} doesn't allow {method} requests"),
-            Mode::Ask => approve::confirm(&format!("{asking}send {method} {url} for {res}"))?,
+            Mode::Ask => approve::confirm(answers, &format!("{asking}send {method} {url} for {res}"))?,
             Mode::Allow => {}
         }
     }

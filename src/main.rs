@@ -949,7 +949,7 @@ fn cmd_rm(res: &str, field: Option<String>) -> Result<()> {
 
 fn cmd_copy(res: &str, field: &str) -> Result<()> {
     let Some(v) = source::current().value(res, field) else { bail!("{res}/{field} not found") };
-    approve::confirm(&format!("copy {res}/{field} to the clipboard"))?;
+    approve::confirm(&mut approve::Answers::default(), &format!("copy {res}/{field} to the clipboard"))?;
     pbcopy(v.trim_end_matches('\n'))?;
     println!("copied {res}/{field} to clipboard");
     Ok(())
@@ -1009,7 +1009,7 @@ fn cmd_run(resources: Vec<String>, command: Vec<String>) -> Result<u8> {
         let fields: Vec<&str> = run.export.keys().map(String::as_str).collect();
         match run.mode {
             Mode::Deny => bail!("the policy for {res} doesn't allow halti run (agents can use halti mcp)"),
-            Mode::Ask => approve::confirm(&format!("run {} with {res}'s {}", command[0], fields.join(", ")))?,
+            Mode::Ask => approve::confirm(&mut approve::Answers::default(), &format!("run {} with {res}'s {}", command[0], fields.join(", ")))?,
             Mode::Allow => {}
         }
         for (name, var) in &run.export {

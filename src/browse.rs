@@ -17,6 +17,7 @@ use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::approve::Answers;
 use crate::index::today;
 use crate::policy::{Approved, Browse, Mode, Policy};
 use crate::{approve, source};
@@ -76,6 +77,18 @@ pub struct Session {
     /// What a question about a page's write starts with: `box acme/dev: ` for a workspace's box,
     /// so the person sees which client asks; empty otherwise.
     asking: String,
+    /// The page writes asked about since `asked` last took them.
+    page_writes: Vec<PageWrite>,
+}
+
+/// A write a page sent that the person was asked about, and the answer. It is a request of its own:
+/// a page sends it when it likes (a timer, say), so the command that reads the question from the
+/// runner may be a later one than the command that caused it.
+#[derive(Debug, PartialEq)]
+pub struct PageWrite {
+    pub method: String,
+    pub url: String,
+    pub approved: bool,
 }
 
 impl Session {
@@ -108,7 +121,7 @@ impl Session {
         let stdin = child.stdin.take().expect("piped");
         let stdout = BufReader::new(child.stdout.take().expect("piped"));
         let secrets = sealed.map(state_values).unwrap_or_default();
-        let mut session = Self { site: site.to_string(), child, stdin, stdout, next_id: 0, closed: false, secrets, asking: asking.to_string() };
+        let mut session = Self { site: site.to_string(), child, stdin, stdout, next_id: 0, closed: false, secrets, asking: asking.to_string(), page_writes: Vec::new() };
         let text = session.call(json!({ "cmd": "open", "config": config }))?;
         Ok((session, text))
     }
@@ -137,7 +150,10 @@ impl Session {
             if let Some(ask) = msg.get("ask") {
                 let method = msg["method"].as_str().unwrap_or("?");
                 let url = msg["url"].as_str().unwrap_or("?");
-                let allow = approve::confirm(&format!("{}let a {} page send {method} {url}", self.asking, self.site)).is_ok();
+                let reason = format!("{}let a {} page send {method} {url}", self.asking, self.site);
+                // The write's own answer, not the command's: see `PageWrite`.
+                let allow = approve::confirm(&mut Answers::default(), &reason).is_ok();
+                self.page_writes.push(PageWrite { method: method.to_string(), url: url.to_string(), approved: allow });
                 writeln!(self.stdin, "{}", json!({ "answer": ask, "allow": allow }))?;
                 self.stdin.flush()?;
                 continue;
@@ -152,9 +168,15 @@ impl Session {
         }
     }
 
+    /// The page writes asked about since the last time, for the audit log.
+    pub fn asked(&mut self) -> Vec<PageWrite> {
+        std::mem::take(&mut self.page_writes)
+    }
+
     /// Close the browser and take back the session it ends with (cookies and Local Storage, as
-    /// Playwright's `storageState`), if the runner gave one.
-    pub fn close(mut self) -> Result<Option<Value>> {
+    /// Playwright's `storageState`), if the runner gave one. Page writes asked about while it
+    /// closes are still in `asked`.
+    pub fn close(&mut self) -> Result<Option<Value>> {
         self.closed = true;
         Ok(closed_state(&self.exchange(json!({ "cmd": "close" }))?))
     }

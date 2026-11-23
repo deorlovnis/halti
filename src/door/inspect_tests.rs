@@ -41,19 +41,26 @@ const MASK: &str = "********";
 const YES: &str = "door::inspect_tests::the_requests_of_a_box_are_judged_and_touch_id_says_yes";
 const NO: &str = "door::inspect_tests::the_requests_of_a_box_are_judged_and_touch_id_says_no";
 
+const AT_ONCE: &str = "door::inspect_tests::an_agents_call_and_a_door_prompt_asked_at_once_each_log_their_own_answer";
+
 #[test]
 fn the_requests_of_a_box_are_judged_and_touch_id_says_yes() {
-    run_scenario(YES, "yes");
+    run_scenario(YES, |dir| scenario(dir, true));
 }
 
 #[test]
 fn the_requests_of_a_box_are_judged_and_touch_id_says_no() {
-    run_scenario(NO, "no");
+    run_scenario(NO, |dir| scenario(dir, false));
 }
 
-fn run_scenario(name: &str, answer: &str) {
+#[test]
+fn an_agents_call_and_a_door_prompt_asked_at_once_each_log_their_own_answer() {
+    run_scenario(AT_ONCE, asked_at_once);
+}
+
+fn run_scenario(name: &str, scenario: impl FnOnce(&Path)) {
     if let Some(dir) = std::env::var_os("HALTI_INSPECT_DIR") {
-        return scenario(Path::new(&dir), answer == "yes");
+        return scenario(Path::new(&dir));
     }
     let dir = TempDir::new("halti-inspect").unwrap();
     for sub in ["keychain", "policy", "home"] {
@@ -162,9 +169,10 @@ struct Rig {
     connects: Arc<AtomicUsize>,
     /// While set, the door can't connect to the site.
     unreachable: Arc<AtomicBool>,
-    /// What `serve` counted, and the answers to what the door asked: they are kept on the thread
-    /// that asked.
-    serving: JoinHandle<((u64, u64), Vec<bool>)>,
+    /// What `serve` counted.
+    serving: JoinHandle<(u64, u64)>,
+    /// What the door's prompts for this box start with.
+    asking: String,
 }
 
 impl Rig {
@@ -211,17 +219,20 @@ impl Rig {
             }
             Ok(site(None))
         };
+        // Prompts the box's earlier connections showed aren't this one's.
+        let asking = format!("let box {} ", shared.cfg.name);
+        approve::shown(&asking);
         let (shared, host) = (shared.clone(), host.to_string());
         let serving = thread::spawn(move || {
             let ctx = Ctx { shared: &shared, host: &host, caller: &Caller::Agent };
-            let counted = match (made, first) {
+            match (made, first) {
                 (Some(made), Some((fresh, _))) => serve(door_guest, first_while_fresh(made, fresh, dial), &ctx),
                 _ => serve(door_guest, dial, &ctx),
-            };
-            (counted, approve::take_answers())
+            }
         });
         guest.set_read_timeout(Some(WAIT)).unwrap();
-        Self { guest: Conn { reader: BufReader::new(guest.try_clone().unwrap()), stream: guest, seen: Vec::new() }, seen, release, connects, unreachable, serving }
+        let guest = Conn { reader: BufReader::new(guest.try_clone().unwrap()), stream: guest, seen: Vec::new() };
+        Self { guest, seen, release, connects, unreachable, serving, asking }
     }
 
     fn connects(&self) -> usize {
@@ -234,18 +245,16 @@ impl Rig {
 
     /// End the guest's side and wait for the door to finish: the log is complete after this.
     fn finish(self) -> (u64, u64) {
-        self.end().0
-    }
-
-    /// `finish`, and how each question the door asked on this connection was answered.
-    fn finish_asked(self) -> Vec<bool> {
-        self.end().1
-    }
-
-    fn end(self) -> ((u64, u64), Vec<bool>) {
         let _ = self.guest.stream.shutdown(Shutdown::Write);
         drop(self.guest);
         self.serving.join().unwrap()
+    }
+
+    /// `finish`, and how each Touch ID prompt the door showed for this connection was answered.
+    fn finish_asked(self) -> Vec<bool> {
+        let asking = self.asking.clone();
+        self.finish();
+        approve::shown(&asking)
     }
 }
 
@@ -389,7 +398,6 @@ fn scenario(dir: &Path, yes: bool) {
     store("pending", "token", SECRET);
     fs::write(dir.join("index.json"), json!({ "app": site_index(), "readonly": site_index(), "askme": site_index(), "pending": site_index() }).to_string()).unwrap();
     policy::approve(&["app".into(), "readonly".into(), "askme".into()]).unwrap();
-    approve::take_answers();
     // The policies are approved; from here Touch ID answers as this scenario says.
     // SAFETY: no other thread is running yet; the doors' threads start later.
     unsafe { std::env::set_var("HALTI_TEST_APPROVE", if yes { "yes" } else { "no" }) };
@@ -411,6 +419,57 @@ fn scenario(dir: &Path, yes: bool) {
     site_raises(dir);
     net_allows(&shared(dir, "allow", Mode::Allow, &[]));
     the_log_chains(dir, yes);
+}
+
+/// An agent's call through halti's MCP server and a write through the door ask at the same time, in
+/// one process as a box run has them. Touch ID says no to the door while the call's prompt is still
+/// open, then yes to the call. The audit log records the call's yes and the door's log its no:
+/// neither hears the other's answer.
+fn asked_at_once(dir: &Path) {
+    write_policy("askme", "[fetch]\nhosts = [\"https://ask.example.com\"]\nwrites = \"ask\"\nauth = \"Bearer {token}\"\n");
+    store("askme", "token", SECRET);
+    // The agent's site: nothing listens there, so its approved write fails after the answer.
+    let nobody = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    write_policy("agentsite", &format!("[fetch]\nhosts = [\"http://{nobody}\"]\nwrites = \"ask\"\n"));
+    fs::write(dir.join("index.json"), json!({ "askme": site_index(), "agentsite": { "fields": {} } }).to_string()).unwrap();
+    policy::approve(&["askme".into(), "agentsite".into()]).unwrap();
+
+    let (call_asks, call_asked) = mpsc::channel();
+    let (door_heard, door_answered) = mpsc::channel();
+    let (call_asked, door_answered) = (Mutex::new(call_asked), Mutex::new(door_answered));
+    approve::answer_by_reason(move |reason| {
+        if reason.contains("ask.example.com") {
+            call_asked.lock().unwrap().recv_timeout(WAIT).expect("the agent's call asks first");
+            false
+        } else {
+            call_asks.send(()).unwrap();
+            door_answered.lock().unwrap().recv_timeout(WAIT).expect("the door has its answer");
+            true
+        }
+    });
+
+    let call = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "fetch", "arguments": { "site": "agentsite", "method": "POST", "url": format!("http://{nobody}/submit") } } });
+    let agent = thread::spawn(move || {
+        let mut replies = Vec::new();
+        let scope = crate::mcp::Scope::boxed("testbox", &["agentsite".into()], None);
+        crate::mcp::serve_io(std::io::Cursor::new(format!("{call}\n")), &mut replies, scope).unwrap();
+        String::from_utf8(replies).unwrap()
+    });
+    let host = "ask.example.com";
+    let mut rig = Rig::new(&shared(dir, "at-once", Mode::Deny, &[]), host);
+    let (reply, body) = rig.guest.post(host, "/submit", &[], "data");
+    assert_eq!(reply.status, 403, "{body}");
+    door_heard.send(()).unwrap();
+    let replies = agent.join().unwrap();
+    assert!(replies.contains("\"isError\":true"), "nothing listens at the agent's site: {replies}");
+    let audit: Vec<Value> = fs::read_to_string(dir.join("audit.log")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let calls: Vec<(Value, Value)> = audit.iter().map(|l| (l["site"].clone(), l["decision"].clone())).collect();
+    assert_eq!(calls, [(json!("agentsite"), json!("asked:yes"))]);
+
+    assert_eq!(rig.finish_asked(), [false], "the door showed one prompt");
+    let door = log_lines(dir, "at-once");
+    assert_eq!((door.len(), door[0]["decision"].clone()), (1, json!("asked:no")));
 }
 
 fn site_index() -> Value {
@@ -769,9 +828,9 @@ fn net_allows(sh: &Arc<Shared>) {
     // A WebSocket can't be carried, even where writes are allowed.
     let (reply, body) = rig.guest.get(host, "/socket", &[("Connection", "Upgrade"), ("Upgrade", "websocket")]);
     assert_eq!(reply.status, 501, "{body}");
-    let ((up, down), asked) = rig.end();
-    assert_eq!((up, down), (4, 8));
-    assert!(asked.is_empty());
+    let asking = rig.asking.clone();
+    assert_eq!(rig.finish(), (4, 8));
+    assert!(approve::shown(&asking).is_empty());
 }
 
 /// One line per request, chained, with the URL masked; an edit or a deletion shows.

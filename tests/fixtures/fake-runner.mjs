@@ -8,12 +8,17 @@
 //   .../nothing           closes the window without signing in
 //   .../fail              can't start
 // Every `open` config is appended to $FAKE_RUNNER_LOG, one JSON line each.
+//
+// A click on ref "later-write" stands for a page that sends a write a moment later (a timer, say):
+// its question to halti comes while the next command runs, as the real runner's would.
 
 import fs from 'node:fs';
 import readline from 'node:readline';
 
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\n');
 let config;
+// The write a page will send, asked about before the answer to the next command.
+let later = null;
 
 const step = (value) => (/#(\d+)$/.test(value) ? value.replace(/#(\d+)$/, (_, n) => `#${Number(n) + 1}`) : `${value}#1`);
 
@@ -43,6 +48,12 @@ const page = () =>
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   const msg = JSON.parse(line);
+  // halti's answer to a question about a page's write.
+  if ('answer' in msg) return;
+  if (later) {
+    send({ ask: 1, method: 'POST', url: later });
+    later = null;
+  }
   if (msg.cmd === 'open') {
     config = msg.config;
     if (process.env.FAKE_RUNNER_LOG) fs.appendFileSync(process.env.FAKE_RUNNER_LOG, JSON.stringify(config) + '\n');
@@ -63,6 +74,7 @@ rl.on('line', (line) => {
     send({ id: msg.id, ok: true, text: JSON.stringify({ storageState }) });
     process.exit(0);
   } else {
+    if (msg.cmd === 'click' && msg.ref === 'later-write') later = `${new URL(config.start).origin}/later`;
     send({ id: msg.id, ok: true, text: page() });
   }
 });
