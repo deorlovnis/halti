@@ -237,7 +237,7 @@ fn scalar_of(bytes: &[u8; 32]) -> Result<Zeroizing<p256::NonZeroScalar>, Refusal
 }
 
 /// The public point of a private scalar: 0x04, then x and y.
-fn p256_public(scalar: &[u8; 32]) -> Result<[u8; 65], Refusal> {
+pub(super) fn p256_public(scalar: &[u8; 32]) -> Result<[u8; 65], Refusal> {
     let scalar = scalar_of(scalar)?;
     let point = p256::PublicKey::from_secret_scalar(&scalar).to_sec1_point(false);
     let mut bytes = [0; 65];
@@ -248,7 +248,7 @@ fn p256_public(scalar: &[u8; 32]) -> Result<[u8; 65], Refusal> {
 /// ECDH over P-256: the x coordinate of scalar times point, 32 bytes big-endian (NIST SP 800-56A
 /// section 5.7.1.2). The point must be 65 bytes starting 0x04 and on the curve, which also rules
 /// out the point at infinity; a compressed point is refused though the curve crate would take it.
-fn ecdh_x(scalar: &[u8; 32], point: &[u8]) -> Result<Zeroizing<[u8; 32]>, Refusal> {
+pub(super) fn ecdh_x(scalar: &[u8; 32], point: &[u8]) -> Result<Zeroizing<[u8; 32]>, Refusal> {
     if point.len() != 65 || point[0] != 0x04 {
         return Err(Refusal::Unreadable);
     }
