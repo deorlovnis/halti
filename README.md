@@ -352,11 +352,13 @@ request = "GET https://api.example.com/items/{id}"
 
 ## Agents
 
-An agent that works for one client gets that client's workspace, and no other's. Register it in the project where you work for acme:
+An agent that works for one client gets that client's workspace, and no other's. Register it from the folder where you work for acme:
 
 ```sh
-claude mcp add --scope project halti -- /usr/local/bin/halti ws mcp acme
+claude mcp add --scope local halti -- /usr/local/bin/halti ws mcp acme
 ```
+
+`--scope local` keeps the line in your own settings for that folder (`~/.claude.json`), not in a file of the repo: no repo file names a workspace, so nobody who can write the repo can point your next session at another client's.
 
 `halti ws mcp acme` asks nothing and holds no secret: the terminal where acme is open serves the agent, with the sites whose policies are approved in acme, until the agent ends or acme closes. While acme isn't open it says so and serves nothing. Two workspaces open at once serve their own agents side by side, and neither sees the other's sites. Consents and writes that ask name the workspace (`workspace acme: ...`), and each call is written to acme's audit log, `WSDIR/boxes/audit.log`.
 
