@@ -240,14 +240,36 @@ fn capture(cmd: &mut Command, what: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// `container` is installed and its system service is running.
+/// The `container` halti was tested with. Apple still makes breaking changes in its minor
+/// releases, so another major or minor version is refused; another patch release is taken.
+pub const TESTED_VERSION: &str = "1.6.1";
+const RELEASES: &str = "https://github.com/apple/container/releases";
+
+/// `container` is installed, it is the version halti was tested with, and its system service is
+/// running.
 pub fn available() -> Result<()> {
-    let status = container().args(["system", "status"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|e| match e.kind() {
-        ErrorKind::NotFound => anyhow!("Apple's `container` isn't installed: get it from https://github.com/apple/container/releases"),
+    let said = container().arg("--version").stdin(Stdio::null()).stderr(Stdio::null()).output().map_err(|e| match e.kind() {
+        ErrorKind::NotFound => anyhow!("Apple's `container` isn't installed: get it from {RELEASES}"),
         _ => anyhow!("running container: {e}"),
     })?;
+    tested_version(&String::from_utf8_lossy(&said.stdout))?;
+    let status = container().args(["system", "status"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().context("running container")?;
     if !status.success() {
         bail!("container's system service isn't running: start it with `container system start`");
+    }
+    Ok(())
+}
+
+/// Fails unless `said`, what `container --version` printed ("container CLI version 1.6.1 (build:
+/// release, commit: aa8d76b)"), names the major and minor version of `TESTED_VERSION`.
+fn tested_version(said: &str) -> Result<()> {
+    let found = said.split_whitespace().skip_while(|word| *word != "version").nth(1).unwrap_or("");
+    let series = |version: &str| version.split('.').take(2).map(str::to_string).collect::<Vec<_>>();
+    if found.is_empty() {
+        bail!("Apple's `container` didn't say its version, and halti was tested with {TESTED_VERSION}: install that one from {RELEASES}");
+    }
+    if series(found) != series(TESTED_VERSION) {
+        bail!("Apple's `container` is {found}, and halti was tested with {TESTED_VERSION}: install that one from {RELEASES}");
     }
     Ok(())
 }
@@ -801,6 +823,20 @@ mod tests {
         );
         assert_eq!(docker_env(), [("HTTPS_PROXY", "http://127.0.0.1:3128"), ("HTTP_PROXY", "http://127.0.0.1:3128"), ("NO_PROXY", NO_PROXY)]);
         assert!(!Container.takes_disk(), "Apple's engine mounts folders");
+    }
+
+    #[test]
+    fn only_the_container_halti_was_tested_with_is_taken() {
+        let said = |version: &str| format!("container CLI version {version} (build: release, commit: aa8d76b)\n");
+        assert!(tested_version(&said(TESTED_VERSION)).is_ok());
+        // A patch release is taken; a minor or major one is refused, in one line.
+        assert!(tested_version(&said("1.6.9")).is_ok());
+        for other in ["1.7.0", "2.6.1", "1.60.1", "0.6.1"] {
+            let err = tested_version(&said(other)).unwrap_err().to_string();
+            assert_eq!(err, format!("Apple's `container` is {other}, and halti was tested with 1.6.1: install that one from {RELEASES}"));
+        }
+        let err = tested_version("").unwrap_err().to_string();
+        assert!(err.starts_with("Apple's `container` didn't say its version") && !err.contains('\n'), "{err}");
     }
 
     #[test]
