@@ -29,9 +29,32 @@ pub fn join(parts: &[&[u8]]) -> Vec<u8> {
     bytes
 }
 
+/// The fields `bytes` is a run of, each without its length; None if the last one is cut short.
+pub fn split(bytes: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut fields = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (length, after) = rest.split_first_chunk::<2>()?;
+        let (field, after) = after.split_at_checked(usize::from(u16::from_be_bytes(*length)))?;
+        fields.push(field);
+        rest = after;
+    }
+    Some(fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_of_fields_splits_back_into_them_or_not_at_all() {
+        assert_eq!(split(&join(&[b"ab", b"", b"c"])), Some(vec![&b"ab"[..], b"", b"c"]));
+        assert_eq!(split(&[]), Some(Vec::new()));
+        let bytes = join(&[b"ab", b"c"]);
+        for end in [1, 3, bytes.len() - 1] {
+            assert_eq!(split(&bytes[..end]), None, "cut at {end}");
+        }
+    }
 
     #[test]
     fn fields_are_length_prefixed_and_nothing_else() {
