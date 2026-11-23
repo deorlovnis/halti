@@ -1,5 +1,5 @@
 //! Notices: that an agent in a box waits for its owner, and what kind of wait it is. The phone
-//! then says "the agent in acme/dev is waiting for you: permission prompt", and the owner answers
+//! then says "the agent in acme/dev is waiting for you: permission prompt", and the answer is given
 //! at its terminal. Nothing can be answered from a notice.
 //!
 //! Inside the box, Claude Code's hooks (the image's managed settings) run the asker,

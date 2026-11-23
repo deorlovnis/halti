@@ -337,6 +337,14 @@ impl Phone {
         })
     }
 
+    /// The notices it is shown: each machine's name, the record and the copy sealed to it.
+    pub fn notices(&self, hub: &TestHub) -> Vec<(String, Vec<u8>, Vec<u8>)> {
+        let (status, body) = hub.call("GET", "/v1/notices", Some(&self.token), None);
+        assert_eq!(status, 200, "{body}");
+        let bytes = |notice: &Value, field: &str| util::unhex(notice[field].as_str().unwrap()).unwrap();
+        body["notices"].as_array().unwrap().iter().map(|n| (n["machine"].as_str().unwrap().to_string(), bytes(n, "record"), bytes(n, "sealed"))).collect()
+    }
+
     /// The requests it is shown: each machine's name and record.
     pub fn requests(&self, hub: &TestHub) -> Vec<(String, Vec<u8>)> {
         let (status, body) = hub.call("GET", "/v1/requests", Some(&self.token), None);

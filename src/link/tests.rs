@@ -1102,3 +1102,118 @@ fn a_renewal_under_way_writes_nothing_back_after_a_leave() {
     assert_eq!(world.folder.joined().unwrap(), None);
     assert!(world.folder.machine_key().unwrap().is_none());
 }
+
+// --- notices that an agent waits ---
+
+/// The notices a phone lists, as the app does: each that opens under the machine key it compared
+/// for the machine the record names, and names a workspace that machine was compared for. The
+/// records, and how many were refused.
+fn listed(world: &World, phone: &Phone) -> (Vec<crate::notices::Notice>, usize) {
+    let state = phone.state(&world.hub);
+    let mut shown = Vec::new();
+    let mut refused = 0;
+    for (machine, record, sealed) in phone.notices(&world.hub) {
+        let compared = state["machines"].as_array().unwrap().iter().find(|m| m["name"] == machine.as_str());
+        let opens = compared.is_some_and(|compared| {
+            let key = AgreementKey::from_spki(&util::unhex(compared["key"].as_str().unwrap()).unwrap()).unwrap();
+            let notice = crate::notices::Notice::decode(&record);
+            sealed::open(Kind::Notice, &phone.second_key(), &key, &record, &sealed).is_ok_and(|text| text.is_empty())
+                && notice.as_ref().is_some_and(|notice| notice.machine == machine && compared["ws"].as_array().unwrap().iter().any(|ws| ws == notice.ws.as_str()))
+        });
+        if opens {
+            shown.push(crate::notices::Notice::decode(&record).unwrap());
+        } else {
+            refused += 1;
+        }
+    }
+    (shown, refused)
+}
+
+/// Notices are sent at once here: the delay is the desk's, tested with it.
+fn sent_at_once() -> Limits {
+    Limits { notice_delay: Duration::ZERO, ..limits() }
+}
+
+#[test]
+fn a_notice_reaches_each_trusted_phone_sealed_to_it_and_closes_with_working() {
+    let mut world = World::new();
+    world.open("acme", sent_at_once());
+    world.open("beta", sent_at_once());
+    let pixel = world.hub.pair_phone("pixel", &["acme", "beta"]);
+    let tablet = world.hub.pair_phone("tablet", &["acme", "beta"]);
+    world.trust(&pixel, &["acme"]);
+    world.trust(&tablet, &["beta"]);
+    let run = RunId([3; 8]);
+    let asker = world.keeper("acme").desk.asker("dev", run);
+    asker.tell(crate::notices::Event::Waiting(crate::notices::Kind::PermissionPrompt), b"tag");
+    until("pixel lists the notice", || listed(&world, &pixel).0.len() == 1);
+    let (shown, refused) = listed(&world, &pixel);
+    let notice = &shown[0];
+    assert_eq!((notice.machine.as_str(), notice.ws.as_str(), notice.box_name.as_str(), notice.run, notice.session), (MACHINE, "acme", "dev", run, 1));
+    assert_eq!((notice.kind, refused), (crate::notices::Kind::PermissionPrompt, 0));
+    // Tablet isn't trusted for acme here: no copy is sealed to it.
+    assert!(tablet.notices(&world.hub).is_empty());
+    // The agent goes on: the notice is closed, at the hub too.
+    asker.tell(crate::notices::Event::Working, b"tag");
+    until("the notice is closed", || pixel.notices(&world.hub).is_empty());
+    // A notice of a run that ends is closed with it; one in beta goes to tablet alone.
+    asker.tell(crate::notices::Event::Waiting(crate::notices::Kind::TurnEnded), b"tag");
+    world.keeper("beta").desk.asker("web", RunId([4; 8])).tell(crate::notices::Event::Waiting(crate::notices::Kind::Question), b"x");
+    until("each phone lists its own", || listed(&world, &pixel).0.len() == 1 && listed(&world, &tablet).0.len() == 1);
+    assert_eq!(listed(&world, &tablet).0[0].box_name, "web");
+    world.keeper("acme").desk.end_run(run);
+    until("the run's notice is closed", || pixel.notices(&world.hub).is_empty());
+    // A hub that restarts has none, and is given them again.
+    world.hub.restart();
+    until("tablet lists it again", || listed(&world, &tablet).0.len() == 1);
+    // The workspace closes: every notice of it is closed.
+    world.keeper("beta").desk.close();
+    until("beta's notice is closed", || tablet.notices(&world.hub).is_empty());
+}
+
+#[test]
+fn a_notice_the_hub_made_up_or_changed_does_not_open() {
+    let mut world = World::new();
+    world.open("acme", sent_at_once());
+    let pixel = world.hub.pair_phone("pixel", &["acme"]);
+    world.trust(&pixel, &["acme"]);
+    world.keeper("acme").desk.asker("dev", RunId([3; 8])).tell(crate::notices::Event::Waiting(crate::notices::Kind::TurnEnded), b"tag");
+    until("pixel lists the notice", || listed(&world, &pixel).0.len() == 1);
+    let (_, record, sealed) = pixel.notices(&world.hub).remove(0);
+    let state = pixel.state(&world.hub);
+    let compared = AgreementKey::from_spki(&util::unhex(state["machines"][0]["key"].as_str().unwrap()).unwrap()).unwrap();
+    let opens = |record: &[u8], sealed: &[u8]| sealed::open(Kind::Notice, &pixel.second_key(), &compared, record, sealed).is_ok();
+    assert!(opens(&record, &sealed));
+    // The hub changes a clear field, keeping the sealed copy: it doesn't open.
+    let mut notice = crate::notices::Notice::decode(&record).unwrap();
+    for changed in [
+        crate::notices::Notice { box_name: "prod".into(), ..notice.clone() },
+        crate::notices::Notice { kind: crate::notices::Kind::Question, ..notice.clone() },
+        crate::notices::Notice { since: notice.since - 3600, ..notice.clone() },
+        crate::notices::Notice { session: 2, ..notice.clone() },
+    ] {
+        assert!(!opens(&changed.encode().unwrap(), &sealed), "{changed:?}");
+    }
+    // A notice it makes up, sealed with a key of its own to the phone's second key it knows, or a
+    // copy sealed to another phone, or one of another kind of sealed text: none opens.
+    notice.id = Id([9; 16]);
+    let made_up = notice.encode().unwrap();
+    let own = halti_core::sealed::SecretKey::derive(&util::random());
+    let second = AgreementKey::from_spki(&pixel.agreement_key()).unwrap();
+    assert!(!opens(&made_up, &sealed::seal(Kind::Notice, &own, &second, &made_up, b"", &util::random()).unwrap()));
+    let other = Phone::new("other");
+    let to_other = AgreementKey::from_spki(&other.agreement_key()).unwrap();
+    assert!(!opens(&record, &sealed::seal(Kind::Notice, &own, &to_other, &record, b"", &util::random()).unwrap()));
+    // The token holder posts it through the hub, as a broken hub could hold it: the app lists it
+    // as refused, and shows nothing of it.
+    let body =
+        json!({"record": hex(&made_up), "sealed": [{"device": "pixel", "sealed": hex(&sealed::seal(Kind::Notice, &own, &second, &made_up, b"", &util::random()).unwrap())}]});
+    let token = world.joined().token;
+    world.stop_link();
+    let ids = json!({"notices": [hex(&notice.id.0), hex(&crate::notices::Notice::decode(&record).unwrap().id.0)]});
+    assert_eq!(world.hub.call("POST", "/v1/machine/notices", Some(&token), Some(&ids)).0, 200);
+    assert_eq!(world.hub.call("POST", "/v1/machine/notice", Some(&token), Some(&body)), (200, json!({})));
+    let (shown, refused) = listed(&world, &pixel);
+    assert_eq!((shown.len(), refused), (1, 1));
+    assert_eq!(shown[0].id, crate::notices::Notice::decode(&record).unwrap().id);
+}

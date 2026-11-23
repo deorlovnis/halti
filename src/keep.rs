@@ -646,7 +646,6 @@ pub fn list(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<Vec<u
 
 /// The records of the notices the open workspace `ws` at `path` sends now. None if nothing
 /// answered in time, or not as a list does; `Other` as an error word.
-#[expect(dead_code, reason = "the link is its first caller")]
 pub fn notices(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<Vec<u8>>, Told>> {
     let mut stream = connect(path)?;
     write_line(&mut stream, &Records::Notices(ws.clone()).line()).ok()?;

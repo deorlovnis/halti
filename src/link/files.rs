@@ -84,7 +84,6 @@ impl Entry {
 
     /// Its second key, which text for it is sealed to, if its keys read and its signing key vouches
     /// for this one.
-    #[cfg_attr(not(test), expect(dead_code, reason = "sealing a question is its first caller outside tests"))]
     pub fn second_key(&self) -> Option<AgreementKey> {
         self.trusted()?;
         AgreementKey::from_spki(&util::unhex(&self.agreement_key)?).ok()
@@ -180,7 +179,6 @@ impl Folder {
     /// The machine key, if there is one, as text is sealed with: the same key from the same file.
     /// The link calls this for each thing it seals, so every copy of the key it makes is wiped:
     /// the file is read here, not through rcgen, whose `KeyPair` keeps a copy it doesn't wipe.
-    #[cfg_attr(not(test), expect(dead_code, reason = "sealing a question is its first caller outside tests"))]
     pub fn sealing_key(&self) -> Result<Option<SecretKey>> {
         let path = self.file("machine-key.pem");
         // `fs::read` sizes the buffer from the file's length, so it isn't grown and copied.
