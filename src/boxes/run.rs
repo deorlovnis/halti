@@ -859,18 +859,16 @@ fn resolve_mounts<'a>(mounts: &'a [MountPolicy], rule: &MountRule) -> Result<Vec
         .collect()
 }
 
-/// Copy a folder into work/<name> the first time. Later runs keep the agent's own copy, even a link
-/// in its place, which isn't followed.
+/// Copy a folder into work/<name> the first time, less what git ignores in it. Later runs keep the
+/// agent's own copy, even a link in its place, which isn't followed.
 fn clone_into(work: &Path, name: &str, host: &Path) -> Result<()> {
     let dst = work.join(name);
     if fs::symlink_metadata(&dst).is_ok() {
         return Ok(());
     }
-    match store::copy_tree(host, &dst) {
+    match store::clone_tree(host, &dst) {
         Ok(copied) => {
-            if copied.skipped > 0 {
-                crate::util::warn(&format!("{} links and special files in {} weren't copied", copied.skipped, host.display()));
-            }
+            say_left_out(&copied, host);
             Ok(())
         }
         Err(e) => {
@@ -968,12 +966,20 @@ fn clone_through(world: &dyn World, vm: &str, name: &str, host: &Path) -> Result
     if world.pipe(vm, &script(THERE, &dst), b"")? == b"there\n" {
         return Ok(());
     }
-    let (tar, skipped) = store::tar_tree(host).with_context(|| format!("copying {} into the box", host.display()))?;
+    let (tar, copied) = store::tar_tree(host).with_context(|| format!("copying {} into the box", host.display()))?;
     world.pipe(vm, &script(UNPACK, &dst), &tar).with_context(|| format!("copying {} into the box", host.display()))?;
-    if skipped > 0 {
-        crate::util::warn(&format!("{skipped} links and special files in {} weren't copied", host.display()));
-    }
+    say_left_out(&copied, host);
     Ok(())
+}
+
+/// Says what a clone of `host` left out: links and special files, and what git ignores.
+fn say_left_out(copied: &store::Copied, host: &Path) {
+    if copied.skipped > 0 {
+        crate::util::warn(&format!("{} links and special files in {} weren't copied", copied.skipped, host.display()));
+    }
+    if copied.ignored > 0 {
+        crate::util::warn(&format!("{} files and folders git ignores in {} weren't copied", copied.ignored, host.display()));
+    }
 }
 
 /// Changes the JSON object in the file `rel` of the store `mnt`; one that isn't there, isn't a plain
@@ -1068,6 +1074,7 @@ pub fn catch_signals() {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::process::{Command, Stdio};
     use std::sync::{Condvar, Mutex};
 
     use halti_core::ids::WsId;
@@ -1431,10 +1438,14 @@ mod tests {
 
     fn policy(s: &Setup, extra: &str) -> BoxPolicy {
         let (proj, data) = (s.dir.0.join("proj"), s.dir.0.join("data"));
-        fs::create_dir_all(proj.join(".git")).unwrap();
+        fs::create_dir_all(&proj).unwrap();
         fs::create_dir_all(&data).unwrap();
         fs::write(proj.join("README"), "original").unwrap();
-        fs::write(proj.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        // A repo, since a clone asks git what to leave out of one.
+        if !proj.join(".git").exists() {
+            let made = Command::new("git").arg("-C").arg(&proj).args(["init", "-q"]).stdin(Stdio::null()).output().unwrap();
+            assert!(made.status.success(), "git init: {}", String::from_utf8_lossy(&made.stderr));
+        }
         BoxPolicy::parse(&format!(
             r#"
             image = "{DIGEST}"
