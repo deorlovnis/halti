@@ -1,21 +1,25 @@
 //! `ask`: the asker. Claude Code's hooks run it (the image's managed settings, which name it for
 //! each event below); it reads the hook's JSON on stdin and tells halti, at `POST /ask` on
 //! halti.internal, whether the agent now waits for its owner, and what kind of wait it is. halti
-//! answers at once, `nobody`: nobody answers from the phone. It then ends as the hook must for
-//! Claude Code to go on as if there were no hook. It prints nothing.
+//! answers at once, `nobody`: nobody answers from the phone. It then ends 0 with no output, so that
+//! Claude Code goes on as if there were no hook. It prints nothing.
 //!
-//! | Hook | Sent | Ends |
-//! |---|---|---|
-//! | Notification `permission_prompt` | `permission-prompt` | 0 |
-//! | Notification `idle_prompt` | `turn-ended` | 0 |
-//! | Notification `elicitation_dialog`, `agent_needs_input` | `needs-input` | 0 |
-//! | PermissionRequest | `permission-prompt`, or `question` for AskUserQuestion | 2 |
-//! | PreToolUse | `question` for AskUserQuestion, else `working` | 0 |
-//! | Stop | `turn-ended`, or nothing while a background task runs | 0 |
-//! | UserPromptSubmit | `typed`, or `working` for a background task's notification | 0 |
-//! | PostToolUse, PermissionDenied | `working` | 0 |
+//! | Hook | Sent |
+//! |---|---|
+//! | Notification `permission_prompt` | `permission-prompt` |
+//! | Notification `idle_prompt` | `turn-ended` |
+//! | Notification `elicitation_dialog`, `agent_needs_input` | `needs-input` |
+//! | PreToolUse | `question` for AskUserQuestion, else `working` |
+//! | Stop | `turn-ended`, or nothing while a background task runs |
+//! | UserPromptSubmit | `typed`, or `working` for a background task's notification |
+//! | PostToolUse, PermissionDenied | `working` |
 //!
-//! Anything else, or input that isn't JSON, sends nothing and ends 0.
+//! Anything else, or input that isn't JSON, sends nothing.
+//!
+//! A permission prompt is told by its Notification alone, which comes 6 seconds after the dialog
+//! opens, and not if it was answered by then. PermissionRequest comes as the dialog opens, and
+//! after a yes nothing is heard until the tool ends: a long build just allowed would be told as a
+//! wait.
 //!
 //! What is sent is one fixed form, fields each after its length in two bytes big-endian: the label
 //! `halti-ask-v1`, the event, a session tag (16 bytes made from the hook's `session_id` and, for a
@@ -39,8 +43,8 @@ const LABEL: &[u8] = b"halti-ask-v1";
 const WAIT: Duration = Duration::from_secs(5);
 /// The most of the hook's input read; longer input sends nothing.
 const INPUT_MAX: u64 = 16 * 1024 * 1024;
-/// halti's caps: a tool's name or a header, a tool's input or the end of a message, a question,
-/// an option's label and description, how many questions and options, and the whole text.
+/// halti's caps: a header, the end of a message, a question, an option's label and description,
+/// how many questions and options, and the whole text.
 const NAME_MAX: usize = 80;
 const BODY_MAX: usize = 2000;
 const QUESTION_MAX: usize = 300;
@@ -52,7 +56,7 @@ const TEXT_MAX: usize = 8 * 1024;
 /// How deep the hook's JSON may nest.
 const DEPTH_MAX: usize = 128;
 
-/// Reads the hook's input, tells halti, and ends as the hook must.
+/// Reads the hook's input, tells halti, and ends 0.
 pub fn main() -> ! {
     let mut input = Vec::new();
     let read = io::stdin().take(INPUT_MAX + 1).read_to_end(&mut input);
@@ -60,11 +64,10 @@ pub fn main() -> ! {
         Ok(_) if input.len() as u64 <= INPUT_MAX => parse(&input).map(|hook| said(&hook)),
         _ => None,
     };
-    let Some(said) = said else { std::process::exit(0) };
-    if let Some(event) = said.event {
-        let _ = send(SocketAddr::from(DOOR), &form(event, &said.tag, &said.text));
+    if let Some(Said { event: Some(event), tag, text }) = said {
+        let _ = send(SocketAddr::from(DOOR), &form(event, &tag, &text));
     }
-    std::process::exit(said.exit)
+    std::process::exit(0)
 }
 
 /// What one hook comes to.
@@ -74,16 +77,13 @@ struct Said {
     event: Option<&'static str>,
     tag: [u8; 16],
     text: Vec<u8>,
-    /// How the asker ends.
-    exit: i32,
 }
 
-/// What the hook whose input is `hook` sends, and how it ends.
+/// What the hook whose input is `hook` sends.
 fn said(hook: &Json) -> Said {
     let text = |field: &str| hook.get(field).and_then(Json::text).unwrap_or("");
     let tag = tag(text("session_id"), text("agent_id"));
     let tool = text("tool_name");
-    let mut exit = 0;
     let (event, body) = match text("hook_event_name") {
         "Notification" => match text("notification_type") {
             "permission_prompt" => (Some("permission-prompt"), Vec::new()),
@@ -91,13 +91,6 @@ fn said(hook: &Json) -> Said {
             "elicitation_dialog" | "agent_needs_input" => (Some("needs-input"), Vec::new()),
             _ => (None, Vec::new()),
         },
-        "PermissionRequest" => {
-            exit = 2;
-            match tool {
-                "AskUserQuestion" => (Some("question"), questions(hook.get("tool_input"))),
-                _ => (Some("permission-prompt"), permit(tool, hook.get("tool_input"))),
-            }
-        }
         "PreToolUse" if tool == "AskUserQuestion" => (Some("question"), questions(hook.get("tool_input"))),
         "PreToolUse" | "PostToolUse" | "PermissionDenied" => (Some("working"), Vec::new()),
         "Stop" if background_runs(hook) => (None, Vec::new()),
@@ -107,22 +100,13 @@ fn said(hook: &Json) -> Said {
         _ => (None, Vec::new()),
     };
     let text = if body.len() > TEXT_MAX { Vec::new() } else { body };
-    Said { event, tag, text, exit }
+    Said { event, tag, text }
 }
 
 /// Whether a background task of the session still runs.
 fn background_runs(hook: &Json) -> bool {
     let tasks = hook.get("background_tasks").and_then(Json::items).unwrap_or_default();
     tasks.iter().any(|task| task.get("status").and_then(Json::text) == Some("running"))
-}
-
-/// A permission prompt's text: the tool's name, and its input as compact JSON, cut at its end.
-fn permit(tool: &str, input: Option<&Json>) -> Vec<u8> {
-    let mut written = String::new();
-    if let Some(input) = input {
-        input.write(&mut written);
-    }
-    fields(&[clip_end(tool, NAME_MAX), clip_end(&written, BODY_MAX)])
 }
 
 /// A question's text: up to four questions, each its header, its question, whether several
@@ -247,7 +231,8 @@ impl Json {
         }
     }
 
-    /// Writes it as compact JSON.
+    /// Writes it as compact JSON: the tests read back what they wrote.
+    #[cfg(test)]
     fn write(&self, out: &mut String) {
         match self {
             Json::Null => out.push_str("null"),
@@ -280,6 +265,7 @@ impl Json {
     }
 }
 
+#[cfg(test)]
 fn quote(text: &str, out: &mut String) {
     out.push('"');
     for c in text.chars() {
@@ -463,41 +449,38 @@ mod tests {
         parse(&std::fs::read(&path).unwrap()).unwrap_or_else(|| panic!("{path} reads"))
     }
 
-    fn event_and_exit(name: &str) -> (Option<&'static str>, i32) {
-        let said = said(&fixture(name));
-        (said.event, said.exit)
-    }
-
     #[test]
-    fn each_hook_says_what_the_design_s_table_says_and_ends_as_it_must() {
-        for (name, event, exit) in [
-            ("Notification-permission_prompt", Some("permission-prompt"), 0),
+    fn each_hook_says_what_the_design_s_table_says() {
+        for (name, event) in [
+            ("Notification-permission_prompt", Some("permission-prompt")),
             // A question's dialog is a permission prompt too: its kind comes from the hooks before.
-            ("Notification-permission_prompt-for-AskUserQuestion", Some("permission-prompt"), 0),
-            ("Notification-idle_prompt", Some("turn-ended"), 0),
-            ("PermissionRequest-Bash", Some("permission-prompt"), 2),
-            ("PermissionRequest-Bash-subagent", Some("permission-prompt"), 2),
-            ("PermissionRequest-AskUserQuestion", Some("question"), 2),
-            ("PreToolUse-AskUserQuestion", Some("question"), 0),
-            ("PreToolUse-Bash", Some("working"), 0),
-            ("PreToolUse-Bash-subagent", Some("working"), 0),
-            ("PreToolUse-Agent", Some("working"), 0),
-            ("PostToolUse-Bash-after-terminal-yes", Some("working"), 0),
-            ("PostToolUse-AskUserQuestion-answered-at-terminal", Some("working"), 0),
-            ("PostToolUse-AskUserQuestion-answered-by-hook-freetext", Some("working"), 0),
-            ("PostToolUse-Agent", Some("working"), 0),
-            ("Stop", Some("turn-ended"), 0),
-            ("Stop-after-block-stop_hook_active", Some("turn-ended"), 0),
-            ("UserPromptSubmit", Some("typed"), 0),
-            ("UserPromptSubmit-typed-while-Stop-hook-waits", Some("typed"), 0),
+            ("Notification-permission_prompt-for-AskUserQuestion", Some("permission-prompt")),
+            ("Notification-idle_prompt", Some("turn-ended")),
+            ("PreToolUse-AskUserQuestion", Some("question")),
+            ("PreToolUse-Bash", Some("working")),
+            ("PreToolUse-Bash-subagent", Some("working")),
+            ("PreToolUse-Agent", Some("working")),
+            ("PostToolUse-Bash-after-terminal-yes", Some("working")),
+            ("PostToolUse-AskUserQuestion-answered-at-terminal", Some("working")),
+            ("PostToolUse-AskUserQuestion-answered-by-hook-freetext", Some("working")),
+            ("PostToolUse-Agent", Some("working")),
+            ("Stop", Some("turn-ended")),
+            ("Stop-after-block-stop_hook_active", Some("turn-ended")),
+            ("UserPromptSubmit", Some("typed")),
+            ("UserPromptSubmit-typed-while-Stop-hook-waits", Some("typed")),
             // A background task's end is not the owner typing.
-            ("UserPromptSubmit-subagent-task-notification", Some("working"), 0),
+            ("UserPromptSubmit-subagent-task-notification", Some("working")),
+            // A permission prompt is told by its Notification: a yes within its 6 seconds, then a
+            // long build, is no wait.
+            ("PermissionRequest-Bash", None),
+            ("PermissionRequest-Bash-subagent", None),
+            ("PermissionRequest-AskUserQuestion", None),
             // Hooks the settings don't name send nothing.
-            ("SessionStart", None, 0),
-            ("SubagentStart", None, 0),
-            ("SubagentStop", None, 0),
+            ("SessionStart", None),
+            ("SubagentStart", None),
+            ("SubagentStop", None),
         ] {
-            assert_eq!(event_and_exit(name), (event, exit), "{name}");
+            assert_eq!(said(&fixture(name)).event, event, "{name}");
         }
     }
 
@@ -521,7 +504,7 @@ mod tests {
 
     #[test]
     fn a_session_and_each_of_its_sub_agents_are_told_apart() {
-        let main = said(&fixture("PermissionRequest-Bash")).tag;
+        let main = said(&fixture("PostToolUse-Bash-after-terminal-yes")).tag;
         let same = said(&fixture("PreToolUse-Bash")).tag;
         assert_eq!(main, same, "one session, one tag");
         let parent = said(&fixture("PreToolUse-Agent")).tag;
@@ -537,9 +520,6 @@ mod tests {
         assert_eq!(clip_end("héllo", 2), "h");
         assert_eq!(clip_start("héllo", 4), "llo");
         assert_eq!(clip_end("abc", 10), "abc");
-        // A permission prompt: the tool's name and its input.
-        let permit = said(&fixture("PermissionRequest-Bash")).text;
-        assert_eq!(permit, fields(&["Bash", r#"{"command":"mkdir made_by_bash","description":"Create directory made_by_bash"}"#]));
         // The end of the last message is kept.
         let long = format!(r#"{{"hook_event_name":"Stop","last_assistant_message":"{}END"}}"#, "é".repeat(3000));
         let text = said(&parse(long.as_bytes()).unwrap()).text;

@@ -154,7 +154,7 @@ fn a_notice_is_sent_after_its_delay_and_working_in_that_time_sends_nothing() {
 fn one_notice_is_open_per_session_and_the_first_kind_is_kept() {
     let start = Instant::now();
     let mut table = Table::default();
-    // A question raises PreToolUse, then PermissionRequest, then a permission_prompt Notification.
+    // A question raises PreToolUse, then a permission_prompt Notification; a hook may come twice.
     tell(&mut table, Event::Waiting(Kind::Question), b"s", false, at(start, 0));
     tell(&mut table, Event::Waiting(Kind::Question), b"s", false, at(start, 0));
     tell(&mut table, Event::Waiting(Kind::PermissionPrompt), b"s", false, at(start, 6));
@@ -343,13 +343,15 @@ fn the_agent_image_runs_the_asker_from_its_managed_settings_with_a_short_timeout
     let settings: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{root}/box/claude-code/halti.json")).unwrap()).unwrap();
     let hooks = settings["hooks"].as_object().unwrap();
     let events: Vec<&str> = hooks.keys().map(String::as_str).collect();
-    let mut expected = ["Notification", "PermissionRequest", "PreToolUse", "PostToolUse", "PermissionDenied", "Stop", "UserPromptSubmit"];
+    // Not PermissionRequest: it comes as the dialog opens, so a yes and a long build would be told
+    // as a wait. The prompt's Notification tells it.
+    let mut expected = ["Notification", "PreToolUse", "PostToolUse", "PermissionDenied", "Stop", "UserPromptSubmit"];
     expected.sort_unstable();
     assert_eq!(events, expected);
     for (event, matchers) in hooks {
         let matchers = matchers.as_array().unwrap();
         assert_eq!(matchers.len(), 1, "{event}");
-        let tool = ["PermissionRequest", "PreToolUse", "PostToolUse", "PermissionDenied"].contains(&event.as_str());
+        let tool = ["PreToolUse", "PostToolUse", "PermissionDenied"].contains(&event.as_str());
         assert_eq!(matchers[0].get("matcher").and_then(|m| m.as_str()), tool.then_some("*"), "{event}: every tool");
         let hook = &matchers[0]["hooks"];
         assert_eq!(hook.as_array().unwrap().len(), 1, "{event}");
