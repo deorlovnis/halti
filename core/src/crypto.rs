@@ -1,6 +1,8 @@
 //! The cryptography a workspace rests on: a key pair anyone can seal to (`kem`), sealing under a
 //! key already shared (`aead`), policy signatures (`sign`), and the one key derivation all of them
-//! go through (`kdf`). `key` builds a workspace's own keys from these.
+//! go through (`kdf`). `key` builds a workspace's own keys from these. Apart from those, `hpke` is
+//! the standard HPKE of RFC 9180 in one suite, for text sealed between a machine and a phone
+//! (`sealed`).
 //!
 //! Nothing here draws randomness or reads a clock: random bytes are arguments the caller drew, so
 //! the same inputs always give the same bytes.
@@ -13,6 +15,7 @@
 //! so can the insides of the crates this is built on.
 
 pub mod aead;
+pub mod hpke;
 pub mod kem;
 pub mod sign;
 

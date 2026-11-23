@@ -136,7 +136,7 @@ pub(crate) fn derive_scalar(id: &[u8], ikm: &[u8; 32]) -> Zeroizing<[u8; 32]> {
 
 /// Whether the bytes, read big-endian, are a P-256 private scalar: above zero and below the
 /// curve's order. The curve's own check decides, in constant time.
-fn in_range(bytes: &[u8; 32]) -> bool {
+pub(super) fn in_range(bytes: &[u8; 32]) -> bool {
     p256::NonZeroScalar::try_from(bytes.as_slice()).map(Zeroizing::new).is_ok()
 }
 

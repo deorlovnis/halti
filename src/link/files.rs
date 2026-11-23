@@ -3,7 +3,8 @@
 //!
 //! - `machine-key.pem`: the machine key, a P-256 key for key agreement, as PKCS#8. `halti hub join`
 //!   makes it if there is none and keeps one that is there; only `halti hub leave` deletes it. The
-//!   hub and the phones know its public half; the link never reads it.
+//!   hub and the phones know its public half; the link never reads it. Text for a phone is sealed
+//!   with it (`sealing_key`) to the phone's second key, which `trusted.json` keeps.
 //! - `link.json`: the hub's address and pin, the name the hub knows this machine by, the machine
 //!   token, and a new token a renewal was sent for and not yet seen to work. `halti hub join`,
 //!   `halti hub leave` and the link change it one at a time under `link.lock`, and the link writes
@@ -22,11 +23,14 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
 use halti_core::device::{self, DeviceKey};
 use halti_core::ids::WsName;
+use halti_core::sealed::{AgreementKey, SecretKey};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::hub::wire;
 use crate::requests::Trusted;
@@ -76,6 +80,14 @@ impl Entry {
         device::check_agreement_key(&agreement).ok()?;
         key.verify(&wire::keys_bytes(&signing, &agreement), &util::unhex(&self.key_signature)?).ok()?;
         Some(Trusted { name: self.name.clone(), key, fingerprint: wire::fingerprint(&signing), ws: self.ws.iter().map(|ws| ws.to_string()).collect() })
+    }
+
+    /// Its second key, which text for it is sealed to, if its keys read and its signing key vouches
+    /// for this one.
+    #[cfg_attr(not(test), expect(dead_code, reason = "sealing a question is its first caller outside tests"))]
+    pub fn second_key(&self) -> Option<AgreementKey> {
+        self.trusted()?;
+        AgreementKey::from_spki(&util::unhex(&self.agreement_key)?).ok()
     }
 
     /// The workspaces it may answer for, as text.
@@ -165,6 +177,23 @@ impl Folder {
         }
     }
 
+    /// The machine key, if there is one, as text is sealed with: the same key from the same file.
+    /// The link calls this for each thing it seals, so every copy of the key it makes is wiped:
+    /// the file is read here, not through rcgen, whose `KeyPair` keeps a copy it doesn't wipe.
+    #[cfg_attr(not(test), expect(dead_code, reason = "sealing a question is its first caller outside tests"))]
+    pub fn sealing_key(&self) -> Result<Option<SecretKey>> {
+        let path = self.file("machine-key.pem");
+        // `fs::read` sizes the buffer from the file's length, so it isn't grown and copied.
+        let pem = match fs::read(&path) {
+            Ok(pem) => Zeroizing::new(pem),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let unreadable = || anyhow!("{} isn't a P-256 key in the form halti writes", path.display());
+        let der = pkcs8_of_pem(&pem).ok_or_else(unreadable)?;
+        Ok(Some(SecretKey::from_pkcs8(&der).map_err(|_| unreadable())?))
+    }
+
     /// The machine key that is there, or one made now; and whether it was made.
     pub fn keep_machine_key(&self) -> Result<(KeyPair, bool)> {
         if let Some(key) = self.machine_key()? {
@@ -233,6 +262,21 @@ impl Folder {
         }
         Ok(had)
     }
+}
+
+/// The DER inside a PEM private key as rcgen writes it, with every copy made on the way wiped; none
+/// if it isn't one. Anything longer than a P-256 key in halti's form doesn't fit.
+fn pkcs8_of_pem(pem: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    const BEGIN: &[u8] = b"-----BEGIN PRIVATE KEY-----";
+    const END: &[u8] = b"-----END PRIVATE KEY-----";
+    let pem = pem.trim_ascii();
+    let body = pem.strip_prefix(BEGIN)?.strip_suffix(END)?;
+    // Sized once, so it isn't grown and copied.
+    let mut text = Zeroizing::new(Vec::with_capacity(body.len()));
+    text.extend(body.iter().filter(|b| !b.is_ascii_whitespace()));
+    let mut der = Zeroizing::new([0; 192]);
+    let len = base64::engine::general_purpose::STANDARD.decode_slice(&*text, &mut *der).ok()?;
+    Some(Zeroizing::new(der[..len].to_vec()))
 }
 
 /// An exclusive lock on a file, held until dropped.

@@ -33,6 +33,7 @@ pub mod passphrase;
 pub mod platform;
 pub mod policy;
 pub mod refusal;
+pub mod sealed;
 pub mod store;
 pub mod verbs;
 

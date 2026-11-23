@@ -58,6 +58,11 @@
 //!   then each workspace the phone is trusted for there, sorted by their bytes, each once; shown as a
 //!   fingerprint is. Example: machine `server-1`, the key in this file's tests, workspaces `beta`
 //!   and `acme`: `0813 369a 1400 9098 7602`.
+//! - **Sealed text** is what the machine and the phone hide from the hub: HPKE (RFC 9180) in
+//!   mode_auth with DHKEM(P-256, HKDF-SHA256), HKDF-SHA256 and AES-256-GCM, by the machine key to
+//!   the phone's agreement key, or by the agreement key to a key the machine made for one question.
+//!   The info, associated data and bytes are in `halti_core::sealed`; the known answers both sides
+//!   test against are in `tests/fixtures/sealed-text-vectors.json`. No call carries it yet.
 //! - **A token** is the client's own: 32 bytes from a secure random source, written as lowercase hex
 //!   behind a prefix, `halti_dev_` for a phone and `halti_mach_` for a machine, so 74 or 75 ASCII
 //!   characters. It travels only in the header `Authorization: Bearer TOKEN`, never in a URL or a

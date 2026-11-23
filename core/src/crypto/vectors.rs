@@ -30,6 +30,7 @@ pub(crate) fn arr<const N: usize>(bytes: &[u8]) -> [u8; N] {
 // ACVP: github.com/usnistgov/ACVP-Server, directory gen-val/json-files, commit 975de31eb83d87039ec88934fdc47d8c312b892d.
 // RFC 6979: rfc-editor.org/rfc/rfc6979.txt, appendix A.2.5.
 // RFC 9106: rfc-editor.org/rfc/rfc9106.txt, section 5.3.
+// RFC 9180: rfc-editor.org/rfc/rfc9180.txt, appendix A, and the JSON it names there.
 
 /// One HKDF-SHA-384 case (RFC 5869). All three are valid: `okm` is the whole expected output.
 pub(crate) struct Hkdf {
@@ -557,6 +558,112 @@ pub(crate) const ARGON2ID_RFC9106: &[Argon2Id] = &[
         tag: "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659",
     },
 ];
+
+/// The KEM part of one HPKE mode_auth case with DHKEM(P-256, HKDF-SHA256) (RFC 9180): each key pair is
+/// DeriveKeyPair of its ikm, and AuthEncap to R by S with E gives `enc` (which is `pk_e`) and `shared`. It
+/// does not depend on the suite's KDF or AEAD.
+pub(crate) struct HpkeKem {
+    /// The RFC's appendix section.
+    pub(crate) section: &'static str,
+    pub(crate) ikm_e: &'static str,
+    pub(crate) sk_e: &'static str,
+    pub(crate) pk_e: &'static str,
+    pub(crate) ikm_r: &'static str,
+    pub(crate) sk_r: &'static str,
+    pub(crate) pk_r: &'static str,
+    pub(crate) ikm_s: &'static str,
+    pub(crate) sk_s: &'static str,
+    pub(crate) pk_s: &'static str,
+    /// The KEM's shared secret.
+    pub(crate) shared: &'static str,
+}
+
+// RFC 9180 appendix A.3.3, A.4.3 and A.5.3: the Auth setups of the three suites with DHKEM(P-256, HKDF-SHA256), whose
+// KDF or AEAD differ from this crate's suite. Their key schedules and ciphertexts are left out.
+pub(crate) const HPKE_AUTH_P256_KEM: &[HpkeKem] = &[
+    HpkeKem {
+        section: "A.3.3",
+        ikm_e: "798d82a8d9ea19dbc7f2c6dfa54e8a6706f7cdc119db0813dacf8440ab37c857",
+        sk_e: "6b8de0873aed0c1b2d09b8c7ed54cbf24fdf1dfc7a47fa501f918810642d7b91",
+        pk_e: "042224f3ea800f7ec55c03f29fc9865f6ee27004f818fcbdc6dc68932c1e52e15b79e264a98f2c535ef06745f3d308624414153b22c7332bc1e691cb4af4d53454",
+        ikm_r: "7bc93bde8890d1fb55220e7f3b0c107ae7e6eda35ca4040bb6651284bf0747ee",
+        sk_r: "d929ab4be2e59f6954d6bedd93e638f02d4046cef21115b00cdda2acb2a4440e",
+        pk_r: "04423e363e1cd54ce7b7573110ac121399acbc9ed815fae03b72ffbd4c18b01836835c5a09513f28fc971b7266cfde2e96afe84bb0f266920e82c4f53b36e1a78d",
+        ikm_s: "874baa0dcf93595a24a45a7f042e0d22d368747daaa7e19f80a802af19204ba8",
+        sk_s: "1120ac99fb1fccc1e8230502d245719d1b217fe20505c7648795139d177f0de9",
+        pk_s: "04a817a0902bf28e036d66add5d544cc3a0457eab150f104285df1e293b5c10eef8651213e43d9cd9086c80b309df22cf37609f58c1127f7607e85f210b2804f73",
+        shared: "d4aea336439aadf68f9348880aa358086f1480e7c167b6ef15453ba69b94b44f",
+    },
+    HpkeKem {
+        section: "A.4.3",
+        ikm_e: "6bb031aa9197562da0b44e737db2b9e61f6c3ea1138c37de28fc37ac29bc7350",
+        sk_e: "93cddd5288e7ef4884c8fe321d075df01501b993ff49ffab8184116f39b3c655",
+        pk_e: "04fec59fa9f76f5d0f6c1660bb179cb314ed97953c53a60ab38f8e6ace60fd59178084d0dd66e0f79172992d4ddb2e91172ce24949bcebfff158dcc417f2c6e9c6",
+        ikm_r: "649a3f92edbb7a2516a0ade0b7dccc58a37240c4ba06f9726a952227b4adf6ff",
+        sk_r: "1ea4484be482bf25fdb2ed39e6a02ed9156b3e57dfb18dff82e4a048de990236",
+        pk_r: "04378bad519aab406e04d0e5608bcca809c02d6afd2272d4dd03e9357bd0eee8adf84c8deba3155c9cf9506d1d4c8bfefe3cf033a75716cc3cc07295100ec96276",
+        ikm_s: "4d79b8691aab55a7265e8490a04bb3860ed64dece90953ad0dc43a6ea59b4bf2",
+        sk_s: "02b266d66919f7b08f42ae0e7d97af4ca98b2dae3043bb7e0740ccadc1957579",
+        pk_s: "0404d3c1f9fca22eb4a6d326125f0814c35593b1da8ea0d11a640730b215a259b9b98a34ad17e21617d19fe1d4fa39a4828bfdb306b729ec51c543caca3b2d9529",
+        shared: "1ed49f6d7ada333d171cd63861a1cb700a1ec4236755a9cd5f9f8f67a2f8e7b3",
+    },
+    HpkeKem {
+        section: "A.5.3",
+        ikm_e: "0ecd212019008138a31f9104d5dba76b9f8e34d5b996041fff9e3df221dd0d5d",
+        sk_e: "085fd5d5e6ce6497c79df960cac93710006b76217d8bcfafbd2bb2c20ea03c42",
+        pk_e: "040d5176aedba55bc41709261e9195c5146bb62d783031280775f32e507d79b5cbc5748b6be6359760c73cfe10ca19521af704ca6d91ff32fc0739527b9385d415",
+        ikm_r: "d32236d8378b9563840653789eb7bc33c3c720e537391727bf1c812d0eac110f",
+        sk_r: "3cb2c125b8c5a81d165a333048f5dcae29a2ab2072625adad66dbb0f48689af9",
+        pk_r: "0444f6ee41818d9fe0f8265bffd016b7e2dd3964d610d0f7514244a60dbb7a11ece876bb110a97a2ac6a9542d7344bf7d2bd59345e3e75e497f7416cf38d296233",
+        ikm_s: "0e6be0851283f9327295fd49858a8c8908ea9783212945eef6c598ee0a3cedbb",
+        sk_s: "39b19402e742d48d319d24d68e494daa4492817342e593285944830320912519",
+        pk_s: "04265529a04d4f46ab6fa3af4943774a9f1127821656a75a35fade898a9a1b014f64d874e88cddb24c1c3d79004d3a587db67670ca357ff4fba7e8b56ec013b98b",
+        shared: "1a45aa4792f4b166bfee7eeab0096c1a6e497480e2261b2a59aad12f2768d469",
+    },
+];
+
+/// One whole HPKE mode_auth case in this crate's suite: DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-256-GCM.
+pub(crate) struct HpkeAuth {
+    pub(crate) info: &'static str,
+    pub(crate) ikm_e: &'static str,
+    pub(crate) ikm_r: &'static str,
+    pub(crate) ikm_s: &'static str,
+    pub(crate) pk_r: &'static str,
+    pub(crate) pk_s: &'static str,
+    pub(crate) enc: &'static str,
+    pub(crate) shared: &'static str,
+    /// mode ‖ psk_id_hash ‖ info_hash.
+    pub(crate) context: &'static str,
+    pub(crate) secret: &'static str,
+    pub(crate) key: &'static str,
+    pub(crate) base_nonce: &'static str,
+    /// The first message: sequence number 0, so its nonce is `base_nonce`.
+    pub(crate) pt: &'static str,
+    pub(crate) aad: &'static str,
+    /// The ciphertext and its tag.
+    pub(crate) ct: &'static str,
+}
+
+// github.com/cfrg/draft-irtf-cfrg-hpke, test-vectors.json at 5f503c564da00b0687b3de75f1dfbdfc4079ad31 (the JSON that RFC 9180
+// appendix A names as [TestVectors]): the case with mode 2, kem_id 16, kdf_id 1, aead_id 2, and its encryption at sequence
+// number 0. Its exporter values are left out.
+pub(crate) const HPKE_AUTH_P256_SHA256_AES256: HpkeAuth = HpkeAuth {
+    info: "4f6465206f6e2061204772656369616e2055726e",
+    ikm_e: "d6c49e442aad90bcc1bc0d166e5c4d3df845c803ba08b8a4d891af2eeae4f97e",
+    ikm_r: "3c56756948f1c27aed3eb27a923c891dc073eccf94bb6c1b64a8bfaa95f1f8f7",
+    ikm_s: "0f3def8cc45967f86c566f2c2a7decedff0d5f8b20a34ab65318144c80cb6b2b",
+    pk_r: "04cd38ef80923e26f157e06c9887f80177c97e1005a41104127271237f946df22eda13d40801bce6184f1a631c44b0807a1a5e8d039975ed0f6079fcbd2dfe6652",
+    pk_s: "04ece9b48cc98ee03ba742fe1218a3fbec960cc34b6e1defdcd3285276f39028e95b90f9526607565888766a1101f429dc3ec87364b5c8c613f0a081881950427f",
+    enc: "04a7aeac79fda402674ef247c12d6f5fdfd21498d896b67ff04ec181382d4516b7662be32b4a2ae817c2d57104ecb6fcaa527438939810612d1b3d0af36ffc66ce",
+    shared: "4b6e403bf494c60342caaa46b3738ee0423892720751607338034b0a067cc1db",
+    context: "028fc3aeb832490a4b5ab3e42023287db29a1f4bc7c222c0df228727b70a4021127f1ff3fd1aa97af7e5d473e1cb01ba74831133d9659b6c26b03a038a49a84074",
+    secret: "163d292303b7947b7b4178e7e5dd259e8ebad6644d6e0a3fb2f2b69fd26c1f16",
+    key: "640064834667025be3ce7abf1eb42ccc0dea2db9782b9823519f474e054524e7",
+    base_nonce: "29240057274f71e55bfcca28",
+    pt: "4265617574792069732074727574682c20747275746820626561757479",
+    aad: "436f756e742d30",
+    ct: "59b9890aabf94c1d502c39d8d356989ab0880ed43e984255db7b32a8d7b0ad5beba799a4ec326a0ddca3dd5e5d",
+};
 
 // ---- known answers ----
 //

@@ -1,0 +1,126 @@
+{
+  "about": [
+    "Sealed text between a halti machine and a phone: known answers that the machine (halti, core/src/sealed.rs) and the app both test against.",
+    "HPKE, RFC 9180, single-shot, mode_auth (0x02), with DHKEM(P-256, HKDF-SHA256) (0x0010), HKDF-SHA256 (0x0001) and AES-256-GCM (0x0002). One message per seal: sequence number 0, so the nonce is base_nonce.",
+    "info is the label of the kind, its ASCII bytes and nothing else (info_text). aad is the record's clear fields exactly as the record carries them; here they are only examples, in halti's field form (each field its length in two bytes big-endian, then its bytes).",
+    "sealed is enc (the ephemeral public key, 65 bytes, 0x04 then x and y) followed by the AES-256-GCM ciphertext and its 16-byte tag.",
+    "Keys: private is the P-256 scalar (32 bytes), point the uncompressed public key, spki its SubjectPublicKeyInfo in DER (91 bytes), the form both sides store. Every key here and every ephemeral key is DeriveKeyPair(ikm) of RFC 9180 section 7.1.3. On the phone the device key is made in the keystore, not derived: ikm is there only to fix the test keys.",
+    "machine and other_machine also give pkcs8: the machine key as halti's machine-key.pem holds it, in DER.",
+    "A question, a notice and a receipt are sealed by the machine key to the device's second key. An answer is sealed by the device's second key to the question's reply key.",
+    "Computed by an independent implementation written from RFC 9180's text (Python, cryptography 46), checked first against the RFC's own JSON test vectors for mode_auth with DHKEM(P-256, HKDF-SHA256), HKDF-SHA256 and AES-128-GCM and AES-256-GCM."
+  ],
+  "suite": {
+    "mode": 2,
+    "kem_id": 16,
+    "kdf_id": 1,
+    "aead_id": 2
+  },
+  "keys": {
+    "machine": {
+      "ikm": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+      "private": "7c49a6a606514a77b48fae8f4be715d5dfa1a8040b6eddc25bb7dcaf6a083e6a",
+      "point": "04d4763e3fc9e85df249265e69e16fab39be55c72fc5d8ab7aa4422cd4bfdbaffe986d8b667c518820f6e451b4c2b27b0dd6cc285cc7761d4dd6e9361e394d328d",
+      "spki": "3059301306072a8648ce3d020106082a8648ce3d03010703420004d4763e3fc9e85df249265e69e16fab39be55c72fc5d8ab7aa4422cd4bfdbaffe986d8b667c518820f6e451b4c2b27b0dd6cc285cc7761d4dd6e9361e394d328d",
+      "pkcs8": "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104207c49a6a606514a77b48fae8f4be715d5dfa1a8040b6eddc25bb7dcaf6a083e6aa14403420004d4763e3fc9e85df249265e69e16fab39be55c72fc5d8ab7aa4422cd4bfdbaffe986d8b667c518820f6e451b4c2b27b0dd6cc285cc7761d4dd6e9361e394d328d"
+    },
+    "other_machine": {
+      "ikm": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "private": "3f7851fb94c9cc4cadb85ce58cb875b98508d138eb89510f3097db9a80641444",
+      "point": "04c1c2f5142333a5af857db225369758c149e7c63a803a9d85abac5b39f49b178e733304398af98a6da5ba2b1813ea73f9d2bd165fba4c4374ed0caa934f97e544",
+      "spki": "3059301306072a8648ce3d020106082a8648ce3d03010703420004c1c2f5142333a5af857db225369758c149e7c63a803a9d85abac5b39f49b178e733304398af98a6da5ba2b1813ea73f9d2bd165fba4c4374ed0caa934f97e544",
+      "pkcs8": "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104203f7851fb94c9cc4cadb85ce58cb875b98508d138eb89510f3097db9a80641444a14403420004c1c2f5142333a5af857db225369758c149e7c63a803a9d85abac5b39f49b178e733304398af98a6da5ba2b1813ea73f9d2bd165fba4c4374ed0caa934f97e544"
+    },
+    "device": {
+      "ikm": "303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f",
+      "private": "d589d81810a975586add9d99afa349998fe32a8820c6b799f14903471336aaa2",
+      "point": "04615c43396a58671e3f82bb3976ef5e18177ba35accd7124864a3ac76fec46aa589bef4cad9d211fad1fd342cc79ae4f36954852db535efa96a4e3572d8a64f0b",
+      "spki": "3059301306072a8648ce3d020106082a8648ce3d03010703420004615c43396a58671e3f82bb3976ef5e18177ba35accd7124864a3ac76fec46aa589bef4cad9d211fad1fd342cc79ae4f36954852db535efa96a4e3572d8a64f0b"
+    },
+    "other_device": {
+      "ikm": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "private": "c68f9126a114d6f43fb9c781e2a935778f91549eaa2d873597472700521960c5",
+      "point": "045864aa8afdd60e38f39ec9a28d9719c273654690310c5c268bc70adecad75975d2a3cfff4abb3f373a0c725ba9bc936a5b1936074c13c9089d130fa79672a557",
+      "spki": "3059301306072a8648ce3d020106082a8648ce3d030107034200045864aa8afdd60e38f39ec9a28d9719c273654690310c5c268bc70adecad75975d2a3cfff4abb3f373a0c725ba9bc936a5b1936074c13c9089d130fa79672a557"
+    },
+    "reply": {
+      "ikm": "505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f",
+      "private": "aa54d40b3d1106c2bb45c7f317b1e5f773c6efcf3619c7dee279572ce9498921",
+      "point": "04ac20821971e545394a5a24deb736db8317695d374319783fa4b61b59e304ac461defb92acd70ad668ff57719dff3b25f95df96488e2d260cdfc40b709e414b52",
+      "spki": "3059301306072a8648ce3d020106082a8648ce3d03010703420004ac20821971e545394a5a24deb736db8317695d374319783fa4b61b59e304ac461defb92acd70ad668ff57719dff3b25f95df96488e2d260cdfc40b709e414b52"
+    }
+  },
+  "cases": [
+    {
+      "kind": "question",
+      "from": "machine",
+      "to": "device",
+      "info": "68616c74692d7365616c65642d7175657374696f6e2d7631",
+      "info_text": "halti-sealed-question-v1",
+      "aad": "001168616c74692d7175657374696f6e2d763100087365727665722d31000461636d65000364657600080102030405060708",
+      "plaintext": "52756e207468652074657374733f206e706d2074657374",
+      "ikm_e": "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f",
+      "ephemeral_private": "bf0cc84790b711042e9beaf5f749dac76549f6d79241035cf2876f5d9f8c6e5c",
+      "enc": "047232f7604b415640d510099143e52de100d210bff519a39be831fff1dd761d741dcfa48b59b8262f202192debe590b724af76f80eb4a2b7847ca594300dadf77",
+      "shared_secret": "3d93b6595c45e21e6ba2fd3bab73b1539e681ddb23f58c18b1341947dada4a3a",
+      "key_schedule_context": "028fc3aeb832490a4b5ab3e42023287db29a1f4bc7c222c0df228727b70a402112f2f1d6fb3eb6725a98cd0005335f33e93cc8ff81a009c96de5f53aa892b99192",
+      "secret": "07cedf88dc142d9b28c1eb018caa4b451c2eba731d696c7ab5b580c424d85b0e",
+      "key": "3eb88fb165e3c40d7b4d3e6d979427af81df5fae15f4679b3615bb14c51e1434",
+      "base_nonce": "f80ef3cbb3af7df950c8daba",
+      "sealed": "047232f7604b415640d510099143e52de100d210bff519a39be831fff1dd761d741dcfa48b59b8262f202192debe590b724af76f80eb4a2b7847ca594300dadf77afbf4ac5f876f791a2d10f43aeef06bc91ff5e6173a0c161d67895d47a44f3acca1ab367e7b8f0"
+    },
+    {
+      "kind": "notice",
+      "from": "machine",
+      "to": "device",
+      "info": "68616c74692d7365616c65642d6e6f746963652d7631",
+      "info_text": "halti-sealed-notice-v1",
+      "aad": "000f68616c74692d6e6f746963652d763100087365727665722d31000461636d650003646576",
+      "plaintext": "",
+      "ikm_e": "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+      "ephemeral_private": "2f07195e1471f7a9fdf33b5819e8b283c166ff2bb4f513656a0e1fcbc59eaf52",
+      "enc": "043f9e4b7067da918fa9e744f18f1e5564419a46aed1e336edc437df65d63fc5001b06a12944f88a9d396930a774b09fef48e9f31297e6ada371eb20c6b4adb098",
+      "shared_secret": "d45dbddc8a305ad629cbcef66950c9bb99d8bc95ef0b7bd921ebe7398880056b",
+      "key_schedule_context": "028fc3aeb832490a4b5ab3e42023287db29a1f4bc7c222c0df228727b70a4021121529ea0a46a26a12e180eef9f7c914fd0d2dcd562acfcc4e9829f123b0b4ea8f",
+      "secret": "98d73c0066ce805f6260a9a0e45de11bcec14083e5121fd6d584cd63604213f9",
+      "key": "47aaac4d04ecec01fb5fe81eb5547e71ff63aca203d42850955ecebfc0b641bb",
+      "base_nonce": "f14e14f0adc132bf7cde71e1",
+      "sealed": "043f9e4b7067da918fa9e744f18f1e5564419a46aed1e336edc437df65d63fc5001b06a12944f88a9d396930a774b09fef48e9f31297e6ada371eb20c6b4adb098ee26706eaaac3c49096002ca52116be7"
+    },
+    {
+      "kind": "receipt",
+      "from": "machine",
+      "to": "device",
+      "info": "68616c74692d7365616c65642d726563656970742d7631",
+      "info_text": "halti-sealed-receipt-v1",
+      "aad": "001068616c74692d726563656970742d763100087365727665722d31000461636d650010e0e1e2e3e4e5e6e7e8e9eaebecedeeef",
+      "plaintext": "64656c697665726564",
+      "ikm_e": "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf",
+      "ephemeral_private": "360204d09622f22da5d7bf7452c9686bd5344f204fbd47238d7999c29fd3b69f",
+      "enc": "0458c38ad367a5ead106758da06afcf57514eb89d04f49b2dd8306f45c7d4c65839b75f5f7ca4298a8ec5d995192347162e9e176496335bdb79bc3d2b48af0187b",
+      "shared_secret": "4bf206cb9473c8d3900a8f7a37f77af5085b27a886b4979e5a9484922aa874dd",
+      "key_schedule_context": "028fc3aeb832490a4b5ab3e42023287db29a1f4bc7c222c0df228727b70a402112374d5b7ba706420dfccd8509f784080eeb949cfd58e0370969499dd277a7ffb8",
+      "secret": "2536268004dc2794ff810e85e544ab460992c75b75b65f8cdcc2d4d2b434c009",
+      "key": "9744476cb516d226747b58c503206c359cd52594a5cf170417fb341137d640b2",
+      "base_nonce": "2e8ca69e976cfc4651bfaab7",
+      "sealed": "0458c38ad367a5ead106758da06afcf57514eb89d04f49b2dd8306f45c7d4c65839b75f5f7ca4298a8ec5d995192347162e9e176496335bdb79bc3d2b48af0187b700f6497da55a350e1d5e755028056522ec68c187b3b063a9c"
+    },
+    {
+      "kind": "answer",
+      "from": "device",
+      "to": "reply",
+      "info": "68616c74692d7365616c65642d616e737765722d7631",
+      "info_text": "halti-sealed-answer-v1",
+      "aad": "000f68616c74692d616e737765722d763100087365727665722d31000461636d650010e0e1e2e3e4e5e6e7e8e9eaebecedeeef",
+      "plaintext": "7965732c20616e64207468656e2070757368",
+      "ikm_e": "d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef",
+      "ephemeral_private": "e9761be8d1c3324adf9c5f69bfb42d37d7ff9f4d88cae7ee694c55d5b782c62e",
+      "enc": "042ce19da3bf6f92821ef50be6c492b4192fba566d578ef058dab532a9c3147976433db69050ab0a5d70db5e24f5a1ddbefa65dbcc91fe3513fd2010b66d478e2c",
+      "shared_secret": "62fbde11c26f82efadc0a970e07f6739bc47868441e1080ce89957e3505e8641",
+      "key_schedule_context": "028fc3aeb832490a4b5ab3e42023287db29a1f4bc7c222c0df228727b70a4021127f49bd87732398084f253a3c7f0d414582339e8deb329b24fd59bd39b6f0615d",
+      "secret": "5e70996d975dfcc3f8a2eca91052c254f79610d41b9ac8e3daecbc18968046c0",
+      "key": "ec9e6d19ec4587d58d542586c642b07c5009abe77714af3c7cf7dd691a78b342",
+      "base_nonce": "ac55e182fe9271e8c5d6ac4f",
+      "sealed": "042ce19da3bf6f92821ef50be6c492b4192fba566d578ef058dab532a9c3147976433db69050ab0a5d70db5e24f5a1ddbefa65dbcc91fe3513fd2010b66d478e2cc805bacfd8a0a8825c19207a402f49c33d19f5bb538885af42d48370d9d1cf22902b"
+    }
+  ]
+}
