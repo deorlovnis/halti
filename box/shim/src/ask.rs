@@ -18,7 +18,10 @@
 //!
 //! `permit`, `question` and `turn-ended` from PermissionRequest, PreToolUse and Stop are held in a
 //! run its owner marked away, until it is answered from a phone or with `halti requests`
-//! (halti's src/questions.rs), and the hook's limit in the settings covers that wait. The answer
+//! (halti's src/questions.rs), and the hook's limit in the settings covers that wait. halti says
+//! at once that it holds the call (`HTTP/1.1 102 Processing`, then the answer when it comes); a call
+//! it neither answers nor holds within 5 seconds is given up, as every other call is, so a hung
+//! host never holds a hook in a run not marked away. The answer
 //! becomes the hook's output on stdout, in one of three fixed shapes:
 //!
 //! - PermissionRequest: `decision.behavior` `allow`, or `deny` with the reason as `message`. Never
@@ -58,8 +61,11 @@ const PATH: &str = "/ask";
 const LABEL: &[u8] = b"halti-ask-v2";
 /// The first field of an answer, in place of `nobody`.
 const REPLY_LABEL: &[u8] = b"halti-reply-v1";
-/// How long the door has to take the call and answer it, unless it is held.
+/// How long the door has to take the call and answer it, or say that it holds it.
 const WAIT: Duration = Duration::from_secs(5);
+/// What the door says first of a call it holds as a question, before the answer: from then on the
+/// asker waits for the answer as long as the hook may.
+const HELD: &[u8] = b"HTTP/1.1 102 Processing\r\n\r\n";
 /// The most of the hook's input read; longer input sends nothing.
 const INPUT_MAX: u64 = 16 * 1024 * 1024;
 /// The most of the door's answer read.
@@ -284,14 +290,22 @@ fn form(event: &str, tag: &[u8], text: &[u8]) -> Vec<u8> {
 }
 
 /// Sends `form` to the door at `to`, and reads the body of its answer. A call that may be `held`
-/// waits for it as long as Claude Code lets the hook run.
+/// waits for it as long as Claude Code lets the hook run, once the door says it holds it; until
+/// then, and for any other call, each read waits `WAIT` at most.
 fn send(to: SocketAddr, form: &[u8], held: bool) -> io::Result<Vec<u8>> {
     let mut door = TcpStream::connect_timeout(&to, WAIT)?;
-    door.set_read_timeout(if held { None } else { Some(WAIT) })?;
+    door.set_read_timeout(Some(WAIT))?;
     door.set_write_timeout(Some(WAIT))?;
     let head = format!("POST {PATH} HTTP/1.1\r\nHost: halti.internal\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", form.len());
     door.write_all(&[head.as_bytes(), form].concat())?;
     let mut answer = Vec::new();
+    (&door).take(HELD.len() as u64).read_to_end(&mut answer)?;
+    // Only a call the door holds as a question waits longer than WAIT, and only one that may be
+    // held: its hook's limit covers that wait.
+    if held && answer == HELD {
+        answer.clear();
+        door.set_read_timeout(None)?;
+    }
     door.take(ANSWER_MAX).read_to_end(&mut answer)?;
     let at = answer.windows(4).position(|w| w == b"\r\n\r\n").ok_or(io::ErrorKind::InvalidData)?;
     if !answer.starts_with(b"HTTP/1.1 200 ") {
@@ -802,6 +816,47 @@ mod tests {
         // With no door, it gives up in time and says nothing.
         let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
         assert!(send(closed, &form, true).is_err());
+    }
+
+    #[test]
+    fn a_call_waits_past_five_seconds_only_once_the_door_says_it_holds_it() {
+        // A door that answers late: after it said it holds the call, or with no word before.
+        let door = |says_held: bool| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let to = listener.local_addr().unwrap();
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (mut got, mut buf) = (Vec::new(), [0; 1024]);
+                while !got.ends_with(b"\x00\x04done") {
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(n > 0, "ended early");
+                    got.extend_from_slice(&buf[..n]);
+                }
+                if says_held {
+                    stream.write_all(HELD).unwrap();
+                }
+                thread::sleep(WAIT + Duration::from_secs(1));
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nnobody");
+            });
+            to
+        };
+        let form = form("turn-ended", &[0xaa; 16], b"done");
+        let (held, silent, unheld) = (door(true), door(false), door(true));
+        let calls = [(held, true), (silent, true), (unheld, false)].map(|(to, may)| {
+            let form = form.clone();
+            thread::spawn(move || {
+                let started = std::time::Instant::now();
+                (send(to, &form, may).ok(), started.elapsed())
+            })
+        });
+        let [held, silent, unheld] = calls.map(|call| call.join().unwrap());
+        assert_eq!(held.0.as_deref(), Some(&b"nobody"[..]), "held: the answer comes");
+        // A door that says nothing in time is given up on, even for a hook that may be held: a
+        // hung host never holds Claude Code up.
+        assert_eq!(silent.0, None);
+        assert!(silent.1 < WAIT + Duration::from_millis(900), "{:?}", silent.1);
+        // A hook that may not be held never waits longer, whatever the door says.
+        assert_eq!(unheld.0, None);
     }
 
     /// What halti tells a held asker for `form` and `content`.

@@ -126,8 +126,8 @@ fn exchange(sh: &Shared, reader: &mut BufReader<UnixStream>, writer: &mut UnixSt
 /// logged: nothing in it leaves the box.
 ///
 /// From a newer asker (`halti-ask-v2`), its text goes there too, and in a run marked away the call
-/// is held as a question until it is answered (`crate::questions`): the answer is written on it,
-/// and one line logged of it, with no text. A call the asker closes withdraws its question. Any
+/// is held as a question until it is answered (`crate::questions`): `HELD` is written on it at
+/// once, then the answer when it comes, and one line logged of it, with no text. A call the asker closes withdraws its question. Any
 /// other is answered at once, as above; an older asker's text is dropped as it is read.
 ///
 /// It needs no key, so it takes only what a web page in the box can't send: a browser there may
@@ -145,7 +145,11 @@ fn ask(sh: &Shared, writer: &mut UnixStream, head: &Head, method: &str, body: &[
             match (&sh.cfg.requests, &ask.text) {
                 (Some(asker), Some(text)) => {
                     let peer = writer.try_clone()?;
-                    if let Asked::Answered { reply, line } = asker.ask(ask.event, &ask.tag, text, &|| gone(&peer)) {
+                    // The asker gives up on a call not answered at once, unless told it is held.
+                    let held = || {
+                        let _ = (&peer).write_all(HELD);
+                    };
+                    if let Asked::Answered { reply, line } = asker.ask(ask.event, &ask.tag, text, &held, &|| gone(&peer)) {
                         let mut entry = Entry {
                             request: Some(line.id.hex()),
                             question: Some(line.kind.word()),
@@ -171,6 +175,10 @@ fn ask(sh: &Shared, writer: &mut UnixStream, head: &Head, method: &str, body: &[
     wire::respond(writer, status, "text/plain", said.as_bytes(), keep)?;
     Ok(keep)
 }
+
+/// What a held call is told first, an interim reply: the asker gives up on a call that is neither
+/// answered nor held within 5 seconds, so a stalled host never holds a hook that may wait long.
+const HELD: &[u8] = b"HTTP/1.1 102 Processing\r\n\r\n";
 
 /// Whether the asker closed its held call: it ended, or Claude Code ended its hook. Looked at
 /// without reading or waiting; anything it sent after its call is no sign.
@@ -565,7 +573,7 @@ mod tests {
         // Not marked away: nobody, at once, as for an older asker.
         let text = crate::fields::join(&[&[0, 0, 0, 0], b"Bash", br#"{"command":"cat SECRET-PLAN"}"#]);
         let reply = exchanged(&sh, &post_ask(&Ask::bytes_v2(b"permit", b"tag", &text)));
-        assert!(reply.ends_with("\r\n\r\nnobody"), "{reply}");
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n") && reply.ends_with("\r\n\r\nnobody"), "{reply}");
         desk.set_away(crate::requests::RunId([7; 8]), Some(crate::requests::now_secs() + 3600));
         // Marked away: the call is held, and the answer given here is written on it.
         let (mut guest, door) = UnixStream::pair().unwrap();
@@ -577,6 +585,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let id = Record::decode(&desk.questions()[0].0).unwrap().id;
+        // The asker is told at once that its call is held, before any answer: it gives up on one
+        // that isn't, so a stalled host never holds its hook.
+        let mut first = [0; HELD.len()];
+        guest.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        guest.read_exact(&mut first).unwrap();
+        assert_eq!(&first[..], HELD);
         assert_eq!(desk.answer_question_here(id, Form::Yes, b""), crate::questions::Outcome::MaybeUnused);
         let mut reply = Vec::new();
         guest.read_to_end(&mut reply).unwrap();

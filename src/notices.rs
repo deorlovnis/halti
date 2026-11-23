@@ -23,8 +23,10 @@
 //! The asker of a newer image says `halti-ask-v2` in place of the label, with the same fields and
 //! caps, and its text in the form `crate::questions` gives. It also says `permit` as Claude Code
 //! asks leave to run a tool. Its `permit`, `question` and `turn-ended` are held in a run marked
-//! away, and answered with what a phone or `halti requests` said (`crate::questions`);
-//! otherwise, and every other event, at once, as above. An asker of an older image is never held.
+//! away, and answered with what a phone or `halti requests` said (`crate::questions`), after the
+//! interim reply `HTTP/1.1 102 Processing` written at once: the asker gives up on a call that is
+//! neither answered nor held within 5 seconds. Otherwise, and every other event, at once, as above.
+//! An asker of an older image is never held.
 //!
 //! The door knows which machine, workspace, box and run it serves; the box names none of them. The
 //! open workspace keeps a run's session tags on this machine and gives each a number of its own, 1,

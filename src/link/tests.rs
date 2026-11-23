@@ -1261,7 +1261,7 @@ fn a_question_reaches_the_phone_sealed_and_its_answer_comes_back_with_a_receipt(
     world.hub.reachable(false);
     let asker = desk.asker("dev", run);
     let text = crate::fields::join(&[&[0, 0, 0, 0], b"Bash", br#"{"command":"npm test"}"#]);
-    let held = thread::spawn(move || asker.ask(crate::notices::Event::Permit, b"tag", &text, &|| false));
+    let held = thread::spawn(move || asker.ask(crate::notices::Event::Permit, b"tag", &text, &|| {}, &|| false));
     until("the question waits", || desk.questions().len() == 1);
     thread::sleep(Duration::from_millis(500));
     world.hub.reachable(true);
@@ -1316,7 +1316,7 @@ fn a_question_past_the_most_the_hub_holds_for_the_machine_is_answered_nobody_whi
     for n in 0..crate::hub::QUESTIONS_MAX {
         acme.set_away(run(n), Some(requests::now_secs() + 3600));
         let (asker, idle) = (acme.asker(&format!("b{}", n / 3), run(n)), idle.clone());
-        held.push(thread::spawn(move || asker.ask(Event::Waiting(Wait::TurnEnded), format!("s{n}").as_bytes(), &idle, &|| false)));
+        held.push(thread::spawn(move || asker.ask(Event::Waiting(Wait::TurnEnded), format!("s{n}").as_bytes(), &idle, &|| {}, &|| false)));
     }
     let questions = || world.hub.call("GET", "/v1/questions", Some(&pixel.token), None).1["questions"].as_array().unwrap().len();
     until("the phone lists them all", || questions() == crate::hub::QUESTIONS_MAX);
@@ -1327,7 +1327,7 @@ fn a_question_past_the_most_the_hub_holds_for_the_machine_is_answered_nobody_whi
     beta.set_away(late, Some(requests::now_secs() + 3600));
     let asker = beta.asker("web", late);
     let started = Instant::now();
-    assert!(matches!(asker.ask(Event::Waiting(Wait::TurnEnded), b"s", &idle, &|| false), requests::Asked::Nobody));
+    assert!(matches!(asker.ask(Event::Waiting(Wait::TurnEnded), b"s", &idle, &|| {}, &|| false), requests::Asked::Nobody));
     assert!(started.elapsed() < Duration::from_secs(10));
     assert!(beta.questions().is_empty());
     assert_eq!(beta.notices().len(), 1);
@@ -1369,7 +1369,7 @@ fn a_question_a_hub_of_before_questions_can_t_carry_is_answered_nobody_and_its_n
     let asker = keeper.desk.asker("dev", run);
     let idle = crate::fields::join(&[&[0, 0, 0, 0], b"done"]);
     let started = Instant::now();
-    assert!(matches!(asker.ask(Event::Waiting(Wait::TurnEnded), b"s", &idle, &|| false), requests::Asked::Nobody));
+    assert!(matches!(asker.ask(Event::Waiting(Wait::TurnEnded), b"s", &idle, &|| {}, &|| false), requests::Asked::Nobody));
     assert!(started.elapsed() < Duration::from_secs(10));
     assert!(!faked.hub.sent("/v1/machine/questions").is_empty(), "the link asked the hub to take it");
     // The agent's own prompt shows, and the phone is told of the wait by its notice.

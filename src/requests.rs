@@ -1041,9 +1041,10 @@ impl Asker {
     }
 
     /// What a newer asker reported, with the text its hook showed: held as a question in a run
-    /// marked away, until what it is told (`asked`). `gone` says its call was closed.
-    pub fn ask(&self, event: Event, tag: &[u8], text: &[u8], gone: &dyn Fn() -> bool) -> Asked {
-        self.desk.ask(&self.box_name, self.run, event, tag, text, gone)
+    /// marked away, until what it is told (`asked`). `held` is called as it is held, and `gone`
+    /// says its call was closed.
+    pub fn ask(&self, event: Event, tag: &[u8], text: &[u8], held: &dyn Fn(), gone: &dyn Fn() -> bool) -> Asked {
+        self.desk.ask(&self.box_name, self.run, event, tag, text, held, gone)
     }
 }
 

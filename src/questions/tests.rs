@@ -305,7 +305,7 @@ fn held_in(desk: &Arc<Desk>, box_name: &str, run: RunId, event: Event, tag: &[u8
     let hang_up = Arc::new(AtomicBool::new(false));
     let gone = hang_up.clone();
     let tag = tag.to_vec();
-    Held { told: thread::spawn(move || asker.ask(event, &tag, &text, &|| gone.load(Ordering::SeqCst))), hang_up }
+    Held { told: thread::spawn(move || asker.ask(event, &tag, &text, &|| {}, &|| gone.load(Ordering::SeqCst))), hang_up }
 }
 
 impl Held {

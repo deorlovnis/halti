@@ -187,8 +187,11 @@ impl Desk {
     /// text its hook showed: held as a question until it is answered, in a run marked away with a
     /// phone to ask; `nobody` at once otherwise. The notice is made as before either way: it stays
     /// beside the question, for a phone whose app reads no questions, and the hub that carries
-    /// none. `gone` says the asker's call was closed: it gave up, or Claude Code ended its hook.
-    pub fn ask(self: &Arc<Self>, box_name: &str, run: RunId, event: Event, tag: &[u8], text: &[u8], gone: &dyn Fn() -> bool) -> Asked {
+    /// none. `held` is called once the question is made, before the wait: the asker is told that
+    /// its call is held, as it gives up on one that isn't answered at once. `gone` says the asker's
+    /// call was closed: it gave up, or Claude Code ended its hook.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ask(self: &Arc<Self>, box_name: &str, run: RunId, event: Event, tag: &[u8], text: &[u8], held: &dyn Fn(), gone: &dyn Fn() -> bool) -> Asked {
         let kind = match event {
             Event::Permit => Kind::Permit,
             Event::Waiting(notices::Kind::Question) => Kind::Choice,
@@ -205,6 +208,7 @@ impl Desk {
         };
         self.tell(box_name, run, event, tag);
         let Some(id) = opened else { return Asked::Nobody };
+        held();
         self.wait_question(id, gone)
     }
 
