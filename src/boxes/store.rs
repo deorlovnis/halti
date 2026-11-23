@@ -664,7 +664,7 @@ fn open_folder(src: &Path) -> Result<Folder> {
 /// client's repo comes into a box without the `.env` and keys it keeps out of git.
 pub fn clone_tree(src: &Path, dst: &Path) -> Result<Copied> {
     let from = open_folder(src)?;
-    let mut leave = Leave::GitIgnored(HashSet::new());
+    let mut leave = Leave::GitIgnored(Ignored::default());
     leave.enter(from.at(), Path::new(""))?;
     let (to, name) = folder_and_name(dst)?;
     let mut copied = Copied { files: Vec::new(), skipped: 0, ignored: 0 };
@@ -676,53 +676,103 @@ pub fn clone_tree(src: &Path, dst: &Path) -> Result<Copied> {
 enum Leave {
     /// Nothing: what `copy_tree` copies.
     Nothing,
-    /// What git ignores, by path from the top of the copy: in the top folder if it is in a git
-    /// work tree, and in each folder inside it that holds a `.git` (a repo of its own, a submodule
-    /// among them), which the repo around it doesn't look into.
-    GitIgnored(HashSet<PathBuf>),
+    /// What git ignores: in the top folder if it is in a git work tree, and in each folder inside
+    /// it that holds a `.git` (a repo of its own, a submodule among them), which the repo around it
+    /// doesn't look into.
+    GitIgnored(Ignored),
+}
+
+/// What git ignores, by path from the top of the copy and by the file each path names. git names
+/// a file as it composes its name (on a Mac, an accent as one letter), which needn't be the bytes
+/// the folder holds, so an entry is also left out when it is one of these files. A file linked
+/// to an ignored one is left out with it.
+#[derive(Default)]
+struct Ignored {
+    paths: HashSet<PathBuf>,
+    /// Device and inode.
+    files: HashSet<(u64, u64)>,
 }
 
 impl Leave {
     /// Called for each folder before its entries are read and before it is made in the copy, `rel`
     /// its path from the top.
     fn enter(&mut self, dir: &Path, rel: &Path) -> Result<()> {
-        if let Leave::GitIgnored(paths) = self
-            && (rel.as_os_str().is_empty() || fs::symlink_metadata(dir.join(".git")).is_ok())
-        {
-            paths.extend(git_ignored(dir)?.into_iter().map(|path| rel.join(path)));
+        let Leave::GitIgnored(ignored) = self else { return Ok(()) };
+        if !rel.as_os_str().is_empty() && fs::symlink_metadata(dir.join(".git")).is_err() {
+            return Ok(());
+        }
+        let names: Vec<PathBuf> = match git_ignored(dir)? {
+            Some(names) => names,
+            // The repo around it ignores the folder as a whole, and so all in it.
+            None => fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?.map(|e| e.map(|e| PathBuf::from(e.file_name()))).collect::<io::Result<_>>()?,
+        };
+        for name in names {
+            if let Ok(meta) = fs::symlink_metadata(dir.join(&name)) {
+                ignored.files.insert((meta.dev(), meta.ino()));
+            }
+            ignored.paths.insert(rel.join(name));
         }
         Ok(())
     }
 
-    fn leaves(&self, rel: &Path) -> bool {
-        matches!(self, Leave::GitIgnored(paths) if paths.contains(rel))
+    /// Whether the entry at `rel`, opened as `found`, is left out.
+    fn leaves(&self, rel: &Path, found: &Found) -> Result<bool> {
+        let Leave::GitIgnored(ignored) = self else { return Ok(false) };
+        if ignored.paths.contains(rel) {
+            return Ok(true);
+        }
+        let meta = match found {
+            Found::Folder(folder) => folder.metadata()?,
+            Found::File(file) => file.metadata().with_context(|| format!("reading {}", rel.display()))?,
+            // A link or a special file isn't copied anyway.
+            Found::Missing | Found::Link | Found::Other => return Ok(false),
+        };
+        Ok(ignored.files.contains(&(meta.dev(), meta.ino())))
     }
 }
 
 /// What git ignores in `dir`: the untracked files and folders its ignore rules match (`.gitignore`,
 /// `.git/info/exclude`, your own excludes file), relative to `dir`, a folder all of whose files are
-/// ignored as the folder. Nothing if `dir` isn't in a git work tree. A folder with a `.git` that
-/// git can't read is an error, not a folder to copy whole.
-fn git_ignored(dir: &Path) -> Result<Vec<PathBuf>> {
-    let found = git(dir, &["rev-parse", "--is-inside-work-tree"]);
-    match found {
-        Ok(out) if out == b"true\n" => {}
-        _ if fs::symlink_metadata(dir.join(".git")).is_err() => return Ok(Vec::new()),
-        Ok(_) => bail!("{} has a .git, but isn't a git work tree", dir.display()),
-        Err(e) => return Err(e.context(format!("{} has a .git, and git can't say what it ignores", dir.display()))),
+/// ignored as the folder. Nothing if `dir` isn't in a git work tree; `None` if the repo around it
+/// ignores `dir` itself. A folder in a repo (a `.git` in it or in a folder above it) that git
+/// can't read, or that git can't be run for, is an error, not a folder to copy whole.
+fn git_ignored(dir: &Path) -> Result<Option<Vec<PathBuf>>> {
+    let real = fs::canonicalize(dir).with_context(|| format!("reading {}", dir.display()))?;
+    let Some(top) = real.ancestors().find(|d| fs::symlink_metadata(d.join(".git")).is_ok()) else {
+        return Ok(Some(Vec::new()));
+    };
+    let unread = || format!("{} is in a git repo ({}), and git can't say what it ignores", dir.display(), top.join(".git").display());
+    if git(dir, &["rev-parse", "--is-inside-work-tree"]).with_context(unread)? != b"true\n" {
+        bail!("{} is in a folder with a .git ({}), but isn't in a git work tree", dir.display(), top.display());
     }
-    let out = git(dir, &["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"])?;
+    // Run inside a folder the repo ignores, ls-files prints "./" or fails; check-ignore says it.
+    let checked = git_command(dir, &["check-ignore", "-q", "."]).output().context("running git").with_context(unread)?;
+    match checked.status.code() {
+        Some(0) => return Ok(None),
+        Some(1) => {}
+        _ => return Err(anyhow!("git check-ignore: {}", String::from_utf8_lossy(&checked.stderr).trim()).context(unread())),
+    }
+    let out = git(dir, &["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"]).with_context(unread)?;
     let paths = out.split(|b| *b == 0).filter(|path| !path.is_empty());
-    Ok(paths.map(|path| PathBuf::from(OsStr::from_bytes(path.strip_suffix(b"/").unwrap_or(path)))).collect())
+    Ok(Some(paths.map(|path| PathBuf::from(OsStr::from_bytes(path.strip_suffix(b"/").unwrap_or(path)))).collect()))
 }
 
-/// Runs git in `dir` and returns what it printed. Only `rev-parse` and `ls-files` are run, and
-/// neither runs a hook; the one command a repo's config could have them run, fsmonitor's, is
-/// turned off here, as are hooks, and the index is never written. Variables that would point git
-/// at another repo than `dir`'s are left out.
+/// Runs git in `dir` and returns what it printed; see `git_command`.
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let out = Command::new("git")
-        .args(["--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C"])
+    let out = git_command(dir, args).output().context("running git")?;
+    if !out.status.success() {
+        bail!("git {}: {}", args[0], String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(out.stdout)
+}
+
+/// git in `dir`. Only `rev-parse`, `check-ignore` and `ls-files` are run, and none runs a hook;
+/// the one command a repo's config could have them run, fsmonitor's, is turned off here, as are
+/// hooks, and the index is never written. Variables that would point git at another repo than
+/// `dir`'s are left out.
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    let mut git = Command::new("git");
+    git.args(["--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C"])
         .arg(dir)
         .args(args)
         .env_remove("GIT_DIR")
@@ -732,22 +782,20 @@ fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
-        .output()
-        .context("running git")?;
-    if !out.status.success() {
-        bail!("git {}: {}", args[0], String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(out.stdout)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    git
 }
 
 fn copy_dir(from: &Folder, to: &Folder, rel: &Path, copied: &mut Copied, leave: &mut Leave) -> Result<()> {
     for name in from.names()? {
         let rel = rel.join(&name);
-        if leave.leaves(&rel) {
+        let found = from.open(&name)?;
+        if leave.leaves(&rel, &found)? {
             copied.ignored += 1;
             continue;
         }
-        match from.open(&name)? {
+        match found {
             Found::Folder(sub) => {
                 leave.enter(sub.at(), &rel)?;
                 copy_dir(&sub, &to.make(&name, 0o755)?, &rel, copied, leave)?
@@ -779,7 +827,7 @@ fn copy_file(mut from: &File, shown: &str, to: &Folder, name: &std::ffi::OsStr) 
 /// root doesn't keep. Returns the stream and what it holds.
 pub fn tar_tree(src: &Path) -> Result<(Vec<u8>, Copied)> {
     let folder = open_folder(src)?;
-    let mut leave = Leave::GitIgnored(HashSet::new());
+    let mut leave = Leave::GitIgnored(Ignored::default());
     leave.enter(folder.at(), Path::new(""))?;
     let mut tar = Vec::new();
     let mut copied = Copied { files: Vec::new(), skipped: 0, ignored: 0 };
@@ -795,12 +843,13 @@ fn tar_dir(folder: &Folder, rel: &str, tar: &mut Vec<u8>, copied: &mut Copied, l
             copied.skipped += 1;
             continue;
         };
-        if leave.leaves(Path::new(&name)) {
+        let found = folder.open(&entry)?;
+        if leave.leaves(Path::new(&name), &found)? {
             copied.ignored += 1;
             continue;
         }
         let mtime = |meta: &fs::Metadata| meta.mtime().max(0) as u64;
-        match folder.open(&entry)? {
+        match found {
             Found::Folder(sub) => {
                 leave.enter(sub.at(), Path::new(&name))?;
                 tar_header(tar, &format!("{name}/"), 0o755, 0, mtime(&sub.metadata()?), b'5');
@@ -1008,14 +1057,15 @@ mod tests {
         assert_eq!(pax_record("path", &"y".repeat(95)), format!("105 path={}\n", "y".repeat(95)));
     }
 
+    fn git(at: &Path, args: &[&str]) {
+        let out = Command::new("git").arg("-C").arg(at).args(args).stdin(Stdio::null()).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
     /// A client's repo, as it would be in ~/Git: tracked files, files its `.gitignore` names, a
     /// repo of its own inside it, and a config whose fsmonitor and hooks would leave a mark if
     /// anything ran them.
     fn client_repo(dir: &Path) -> PathBuf {
-        let git = |at: &Path, args: &[&str]| {
-            let out = Command::new("git").arg("-C").arg(at).args(args).stdin(Stdio::null()).output().unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        };
         let repo = dir.join("client");
         for folder in ["src", "target/debug", "notes", "vendor/lib"] {
             fs::create_dir_all(repo.join(folder)).unwrap();
@@ -1084,16 +1134,67 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_leaves_out_an_ignored_name_however_its_accents_are_written() {
+        let dir = TempDir::new("halti-clone-accent").unwrap();
+        let repo = dir.0.join("client");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        fs::write(repo.join(".gitignore"), "*.pem\n").unwrap();
+        // An accent as a letter of its own (as Java or a zip made on HFS+ write it), and as one with
+        // its letter: git on a Mac names both the second way.
+        for name in ["cle\u{301}.pem", "caf\u{e9}.pem", "main.rs"] {
+            fs::write(repo.join(name), "x").unwrap();
+        }
+
+        let copied = clone_tree(&repo, &dir.0.join("dst")).unwrap();
+        let pem = |files: &[PathBuf]| files.iter().any(|f| f.extension().is_some_and(|e| e == "pem"));
+        assert!(!pem(&copied.files), "{:?}", copied.files);
+        assert!(copied.files.contains(&PathBuf::from("main.rs")));
+        assert_eq!(copied.ignored, 2);
+        let (_, sent) = tar_tree(&repo).unwrap();
+        assert!(!pem(&sent.files), "{:?}", sent.files);
+        assert_eq!(sent.ignored, 2);
+    }
+
+    #[test]
+    fn a_clone_of_a_folder_its_repo_ignores_copies_nothing_in_it() {
+        let dir = TempDir::new("halti-clone-ignored").unwrap();
+        let repo = dir.0.join("client");
+        for folder in ["deploy", "build/sub"] {
+            fs::create_dir_all(repo.join(folder)).unwrap();
+            fs::write(repo.join(folder).join(".env"), "TOKEN=s3cret").unwrap();
+            fs::write(repo.join(folder).join("run.sh"), "").unwrap();
+        }
+        git(&repo, &["init", "-q"]);
+        fs::write(repo.join(".gitignore"), "deploy/\nbuild/\n").unwrap();
+
+        // The folder the rules name, and one inside it, where git's ls-files fails.
+        for (i, folder) in ["deploy", "build/sub"].into_iter().enumerate() {
+            let dst = dir.0.join(format!("dst{i}"));
+            let copied = clone_tree(&repo.join(folder), &dst).unwrap();
+            assert_eq!((copied.files.len(), copied.ignored), (0, 2), "{folder}");
+            assert_eq!(fs::read_dir(&dst).unwrap().count(), 0, "{folder}");
+            let (_, sent) = tar_tree(&repo.join(folder)).unwrap();
+            assert_eq!((sent.files.len(), sent.ignored), (0, 2), "{folder}");
+        }
+    }
+
+    #[test]
     fn a_clone_of_a_folder_whose_git_is_broken_copies_nothing() {
         let dir = TempDir::new("halti-clone-broken").unwrap();
         let src = dir.0.join("src");
-        fs::create_dir(&src).unwrap();
+        fs::create_dir_all(src.join("app")).unwrap();
         fs::write(src.join(".env"), "TOKEN=s3cret").unwrap();
+        fs::write(src.join("app/.env"), "TOKEN=s3cret").unwrap();
         fs::write(src.join(".git"), "not a repo").unwrap();
-        let error = format!("{:#}", clone_tree(&src, &dir.0.join("dst")).err().expect("refused"));
-        assert!(error.contains("has a .git, and git can't say what it ignores"), "{error}");
-        assert!(!dir.0.join("dst").exists());
-        assert!(tar_tree(&src).is_err());
+        // The folder with the .git, and a folder in it with none of its own: that git fails there
+        // doesn't make it a folder outside a repo.
+        for top in [src.clone(), src.join("app")] {
+            let error = format!("{:#}", clone_tree(&top, &dir.0.join("dst")).err().expect("refused"));
+            assert!(error.contains("is in a git repo") && error.contains("git can't say what it ignores"), "{error}");
+            assert!(!dir.0.join("dst").exists());
+            assert!(tar_tree(&top).is_err());
+        }
     }
 
     #[test]
