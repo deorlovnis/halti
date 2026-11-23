@@ -123,7 +123,8 @@ store_tests() {
 # The first run builds the agent and browser images, which takes most of the time.
 vm_tests() {
   HALTI_E2E_BOX=1 limit 1800 cargo test --test box_engine -- --ignored --nocapture &&
-    HALTI_E2E_BOX=1 limit 900 cargo test --bin halti real_vm -- --ignored --nocapture
+    HALTI_E2E_BOX=1 limit 900 cargo test --bin halti real_vm -- --ignored --nocapture &&
+    HALTI_E2E_ENGINE=container limit 600 cargo test --bin halti engine_tests -- --ignored --nocapture
 }
 
 # HALTI_SE_FINGER=1 tells the library's tests that a finger was promised.
