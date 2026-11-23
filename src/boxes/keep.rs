@@ -97,7 +97,7 @@ pub fn serve(keep: Keep) -> Result<u8> {
     let settings = keep.settings.clone();
     let world = keep.vms.map(|vms| run::Real { vms, keys: KeyStore::of(&settings), settings: &settings });
     let ready = |name: &str, shown: &str, checked: &Checked| super::ready(name, shown, &checked.text, checked.policy.keep, &settings);
-    let desk = Desk::following(requests::machine_name, keep.name.to_string(), requests::LIMITS, Arc::new(requests::TouchId));
+    let desk = Desk::following(requests::machine_name, keep.name.to_string(), limits(), Arc::new(requests::TouchId));
     let trust = |name: &str| crate::link::trusted(name);
     let ws = keep.name.to_string();
     let serve_mcp = move |reading: UnixStream, writing: UnixStream, ended: Arc<AtomicBool>| mcp::serve_io(BufReader::new(reading), writing, mcp::Scope::workspace(&ws, ended));
@@ -113,6 +113,25 @@ pub fn serve(keep: Keep) -> Result<u8> {
         mcp: &serve_mcp,
     };
     serve_with(keep, &outside)
+}
+
+/// The desk's limits. A debug build takes how long a notice is held, in seconds, from
+/// `HALTI_TEST_NOTICE_DELAY`, so a run with the phone need not wait 5 minutes for it.
+fn limits() -> requests::Limits {
+    #[cfg(halti_dev)]
+    if let Some(delay) = crate::util::dev_var("HALTI_TEST_NOTICE_DELAY") {
+        return limits_with(&delay);
+    }
+    requests::LIMITS
+}
+
+/// The desk's limits with a notice held `delay` seconds; as they are for anything but a number.
+#[cfg(any(halti_dev, test))]
+fn limits_with(delay: &std::ffi::OsStr) -> requests::Limits {
+    match delay.to_str().and_then(|text| text.parse().ok()) {
+        Some(secs) => requests::Limits { notice_delay: Duration::from_secs(secs), ..requests::LIMITS },
+        None => requests::LIMITS,
+    }
 }
 
 /// What the keeper reaches outside itself; tests give their own.
