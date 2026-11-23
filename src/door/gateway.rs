@@ -21,6 +21,7 @@ use super::{Entry, STANDIN, Shared};
 use crate::mask::Masker;
 use crate::notices::{ASK_MAX, ASK_PATH, Ask, NOBODY};
 use crate::policy::{self, METHODS, Mode};
+use crate::requests::{Asked, By};
 use crate::source::{self, Hint};
 
 /// Request bodies (a long conversation with images) are read whole, up to this size.
@@ -119,10 +120,15 @@ fn exchange(sh: &Shared, reader: &mut BufReader<UnixStream>, writer: &mut UnixSt
     result.map(|()| keep)
 }
 
-/// `POST /ask`: what the asker in the box saw. Its text is dropped as it is read; its event and
-/// session tag go to the open workspace that runs the box, if one does, which makes a notice of
-/// them that holds neither (`crate::notices`). It is answered at once, `nobody`: nobody answers
-/// from the phone. Not logged: nothing in it leaves the box.
+/// `POST /ask`: what the asker in the box saw. Its event and session tag go to the open workspace
+/// that runs the box, if one does, which makes a notice of them that holds neither
+/// (`crate::notices`), and it is answered at once, `nobody`: nobody answers from the phone. Not
+/// logged: nothing in it leaves the box.
+///
+/// From a newer asker (`halti-ask-v2`), its text goes there too, and in a run marked away the call
+/// is held as a question until it is answered (`crate::questions`): the answer is written on it,
+/// and one line logged of it, with no text. A call the asker closes withdraws its question. Any
+/// other is answered at once, as above; an older asker's text is dropped as it is read.
 ///
 /// It needs no key, so it takes only what a web page in the box can't send: a browser there may
 /// POST to halti.internal with no preflight, but only with a type such as `text/plain`, and it
@@ -136,8 +142,27 @@ fn ask(sh: &Shared, writer: &mut UnixStream, head: &Head, method: &str, body: &[
         _ if !octets => 415,
         None => 400,
         Some(ask) => {
-            if let Some(asker) = &sh.cfg.requests {
-                asker.tell(ask.event, &ask.tag);
+            match (&sh.cfg.requests, &ask.text) {
+                (Some(asker), Some(text)) => {
+                    let peer = writer.try_clone()?;
+                    if let Asked::Answered { reply, line } = asker.ask(ask.event, &ask.tag, text, &|| gone(&peer)) {
+                        let mut entry = Entry {
+                            request: Some(line.id.hex()),
+                            question: Some(line.kind.word()),
+                            asked: Some(crate::util::hex(&line.hash)),
+                            ..Entry::new("question", &format!("answered:{}", line.form.word()))
+                        };
+                        entry = match &line.by {
+                            By::Device(signed) => Entry::signed(Some(line.by.word()), Some(signed), entry),
+                            By::Local => Entry { by: Some(line.by.word()), ..entry },
+                        };
+                        sh.log.write(&entry);
+                        wire::respond(writer, 200, "application/octet-stream", &reply, keep)?;
+                        return Ok(keep);
+                    }
+                }
+                (Some(asker), None) => asker.tell(ask.event, &ask.tag),
+                (None, _) => {}
             }
             200
         }
@@ -145,6 +170,19 @@ fn ask(sh: &Shared, writer: &mut UnixStream, head: &Head, method: &str, body: &[
     let said = if status == 200 { NOBODY } else { "refused" };
     wire::respond(writer, status, "text/plain", said.as_bytes(), keep)?;
     Ok(keep)
+}
+
+/// Whether the asker closed its held call: it ended, or Claude Code ended its hook. Looked at
+/// without reading or waiting; anything it sent after its call is no sign.
+fn gone(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut byte = [0u8; 1];
+    let read = unsafe { libc::recv(stream.as_raw_fd(), byte.as_mut_ptr().cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    match read {
+        0 => true,
+        n if n > 0 => false,
+        _ => !matches!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted),
+    }
 }
 
 /// Decide what the request becomes upstream, or why it is refused. The model resource's policy
@@ -453,9 +491,9 @@ mod tests {
         assert!(reply.starts_with("HTTP/1.1 200 OK\r\n") && reply.ends_with("\r\n\r\nnobody"), "{reply}");
         let records = desk.notices();
         assert_eq!(records.len(), 1);
-        let notice = crate::notices::Notice::decode(&records[0]).unwrap();
+        let notice = crate::notices::Notice::decode(&records[0].0).unwrap();
         assert_eq!((notice.box_name.as_str(), notice.session, notice.kind), ("dev", 1, crate::notices::Kind::TurnEnded));
-        assert!(!records[0].windows(7).any(|w| w == b"PLANTED" || w == b"session"));
+        assert!(!records[0].0.windows(7).any(|w| w == b"PLANTED" || w == b"session") && records[0].1.is_empty());
         // Working closes it.
         assert!(exchanged(&sh, &post_ask(&Ask::bytes(b"working", b"session-tag", b""))).ends_with("nobody"));
         assert!(desk.notices().is_empty());
@@ -489,6 +527,90 @@ mod tests {
         let alone = Shared::new(super::super::Config { requests: None, ..door_of(&dir.0, &desk).cfg }, super::super::addr::Net::system()).unwrap();
         assert!(exchanged(&alone, &post_ask(&Ask::bytes(b"question", b"t", b""))).ends_with("nobody"));
         assert!(desk.notices().is_empty());
+    }
+
+    /// A desk whose questions go to one phone, trusted for acme in a link's folder under `dir`.
+    fn asking_desk(dir: &std::path::Path) -> std::sync::Arc<crate::requests::Desk> {
+        struct One(halti_core::sealed::AgreementKey, crate::requests::Trusted);
+        impl crate::requests::Phones for One {
+            fn trusted(&self) -> Vec<(crate::requests::Trusted, Option<halti_core::sealed::AgreementKey>)> {
+                vec![(self.1.clone(), Some(self.0))]
+            }
+            fn machine_key(&self) -> Option<halti_core::sealed::SecretKey> {
+                Some(halti_core::sealed::SecretKey::derive(&[1; 32]))
+            }
+        }
+        use rcgen::PublicKeyData;
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let spki = key.subject_public_key_info();
+        let trusted =
+            crate::requests::Trusted { name: "pixel".into(), key: halti_core::device::DeviceKey::from_spki(&spki).unwrap(), fingerprint: "f".into(), ws: vec!["acme".into()] };
+        let _ = dir;
+        let limits = crate::requests::Limits { notice_delay: Duration::ZERO, ..crate::requests::LIMITS };
+        crate::requests::Desk::with_phones(
+            "mac-1".into(),
+            "acme".into(),
+            limits,
+            std::sync::Arc::new(Unshown),
+            Box::new(One(halti_core::sealed::SecretKey::derive(&[2; 32]).public(), trusted)),
+        )
+    }
+
+    #[test]
+    fn a_newer_ask_in_a_run_marked_away_is_held_until_answered_and_logged_without_its_text() {
+        use crate::questions::{Form, Record};
+        let dir = crate::util::TempDir::new("halti-gateway-held").unwrap();
+        let desk = asking_desk(&dir.0);
+        let sh = door_of(&dir.0, &desk);
+        // Not marked away: nobody, at once, as for an older asker.
+        let text = crate::fields::join(&[&[0, 0, 0, 0], b"Bash", br#"{"command":"cat SECRET-PLAN"}"#]);
+        let reply = exchanged(&sh, &post_ask(&Ask::bytes_v2(b"permit", b"tag", &text)));
+        assert!(reply.ends_with("\r\n\r\nnobody"), "{reply}");
+        desk.set_away(crate::requests::RunId([7; 8]), Some(crate::requests::now_secs() + 3600));
+        // Marked away: the call is held, and the answer given here is written on it.
+        let (mut guest, door) = UnixStream::pair().unwrap();
+        guest.write_all(&post_ask(&Ask::bytes_v2(b"permit", b"tag", &text))).unwrap();
+        let serving = std::thread::spawn(move || serve(&sh, BufReader::new(door.try_clone().unwrap()), door));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while desk.questions().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "never asked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let id = Record::decode(&desk.questions()[0].0).unwrap().id;
+        assert_eq!(desk.answer_question_here(id, Form::Yes, b""), crate::questions::Outcome::Delivered);
+        let mut reply = Vec::new();
+        guest.read_to_end(&mut reply).unwrap();
+        serving.join().unwrap();
+        let body = crate::questions::reply(Form::Yes, b"");
+        assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n") && reply.ends_with(&body), "{}", String::from_utf8_lossy(&reply));
+        // One line is logged of it: who, which question, its kind and the form, and no text.
+        let log = std::fs::read_to_string(dir.0.join("door.log")).unwrap();
+        let line = log.lines().find(|line| line.contains("\"kind\":\"question\"")).unwrap();
+        for word in ["\"decision\":\"answered:yes\"", "\"by\":\"local\"", "\"question\":\"permit\"", &format!("\"request\":\"{}\"", id.hex()), "\"asked\":\""] {
+            assert!(line.contains(word), "{word} in {line}");
+        }
+        assert!(!log.contains("SECRET") && !log.contains("npm") && !log.contains("Bash"), "{log}");
+    }
+
+    #[test]
+    fn a_held_ask_the_asker_closes_is_withdrawn() {
+        let dir = crate::util::TempDir::new("halti-gateway-gone").unwrap();
+        let desk = asking_desk(&dir.0);
+        let sh = door_of(&dir.0, &desk);
+        desk.set_away(crate::requests::RunId([7; 8]), Some(crate::requests::now_secs() + 3600));
+        let text = crate::fields::join(&[&[0, 0, 0, 0], b"done"]);
+        let (mut guest, door) = UnixStream::pair().unwrap();
+        guest.write_all(&post_ask(&Ask::bytes_v2(b"turn-ended", b"tag", &text))).unwrap();
+        let serving = std::thread::spawn(move || serve(&sh, BufReader::new(door.try_clone().unwrap()), door));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while desk.questions().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "never asked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Claude Code ends the hook: its call closes, and the question goes.
+        drop(guest);
+        serving.join().unwrap();
+        assert!(desk.questions().is_empty());
     }
 
     struct Unshown;

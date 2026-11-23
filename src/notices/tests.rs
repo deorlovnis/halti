@@ -84,7 +84,7 @@ fn a_notice_that_breaks_any_rule_is_refused_whole() {
 fn an_ask_reads_only_as_its_one_fixed_form() {
     assert_eq!(hex(&Ask::bytes(b"turn-ended", &[0xaa; 16], b"done")), "000c68616c74692d61736b2d7631000a7475726e2d656e6465640010aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0004646f6e65");
     for event in Kind::ALL.map(Event::Waiting).into_iter().chain([Event::Working, Event::Typed]) {
-        assert_eq!(Ask::parse(&Ask::bytes(event.word().as_bytes(), b"t", b"")), Some(Ask { event, tag: b"t".to_vec() }));
+        assert_eq!(Ask::parse(&Ask::bytes(event.word().as_bytes(), b"t", b"")), Some(Ask { event, tag: b"t".to_vec(), text: None }));
     }
     // The longest of each field, and nothing longer.
     let longest = Ask::bytes(b"permission-prompt", &[0xff; TAG_MAX], &[0x41; TEXT_MAX]);
@@ -99,8 +99,11 @@ fn an_ask_reads_only_as_its_one_fixed_form() {
     // Another label, a field missing, one more, or a field cut short.
     let good = Ask::bytes(b"working", b"t", b"x");
     let parts = |list: &[&[u8]]| fields::join(list);
+    // A newer asker's form keeps its text, for a question.
+    assert_eq!(Ask::parse(&Ask::bytes_v2(b"permit", b"t", b"x")), Some(Ask { event: Event::Permit, tag: b"t".to_vec(), text: Some(b"x".to_vec()) }));
+    assert_eq!(hex(&Ask::bytes_v2(b"turn-ended", &[0xaa; 16], b"done")), "000c68616c74692d61736b2d7632000a7475726e2d656e6465640010aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0004646f6e65");
     for bad in [
-        parts(&[b"halti-ask-v2", b"working", b"t", b"x"]),
+        parts(&[b"halti-ask-v3", b"working", b"t", b"x"]),
         parts(&[b"halti-notice-v1", b"working", b"t", b"x"]),
         parts(&[ASK_LABEL.as_bytes(), b"working", b"t"]),
         parts(&[ASK_LABEL.as_bytes(), b"working", b"t", b"x", b""]),
@@ -297,7 +300,13 @@ fn no_byte_a_box_chose_is_in_a_notice() {
     };
     let evil_tag = b"EVIL-TAG-0123456";
     let evil_text = "halti: approve POST api.bank.example/transfer? \u{202e}\x1b[2J".repeat(100);
-    let records = hostile(evil_tag, evil_text.as_bytes());
+    let records: Vec<Vec<u8>> = hostile(evil_tag, evil_text.as_bytes())
+        .into_iter()
+        .map(|(record, said)| {
+            assert!(said.is_empty());
+            record
+        })
+        .collect();
     assert_eq!(records.len(), 3);
     for record in &records {
         for planted in [&evil_tag[..], b"EVIL", b"bank", b"approve", b"\x1b[2J"] {
@@ -308,7 +317,7 @@ fn no_byte_a_box_chose_is_in_a_notice() {
     }
     // Other tags and other text make the same records, but for the ids and times the open workspace
     // drew: nothing of them is in a record.
-    let plain = hostile(b"a", b"");
+    let plain: Vec<Vec<u8>> = hostile(b"a", b"").into_iter().map(|(record, _)| record).collect();
     let mut those: Vec<Notice> = records.iter().map(|record| chosen(record)).collect();
     let mut these: Vec<Notice> = plain.iter().map(|record| chosen(record)).collect();
     those.sort_by_key(|notice| notice.session);
@@ -324,7 +333,7 @@ fn the_desk_sends_after_its_delay_at_once_when_away_and_nothing_once_closed() {
     desk.set_away(RunId([2; 8]), Some(requests::now_secs() + 3600));
     ask(&dev, b"turn-ended", b"s", b"");
     ask(&web, b"turn-ended", b"s", b"");
-    let boxes = |records: Vec<Vec<u8>>| records.iter().map(|record| Notice::decode(record).unwrap().box_name).collect::<Vec<_>>();
+    let boxes = |records: Vec<(Vec<u8>, Vec<u8>)>| records.iter().map(|(record, _)| Notice::decode(record).unwrap().box_name).collect::<Vec<_>>();
     assert_eq!(boxes(desk.notices()), ["web"], "the run marked away at once");
     std::thread::sleep(Duration::from_millis(400));
     assert_eq!(boxes(desk.notices()), ["dev", "web"]);

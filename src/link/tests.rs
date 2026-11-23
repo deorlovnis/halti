@@ -192,6 +192,13 @@ impl World {
         self.opened(ws, keeper);
     }
 
+    /// Opens workspace `ws` here, its questions asking the phones this machine trusts.
+    fn open_asking(&mut self, ws: &str) {
+        let desk = Desk::with_phones(MACHINE.into(), ws.into(), sent_at_once(), Arc::new(Nobody), Box::new(requests::LinkFiles(self.folder.clone())));
+        let keeper = Keeper::start_with(&self.dir.0, &self.folder, ws, desk);
+        self.opened(ws, keeper);
+    }
+
     fn opened(&mut self, ws: &str, keeper: Keeper) {
         self.locals.0.lock().unwrap().push((WsName::parse(ws).unwrap(), Some(keeper.socket.clone())));
         self.keepers.push((ws.to_string(), keeper));
@@ -945,7 +952,7 @@ fn a_workspace_opened_before_the_join_takes_signed_stops_once_joined() {
     // names this machine by its host, as records do.
     assert!(world.folder.leave().unwrap());
     let folder = world.folder.clone();
-    let desk = Desk::following(move || requests::machine_name_in(&folder), "acme".into(), limits(), Arc::new(Nobody));
+    let desk = Desk::following(move || requests::machine_name_in(&folder), "acme".into(), limits(), Arc::new(Nobody), Box::new(requests::NoPhones));
     let host = requests::machine_name_in(&world.folder);
     let keeper = Keeper::start_with(&world.dir.0, &world.folder, "acme", desk);
     world.opened("acme", keeper);
@@ -1236,4 +1243,75 @@ fn a_notice_follows_trust_while_it_is_open() {
     assert!(untrust_at(&world.folder, "pixel").unwrap());
     until("pixel no longer lists it", || pixel.notices(&world.hub).is_empty());
     assert_eq!(listed(&world, &tablet).0.len(), 1);
+}
+
+// --- agents' questions ---
+
+#[test]
+fn a_question_reaches_the_phone_sealed_and_its_answer_comes_back_with_a_receipt() {
+    use crate::questions::{self, Answer, Form, Outcome};
+    let mut world = World::new();
+    world.open_asking("acme");
+    let pixel = world.hub.pair_phone("pixel", &["acme"]);
+    world.trust(&pixel, &["acme"]);
+    let run = RunId([3; 8]);
+    let desk = world.keeper("acme").desk.clone();
+    desk.set_away(run, Some(requests::now_secs() + 3600));
+    // The hub can't be reached as the agent asks: the question waits, and is posted when it can.
+    world.hub.reachable(false);
+    let asker = desk.asker("dev", run);
+    let text = crate::fields::join(&[&[0, 0, 0, 0], b"Bash", br#"{"command":"npm test"}"#]);
+    let held = thread::spawn(move || asker.ask(crate::notices::Event::Permit, b"tag", &text, &|| false));
+    until("the question waits", || desk.questions().len() == 1);
+    thread::sleep(Duration::from_millis(500));
+    world.hub.reachable(true);
+    let questions = || world.hub.call("GET", "/v1/questions", Some(&pixel.token), None).1["questions"].as_array().unwrap().clone();
+    until("the phone lists it", || questions().len() == 1);
+    // A hub that restarts has none, and is given it again.
+    world.hub.restart();
+    until("the phone lists it again", || questions().len() == 1);
+    let listed = &questions()[0];
+    let bytes = |field: &str| util::unhex(listed[field].as_str().unwrap()).unwrap();
+    let (clear, copy) = (bytes("record"), bytes("sealed"));
+    let state = pixel.state(&world.hub);
+    let machine_key = AgreementKey::from_spki(&util::unhex(state["machines"][0]["key"].as_str().unwrap()).unwrap()).unwrap();
+    let opened = sealed::open(Kind::Question, &pixel.second_key(), &machine_key, &clear, &copy).unwrap();
+    let whole = [clear.as_slice(), &opened].concat();
+    let (record, _, reply_key, _) = questions::open_whole(&whole).unwrap();
+    // The phone signs and seals its yes to the question's reply key.
+    let salt: [u8; 16] = util::random();
+    let signed = questions::signed_bytes(&questions::hash(&clear, &opened), Form::Yes, &salt, b"");
+    let answer = Answer { form: Form::Yes, salt, content: Vec::new(), signature: pixel.sign(&signed) };
+    let sealed = sealed::seal(Kind::Answer, &pixel.second_key(), &AgreementKey::from_spki(&reply_key).unwrap(), &clear, &answer.encode(), &util::random()).unwrap();
+    let (status, reply) = world.hub.call("POST", "/v1/reply", Some(&pixel.token), Some(&json!({"machine": MACHINE, "id": record.id.hex(), "sealed": util::hex(&sealed)})));
+    assert_eq!(status, 202, "{reply}");
+    let n = reply["n"].as_u64().unwrap();
+    assert!(matches!(held.join().unwrap(), requests::Asked::Answered { .. }));
+    assert_eq!(world.said(&pixel, n), "delivered");
+    // The receipt opens under the machine key, for this answer; the hub could make none.
+    let sent = pixel.state(&world.hub)["sent"].as_array().unwrap().iter().find(|sent| sent["n"] == n).unwrap().clone();
+    let receipt = util::unhex(sent["receipt"].as_str().unwrap()).unwrap();
+    let said = sealed::open(Kind::Receipt, &pixel.second_key(), &machine_key, &questions::receipt_clear(MACHINE, "acme", record.id), &receipt).unwrap();
+    let signed_hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&signed).into();
+    assert_eq!(said.as_slice(), questions::receipt_fields(&signed_hash, Outcome::Delivered));
+    until("the question is closed at the hub", || questions().is_empty());
+    // Sent again, it is not pending, and its receipt says so.
+    let (_, reply) = world.hub.call("POST", "/v1/reply", Some(&pixel.token), Some(&json!({"machine": MACHINE, "id": record.id.hex(), "sealed": util::hex(&sealed)})));
+    assert_eq!(reply, json!({"error": "gone"}), "the hub holds it no more");
+}
+
+#[test]
+fn a_reply_from_a_phone_not_trusted_here_gets_no_receipt() {
+    let mut world = World::new();
+    world.open_asking("acme");
+    let pixel = world.hub.pair_phone("pixel", &["acme"]);
+    // Handed straight to the open workspace, as a broken hub might: a phone not trusted here gets
+    // no receipt, as there is no key to seal one to.
+    let told =
+        keep::tell(&world.keeper("acme").socket, &Records::Reply { ws: WsName::parse("acme").unwrap(), device: "pixel".into(), id: Id([1; 16]), sealed: vec![4; 100] }, LONG);
+    assert_eq!(told, Some(Told::Refused));
+    world.trust(&pixel, &["acme"]);
+    let told =
+        keep::tell(&world.keeper("acme").socket, &Records::Reply { ws: WsName::parse("acme").unwrap(), device: "pixel".into(), id: Id([1; 16]), sealed: vec![4; 100] }, LONG);
+    assert!(matches!(told, Some(Told::Receipt(crate::questions::Outcome::NotPending, _))), "{told:?}");
 }

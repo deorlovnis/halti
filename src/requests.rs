@@ -38,8 +38,15 @@
 //! mark doesn't shorten a request that waits already.
 //!
 //! The desk also keeps the notices that an agent in one of its boxes waits for its owner
-//! (`crate::notices`), which the door's asker call reports. They are apart from requests: no notice
+//! (`crate::notices`), which the door's asker call reports, and the questions of agents in runs
+//! marked away (`crate::questions`, `asked`). They are apart from requests: no notice or question
 //! holds up, replaces or counts against a request, nor the other way round.
+
+mod asked;
+
+pub use asked::{Asked, LinkFiles, Phones};
+#[cfg(test)]
+pub use asked::{NoPhones, PER_DESK as QUESTIONS_PER_DESK};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -494,6 +501,9 @@ struct Table {
     away: HashMap<RunId, u64>,
     /// The notices that agents in its boxes wait.
     notices: notices::Table,
+    /// The questions of agents in runs marked away, and what came of the last ones that closed.
+    questions: Vec<asked::Pending>,
+    closed_questions: VecDeque<(Id, crate::questions::Outcome)>,
     closed: bool,
 }
 
@@ -505,6 +515,8 @@ pub struct Desk {
     ws: String,
     limits: Limits,
     prompt: Arc<dyn Prompt>,
+    /// The phones a question goes to, and the key it is sealed by.
+    phones: Box<dyn Phones>,
     table: Mutex<Table>,
     /// Told whenever a request is raised, answered or goes.
     changed: Condvar,
@@ -520,13 +532,29 @@ impl Desk {
     /// A desk whose records name this machine `machine`.
     #[cfg(test)]
     pub fn new(machine: String, ws: String, limits: Limits, prompt: Arc<dyn Prompt>) -> Arc<Desk> {
-        Desk::following(move || machine.clone(), ws, limits, prompt)
+        Desk::following(move || machine.clone(), ws, limits, prompt, Box::new(NoPhones))
+    }
+
+    /// As `new`, asking these phones.
+    #[cfg(test)]
+    pub fn with_phones(machine: String, ws: String, limits: Limits, prompt: Arc<dyn Prompt>, phones: Box<dyn Phones>) -> Arc<Desk> {
+        Desk::following(move || machine.clone(), ws, limits, prompt, phones)
     }
 
     /// A desk whose records name this machine as `machine` says at the time: `machine_name`, so
-    /// that a join while the workspace is open counts from then on.
-    pub fn following(machine: impl Fn() -> String + Send + Sync + 'static, ws: String, limits: Limits, prompt: Arc<dyn Prompt>) -> Arc<Desk> {
-        Arc::new(Desk { machine: Box::new(machine), ws, limits, prompt, table: Mutex::default(), changed: Condvar::new(), counted: Mutex::default(), counted_done: Condvar::new() })
+    /// that a join while the workspace is open counts from then on. Its questions go to `phones`.
+    pub fn following(machine: impl Fn() -> String + Send + Sync + 'static, ws: String, limits: Limits, prompt: Arc<dyn Prompt>, phones: Box<dyn Phones>) -> Arc<Desk> {
+        Arc::new(Desk {
+            machine: Box::new(machine),
+            ws,
+            limits,
+            prompt,
+            phones,
+            table: Mutex::default(),
+            changed: Condvar::new(),
+            counted: Mutex::default(),
+            counted_done: Condvar::new(),
+        })
     }
 
     /// What `records`, a signed answer or stop, comes to: what `work` says the first time, and
@@ -577,15 +605,30 @@ impl Desk {
     }
 
     /// Marks run `run` away until `until`, seconds since 1970, or clears its mark with None. A
-    /// request that waits already keeps its wait.
+    /// request that waits already keeps its wait. A notice of the run open now comes back at once,
+    /// as its wait began before the mark; clearing the mark withdraws the run's questions.
     pub fn set_away(&self, run: RunId, until: Option<u64>) {
         let now = now_secs();
         let mut table = self.table();
         table.away.retain(|_, until| *until > now);
         match until {
-            Some(until) => table.away.insert(run, until),
-            None => table.away.remove(&run),
+            Some(until) => {
+                table.away.insert(run, until);
+                table.notices.before_away(run, Instant::now());
+            }
+            None => {
+                table.away.remove(&run);
+                table.withdraw(|pending| pending.record.run == run, |_| Some(notices::Reason::NotAway));
+            }
         };
+        drop(table);
+        self.changed.notify_all();
+    }
+
+    /// The runs marked away now, each with when its mark ends.
+    pub fn marks(&self) -> Vec<(RunId, u64)> {
+        let now = now_secs();
+        self.table().away.iter().filter(|(_, until)| **until > now).map(|(run, until)| (*run, *until)).collect()
     }
 
     /// When the away mark of run `run` ends, if it has one that hasn't.
@@ -600,6 +643,7 @@ impl Desk {
     pub fn close(&self) {
         let mut table = self.table();
         table.closed = true;
+        table.withdraw(|_| true, |_| None);
         table.notices.clear();
         drop(table);
         self.changed.notify_all();
@@ -612,12 +656,20 @@ impl Desk {
             return;
         }
         let now = notices::Now { instant: Instant::now(), secs: now_secs() };
+        table.told(run, event, tag);
+        // A question replaces its session's notice while it waits.
+        if matches!(event, Event::Waiting(_)) && table.has_question(run, tag) {
+            return;
+        }
         let away = table.away.get(&run).is_some_and(|until| *until > now.secs);
         table.notices.tell(box_name, run, event, tag, away, self.limits.notice_delay, self.limits.notices_per_box, now);
+        drop(table);
+        self.changed.notify_all();
     }
 
-    /// The records of the notices that are sent now: open, and past their delay.
-    pub fn notices(&self) -> Vec<Vec<u8>> {
+    /// The notices that are sent now, open and past their delay: each its record, and the text it
+    /// is sealed with, empty or the reason it came back (`notices::Reason`).
+    pub fn notices(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let due = self.table().notices.due(Instant::now());
         let machine = (self.machine)();
         due.into_iter()
@@ -632,14 +684,18 @@ impl Desk {
                     id: open.id,
                     since: open.since,
                 };
-                notice.encode().ok()
+                Some((notice.encode().ok()?, open.reason.map(notices::Reason::said).unwrap_or_default()))
             })
             .collect()
     }
 
-    /// Closes the notices of run `run`, which ended.
+    /// Closes the notices and withdraws the questions of run `run`, which ended.
     pub fn end_run(&self, run: RunId) {
-        self.table().notices.end_run(run);
+        let mut table = self.table();
+        table.withdraw(|pending| pending.record.run == run, |_| None);
+        table.notices.end_run(run);
+        drop(table);
+        self.changed.notify_all();
     }
 
     /// A phone's answer: `yes` or not, to request `id`, signed by the device named `device`. It
@@ -919,7 +975,27 @@ fn runs_named(runs: usize) -> String {
 pub fn told(desk: &Arc<Desk>, trust: Trust, boxes: &dyn Runs, records: &Records) -> Vec<Told> {
     match records {
         Records::List(_) => desk.records().into_iter().map(Told::Request).chain([Told::End]).collect(),
-        Records::Notices(_) => desk.notices().into_iter().map(Told::Notice).chain([Told::End]).collect(),
+        Records::Notices(_) => desk.notices().into_iter().map(|(record, said)| Told::Notice(record, said)).chain([Told::End]).collect(),
+        Records::Questions(_) => {
+            let mut lines = Vec::new();
+            for (record, copies) in desk.questions() {
+                lines.push(Told::Question(record));
+                lines.extend(copies.into_iter().map(|(device, sealed)| Told::Copy(device, sealed)));
+            }
+            lines.push(Told::End);
+            lines
+        }
+        Records::Asked(_) => desk.asked().into_iter().map(Told::Asked).chain([Told::End]).collect(),
+        Records::Marks(_) => {
+            let running = boxes.runs();
+            let marks = desk.marks();
+            running.into_iter().filter_map(|(name, run)| marks.iter().find(|(marked, _)| *marked == run).map(|(_, until)| Told::Mark(name, *until))).chain([Told::End]).collect()
+        }
+        Records::Here { id, form, content, .. } => vec![Told::Receipt(desk.answer_question_here(*id, *form, content), None)],
+        Records::Reply { device, id, sealed, .. } => {
+            let (outcome, receipt) = desk.reply(device, *id, sealed);
+            vec![if receipt.is_none() && outcome == crate::questions::Outcome::Untrusted { Told::Refused } else { Told::Receipt(outcome, receipt) }]
+        }
         Records::Runs(_) => boxes.runs().into_iter().map(|(name, run)| Told::Run(name, run)).chain([Told::End]).collect(),
         Records::Answer(_, yes, digest) => vec![told_by(desk.answer_here(*yes, digest))],
         Records::Signed { device, yes, id, signature, .. } => vec![desk.once(records, || told_by(desk.answer_signed(trust, device, *yes, *id, signature)))],
@@ -961,6 +1037,12 @@ impl Asker {
     /// What the asker in the box reported for its session `tag` (`crate::notices`).
     pub fn tell(&self, event: Event, tag: &[u8]) {
         self.desk.tell(&self.box_name, self.run, event, tag);
+    }
+
+    /// What a newer asker reported, with the text its hook showed: held as a question in a run
+    /// marked away, until what it is told (`asked`). `gone` says its call was closed.
+    pub fn ask(&self, event: Event, tag: &[u8], text: &[u8], gone: &dyn Fn() -> bool) -> Asked {
+        self.desk.ask(&self.box_name, self.run, event, tag, text, gone)
     }
 }
 

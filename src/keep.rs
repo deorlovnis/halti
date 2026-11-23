@@ -12,7 +12,8 @@
 //! ```
 //!
 //! `away` marks the run of the box that runs now away for SECS seconds (60 to 86400), or clears its
-//! mark: its requests wait longer for an answer (`crate::requests`). It is answered `away UNTIL`,
+//! mark: its requests wait longer for an answer (`crate::requests`), and its agents' waits are
+//! questions a phone may answer (`crate::questions`). It is answered `away UNTIL`,
 //! seconds since 1970, or `away off`; `idle` if the box doesn't run.
 //!
 //! `mcp` is answered `serving`, and from then on the connection is an agent's MCP session of the
@@ -40,8 +41,18 @@
 //!         | "halti-keep/2 runs " WS "\n"                      the boxes that run, by run id
 //!         | "halti-keep/2 signed " WS " " DEVICE " " ("yes" | "no") " " ID " " SIGNATURE "\n"
 //!         | "halti-keep/2 stop " WS " " DEVICE " " BOX ":" RUN *("," BOX ":" RUN) " " SIGNATURE "\n"
+//!         | "halti-keep/2 questions " WS "\n"                 the questions that wait, sealed
+//!         | "halti-keep/2 asked " WS "\n"                     the same, whole, for halti requests
+//!         | "halti-keep/2 here " WS " " ID " " FORM " " (HEX | "-") "\n"
+//!         | "halti-keep/2 reply " WS " " DEVICE " " ID " " SEALED "\n"
+//!         | "halti-keep/2 marks " WS "\n"                     the runs marked away
 //! reply   = *("halti-keep/2 request " HEX "\n") "halti-keep/2 end\n"
-//!         | *("halti-keep/2 notice " HEX "\n") "halti-keep/2 end\n"
+//!         | *("halti-keep/2 notice " HEX [" " HEX] "\n") "halti-keep/2 end\n"
+//!         | *("halti-keep/2 question " HEX "\n" *("halti-keep/2 copy " DEVICE " " HEX "\n"))
+//!           "halti-keep/2 end\n"
+//!         | *("halti-keep/2 asked " HEX "\n") "halti-keep/2 end\n"
+//!         | *("halti-keep/2 mark " BOX " " UNTIL "\n") "halti-keep/2 end\n"
+//!         | "halti-keep/2 receipt " OUTCOME [" " HEX] "\n"
 //!         | *("halti-keep/2 run " BOX " " RUN "\n") "halti-keep/2 end\n"
 //!         | "halti-keep/2 " ("approved" | "denied" | "gone" | "declined" | "busy" | "refused"
 //!                           | "other") "\n"
@@ -57,6 +68,16 @@
 //! `stopped` says how many boxes the stop put away, then how many of the runs it named run here in
 //! another box than the one named with them, which it left running. Still no passphrase, key or
 //! value crosses.
+//!
+//! The questions of agents in runs marked away (`crate::questions`) cross as their clear fields,
+//! each followed by a copy sealed to each phone trusted for the workspace; `asked` gives them whole,
+//! their text in the clear, for `halti requests` as the same user. A notice that came back from a
+//! question carries its reason (`notices::Reason`) as a second HEX. `here` is an answer from
+//! `halti requests`: the question's 32 hex characters of id, the form, and its content in hex, `-`
+//! for none. `reply` is a phone's sealed answer, as the link hands it on; both are answered with
+//! the outcome's word (`questions::Outcome`), and a reply with the receipt sealed to that phone,
+//! unless the phone isn't trusted here at all. A line about questions may be 8 KiB long, and an
+//! answer to one 32 KiB.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -73,6 +94,7 @@ use halti_core::boxkey::check_box;
 use halti_core::ids::WsName;
 use halti_core::item::ItemKey;
 
+use crate::questions::{Form, Outcome};
 use crate::requests::{Id, RunId};
 use crate::util;
 
@@ -82,10 +104,11 @@ const VERSION: &str = "halti-keep/1";
 const RECORDS: &str = "halti-keep/2";
 /// The longest line, its newline included.
 pub const LINE_MAX: usize = 128;
-/// The longest line that answers a request about requests: one record, in hex.
-const RECORD_LINE_MAX: usize = 8192;
-/// The longest line that asks about requests: a signed stop of the most runs.
-pub const RECORDS_REQUEST_MAX: usize = 2048;
+/// The longest line that answers a request about requests: one record, or one sealed copy of a
+/// question, in hex.
+const RECORD_LINE_MAX: usize = 32 * 1024;
+/// The longest line that asks about requests: a phone's sealed answer, in hex.
+pub const RECORDS_REQUEST_MAX: usize = 8 * 1024;
 /// The most runs one stop names.
 pub const STOP_RUNS_MAX: usize = 32;
 /// How long the open workspace waits for a request's line.
@@ -348,6 +371,16 @@ pub enum Records {
     Signed { ws: WsName, device: String, yes: bool, id: Id, signature: Vec<u8> },
     /// A device's signed stop of these runs, each with the box the device named it with.
     Stop { ws: WsName, device: String, runs: Vec<(String, RunId)>, signature: Vec<u8> },
+    /// Say every question that waits, sealed to each phone.
+    Questions(WsName),
+    /// Say every question that waits, whole.
+    Asked(WsName),
+    /// An answer from this machine to the question with this id.
+    Here { ws: WsName, id: Id, form: Form, content: Vec<u8> },
+    /// A device's sealed answer to the question with this id.
+    Reply { ws: WsName, device: String, id: Id, sealed: Vec<u8> },
+    /// Say every run marked away.
+    Marks(WsName),
 }
 
 /// A device's signature as a line carries it: 1 to 72 bytes.
@@ -359,7 +392,17 @@ impl Records {
     /// The workspace it names.
     pub fn ws(&self) -> &WsName {
         match self {
-            Records::List(ws) | Records::Notices(ws) | Records::Answer(ws, _, _) | Records::Runs(ws) | Records::Signed { ws, .. } | Records::Stop { ws, .. } => ws,
+            Records::List(ws)
+            | Records::Notices(ws)
+            | Records::Answer(ws, _, _)
+            | Records::Runs(ws)
+            | Records::Signed { ws, .. }
+            | Records::Stop { ws, .. }
+            | Records::Questions(ws)
+            | Records::Asked(ws)
+            | Records::Here { ws, .. }
+            | Records::Reply { ws, .. }
+            | Records::Marks(ws) => ws,
         }
     }
 
@@ -375,6 +418,14 @@ impl Records {
                 let runs: Vec<String> = runs.iter().map(|(name, run)| format!("{name}:{}", run.hex())).collect();
                 format!("{RECORDS} stop {ws} {device} {} {}\n", runs.join(","), util::hex(signature))
             }
+            Records::Questions(ws) => format!("{RECORDS} questions {ws}\n"),
+            Records::Asked(ws) => format!("{RECORDS} asked {ws}\n"),
+            Records::Here { ws, id, form, content } => {
+                let content = if content.is_empty() { "-".to_string() } else { util::hex(content) };
+                format!("{RECORDS} here {ws} {} {} {content}\n", id.hex(), form.word())
+            }
+            Records::Reply { ws, device, id, sealed } => format!("{RECORDS} reply {ws} {device} {} {}\n", id.hex(), util::hex(sealed)),
+            Records::Marks(ws) => format!("{RECORDS} marks {ws}\n"),
         }
     }
 
@@ -409,6 +460,21 @@ impl Records {
                 }
                 Some(Records::Stop { ws: WsName::parse(ws).ok()?, device: device(name)?, runs, signature: signature(sig)? })
             }
+            ["questions", ws] => Some(Records::Questions(WsName::parse(ws).ok()?)),
+            ["asked", ws] => Some(Records::Asked(WsName::parse(ws).ok()?)),
+            ["marks", ws] => Some(Records::Marks(WsName::parse(ws).ok()?)),
+            ["here", ws, id, form, content] => Some(Records::Here {
+                ws: WsName::parse(ws).ok()?,
+                id: Id(util::unhex(id)?.try_into().ok()?),
+                form: Form::parse(form.as_bytes())?,
+                content: if content == "-" { Vec::new() } else { util::unhex(content).filter(|bytes| !bytes.is_empty())? },
+            }),
+            ["reply", ws, name, id, sealed] => Some(Records::Reply {
+                ws: WsName::parse(ws).ok()?,
+                device: device(name)?,
+                id: Id(util::unhex(id)?.try_into().ok()?),
+                sealed: util::unhex(sealed).filter(|bytes| !bytes.is_empty())?,
+            }),
             _ => None,
         }
     }
@@ -419,8 +485,19 @@ impl Records {
 pub enum Told {
     /// One request that waits: its record.
     Request(Vec<u8>),
-    /// One notice that is sent now: its record.
-    Notice(Vec<u8>),
+    /// One notice that is sent now: its record, and the text it is sealed with, empty or the reason
+    /// it came back.
+    Notice(Vec<u8>, Vec<u8>),
+    /// One question that waits: its clear fields.
+    Question(Vec<u8>),
+    /// A copy of the question before it, sealed to the device named.
+    Copy(String, Vec<u8>),
+    /// One question that waits, whole.
+    Asked(Vec<u8>),
+    /// A run marked away, by its box, and when its mark ends.
+    Mark(String, u64),
+    /// What came of an answer to a question, and for a phone's the receipt sealed to it.
+    Receipt(Outcome, Option<Vec<u8>>),
     /// One box that runs, and its run.
     Run(String, RunId),
     /// No more requests wait, or no more boxes run.
@@ -449,7 +526,14 @@ impl Told {
     pub fn line(&self) -> String {
         let words = match self {
             Told::Request(record) => format!("request {}", util::hex(record)),
-            Told::Notice(record) => format!("notice {}", util::hex(record)),
+            Told::Notice(record, said) if said.is_empty() => format!("notice {}", util::hex(record)),
+            Told::Notice(record, said) => format!("notice {} {}", util::hex(record), util::hex(said)),
+            Told::Question(record) => format!("question {}", util::hex(record)),
+            Told::Copy(device, sealed) => format!("copy {device} {}", util::hex(sealed)),
+            Told::Asked(record) => format!("asked {}", util::hex(record)),
+            Told::Mark(name, until) => format!("mark {name} {until}"),
+            Told::Receipt(outcome, None) => format!("receipt {}", outcome.word()),
+            Told::Receipt(outcome, Some(sealed)) => format!("receipt {} {}", outcome.word(), util::hex(sealed)),
             Told::Run(name, run) => format!("run {name} {}", run.hex()),
             Told::End => "end".into(),
             Told::Approved => "approved".into(),
@@ -471,7 +555,17 @@ impl Told {
         let count = |text: &str| text.parse::<u32>().ok().filter(|_| text.len() <= 9 && text.bytes().all(|b| b.is_ascii_digit()));
         Some(match words[..] {
             ["request", record] => Told::Request(util::unhex(record).filter(|bytes| !bytes.is_empty())?),
-            ["notice", record] => Told::Notice(util::unhex(record).filter(|bytes| !bytes.is_empty())?),
+            ["notice", record] => Told::Notice(util::unhex(record).filter(|bytes| !bytes.is_empty())?, Vec::new()),
+            ["notice", record, said] => Told::Notice(util::unhex(record).filter(|bytes| !bytes.is_empty())?, util::unhex(said).filter(|bytes| !bytes.is_empty())?),
+            ["question", record] => Told::Question(util::unhex(record).filter(|bytes| !bytes.is_empty())?),
+            ["copy", name, sealed] if crate::fields::is_name(name) => Told::Copy(name.to_string(), util::unhex(sealed).filter(|bytes| !bytes.is_empty())?),
+            ["asked", record] => Told::Asked(util::unhex(record).filter(|bytes| !bytes.is_empty())?),
+            ["mark", name, until] if until.len() <= 19 && until.bytes().all(|b| b.is_ascii_digit()) => {
+                check_box(name).ok()?;
+                Told::Mark(name.to_string(), until.parse().ok()?)
+            }
+            ["receipt", outcome] => Told::Receipt(Outcome::parse(outcome)?, None),
+            ["receipt", outcome, sealed] => Told::Receipt(Outcome::parse(outcome)?, Some(util::unhex(sealed).filter(|bytes| !bytes.is_empty())?)),
             ["run", name, run] => {
                 check_box(name).ok()?;
                 Told::Run(name.to_string(), RunId::parse(run)?)
@@ -644,16 +738,68 @@ pub fn list(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<Vec<u
     }
 }
 
-/// The records of the notices the open workspace `ws` at `path` sends now. None if nothing
-/// answered in time, or not as a list does; `Other` as an error word.
-pub fn notices(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<Vec<u8>>, Told>> {
+/// The notices the open workspace `ws` at `path` sends now, each its record and the text it is
+/// sealed with. None if nothing answered in time, or not as a list does; `Other` as an error word.
+pub fn notices(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<NoticeSaid>, Told>> {
     let mut stream = connect(path)?;
     write_line(&mut stream, &Records::Notices(ws.clone()).line()).ok()?;
     let mut records = Vec::new();
     loop {
         match Told::parse(&read_line_up_to(&mut stream, wait, RECORD_LINE_MAX)?)? {
-            Told::Notice(record) => records.push(record),
+            Told::Notice(record, said) => records.push((record, said)),
             Told::End => return Some(Ok(records)),
+            other => return Some(Err(other)),
+        }
+    }
+}
+
+/// The questions the open workspace `ws` at `path` waits on, each its clear fields and a copy
+/// sealed to each phone. None if nothing answered in time, or not as a list does.
+pub fn questions(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<SealedQuestion>, Told>> {
+    let mut stream = connect(path)?;
+    write_line(&mut stream, &Records::Questions(ws.clone()).line()).ok()?;
+    let mut questions: Vec<SealedQuestion> = Vec::new();
+    loop {
+        match Told::parse(&read_line_up_to(&mut stream, wait, RECORD_LINE_MAX)?)? {
+            Told::Question(record) => questions.push((record, Vec::new())),
+            Told::Copy(device, sealed) => questions.last_mut()?.1.push((device, sealed)),
+            Told::End => return Some(Ok(questions)),
+            other => return Some(Err(other)),
+        }
+    }
+}
+
+/// A notice as the link takes it: its record, and the text it is sealed with.
+pub type NoticeSaid = (Vec<u8>, Vec<u8>);
+
+/// A question as the link takes it: its clear fields, and each phone's name with its copy.
+pub type SealedQuestion = (Vec<u8>, Vec<(String, Vec<u8>)>);
+
+/// The whole records of the questions the open workspace `ws` at `path` waits on. None if nothing
+/// answered in time, or not as a list does.
+pub fn asked(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<Vec<u8>>, Told>> {
+    let mut stream = connect(path)?;
+    write_line(&mut stream, &Records::Asked(ws.clone()).line()).ok()?;
+    let mut records = Vec::new();
+    loop {
+        match Told::parse(&read_line_up_to(&mut stream, wait, RECORD_LINE_MAX)?)? {
+            Told::Asked(record) => records.push(record),
+            Told::End => return Some(Ok(records)),
+            other => return Some(Err(other)),
+        }
+    }
+}
+
+/// The boxes of the open workspace `ws` at `path` whose runs are marked away, each with when its
+/// mark ends. None if nothing answered in time, or not as a list does.
+pub fn marks(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<(String, u64)>, Told>> {
+    let mut stream = connect(path)?;
+    write_line(&mut stream, &Records::Marks(ws.clone()).line()).ok()?;
+    let mut marks = Vec::new();
+    loop {
+        match Told::parse(&read_line(&mut stream, wait)?)? {
+            Told::Mark(name, until) => marks.push((name, until)),
+            Told::End => return Some(Ok(marks)),
             other => return Some(Err(other)),
         }
     }
@@ -666,11 +812,11 @@ pub fn answer(path: &Path, ws: &WsName, yes: bool, digest: [u8; 32], wait: Durat
 }
 
 /// Sends `records`, which one line answers, to the open workspace at `path`: what it says, or None
-/// if nothing answered within `wait`.
+/// if nothing answered within `wait`. The line may hold a receipt.
 pub fn tell(path: &Path, records: &Records, wait: Duration) -> Option<Told> {
     let mut stream = connect(path)?;
     write_line(&mut stream, &records.line()).ok()?;
-    Told::parse(&read_line(&mut stream, wait)?)
+    Told::parse(&read_line_up_to(&mut stream, wait, RECORD_LINE_MAX)?)
 }
 
 /// The boxes the open workspace `ws` at `path` runs, each with its run. None if nothing answered in
@@ -789,11 +935,22 @@ mod tests {
             assert_eq!(Request::parse(line.strip_suffix('\n').unwrap()), None, "never a line of names");
         }
         assert_eq!(Records::List(acme()).line(), "halti-keep/2 list acme\n");
-        assert_eq!((Records::Notices(acme()).line().as_str(), Told::Notice(vec![0xab]).line().as_str()), ("halti-keep/2 notices acme\n", "halti-keep/2 notice ab\n"));
+        assert_eq!((Records::Notices(acme()).line().as_str(), Told::Notice(vec![0xab], Vec::new()).line().as_str()), ("halti-keep/2 notices acme\n", "halti-keep/2 notice ab\n"));
         assert_eq!(Records::Answer(acme(), true, digest).line(), format!("halti-keep/2 answer acme yes {}\n", "ab".repeat(32)));
         // An answer fits a line of a request, with the longest name.
         assert_eq!(Records::Answer(longest, true, digest).line().len(), 122);
-        for told in [Told::Request(vec![0, 1, 0xff]), Told::Notice(vec![2]), Told::End, Told::Approved, Told::Denied, Told::Gone, Told::Declined, Told::Busy, Told::Other] {
+        for told in [
+            Told::Request(vec![0, 1, 0xff]),
+            Told::Notice(vec![2], Vec::new()),
+            Told::Notice(vec![2], vec![3]),
+            Told::End,
+            Told::Approved,
+            Told::Denied,
+            Told::Gone,
+            Told::Declined,
+            Told::Busy,
+            Told::Other,
+        ] {
             let line = told.line();
             assert_eq!(Told::parse(line.strip_suffix('\n').unwrap()), Some(told), "{line}");
         }
@@ -872,6 +1029,62 @@ mod tests {
             "halti-keep/2 stopped 1e3 0",
             "halti-keep/2 stopped 1",
             "halti-keep/2 stopped 1 -1",
+        ] {
+            assert_eq!(Told::parse(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_line_about_questions_reads_only_as_what_was_written() {
+        let longest = WsName::parse(&"w".repeat(32)).unwrap();
+        let reply = Records::Reply { ws: longest.clone(), device: "d".repeat(32), id: Id([0xab; 16]), sealed: vec![4; crate::hub::REPLY_SEALED_MAX] };
+        for records in [
+            Records::Questions(acme()),
+            Records::Asked(acme()),
+            Records::Marks(acme()),
+            Records::Here { ws: acme(), id: Id([1; 16]), form: Form::Yes, content: Vec::new() },
+            Records::Here { ws: acme(), id: Id([1; 16]), form: Form::Text, content: b"run the tests".to_vec() },
+            reply.clone(),
+        ] {
+            let line = records.line();
+            assert_eq!(Records::parse(line.strip_suffix('\n').unwrap()), Some(records), "{line}");
+        }
+        // The longest sealed answer, and the longest answer typed here, fit a line about requests.
+        assert!(reply.line().len() <= RECORDS_REQUEST_MAX, "{}", reply.line().len());
+        let here = Records::Here { ws: longest, id: Id([1; 16]), form: Form::Options, content: vec![0x41; crate::questions::TYPED_MAX + 64] };
+        assert!(here.line().len() <= RECORDS_REQUEST_MAX);
+        assert_eq!(
+            Records::Here { ws: acme(), id: Id([1; 16]), form: Form::Stopped, content: Vec::new() }.line(),
+            format!("halti-keep/2 here acme {} stopped -\n", "01".repeat(16))
+        );
+        for told in [
+            Told::Question(vec![1, 2]),
+            Told::Copy("pixel".into(), vec![3]),
+            Told::Asked(vec![4]),
+            Told::Mark("dev".into(), 1_763_164_800),
+            Told::Receipt(Outcome::Delivered, None),
+            Told::Receipt(Outcome::NotPending, Some(vec![5; 120])),
+        ] {
+            let line = told.line();
+            assert_eq!(Told::parse(line.strip_suffix('\n').unwrap()), Some(told), "{line}");
+        }
+        for line in [
+            "halti-keep/2 here acme 0101 yes -",
+            &format!("halti-keep/2 here acme {} maybe -", "01".repeat(16)),
+            &format!("halti-keep/2 here acme {} text ", "01".repeat(16)),
+            &format!("halti-keep/2 reply acme Pixel {} 04", "01".repeat(16)),
+            &format!("halti-keep/2 reply acme pixel {} -", "01".repeat(16)),
+            "halti-keep/2 questions",
+        ] {
+            assert_eq!(Records::parse(line), None, "{line}");
+        }
+        for line in [
+            "halti-keep/2 copy Pixel 03",
+            "halti-keep/2 copy pixel",
+            "halti-keep/2 mark Dev 1",
+            "halti-keep/2 mark dev -1",
+            "halti-keep/2 receipt done",
+            "halti-keep/2 receipt delivered 0g",
         ] {
             assert_eq!(Told::parse(line), None, "{line}");
         }

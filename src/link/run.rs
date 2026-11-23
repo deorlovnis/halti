@@ -11,10 +11,15 @@
 //!   trust`, never a list. Then it names the open notices to the hub, which closes the rest, and
 //!   posts each the hub lacks, sealed by the machine key to each device trusted for its workspace,
 //!   and again when those devices change. That is the only key it reads, and only to seal: a copy
-//!   is made once, kept while its notice is open, and the key read again for the next.
+//!   is made once, kept while its notice is open, and the key read again for the next. The questions
+//!   of agents in runs marked away come sealed already from the open workspace, which alone can
+//!   read them (`crate::questions`): it names them to the hub, with the phones each is sealed to,
+//!   and posts each copy the hub lacks. So a question asked while the hub can't be reached is
+//!   posted when it can.
 //! - **Inbox.** It holds one call to the hub that waits for what phones sent this machine: signed
-//!   answers and stops. Each goes to the open workspace it names, which checks it, and what came of
-//!   it is said to the hub with the next call. A stop waits until its boxes are put away, so each
+//!   answers and stops, and sealed answers to questions. Each goes to the open workspace it names,
+//!   which checks it, and what came of it is said to the hub with the next call, with the receipt
+//!   the open workspace sealed for the phone if there is one. A stop waits until its boxes are put away, so each
 //!   is handed over on a thread of its own and answers go on meanwhile. An item of a kind this link
 //!   doesn't know is said `unknown`.
 //! - **Socket.** `link.sock` in its folder, 0600, for `halti devices trust` as the same user: lines
@@ -56,9 +61,10 @@ use halti_core::sealed;
 use serde_json::{Value, json};
 
 use super::files::{Entry, Folder, Joined};
-use crate::hub::{BODY_MAX, ITEMS_MAX, NOTICES_MAX, REPORT_IDS_MAX, REPORT_MAX, STATE_BODY_MAX, pin, wire};
+use crate::hub::{BODY_MAX, ITEMS_MAX, NOTICES_MAX, QUESTIONS_MAX, REPORT_IDS_MAX, REPORT_MAX, STATE_BODY_MAX, pin, wire};
 use crate::keep::{self, Records, STOP_RUNS_MAX, Told};
 use crate::notices::Notice;
+use crate::questions;
 use crate::requests::{Id, Record, RunId};
 use crate::util::{self, hex, say};
 
@@ -155,17 +161,35 @@ impl Listed {
 /// What a phone sent this machine, read whole from what the hub handed over: a signed answer, or
 /// a signed stop of runs, each with the box the phone named it with.
 enum Inbound {
-    Answer { ws: WsName, device: String, id: Id, yes: bool, signature: Vec<u8> },
-    Stop { ws: WsName, device: String, runs: Vec<(String, RunId)>, signature: Vec<u8> },
+    Answer {
+        ws: WsName,
+        device: String,
+        id: Id,
+        yes: bool,
+        signature: Vec<u8>,
+    },
+    Stop {
+        ws: WsName,
+        device: String,
+        runs: Vec<(String, RunId)>,
+        signature: Vec<u8>,
+    },
+    /// A sealed answer to a question.
+    Reply {
+        ws: WsName,
+        device: String,
+        id: Id,
+        sealed: Vec<u8>,
+    },
 }
 
 /// What came of the items the hub handed over, each known by its number and signature: a hub
 /// that restarted numbers its items from 1 again.
 #[derive(Default)]
 struct Handled {
-    /// Handled, and to be said to the hub with the next call: the number, the signature and the
-    /// word.
-    said: Vec<(u64, String, &'static str)>,
+    /// Handled, and to be said to the hub with the next call: the number, the signature (for a
+    /// sealed answer, the sealed bytes), the word, and the receipt for the phone, if there is one.
+    said: Vec<(u64, String, &'static str, Option<String>)>,
     /// Being handled on a thread of its own.
     under_way: Vec<(u64, String)>,
 }
@@ -176,8 +200,10 @@ struct Look {
     state: Value,
     /// The requests that wait, each with its bytes.
     records: Vec<(Record, Vec<u8>)>,
-    /// The notices that are open, each with its bytes.
-    notices: Vec<(Notice, Vec<u8>)>,
+    /// The notices that are open, each with its bytes and the text it is sealed with.
+    notices: Vec<(Notice, Vec<u8>, Vec<u8>)>,
+    /// The questions that wait, each its clear fields read, their bytes, and a copy for each phone.
+    questions: Vec<Asking>,
     /// The trust list the report was made from.
     trust: Vec<Entry>,
 }
@@ -212,8 +238,12 @@ pub struct Link<'a> {
     posted: Mutex<HashMap<[u8; 16], Devices>>,
 }
 
-/// Which copy of a notice: its bytes, and the name and second key of the device it is sealed to.
-type CopyOf = (Vec<u8>, String, String);
+/// A question that waits: its clear fields read, their bytes, and a copy for each phone.
+type Asking = (questions::Record, Vec<u8>, Vec<(String, Vec<u8>)>);
+
+/// Which copy of a notice: its bytes, the text it is sealed with, and the name and second key of the
+/// device it is sealed to.
+type CopyOf = (Vec<u8>, Vec<u8>, String, String);
 
 /// The devices a notice is sealed to, each its name and second key.
 type Devices = Vec<(String, String)>;
@@ -347,7 +377,7 @@ impl Link<'_> {
     // --- the report ---
 
     fn report_loop(&self) {
-        let mut last: Option<(Value, Vec<[u8; 16]>, Instant)> = None;
+        let mut last: Option<(Value, Vec<Vec<u8>>, Instant)> = None;
         let mut backoff = self.timing.look;
         let mut renew_at = Instant::now();
         while !self.stopping() {
@@ -362,7 +392,11 @@ impl Link<'_> {
             // The reports asked for so far are made by the look that follows.
             let asked = locked(&self.reports).0;
             let look = self.look();
-            let notices: Vec<[u8; 16]> = look.notices.iter().map(|(notice, _)| notice.id.0).collect();
+            let mut notices: Vec<Vec<u8>> = look.notices.iter().map(|(notice, _, _)| notice.id.0.to_vec()).collect();
+            // A question, or the phones it is sealed to, changing is a change too.
+            for (record, _, copies) in &look.questions {
+                notices.push(record.id.0.iter().copied().chain(copies.iter().flat_map(|(device, _)| device.bytes().chain([b' ']))).collect());
+            }
             let due = match &last {
                 None => true,
                 Some((body, open, at)) => *body != look.state || *open != notices || at.elapsed() >= self.timing.heartbeat || asked > locked(&self.reports).1,
@@ -426,6 +460,7 @@ impl Link<'_> {
         let mut workspaces = Vec::new();
         let mut records = Vec::new();
         let mut notices = Vec::new();
+        let mut asked = Vec::new();
         let mut ids = HashMap::new();
         for (ws, socket) in self.local.workspaces() {
             if !trusted_ws.contains(&ws) {
@@ -454,13 +489,21 @@ impl Link<'_> {
                         records.push((record, bytes));
                     }
                 }
-                for bytes in keep::notices(&socket, &ws, KEEPER_WAIT).and_then(Result::ok).unwrap_or_default() {
+                for (bytes, said) in keep::notices(&socket, &ws, KEEPER_WAIT).and_then(Result::ok).unwrap_or_default() {
                     let Some(notice) = Notice::decode(&bytes).filter(|notice| notice.ws == ws.as_str() && notice.machine == name) else { continue };
                     if notices.len() == NOTICES_MAX {
                         self.note_once(format!("more than {NOTICES_MAX} agents wait: the hub is told of {NOTICES_MAX}"));
                         break;
                     }
-                    notices.push((notice, bytes));
+                    notices.push((notice, bytes, said));
+                }
+                for (bytes, copies) in keep::questions(&socket, &ws, KEEPER_WAIT).and_then(Result::ok).unwrap_or_default() {
+                    let Some(record) = questions::Record::decode(&bytes).filter(|record| record.ws == ws.as_str() && record.machine == name) else { continue };
+                    if asked.len() == QUESTIONS_MAX {
+                        self.note_once(format!("more than {QUESTIONS_MAX} agents ask: the hub is told of {QUESTIONS_MAX}"));
+                        break;
+                    }
+                    asked.push((record, bytes, copies));
                 }
                 if let Some(Ok(running)) = keep::runs(&socket, &ws, KEEPER_WAIT) {
                     runs = running;
@@ -485,7 +528,7 @@ impl Link<'_> {
             self.note_once("this machine's report is longer than the hub takes: it names fewer requests, and the rest are answered here".to_string());
         }
         *locked(&self.ids) = ids;
-        Look { state: state(&records), records, notices, trust }
+        Look { state: state(&records), records, notices, questions: asked, trust }
     }
 
     /// Reports what `look` saw, posts the requests the hub lacks, and keeps the trust list to the
@@ -512,7 +555,42 @@ impl Link<'_> {
                 Err(failed) => return Err(failed),
             }
         }
-        self.post_notices(look)
+        self.post_notices(look)?;
+        self.post_questions(look)
+    }
+
+    /// Names the questions that wait to the hub, each with the phones it is sealed to: the hub drops
+    /// the rest, and the copies of phones not named. Then posts each copy the hub lacks. A hub that
+    /// carries no questions is noted once.
+    fn post_questions(&self, look: &Look) -> Result<(), Failed> {
+        let listed: Vec<Value> =
+            look.questions.iter().map(|(record, _, copies)| json!({"id": record.id.hex(), "devices": copies.iter().map(|(device, _)| device).collect::<Vec<_>>()})).collect();
+        let reply = match self.call("POST", "/v1/machine/questions", Some(&json!({"questions": listed})), self.timing.call_wait) {
+            Ok(reply) => reply,
+            Err(Failed::Refused(404, _)) => {
+                if !look.questions.is_empty() {
+                    self.note_once("the hub carries no questions of agents: it runs an older halti, so they are answered here".to_string());
+                }
+                return Ok(());
+            }
+            Err(failed) => return Err(failed),
+        };
+        let missing = reply["missing"].as_array().map(Vec::as_slice).unwrap_or_default();
+        for wanted in missing {
+            let (Some(id), Some(device)) = (wanted["id"].as_str().and_then(wire::unhex::<16>), wanted["device"].as_str()) else { continue };
+            let Some((_, bytes, copies)) = look.questions.iter().find(|(record, _, _)| record.id.0 == id) else { continue };
+            let Some((_, sealed)) = copies.iter().find(|(named, _)| named == device) else { continue };
+            let body = json!({"record": hex(bytes), "device": device, "sealed": hex(sealed)});
+            match self.call("POST", "/v1/machine/question", Some(&body), self.timing.call_wait) {
+                Ok(_) | Err(Failed::Refused(410, _)) => {}
+                Err(Failed::Refused(429, _)) => {
+                    self.say_once("the hub holds as many of this machine's questions as it takes: the rest are answered here");
+                    break;
+                }
+                Err(failed) => return Err(failed),
+            }
+        }
+        Ok(())
     }
 
     /// Names the open notices to the hub, which closes the rest, and posts each it lacks, sealed
@@ -520,7 +598,7 @@ impl Link<'_> {
     /// a phone was trusted, untrusted or paired again, is posted again with the copies of now. A
     /// hub that carries no notices is noted once.
     fn post_notices(&self, look: &Look) -> Result<(), Failed> {
-        let ids: Vec<String> = look.notices.iter().map(|(notice, _)| notice.id.hex()).collect();
+        let ids: Vec<String> = look.notices.iter().map(|(notice, _, _)| notice.id.hex()).collect();
         let reply = match self.call("POST", "/v1/machine/notices", Some(&json!({"notices": ids})), self.timing.call_wait) {
             Ok(reply) => reply,
             Err(Failed::Refused(404, _)) => {
@@ -529,17 +607,17 @@ impl Link<'_> {
             }
             Err(failed) => return Err(failed),
         };
-        locked(&self.sealed).retain(|(bytes, _, _), _| look.notices.iter().any(|(_, open)| open == bytes));
-        locked(&self.posted).retain(|id, _| look.notices.iter().any(|(notice, _)| notice.id.0 == *id));
+        locked(&self.sealed).retain(|(bytes, _, _, _), _| look.notices.iter().any(|(_, open, _)| open == bytes));
+        locked(&self.posted).retain(|id, _| look.notices.iter().any(|(notice, _, _)| notice.id.0 == *id));
         let missing: Vec<[u8; 16]> = reply["missing"].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|id| id.as_str().and_then(wire::unhex::<16>)).collect();
-        for (notice, bytes) in &look.notices {
+        for (notice, bytes, said) in &look.notices {
             let id = notice.id.0;
             let devices = sealed_to(&notice.ws, &look.trust).map(|(entry, _)| (entry.name.clone(), entry.agreement_key.clone())).collect::<Vec<_>>();
             let changed = locked(&self.posted).get(&id).is_some_and(|posted| *posted != devices);
             if !missing.contains(&id) && !changed {
                 continue;
             }
-            let mut copies = self.copies(notice, bytes, &look.trust);
+            let mut copies = self.copies(notice, bytes, said, &look.trust);
             let body = |copies: &[Value]| json!({"record": hex(bytes), "sealed": copies});
             while !copies.is_empty() && body(&copies).to_string().len() > BODY_MAX {
                 copies.pop();
@@ -562,13 +640,14 @@ impl Link<'_> {
         Ok(())
     }
 
-    /// A copy of `notice`, whose bytes are `bytes`, sealed by the machine key to each device in
-    /// `trust` that is trusted for its workspace: those made before, and the rest made now.
-    fn copies(&self, notice: &Notice, bytes: &[u8], trust: &[Entry]) -> Vec<Value> {
+    /// A copy of `notice`, whose bytes are `bytes`, sealed with the text `said` by the machine key
+    /// to each device in `trust` that is trusted for its workspace: those made before, and the rest
+    /// made now.
+    fn copies(&self, notice: &Notice, bytes: &[u8], said: &[u8], trust: &[Entry]) -> Vec<Value> {
         let mut key = None;
         let mut copies = Vec::new();
         for (entry, second) in sealed_to(&notice.ws, trust) {
-            let held = (bytes.to_vec(), entry.name.clone(), entry.agreement_key.clone());
+            let held = (bytes.to_vec(), said.to_vec(), entry.name.clone(), entry.agreement_key.clone());
             let made = locked(&self.sealed).get(&held).cloned();
             let sealed = match made {
                 Some(sealed) => sealed,
@@ -584,7 +663,7 @@ impl Link<'_> {
                         };
                     }
                     let machine = key.as_ref().expect("read above");
-                    let Ok(sealed) = sealed::seal(sealed::Kind::Notice, machine, &second, bytes, b"", &util::random()) else { continue };
+                    let Ok(sealed) = sealed::seal(sealed::Kind::Notice, machine, &second, bytes, said, &util::random()) else { continue };
                     locked(&self.sealed).insert(held, sealed.clone());
                     sealed
                 }
@@ -717,7 +796,13 @@ impl Link<'_> {
             }
             // As many words as the hub takes in one call; any more go with the next.
             let said: Vec<_> = locked(&self.handled).said.iter().take(ITEMS_MAX).cloned().collect();
-            let done: Vec<Value> = said.iter().map(|(n, _, word)| json!({"n": n, "said": word})).collect();
+            let done: Vec<Value> = said
+                .iter()
+                .map(|(n, _, word, receipt)| match receipt {
+                    Some(receipt) => json!({"n": n, "said": word, "receipt": receipt}),
+                    None => json!({"n": n, "said": word}),
+                })
+                .collect();
             let wait = crate::hub::INBOX_WAIT + self.timing.call_wait;
             match self.call("POST", "/v1/machine/inbox", Some(&json!({"done": done})), wait) {
                 Ok(reply) => {
@@ -726,9 +811,9 @@ impl Link<'_> {
                     let mut new = false;
                     for item in reply["items"].as_array().map(Vec::as_slice).unwrap_or_default() {
                         let Some(n) = item["n"].as_u64() else { continue };
-                        let key = (n, item["signature"].as_str().unwrap_or("").to_string());
+                        let key = (n, item["signature"].as_str().or(item["sealed"].as_str()).unwrap_or("").to_string());
                         let handled = locked(&self.handled);
-                        if handled.under_way.contains(&key) || handled.said.iter().any(|(m, signature, _)| (*m, signature) == (key.0, &key.1)) {
+                        if handled.under_way.contains(&key) || handled.said.iter().any(|(m, signature, _, _)| (*m, signature) == (key.0, &key.1)) {
                             continue;
                         }
                         drop(handled);
@@ -737,17 +822,17 @@ impl Link<'_> {
                             Ok(stop @ Inbound::Stop { .. }) => {
                                 locked(&self.handled).under_way.push(key.clone());
                                 scope.spawn(move || {
-                                    let word = self.hand(stop);
+                                    let (word, receipt) = self.hand(stop);
                                     let mut handled = locked(&self.handled);
-                                    handled.said.push((key.0, key.1.clone(), word));
+                                    handled.said.push((key.0, key.1.clone(), word, receipt));
                                     handled.under_way.retain(|under_way| *under_way != key);
                                 });
                             }
                             Ok(answer) => {
-                                let word = self.hand(answer);
-                                locked(&self.handled).said.push((key.0, key.1, word));
+                                let (word, receipt) = self.hand(answer);
+                                locked(&self.handled).said.push((key.0, key.1, word, receipt));
                             }
-                            Err(word) => locked(&self.handled).said.push((key.0, key.1, word)),
+                            Err(word) => locked(&self.handled).said.push((key.0, key.1, word, None)),
                         }
                     }
                     // What is under way stays queued at the hub, which hands it over again at once:
@@ -770,13 +855,14 @@ impl Link<'_> {
     }
 
     /// Hands what a phone sent to the open workspace it names, and says what came of it: the
-    /// workspace's word, or `unreached` if none answered.
-    fn hand(&self, inbound: Inbound) -> &'static str {
-        match inbound {
+    /// workspace's word, or `unreached` if none answered; and for a sealed answer, the receipt for
+    /// the phone, in hex, if the workspace sealed one.
+    fn hand(&self, inbound: Inbound) -> (&'static str, Option<String>) {
+        let word = match inbound {
             Inbound::Answer { ws, device, id, yes, signature } => {
                 // The workspace is the one this machine's own listing gave the id, where it has it.
                 let ws = locked(&self.ids).get(&id.0).cloned().unwrap_or(ws);
-                let Some(socket) = self.keeper(&ws) else { return "unreached" };
+                let Some(socket) = self.keeper(&ws) else { return ("unreached", None) };
                 match keep::tell(&socket, &Records::Signed { ws, device, yes, id, signature }, ANSWER_WAIT) {
                     Some(Told::Approved) => "approved",
                     Some(Told::Denied) => "denied",
@@ -786,7 +872,7 @@ impl Link<'_> {
                 }
             }
             Inbound::Stop { ws, device, runs, signature } => {
-                let Some(socket) = self.keeper(&ws) else { return "unreached" };
+                let Some(socket) = self.keeper(&ws) else { return ("unreached", None) };
                 match keep::tell(&socket, &Records::Stop { ws, device, runs, signature }, STOP_WAIT) {
                     Some(Told::Stopped { wrong_box: 1.., .. }) => "wrong-box",
                     Some(Told::Stopped { stopped: 0, .. }) => "none",
@@ -795,7 +881,16 @@ impl Link<'_> {
                     _ => "unreached",
                 }
             }
-        }
+            Inbound::Reply { ws, device, id, sealed } => {
+                let Some(socket) = self.keeper(&ws) else { return ("unreached", None) };
+                return match keep::tell(&socket, &Records::Reply { ws, device, id, sealed }, ANSWER_WAIT) {
+                    Some(Told::Receipt(outcome, receipt)) => (outcome.word(), receipt.map(|sealed| hex(&sealed))),
+                    Some(Told::Refused) => ("refused", None),
+                    _ => ("unreached", None),
+                };
+            }
+        };
+        (word, None)
     }
 
     // --- the socket ---
@@ -866,11 +961,17 @@ fn sealed_to<'a>(ws: &'a str, trust: &'a [Entry]) -> impl Iterator<Item = (&'a E
 fn inbound(item: &Value) -> Result<Inbound, &'static str> {
     let text = |field: &str| item[field].as_str();
     let kind = text("kind");
-    if !matches!(kind, Some("answer" | "stop")) {
+    if !matches!(kind, Some("answer" | "stop" | "reply")) {
         return Err("unknown");
     }
     let device = text("device").filter(|name| crate::fields::is_name(name)).map(str::to_string);
     let ws = text("ws").and_then(|ws| WsName::parse(ws).ok());
+    if kind == Some("reply") {
+        let id = text("id").and_then(wire::unhex::<16>).map(Id);
+        let sealed = text("sealed").and_then(util::unhex).filter(|sealed| (1..=crate::hub::REPLY_SEALED_MAX).contains(&sealed.len()));
+        let (Some(device), Some(ws), Some(id), Some(sealed)) = (device, ws, id, sealed) else { return Err("malformed") };
+        return Ok(Inbound::Reply { ws, device, id, sealed });
+    }
     let signature = text("signature").and_then(util::unhex).filter(|sig| !sig.is_empty() && sig.len() <= halti_core::device::SIGNATURE_MAX);
     let (Some(device), Some(ws), Some(signature)) = (device, ws, signature) else { return Err("malformed") };
     if kind == Some("answer") {
