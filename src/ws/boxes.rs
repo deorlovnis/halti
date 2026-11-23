@@ -482,7 +482,10 @@ pub fn run(target_text: &str, command: Vec<String>, type_it: bool, away: Option<
         if away.is_some() {
             // The box runs: a mark that can't be made is said, and the run goes on.
             match mark_away(&kept, &found, away) {
-                Ok(said) => println!("{said}"),
+                Ok(said) => {
+                    println!("{said}");
+                    say_where_asked(&name);
+                }
                 Err(e) => warn(&format!("{e:#}")),
             }
         }
@@ -555,7 +558,51 @@ pub fn away(target_text: &str, secs: Option<u32>) -> Result<()> {
     let found = find(&here, &name, box_name)?;
     let kept = Kept::of(&here, found.id)?;
     println!("{}", mark_away(&kept, &found, secs)?);
+    if secs.is_some() {
+        say_where_asked(&name);
+    }
     Ok(())
+}
+
+/// Says where the questions of a run marked away in `ws` go: the phones trusted for it here, and
+/// whether this machine's link reaches the hub now; and warns when no phone can be told.
+fn say_where_asked(ws: &WsName) {
+    let folder = crate::link::files::Folder::here();
+    let joined = folder.joined().ok().flatten().is_some();
+    let phones: Vec<String> =
+        folder.trust().unwrap_or_default().into_iter().filter(|entry| entry.ws.contains(ws) && entry.second_key().is_some()).map(|entry| entry.name).collect();
+    let link = if joined { crate::link::run::ask(&folder.socket(), "sync", Duration::from_secs(5)) } else { None };
+    let (said, warnings) = where_asked(ws, &phones, joined, link.as_deref());
+    for line in said {
+        println!("{line}");
+    }
+    for line in warnings {
+        warn(&line);
+    }
+}
+
+/// What `say_where_asked` says, from the phones trusted for `ws`, whether this machine joined a
+/// hub, and what its link said to `sync`, if it answered.
+fn where_asked(ws: &WsName, phones: &[String], joined: bool, link: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let mut said = Vec::new();
+    let mut warnings = Vec::new();
+    let answer_here = "its agent's questions wait here: answer them with halti requests, or at its terminal";
+    if !joined {
+        warnings.push(format!("this machine hasn't joined a hub, so no phone can be told: {answer_here}"));
+        return (said, warnings);
+    }
+    if phones.is_empty() {
+        warnings.push(format!("no phone is trusted for {ws} here, so none can be told: {answer_here}. trust one with: halti devices trust NAME --ws {ws}"));
+        return (said, warnings);
+    }
+    said.push(format!("Its agent's questions go to: {}.", phones.join(", ")));
+    match link {
+        Some("synced") => said.push("This machine's link reaches the hub now.".to_string()),
+        Some(no) => warnings.push(format!("this machine's link can't reach the hub now ({}): its questions are posted when it can", no.strip_prefix("no ").unwrap_or(no))),
+        None => warnings.push("no link answers here (halti link): its questions are posted once one runs".to_string()),
+    }
+    said.push("A box on an image built before agents could be answered asks nothing: rebuild it with install.sh and pin the new digest.".to_string());
+    (said, warnings)
 }
 
 /// Marks `found`'s run away through the open workspace `kept` found; what to say.
@@ -567,9 +614,17 @@ fn mark_away(kept: &Kept, found: &Found, secs: Option<u32>) -> Result<String> {
     Ok(match keep::away(kept, name, &found.box_name, secs)? {
         Some(until) => {
             let wait = requests::LIMITS.wait_of(Some(until), requests::now_secs());
-            format!("{} is away until {}. Its requests wait up to {} for an answer.", found.shown, requests::clock(until), requests::wait_said(wait))
+            let (shown, until) = (&found.shown, requests::clock(until));
+            format!(
+                "{shown} is away until {until}. Its requests wait up to {} for an answer, and its agent's questions wait for your phone until then. To answer at its terminal: halti ws away {shown} off",
+                requests::wait_said(wait)
+            )
         }
-        None => format!("{} is no longer away. Its requests wait up to {} for an answer.", found.shown, requests::wait_said(requests::LIMITS.wait)),
+        None => format!(
+            "{} is no longer away. Its requests wait up to {} for an answer, and its agent's questions are back at its terminal.",
+            found.shown,
+            requests::wait_said(requests::LIMITS.wait)
+        ),
     })
 }
 
@@ -965,6 +1020,24 @@ mod tests {
     use crate::approval::fake_tests::Fake;
     use crate::util::TempDir;
     use zeroize::Zeroizing;
+
+    #[test]
+    fn ws_away_says_where_the_questions_go_and_warns_when_no_phone_can_be_told() {
+        let acme = WsName::parse("acme").unwrap();
+        let phones = ["pixel".to_string(), "tablet".to_string()];
+        let (said, warnings) = where_asked(&acme, &phones, true, Some("synced"));
+        assert_eq!(said[..2], ["Its agent's questions go to: pixel, tablet.", "This machine's link reaches the hub now."]);
+        assert!(warnings.is_empty());
+        let (_, warnings) = where_asked(&acme, &phones, true, Some("no unreachable"));
+        assert_eq!(warnings, ["this machine's link can't reach the hub now (unreachable): its questions are posted when it can"]);
+        let (_, warnings) = where_asked(&acme, &phones, true, None);
+        assert_eq!(warnings, ["no link answers here (halti link): its questions are posted once one runs"]);
+        let (said, warnings) = where_asked(&acme, &[], true, Some("synced"));
+        assert!(said.is_empty());
+        assert!(warnings[0].starts_with("no phone is trusted for acme here, so none can be told"), "{warnings:?}");
+        let (said, warnings) = where_asked(&acme, &phones, false, None);
+        assert!(said.is_empty() && warnings[0].starts_with("this machine hasn't joined a hub"), "{warnings:?}");
+    }
 
     const ACME: &str = "acme passphrase one";
     /// A box that keeps nothing between runs: no store to make.

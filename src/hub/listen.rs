@@ -33,6 +33,10 @@ pub const STATE_BODY_MAX: usize = 16 * 1024;
 const STATE_PATH: &str = "/v1/machine/state";
 /// The path of a phone's call to be told what waits: the one that takes a wake credential.
 const WAIT_PATH: &str = "/v1/wait";
+/// The longest body of a phone's sealed answer to a question.
+pub const REPLY_BODY_MAX: usize = 8 * 1024;
+/// The longest body of a machine's copy of a question: one sealed record, in hex.
+pub const QUESTION_BODY_MAX: usize = 20 * 1024;
 /// How often a held call looks again, at most this far apart.
 const WAIT_LOOK: Duration = Duration::from_secs(1);
 /// How long a connection has to send its whole request, TLS handshake included.
@@ -162,7 +166,7 @@ fn connection(hub: &Hub, tcp: TcpStream, tls: Arc<ServerConfig>, request_wait: D
     let Ok(conn) = ServerConnection::new(tls) else { return };
     let mut stream = StreamOwned::new(conn, Timed { tcp, deadline: Instant::now() + request_wait });
     let request: Option<Result<(http::Head, Vec<u8>), Refused>> = {
-        let mut reader = BufReader::new((&mut stream).take((HEAD_MAX + STATE_BODY_MAX + 1024) as u64));
+        let mut reader = BufReader::new((&mut stream).take((HEAD_MAX + QUESTION_BODY_MAX + 1024) as u64));
         match http::read_head(&mut reader) {
             Ok(Some(head)) if head_len(&head) <= HEAD_MAX && head.parts().is_some() => match http::read_body(&mut reader, &head, body_max(&head)) {
                 Ok(body) => Some(Ok((head, body))),
@@ -190,10 +194,13 @@ fn connection(hub: &Hub, tcp: TcpStream, tls: Arc<ServerConfig>, request_wait: D
     let _ = reply(&mut stream, status, &body);
 }
 
-/// The longest body this request may have: a machine's report may be longer than other calls'.
+/// The longest body this request may have: a machine's report and its list of questions, a copy of
+/// a question and a sealed answer may be longer than other calls'.
 fn body_max(head: &http::Head) -> usize {
     match head.parts() {
-        Some((_, STATE_PATH, _)) => STATE_BODY_MAX,
+        Some((_, STATE_PATH | "/v1/machine/questions", _)) => STATE_BODY_MAX,
+        Some((_, "/v1/machine/question", _)) => QUESTION_BODY_MAX,
+        Some((_, "/v1/reply", _)) => REPLY_BODY_MAX,
         _ => BODY_MAX,
     }
 }
@@ -221,7 +228,7 @@ fn reply(stream: &mut StreamOwned<ServerConnection, Timed>, status: u16, body: &
 }
 
 /// The paths the hub answers, and the method each takes.
-pub(super) const PATHS: [(&str, &str); 18] = [
+pub(super) const PATHS: [(&str, &str); 22] = [
     ("POST", "/v1/pair"),
     ("POST", "/v1/join"),
     ("GET", "/v1/me"),
@@ -230,7 +237,9 @@ pub(super) const PATHS: [(&str, &str); 18] = [
     ("GET", "/v1/requests"),
     ("GET", "/v1/state"),
     ("GET", "/v1/notices"),
+    ("GET", "/v1/questions"),
     ("POST", "/v1/answer"),
+    ("POST", "/v1/reply"),
     ("POST", "/v1/stop"),
     ("POST", "/v1/hide"),
     ("POST", WAIT_PATH),
@@ -240,6 +249,8 @@ pub(super) const PATHS: [(&str, &str); 18] = [
     ("POST", "/v1/machine/device"),
     ("POST", "/v1/machine/notices"),
     ("POST", "/v1/machine/notice"),
+    ("POST", "/v1/machine/questions"),
+    ("POST", "/v1/machine/question"),
 ];
 
 /// What a request gets: its status and body.
@@ -276,6 +287,8 @@ fn route(hub: &Hub, method: &str, path: &str, authorization: Option<&str>, body:
                 "/v1/machine/inbox" => inbox(hub, &caller, body),
                 "/v1/machine/notices" => sync_notices(hub, &caller, body),
                 "/v1/machine/notice" => post_notice(hub, &caller, body),
+                "/v1/machine/questions" => sync_questions(hub, &caller, body),
+                "/v1/machine/question" => post_question(hub, &caller, body),
                 _ => device_keys(hub, body),
             }
         }
@@ -288,7 +301,9 @@ fn route(hub: &Hub, method: &str, path: &str, authorization: Option<&str>, body:
                 "/v1/requests" => requests(hub, &scope, body),
                 "/v1/state" => state(hub, &caller, &scope, body),
                 "/v1/notices" => notices(hub, &caller, &scope, body),
+                "/v1/questions" => questions(hub, &caller, &scope, body),
                 "/v1/answer" => answer(hub, &caller, &scope, body),
+                "/v1/reply" => reply_to(hub, &caller, &scope, body),
                 "/v1/stop" => stop(hub, &caller, &scope, body),
                 _ => hide(hub, &scope, body),
             }
@@ -411,6 +426,48 @@ fn notices(hub: &Hub, caller: &Caller, scope: &[WsName], body: &[u8]) -> Result<
     Ok((200, json!({"notices": listed})))
 }
 
+/// A machine's link names the questions that wait, each with the phones it is sealed to: the rest
+/// are dropped. It is told the copies the hub lacks and has room for.
+fn sync_questions(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refused> {
+    let listed = relay::questions_body(body)?;
+    let missing = locked(&hub.relay).sync_questions(&caller.name, &listed, hub.now());
+    hub.stir();
+    Ok((200, json!({"missing": missing.iter().map(|(id, device)| json!({"id": util::hex(id), "device": device})).collect::<Vec<_>>()})))
+}
+
+/// A machine posts one phone's copy of a question.
+fn post_question(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refused> {
+    let (record, bytes, device, sealed) = relay::question_body(body)?;
+    locked(&hub.relay).post_question(&caller.name, record, bytes, device, sealed, hub.now())?;
+    hub.stir();
+    Ok((200, json!({})))
+}
+
+/// A phone lists the questions in its workspaces sealed to it, from every machine.
+fn questions(hub: &Hub, caller: &Caller, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refused> {
+    wire::no_body(body)?;
+    let machines: Vec<String> = hub.with_table(|table, now| table.machines(now)).into_iter().map(|(name, _, _)| name).collect();
+    let held = locked(&hub.relay).questions(&caller.name, scope, &machines, hub.now());
+    let listed: Vec<Value> = held.iter().map(|(machine, record, sealed)| json!({"machine": machine, "record": util::hex(record), "sealed": util::hex(sealed)})).collect();
+    Ok((200, json!({"questions": listed})))
+}
+
+/// A phone's sealed answer to a question it was sealed: held for the machine, which alone can open
+/// and check it. The hub can read none of it.
+fn reply_to(hub: &Hub, caller: &Caller, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refused> {
+    let (machine, id, sealed) = relay::reply_body(body)?;
+    if !machine_known(hub, &machine) {
+        return Err(Refused::Gone);
+    }
+    let now = hub.now();
+    let mut relay = locked(&hub.relay);
+    let ws = relay.question_ws(&machine, id, &caller.name, scope, now).ok_or(Refused::Gone)?;
+    let n = relay.queue(&machine, &caller.name, What::Reply { ws, id, sealed }, now)?;
+    drop(relay);
+    hub.sent.notify_all();
+    Ok((202, json!({"n": n})))
+}
+
 /// A machine takes what phones sent it, saying first what came of what it took before. With
 /// nothing to take, the call waits until something comes or `inbox_wait` is over.
 fn inbox(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refused> {
@@ -531,23 +588,22 @@ fn wait(hub: &Hub, authorization: Option<&str>, body: &[u8]) -> Result<(u16, Val
                 let (_, scope) = table.wake(&wake, now)?;
                 Ok((scope, table.machines(now).into_iter().map(|(name, _, _)| name).collect::<Vec<_>>()))
             })?;
-            let (ids, notices) = {
+            let (ids, lists) = {
                 let mut relay = locked(&hub.relay);
                 let ids = relay.ids(&scope, &machines, hub.now());
-                (ids, seen.notices.map(|_| relay.notice_keys(&name, &scope, &machines, hub.now())))
+                let notices = seen.notices.map(|told| (Which::Notices, told, relay.notice_keys(&name, &scope, &machines, hub.now())));
+                let questions = seen.questions.map(|told| (Which::Questions, told, relay.question_keys(&name, &scope, &machines, hub.now())));
+                (ids, notices.into_iter().chain(questions).collect::<Vec<_>>())
             };
             let left = deadline.saturating_duration_since(Instant::now());
             let mut waits = locked(&hub.waits);
             if wire::seen_of(&ids) != seen.requests || left.is_zero() || waits.newest.get(&name) != Some(&mine) {
                 let agents = waits.agents.entry(name.clone()).or_default();
-                let notices = seen.notices.zip(notices).map(|(told, listed)| agents.told_now(told, listed, &hub.agent_limits, Instant::now()));
-                return Ok((ids, notices));
+                return Ok((ids, agents.told_now(lists, &hub.agent_limits, Instant::now())));
             }
-            if let (Some(told), Some(listed)) = (seen.notices, &notices)
-                && wire::seen_of(&listed.iter().map(|key| key.id).collect::<Vec<_>>()) != told
-                && waits.agents.entry(name.clone()).or_default().wake(told, listed, &hub.agent_limits, Instant::now())
-            {
-                return Ok((ids, notices));
+            let changed = lists.iter().any(|(_, told, listed)| wire::seen_of(&listed.iter().map(|key| key.id).collect::<Vec<_>>()) != *told);
+            if changed && waits.agents.entry(name.clone()).or_default().wake(&lists, &hub.agent_limits, Instant::now()) {
+                return Ok((ids, lists));
             }
             if waits.stirs == stirs {
                 drop(hub.stirred.wait_timeout(waits, left.min(WAIT_LOOK)).unwrap_or_else(PoisonError::into_inner));
@@ -560,83 +616,135 @@ fn wait(hub: &Hub, authorization: Option<&str>, body: &[u8]) -> Result<(u16, Val
         if waits.newest.get(&name) == Some(&mine) {
             waits.newest.remove(&name);
         }
-        if let Ok((_, Some(notices))) = &told {
-            waits.agents.entry(name.clone()).or_default().answered(notices.clone());
+        if let Ok((_, lists)) = &told {
+            let agents = waits.agents.entry(name.clone()).or_default();
+            for (which, _, listed) in lists {
+                agents.answered(*which, listed.clone());
+            }
         }
     }
-    let (ids, notices) = told?;
+    let (ids, lists) = told?;
     let mut reply = json!({"requests": ids.iter().map(|id| util::hex(id)).collect::<Vec<_>>()});
-    if let Some(notices) = notices {
-        reply["notices"] = notices.iter().map(|key| util::hex(&key.id)).collect::<Vec<_>>().into();
+    for (which, _, listed) in lists {
+        reply[which.field()] = listed.iter().map(|key| util::hex(&key.id)).collect::<Vec<_>>().into();
     }
     Ok((200, reply))
 }
 
-/// What a held call answers: the request ids, and the notices for an app that is told of them.
-type Listed = (Vec<[u8; 16]>, Option<Vec<NoticeKey>>);
+/// What a held call answers: the request ids, and for an app that is told of them, the notices and
+/// the questions, each with what the phone said it was told.
+type Listed = (Vec<[u8; 16]>, Vec<AgentList>);
+
+/// One list of agents' waits a held call tells of: which, the hash the phone named as what it was
+/// told, and the waits listed now.
+pub type AgentList = (Which, Option<[u8; 32]>, Vec<NoticeKey>);
+
+/// The two lists of agents' waits: notices, and questions. They share the agents' limits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Which {
+    Notices,
+    Questions,
+}
+
+impl Which {
+    /// Its field in the wait call's reply.
+    pub fn field(self) -> &'static str {
+        match self {
+            Which::Notices => "notices",
+            Which::Questions => "questions",
+        }
+    }
+}
 
 /// How many answers before the last one the hub keeps for a phone, to know what it names as told.
 const EARLIER_KEPT: usize = 4;
 
-/// A phone's wake-ups for agents' notices: what its held calls last told it, and when a change of
-/// the notices last ended one, and for which boxes.
+/// What a phone's held calls told it of one list: the last answer, and the answers before it, the
+/// newest first. A phone that gave up on a call (the app does at each start) or lost its answer
+/// names one of these as what it was told.
 #[derive(Default)]
-pub struct Agents {
+pub struct Told {
     pub(super) told: Vec<NoticeKey>,
-    /// The answers before `told`, the newest first. A phone that gave up on a call (the app does at
-    /// each start) or lost its answer names one of these as what it was told.
     earlier: VecDeque<Vec<NoticeKey>>,
-    last: Option<Instant>,
-    /// Each box a notice of which ended a held call within the window: when, and the machine,
-    /// workspace and box.
-    woke: Vec<(Instant, String, String, String)>,
 }
 
-impl Agents {
-    /// Keeps `notices` as what the phone was last answered, and the answer before it among the
-    /// earlier ones.
-    pub(super) fn answered(&mut self, notices: Vec<NoticeKey>) {
-        if notices != self.told {
-            let before = std::mem::replace(&mut self.told, notices);
-            self.earlier.push_front(before);
-            self.earlier.truncate(EARLIER_KEPT);
-        }
-    }
-
-    /// The ids of the notices the phone was told, if `told` names one of the answers kept; else
-    /// none.
+impl Told {
+    /// The ids the phone was told, if `told` names one of the answers kept; else none.
     fn known(&self, told: Option<[u8; 32]>) -> Vec<[u8; 16]> {
         let ids = |answer: &[NoticeKey]| answer.iter().map(|key| key.id).collect::<Vec<_>>();
         std::iter::once(&self.told).chain(&self.earlier).map(|answer| ids(answer)).find(|ids| wire::seen_of(ids) == told).unwrap_or_default()
     }
+}
 
-    /// The notices an answer that ends for another reason (a request, the hold's end, a newer call)
-    /// tells the phone of, out of those `listed`: each one if the change from `told` may end a call
-    /// now (counted, as `wake` says), else only those it was told already. So a notice the limits
-    /// hold back raises the app's agent notification at no answer.
-    pub fn told_now(&mut self, told: Option<[u8; 32]>, listed: Vec<NoticeKey>, limits: &AgentLimits, now: Instant) -> Vec<NoticeKey> {
-        if wire::seen_of(&listed.iter().map(|key| key.id).collect::<Vec<_>>()) == told || self.wake(told, &listed, limits, now) {
-            return listed;
+/// A phone's wake-ups for agents' notices and questions: what its held calls last told it of each,
+/// and when a change of either last ended one, and for which boxes. Notices and questions share the
+/// limits.
+#[derive(Default)]
+pub struct Agents {
+    pub(super) notices: Told,
+    questions: Told,
+    last: Option<Instant>,
+    /// Each box a notice or question of which ended a held call within the window: when, and the
+    /// machine, workspace and box.
+    woke: Vec<(Instant, String, String, String)>,
+}
+
+impl Agents {
+    fn list(&mut self, which: Which) -> &mut Told {
+        match which {
+            Which::Notices => &mut self.notices,
+            Which::Questions => &mut self.questions,
         }
-        let known = self.known(told);
-        listed.into_iter().filter(|key| known.contains(&key.id)).collect()
     }
 
-    /// Whether the change from what the phone says it was told, `told`, to the notices `listed` may
-    /// end its held call now, counted if so. Not within `gap` of the last. A change that adds no
-    /// notice may; one that adds notices may if any of them is of a box and a machine under their
-    /// counts in the window, and counts once for each such box. The phone's notices are known from
-    /// the answer of the hub's that `told` names, of the last few; else every notice listed counts
-    /// as new.
-    pub fn wake(&mut self, told: Option<[u8; 32]>, listed: &[NoticeKey], limits: &AgentLimits, now: Instant) -> bool {
+    /// Keeps `listed` as what the phone was last answered of the list `which`, and the answer
+    /// before it among the earlier ones.
+    pub(super) fn answered(&mut self, which: Which, listed: Vec<NoticeKey>) {
+        let list = self.list(which);
+        if listed != list.told {
+            let before = std::mem::replace(&mut list.told, listed);
+            list.earlier.push_front(before);
+            list.earlier.truncate(EARLIER_KEPT);
+        }
+    }
+
+    /// What an answer that ends for another reason (a request, the hold's end, a newer call) tells
+    /// the phone of, out of the waits `lists` hold: each one if the change from what it was told may
+    /// end a call now (counted, as `wake` says), else only those it was told already. So a wait the
+    /// limits hold back raises the app's agent notification at no answer.
+    pub fn told_now(&mut self, lists: Vec<AgentList>, limits: &AgentLimits, now: Instant) -> Vec<AgentList> {
+        let same = lists.iter().all(|(_, told, listed)| wire::seen_of(&listed.iter().map(|key| key.id).collect::<Vec<_>>()) == *told);
+        if same || self.wake(&lists, limits, now) {
+            return lists;
+        }
+        lists
+            .into_iter()
+            .map(|(which, told, listed)| {
+                let known = self.list(which).known(told);
+                (which, told, listed.into_iter().filter(|key| known.contains(&key.id)).collect())
+            })
+            .collect()
+    }
+
+    /// Whether the change from what the phone says it was told of each list to the waits `lists`
+    /// hold may end its held call now, counted if so. Not within `gap` of the last. A change that
+    /// adds no wait may; one that adds waits may if any of them is of a box and a machine under
+    /// their counts in the window, and counts once for each such box. The phone's waits are known
+    /// from the answer of the hub's that it names, of the last few; else every one listed counts as
+    /// new.
+    pub fn wake(&mut self, lists: &[AgentList], limits: &AgentLimits, now: Instant) -> bool {
         if self.last.is_some_and(|last| now.duration_since(last) < limits.gap) {
             return false;
         }
         self.woke.retain(|(at, ..)| now.duration_since(*at) < limits.window);
-        let known = self.known(told);
+        let mut new: Vec<&NoticeKey> = Vec::new();
+        for (which, told, listed) in lists {
+            let known = self.list(*which).known(*told);
+            new.extend(listed.iter().filter(|key| !known.contains(&key.id)));
+        }
         let mut boxes: Vec<(&str, &str, &str)> = Vec::new();
         let mut added = false;
-        for key in listed.iter().filter(|key| !known.contains(&key.id)) {
+        for key in new {
             added = true;
             let named = (key.machine.as_str(), key.ws.as_str(), key.box_name.as_str());
             let of_box = self.woke.iter().filter(|(_, machine, ws, box_name)| (machine.as_str(), ws.as_str(), box_name.as_str()) == named).count();

@@ -322,19 +322,29 @@ pub fn ls(typed: Option<&str>, type_it: bool) -> Result<()> {
     } else {
         println!("{:<16} {:<10} {:<10} ID", "WORKSPACE", "STATE", "KEY");
     }
+    let mut away = Vec::new();
     for entry in &listed {
         let name = entry.name.as_str();
         match entry.record {
             Some(record) => {
+                let open = entry.pinned && keep::answers(&here, &entry.name, record.id);
                 let state = match entry.pinned {
-                    true if keep::answers(&here, &entry.name, record.id) => "open",
+                    true if open => "open",
                     true => "closed",
                     false => "unfinished",
                 };
                 println!("{name:<16} {state:<10} {:<10} {}", key_name(record.key), record.id);
+                if open {
+                    away.extend(
+                        keep::marks(&here, &entry.name, record.id).into_iter().map(|(box_name, until)| format!("{name}/{box_name} away until {}", crate::requests::clock(until))),
+                    );
+                }
             }
             None => println!("{name:<16} {:<10} {:<10} -", "unreadable", "-"),
         }
+    }
+    for line in away {
+        println!("{line}");
     }
     for entry in listed.iter().filter(|entry| entry.record.is_some() && !entry.pinned) {
         println!("{0} was never fully created. remove it with: halti ws delete {0}", entry.name);

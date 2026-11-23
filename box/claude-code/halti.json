@@ -11,6 +11,18 @@
         ]
       }
     ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/halti-shim ask",
+            "timeout": 28860,
+            "statusMessage": "halti: if this run is marked away, this waits for your phone. To answer here: halti ws away WS/BOX off"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "*",
@@ -18,7 +30,8 @@
           {
             "type": "command",
             "command": "/usr/local/bin/halti-shim ask",
-            "timeout": 10
+            "timeout": 28860,
+            "statusMessage": "halti: if this run is marked away, this waits for your phone. To answer here: halti ws away WS/BOX off"
           }
         ]
       }
@@ -53,7 +66,8 @@
           {
             "type": "command",
             "command": "/usr/local/bin/halti-shim ask",
-            "timeout": 10
+            "timeout": 28860,
+            "statusMessage": "halti: if this run is marked away, this waits for your phone. To answer here: halti ws away WS/BOX off"
           }
         ]
       }

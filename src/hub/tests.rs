@@ -1485,7 +1485,7 @@ fn a_phone_is_shown_the_last_64_it_sent_each_machine() {
     for _ in 0..relay::ITEMS_MAX {
         relay.queue("server-1", "pixel", stop(), now).unwrap();
     }
-    let done: Vec<(u64, String)> = relay.take("server-1", &[], now).iter().map(|item| (item.n, "none".to_string())).collect();
+    let done: Vec<(u64, String, Option<Vec<u8>>)> = relay.take("server-1", &[], now).iter().map(|item| (item.n, "none".to_string(), None)).collect();
     relay.take("server-1", &done, now);
     for _ in 0..relay::ITEMS_MAX {
         relay.queue("server-1", "pixel", stop(), now).unwrap();
@@ -1503,7 +1503,7 @@ fn what_a_phone_sent_stays_listed_with_the_machine_s_word_whatever_other_phones_
     // pixel's stop is taken and said stopped; its run leaves the machine's report.
     let n = relay.queue("server-1", "pixel", stop(), now).unwrap();
     relay.take("server-1", &[], now);
-    relay.take("server-1", &[(n, "stopped".to_string())], now);
+    relay.take("server-1", &[(n, "stopped".to_string(), None)], now);
     let reported = relay::Reported { link: [5; 16], workspaces: Vec::new(), trusted: Vec::new(), ids: Vec::new() };
     relay.report("server-1", reported, now);
     // Then another phone sends that machine more than the hub keeps for one phone, all said done.
@@ -1511,7 +1511,7 @@ fn what_a_phone_sent_stays_listed_with_the_machine_s_word_whatever_other_phones_
         for _ in 0..relay::ITEMS_MAX {
             relay.queue("server-1", "tablet", stop(), now).unwrap();
         }
-        let done: Vec<(u64, String)> = relay.take("server-1", &[], now).iter().map(|item| (item.n, "none".to_string())).collect();
+        let done: Vec<(u64, String, Option<Vec<u8>>)> = relay.take("server-1", &[], now).iter().map(|item| (item.n, "none".to_string(), None)).collect();
         relay.take("server-1", &done, now);
     }
     let view = relay.view("pixel", &acme(), &|_| Some((Vec::new(), None)), now);
@@ -1952,7 +1952,7 @@ fn a_box_wakes_a_phone_six_times_an_hour_and_a_machine_twenty() {
     let mut listed: Vec<relay::NoticeKey> = Vec::new();
     let told = |agents: &mut listen::Agents, listed: &[relay::NoticeKey], at: u64| {
         let seen = wire::seen_of(&agents_told(agents));
-        let woke = agents.wake(seen, listed, &limits, start + Duration::from_secs(at));
+        let woke = agents.wake(&[(listen::Which::Notices, seen, listed.to_vec())], &limits, start + Duration::from_secs(at));
         if woke {
             set_told(agents, listed);
         }
@@ -1988,9 +1988,152 @@ fn a_box_wakes_a_phone_six_times_an_hour_and_a_machine_twenty() {
 }
 
 fn agents_told(agents: &listen::Agents) -> Vec<[u8; 16]> {
-    agents.told.iter().map(|key| key.id).collect()
+    agents.notices.told.iter().map(|key| key.id).collect()
 }
 
 fn set_told(agents: &mut listen::Agents, listed: &[relay::NoticeKey]) {
-    agents.told = listed.to_vec();
+    agents.notices.told = listed.to_vec();
+}
+
+// --- agents' questions ---
+
+/// A question's clear fields of `machine`'s, in workspace `ws` and box `box_name`, its id all `id`,
+/// expiring `life` from the hub's now.
+fn question(hub: &Running, machine: &str, ws: &str, box_name: &str, id: u8, life: i64) -> Vec<u8> {
+    crate::questions::Record {
+        machine: machine.into(),
+        ws: ws.into(),
+        box_name: box_name.into(),
+        run: crate::requests::RunId([1; 8]),
+        session: 1,
+        kind: crate::questions::Kind::Permit,
+        id: crate::requests::Id([id; 16]),
+        expiry: u64::try_from(hub.clock.now().as_second() + life).unwrap(),
+    }
+    .encode()
+    .unwrap()
+}
+
+/// The machine's link names these questions, each sealed to these phones, and posts each copy the
+/// hub lacks.
+fn open_questions(hub: &Running, machine: &Machine, records: &[Vec<u8>], devices: &[&str]) {
+    let id = |record: &[u8]| util::hex(&crate::questions::Record::decode(record).unwrap().id.0);
+    let listed: Vec<Value> = records.iter().map(|record| json!({"id": id(record), "devices": devices})).collect();
+    let (status, reply) = hub.call("POST", "/v1/machine/questions", Some(&machine.token), Some(&json!({"questions": listed})));
+    assert_eq!(status, 200, "{reply}");
+    for missing in reply["missing"].as_array().unwrap() {
+        let record = records.iter().find(|record| id(record) == missing["id"].as_str().unwrap()).unwrap();
+        let device = missing["device"].as_str().unwrap();
+        let body = json!({"record": util::hex(record), "device": device, "sealed": util::hex(&sealed_for(device, record[record.len() - 11]))});
+        assert_eq!(hub.call("POST", "/v1/machine/question", Some(&machine.token), Some(&body)), (200, json!({})));
+    }
+}
+
+/// `POST /v1/wait` from an app that is told of notices and questions.
+fn wait_all(hub: &Running, token_: &str, seen: &[[u8; 16]], notices: &[[u8; 16]], questions: &[[u8; 16]]) -> (u16, Value) {
+    let hash = |ids: &[[u8; 16]]| wire::seen_of(ids).map(|hash| util::hex(&hash)).unwrap_or_default();
+    let body = json!({"seen": hash(seen), "notices_seen": hash(notices), "questions_seen": hash(questions)});
+    hub.call_as("POST", "/v1/wait", Some(&format!("Wake {}", wake_of(token_))), Some(&body))
+}
+
+fn all(requests: &[[u8; 16]], notices: &[[u8; 16]], questions: &[[u8; 16]]) -> Value {
+    let hex = |ids: &[[u8; 16]]| ids.iter().map(|id| util::hex(id)).collect::<Vec<_>>();
+    json!({"requests": hex(requests), "notices": hex(notices), "questions": hex(questions)})
+}
+
+#[test]
+fn a_machine_posts_questions_sealed_to_each_phone_and_a_phone_lists_only_its_own() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    let tablet = paired_phone(&hub, "tablet");
+    let acme = question(&hub, "server-1", "acme", "dev", 1, 3600);
+    open_questions(&hub, &server, &[acme.clone(), question(&hub, "server-1", "beta", "dev", 2, 3600)], &["pixel", "tablet"]);
+    let listed = |phone: &Phone| hub.call("GET", "/v1/questions", Some(&phone.token), None);
+    assert_eq!(listed(&pixel), (200, json!({"questions": [{"machine": "server-1", "record": util::hex(&acme), "sealed": util::hex(&sealed_for("pixel", 1))}]})));
+    // Named again with one phone less: the other's copy goes, and nothing more is asked for.
+    let id = util::hex(&[1; 16]);
+    let (_, reply) = hub.call("POST", "/v1/machine/questions", Some(&server.token), Some(&json!({"questions": [{"id": id, "devices": ["tablet"]}]})));
+    assert_eq!(reply, json!({"missing": []}));
+    assert_eq!(listed(&pixel), (200, json!({"questions": []})));
+    assert_eq!(listed(&tablet).1["questions"].as_array().unwrap().len(), 1);
+    // Another record under its id, another machine's, one past its expiry: refused.
+    let post = |record: &[u8]| {
+        hub.call("POST", "/v1/machine/question", Some(&server.token), Some(&json!({"record": util::hex(record), "device": "pixel", "sealed": util::hex(&sealed_for("pixel", 1))})))
+    };
+    assert_eq!(post(&question(&hub, "server-1", "acme", "web", 1, 3600)), (400, error("malformed")));
+    assert_eq!(post(&question(&hub, "server-2", "acme", "dev", 3, 3600)), (403, error("other-machine")));
+    assert_eq!(post(&question(&hub, "server-1", "acme", "dev", 3, -120)), (410, error("gone")));
+    // A phone's call takes a machine's token nowhere, and the hub holds twenty at most.
+    assert_eq!(hub.call("GET", "/v1/questions", Some(&server.token), None), (403, error("wrong-kind")));
+    let records: Vec<Vec<u8>> = (10..31).map(|n| question(&hub, "server-1", "acme", "dev", n, 3600)).collect();
+    let ids: Vec<Value> = records.iter().map(|record| json!({"id": util::hex(&crate::questions::Record::decode(record).unwrap().id.0), "devices": ["pixel"]})).collect();
+    assert_eq!(hub.call("POST", "/v1/machine/questions", Some(&server.token), Some(&json!({"questions": ids}))), (400, error("malformed")), "one call names at most 20");
+    open_questions(&hub, &server, &records[..20], &["pixel"]);
+    assert_eq!(post(&records[20]), (429, error("full")));
+    // Past its expiry, by the hub's clock and a minute's grace, a question goes by itself.
+    hub.advance(SignedDuration::from_secs(3600 + 61));
+    assert_eq!(listed(&pixel), (200, json!({"questions": []})));
+}
+
+#[test]
+fn a_phone_s_sealed_answer_reaches_the_machine_and_its_receipt_the_phone() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    let tablet = paired_phone(&hub, "tablet");
+    open_questions(&hub, &server, &[question(&hub, "server-1", "acme", "dev", 1, 3600)], &["pixel"]);
+    let reply_to = |phone: &Phone, machine: &str, id: u8, sealed: &[u8]| {
+        hub.call("POST", "/v1/reply", Some(&phone.token), Some(&json!({"machine": machine, "id": util::hex(&[id; 16]), "sealed": util::hex(sealed)})))
+    };
+    let sealed = vec![0x04; 300];
+    // Only to a question held and sealed to that phone.
+    assert_eq!(reply_to(&tablet, "server-1", 1, &sealed), (410, error("gone")));
+    assert_eq!(reply_to(&pixel, "server-1", 2, &sealed), (410, error("gone")));
+    assert_eq!(reply_to(&pixel, "server-9", 1, &sealed), (410, error("gone")));
+    assert_eq!(reply_to(&pixel, "server-1", 1, &[0x04; 10]), (400, error("malformed")), "shorter than any seal");
+    assert_eq!(reply_to(&pixel, "server-1", 1, &vec![0x04; crate::hub::REPLY_SEALED_MAX + 1]), (400, error("malformed")));
+    // The longest fits the call's body.
+    let (status, reply) = reply_to(&pixel, "server-1", 1, &vec![0x04; crate::hub::REPLY_SEALED_MAX]);
+    assert_eq!((status, reply), (202, json!({"n": 1})));
+    assert_eq!(reply_to(&pixel, "server-1", 1, &sealed), (202, json!({"n": 2})));
+    let inbox = |done: Value| hub.call("POST", "/v1/machine/inbox", Some(&server.token), Some(&json!({"done": done})));
+    let items = inbox(json!([])).1["items"].clone();
+    assert_eq!(items[1], json!({"n": 2, "kind": "reply", "device": "pixel", "ws": "acme", "id": util::hex(&[1; 16]), "sealed": util::hex(&sealed)}));
+    // Said done with a receipt: the phone sees the word and the receipt, which the hub can't read.
+    let receipt = vec![0x04; 120];
+    assert_eq!(inbox(json!([{"n": 2, "said": "delivered", "receipt": util::hex(&receipt)}, {"n": 1, "said": "unreadable"}])).0, 200);
+    let sent = hub.call("GET", "/v1/state", Some(&pixel.token), None).1["sent"].clone();
+    assert_eq!(sent[1]["receipt"], util::hex(&receipt));
+    assert_eq!((sent[1]["kind"].as_str(), sent[1]["state"].as_str(), sent[1]["id"].as_str()), (Some("reply"), Some("delivered"), Some(util::hex(&[1; 16]).as_str())));
+    assert!(sent[0].get("receipt").is_none());
+    assert_eq!(inbox(json!([{"n": 9, "said": "delivered", "receipt": "00"}])), (400, error("malformed")));
+}
+
+#[test]
+fn a_question_ends_a_held_wait_within_the_agents_limits_and_old_waits_never_see_one() {
+    let hub = start_with_agents(AgentLimits { gap: Duration::ZERO, per_box: 1, ..AGENT_LIMITS });
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    // A question comes: an app told of questions is woken at once.
+    let (reply, _) = held(|| wait_all(&hub, &pixel.token, &[], &[], &[]), || open_questions(&hub, &server, &[question(&hub, "server-1", "acme", "dev", 1, 3600)], &["pixel"]));
+    assert_eq!(reply, (200, all(&[], &[], &[[1; 16]])));
+    // Its box's one wake-up of the hour is spent: its notice comes back and is held back, and so is
+    // another question of it, notices and questions counting together.
+    open_notices(&hub, &server, &[notice("server-1", "acme", "dev", 7)], &["pixel"]);
+    let quick = || wait_all(&hub, &pixel.token, &[[9; 16]], &[], &[[1; 16]]);
+    post(&hub, &server, "acme", 9);
+    assert_eq!(quick(), (200, all(&[[9; 16]], &[], &[[1; 16]])), "a request ends the call; the notice held back is not told");
+    // Another box wakes the phone, with what was held back.
+    open_questions(&hub, &server, &[question(&hub, "server-1", "acme", "dev", 1, 3600), question(&hub, "server-1", "acme", "web", 2, 3600)], &["pixel"]);
+    assert_eq!(wait_all(&hub, &pixel.token, &[[9; 16]], &[], &[[1; 16]]), (200, all(&[[9; 16]], &[[7; 16]], &[[1; 16], [2; 16]])));
+    // The app of today, and the one told of notices, never see a question, nor does one end their
+    // calls; both lists are as they were.
+    assert_eq!(wait(&hub, &pixel.token, &[]), (200, ids(&[[9; 16]])));
+    assert_eq!(wait_both(&hub, &pixel.token, &[], &[[7; 16]]).1, both(&[[9; 16]], &[[7; 16]]));
+    let (reply, took) =
+        held(|| wait_both(&hub, &pixel.token, &[[9; 16]], &[[7; 16]]), || open_questions(&hub, &server, &[question(&hub, "server-1", "acme", "ci", 3, 3600)], &["pixel"]));
+    assert_eq!(reply, (200, both(&[[9; 16]], &[[7; 16]])));
+    assert!(took >= WAIT_HOLD - Duration::from_millis(50), "{took:?}");
+    assert_eq!(hub.call("GET", "/v1/notices", Some(&pixel.token), None).1["notices"].as_array().unwrap().len(), 1);
 }

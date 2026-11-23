@@ -97,7 +97,8 @@ pub fn serve(keep: Keep) -> Result<u8> {
     let settings = keep.settings.clone();
     let world = keep.vms.map(|vms| run::Real { vms, keys: KeyStore::of(&settings), settings: &settings });
     let ready = |name: &str, shown: &str, checked: &Checked| super::ready(name, shown, &checked.text, checked.policy.keep, &settings);
-    let desk = Desk::following(requests::machine_name, keep.name.to_string(), limits(), Arc::new(requests::TouchId));
+    let desk =
+        Desk::following(requests::machine_name, keep.name.to_string(), limits(), Arc::new(requests::TouchId), Box::new(requests::LinkFiles(crate::link::files::Folder::here())));
     let trust = |name: &str| crate::link::trusted(name);
     let ws = keep.name.to_string();
     let serve_mcp = move |reading: UnixStream, writing: UnixStream, ended: Arc<AtomicBool>| mcp::serve_io(BufReader::new(reading), writing, mcp::Scope::workspace(&ws, ended));

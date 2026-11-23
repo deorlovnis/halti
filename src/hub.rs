@@ -57,7 +57,7 @@ use table::{Row, Table};
 
 pub use admin::{devices, pair, revoke};
 pub use listen::{BODY_MAX, STATE_BODY_MAX};
-pub use relay::{ITEMS_MAX, NOTICES_MAX, REPORT_IDS_MAX, REPORT_MAX};
+pub use relay::{ITEMS_MAX, NOTICES_MAX, QUESTIONS_MAX, REPLY_SEALED_MAX, REPORT_IDS_MAX, REPORT_MAX};
 
 /// What the hub's certificate names. Clients check only its key.
 const CERT_NAME: &str = "halti-hub";

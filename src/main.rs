@@ -40,6 +40,7 @@ mod mcp;
 mod names;
 mod notices;
 mod policy;
+mod questions;
 mod refresh;
 mod requests;
 #[cfg(all(halti_dev, target_os = "linux"))]
@@ -381,6 +382,19 @@ enum RequestsCmd {
     Deny {
         /// The request's id as halti requests lists it, or enough of its start
         id: String,
+    },
+    /// Answer an agent's question here: the run is no longer marked away (needs a terminal)
+    #[command(
+        after_help = "A permission prompt: yes, or no and an optional reason. A choice: for each question, the numbers of the options (2, or 1,3), or text in their place. A turn that ended: the text to send, or --leave to leave it stopped."
+    )]
+    Reply {
+        /// The question's id as halti requests lists it, or enough of its start
+        id: String,
+        /// Leave the agent stopped, its turn ended
+        #[arg(long, conflicts_with = "answer")]
+        leave: bool,
+        #[arg(value_name = "ANSWER", num_args = 0.., trailing_var_arg = true)]
+        answer: Vec<String>,
     },
 }
 
@@ -1196,6 +1210,7 @@ fn run() -> ExitCode {
             None => ws::requests::list(),
             Some(RequestsCmd::Approve { id }) => ws::requests::answer(&id, true),
             Some(RequestsCmd::Deny { id }) => ws::requests::answer(&id, false),
+            Some(RequestsCmd::Reply { id, leave, answer }) => ws::requests::reply(&id, leave, &answer),
         }),
         Cmd::Hub { action: HubCmd::Serve { listen, address } } => ok(hub::serve(&listen, address.as_deref())),
         Cmd::Hub { action: HubCmd::Join { string } } => ok(link::join(&string)),

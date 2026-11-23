@@ -20,6 +20,14 @@
 //! `403`. It is answered at once, `200` with the body `nobody`: nobody answers from the phone.
 //! Anything else is `400`.
 //!
+//! The asker of a newer image says `halti-ask-v2` in place of the label, with the same fields and
+//! caps, and its text in the form `crate::questions` gives. It also says `permit` as Claude Code
+//! asks leave to run a tool. Its `permit`, `question` and `turn-ended` are held in a run marked
+//! away, and answered with what a phone or `halti requests` said (`crate::questions`), after the
+//! interim reply `HTTP/1.1 102 Processing` written at once: the asker gives up on a call that is
+//! neither answered nor held within 5 seconds. Otherwise, and every other event, at once, as above.
+//! An asker of an older image is never held.
+//!
 //! The door knows which machine, workspace, box and run it serves; the box names none of them. The
 //! open workspace keeps a run's session tags on this machine and gives each a number of its own, 1,
 //! 2, 3 within the run, as its first notice opens: the smallest that no other tag of the run holds.
@@ -51,6 +59,15 @@
 //! closed by `working`, by the end of its run, or as the workspace closes; never for its age. A run
 //! that ended opens none: an ask the door read before it stopped may come after. One is open per
 //! session, the first kind kept (two hooks may see one wait), and eight per box.
+//!
+//! A session's notice stays open while its question waits, so that a phone whose app reads no
+//! questions, or a hub that carries none, still tells the owner of the wait; an app that lists the
+//! question shows it in the notice's place. An answer closes the notice, as the agent goes on. When
+//! the question ends with the agent still waiting (its time was over, the run is no longer marked
+//! away, the owner left it for the terminal, or no phone is trusted any more), a new notice takes
+//! the session's place, with the reason: its sealed text (`Reason`), which no box chose. A notice
+//! open as its run is marked away comes back at once with the reason that its wait began before the
+//! mark.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -64,6 +81,8 @@ use crate::requests::{Id, RunId, check_name};
 pub const LABEL: &str = "halti-notice-v1";
 /// The first field of what the asker sends.
 pub const ASK_LABEL: &str = "halti-ask-v1";
+/// The first field of what the asker of a newer image sends, whose asks may be held.
+pub const ASK_LABEL_V2: &str = "halti-ask-v2";
 /// The path the asker sends it to on halti.internal.
 pub const ASK_PATH: &str = "/ask";
 /// What every ask is answered: nobody answers from the phone.
@@ -109,6 +128,9 @@ impl Kind {
 pub enum Event {
     /// The agent waits.
     Waiting(Kind),
+    /// Claude Code asks leave to run a tool, as its dialog opens: a question in a run marked away
+    /// (`crate::questions`), and nothing else. Its notice comes from the Notification that follows.
+    Permit,
     /// It no longer waits.
     Working,
     /// It no longer waits: the owner typed at its terminal. Counted as `Working` here.
@@ -120,6 +142,7 @@ impl Event {
     pub fn word(self) -> &'static str {
         match self {
             Event::Waiting(kind) => kind.word(),
+            Event::Permit => "permit",
             Event::Working => "working",
             Event::Typed => "typed",
         }
@@ -129,33 +152,77 @@ impl Event {
         match word {
             b"working" => Some(Event::Working),
             b"typed" => Some(Event::Typed),
+            b"permit" => Some(Event::Permit),
             _ => Kind::parse(word).map(Event::Waiting),
         }
     }
 }
 
-/// What an ask comes to here: its event and session tag. Its text is checked for length and
-/// dropped as it is read.
+/// What an ask comes to here: its event and session tag, and from a newer asker its text, which may
+/// become a question. The text of an older one is checked for length and dropped as it is read.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Ask {
     pub event: Event,
     pub tag: Vec<u8>,
+    /// From an asker that may be held (`ASK_LABEL_V2`): what the hook showed.
+    pub text: Option<Vec<u8>>,
 }
 
 impl Ask {
     /// The ask these bytes are, or None if they are not one in every field.
     pub fn parse(body: &[u8]) -> Option<Ask> {
         let [label, event, tag, text] = fields::split(body)?[..] else { return None };
-        if label != ASK_LABEL.as_bytes() || tag.len() > TAG_MAX || text.len() > TEXT_MAX {
+        let held = label == ASK_LABEL_V2.as_bytes();
+        if !(held || label == ASK_LABEL.as_bytes()) || tag.len() > TAG_MAX || text.len() > TEXT_MAX {
             return None;
         }
-        Some(Ask { event: Event::parse(event)?, tag: tag.to_vec() })
+        Some(Ask { event: Event::parse(event)?, tag: tag.to_vec(), text: held.then(|| text.to_vec()) })
     }
 
     /// The bytes the asker sends for `event`, `tag` and `text`.
     #[cfg(test)]
     pub fn bytes(event: &[u8], tag: &[u8], text: &[u8]) -> Vec<u8> {
         fields::join(&[ASK_LABEL.as_bytes(), event, tag, text])
+    }
+
+    /// The bytes a newer asker sends.
+    #[cfg(test)]
+    pub fn bytes_v2(event: &[u8], tag: &[u8], text: &[u8]) -> Vec<u8> {
+        fields::join(&[ASK_LABEL_V2.as_bytes(), event, tag, text])
+    }
+}
+
+/// Why a notice came back from a question that ended while its agent still waited.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reason {
+    /// The question's time was over, at this time: seconds since 1970.
+    Expired(u64),
+    /// The run is no longer marked away.
+    NotAway,
+    /// The owner left it for the terminal ("Leave it stopped").
+    Left,
+    /// No phone is trusted for the workspace any more.
+    NoPhone,
+    /// The wait began before the run was marked away.
+    BeforeAway,
+}
+
+impl Reason {
+    pub fn word(self) -> &'static str {
+        match self {
+            Reason::Expired(_) => "expired",
+            Reason::NotAway => "not-away",
+            Reason::Left => "left",
+            Reason::NoPhone => "no-phone",
+            Reason::BeforeAway => "before-away",
+        }
+    }
+
+    /// The notice's sealed text: the word, and the time it names (the expiry), else 0, 8 bytes
+    /// big-endian.
+    pub fn said(self) -> Vec<u8> {
+        let at = if let Reason::Expired(at) = self { at } else { 0 };
+        fields::join(&[self.word().as_bytes(), &at.to_be_bytes()])
     }
 }
 
@@ -225,6 +292,8 @@ pub struct Open {
     pub kind: Kind,
     pub id: Id,
     pub since: u64,
+    /// Why it came back, if it did.
+    pub reason: Option<Reason>,
     due: Instant,
 }
 
@@ -272,10 +341,11 @@ impl Table {
                     return;
                 }
                 // Numbered only as its notice opens, so a wait that opens none moves no number.
-                let Some(session) = known.or_else(|| self.number(run, tag, per_box)) else { return };
+                let Some(session) = known.or_else(|| self.number(run, tag, per_box, &[])) else { return };
                 let due = if away { now.instant } else { now.instant.checked_add(delay).unwrap_or(now.instant) };
-                self.open.push(Open { box_name: box_name.to_string(), run, session, kind, id: Id::random(), since: now.secs, due });
+                self.open.push(Open { box_name: box_name.to_string(), run, session, kind, id: Id::random(), since: now.secs, reason: None, due });
             }
+            Event::Permit => {}
             Event::Working | Event::Typed => {
                 if let Some(session) = self.known(run, tag) {
                     self.open.retain(|open| !(open.run == run && open.session == session));
@@ -284,11 +354,19 @@ impl Table {
         }
     }
 
+    /// The number of `tag` in `run`, given now if it has none, for a question: `busy` are the
+    /// sessions of the run with a question, which keep their numbers as one with a notice does.
+    pub fn session(&mut self, run: RunId, tag: &[u8], keep: usize, busy: &[u32]) -> Option<u32> {
+        self.known(run, tag).or_else(|| self.number(run, tag, keep, busy))
+    }
+
     /// A number for `tag`, which has none in `run`: the smallest no other tag kept for the run
     /// holds. At most `keep` tags of a run are kept, so it is never more than `keep`; past that, the
-    /// one used longest ago that has no notice open gives its place up. None if every one has.
-    fn number(&mut self, run: RunId, tag: &[u8], keep: usize) -> Option<u32> {
-        let open: Vec<u32> = self.open.iter().filter(|open| open.run == run).map(|open| open.session).collect();
+    /// one used longest ago that has no notice open, nor is `busy`, gives its place up. None if
+    /// every one has.
+    fn number(&mut self, run: RunId, tag: &[u8], keep: usize, busy: &[u32]) -> Option<u32> {
+        let mut open: Vec<u32> = self.open.iter().filter(|open| open.run == run).map(|open| open.session).collect();
+        open.extend_from_slice(busy);
         self.uses += 1;
         let uses = self.uses;
         let sessions = self.runs.entry(run).or_default();
@@ -302,7 +380,7 @@ impl Table {
     }
 
     /// The number `tag` has in `run`, if it has one.
-    fn known(&mut self, run: RunId, tag: &[u8]) -> Option<u32> {
+    pub fn known(&mut self, run: RunId, tag: &[u8]) -> Option<u32> {
         self.uses += 1;
         let uses = self.uses;
         let (_, session, used) = self.runs.get_mut(&run)?.tags.iter_mut().find(|(kept, _, _)| kept == tag)?;
@@ -313,6 +391,43 @@ impl Table {
     /// The notices that are sent now: open, and past their delay.
     pub fn due(&self, now: Instant) -> Vec<Open> {
         self.open.iter().filter(|open| open.due <= now).cloned().collect()
+    }
+
+    /// Closes the notice of session `session` of `run`, if one is open: its question was answered,
+    /// or gives it back with a reason.
+    pub fn close_session(&mut self, run: RunId, session: u32) {
+        self.open.retain(|open| !(open.run == run && open.session == session));
+    }
+
+    /// Opens a notice again for a wait that a question gave back, with the reason, as a new notice
+    /// in place of the session's own. Nothing once the run ended, or when the box has as many open
+    /// as it may.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reopen(&mut self, box_name: &str, run: RunId, session: u32, kind: Kind, since: u64, reason: Reason, due: Instant, per_box: usize) {
+        if self.ended.contains(&run) {
+            return;
+        }
+        self.close_session(run, session);
+        if self.open.iter().filter(|open| open.box_name == box_name).count() >= per_box {
+            return;
+        }
+        self.open.push(Open { box_name: box_name.to_string(), run, session, kind, id: Id::random(), since, reason: Some(reason), due });
+    }
+
+    /// The run `run` was marked away: each notice of it open now comes back at once, as a new
+    /// notice, with the reason that its wait began before the mark. Not those of the sessions
+    /// `asking`, whose waits are questions already: a mark set again leaves them be.
+    pub fn before_away(&mut self, run: RunId, now: Instant, asking: &[u32]) {
+        for open in self.open.iter_mut().filter(|open| open.run == run && open.reason.is_none() && !asking.contains(&open.session)) {
+            open.id = Id::random();
+            open.reason = Some(Reason::BeforeAway);
+            open.due = now;
+        }
+    }
+
+    /// Whether run `run` ended while the workspace is open.
+    pub fn ended(&self, run: RunId) -> bool {
+        self.ended.contains(&run)
     }
 
     /// Closes the notices of run `run`, which ended, forgets its sessions, and opens none for it

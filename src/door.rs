@@ -429,6 +429,12 @@ struct Entry {
     record: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
+    /// An answer to an agent's question: the question's kind, and the SHA-256 of its record in hex,
+    /// salted as the record holds a salt. Its text is never written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    question: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asked: Option<String>,
 }
 
 impl Entry {
@@ -449,6 +455,8 @@ impl Entry {
             request: None,
             record: None,
             signature: None,
+            question: None,
+            asked: None,
         }
     }
 

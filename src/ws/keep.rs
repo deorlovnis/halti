@@ -384,6 +384,13 @@ pub(super) fn answers(here: &Here, name: &WsName, id: WsId) -> bool {
     kept.held() && matches!(keep::ask(&kept.socket(), &Request::Ping(name.clone()), keep::PING_WAIT), Some(Reply::Open(_)))
 }
 
+/// The boxes of the open workspace `name` whose runs are marked away, each with when its mark
+/// ends; none if it doesn't say, as one of an older halti doesn't.
+pub(super) fn marks(here: &Here, name: &WsName, id: WsId) -> Vec<(String, u64)> {
+    let Ok(kept) = Kept::of(here, id) else { return Vec::new() };
+    keep::marks(&kept.socket(), name, keep::LINE_WAIT).and_then(Result::ok).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;

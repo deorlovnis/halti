@@ -1,7 +1,8 @@
 //! What the hub carries between machines and phones, in memory only: each machine's last report of
-//! its state, the requests it posted, the notices that an agent waits (`crate::notices`), sealed
-//! to each phone, and what phones sent it, signed answers and stops, until its link has taken them
-//! and said what came of them. A restart loses all of it: a machine's link reports again, and is
+//! its state, the requests it posted, the notices that an agent waits (`crate::notices`) and the
+//! questions of agents (`crate::questions`), sealed to each phone, and what phones sent it, signed
+//! answers and stops and sealed answers to questions, until its link has taken them and said what
+//! came of them, with the receipt it sealed for the phone. A restart loses all of it: a machine's link reports again, and is
 //! told which of its requests and notices the hub lacks, so it posts them again.
 //!
 //! Nothing here can say yes. An answer or a stop counts only at the machine, which checks the
@@ -18,6 +19,7 @@ use serde_json::{Value, json};
 use super::wire::{self, Refused};
 use crate::keep::STOP_RUNS_MAX;
 use crate::notices::Notice;
+use crate::questions;
 use crate::requests::{Id, Record, RunId};
 use crate::util::hex;
 
@@ -30,6 +32,14 @@ pub const SEALED_MIN: usize = 65 + 16;
 pub const SEALED_MAX: usize = 256;
 /// The most answers and stops that wait for one machine to take them.
 pub const ITEMS_MAX: usize = 64;
+/// The most questions the hub holds for one machine, and the most one call of its link names.
+pub const QUESTIONS_MAX: usize = 20;
+/// The longest sealed copy of a question: a whole record's sealed fields, sealed.
+pub const QUESTION_SEALED_MAX: usize = questions::RECORD_MAX + 65 + 16;
+/// The longest sealed answer: its form, salt, content and signature, sealed.
+pub const REPLY_SEALED_MAX: usize = 3 * 1024;
+/// The longest sealed receipt: the answer's hash and a word, sealed.
+pub const RECEIPT_SEALED_MAX: usize = 256;
 /// How many of what each phone sent one machine are kept once taken, for the phone to see what
 /// came of them, and for how long at most. What one phone sends never pushes out another's.
 const DONE_MAX: usize = 64;
@@ -92,8 +102,15 @@ struct HeldNotice {
     sealed: Copies,
 }
 
+/// A question a machine posted: its clear fields read, their bytes, and a copy for each phone.
+struct HeldQuestion {
+    record: questions::Record,
+    bytes: Vec<u8>,
+    sealed: Copies,
+}
+
 /// A notice as a held call of a phone tells it apart: its id, and the machine, workspace and box
-/// it is of.
+/// it is of. A question is told apart the same way.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NoticeKey {
     pub id: [u8; 16],
@@ -114,19 +131,36 @@ pub struct Item {
     pub taken: bool,
     /// What the machine said came of it.
     pub said: Option<String>,
+    /// For a sealed answer, the receipt the machine sealed for the phone.
+    pub receipt: Option<Vec<u8>>,
 }
 
 /// A signed answer, or a signed stop of runs, each with the box the phone named it with.
 #[derive(Clone, Debug)]
 pub enum What {
-    Answer { ws: String, id: Id, yes: bool, signature: Vec<u8> },
-    Stop { ws: String, runs: Vec<(String, RunId)>, signature: Vec<u8> },
+    Answer {
+        ws: String,
+        id: Id,
+        yes: bool,
+        signature: Vec<u8>,
+    },
+    Stop {
+        ws: String,
+        runs: Vec<(String, RunId)>,
+        signature: Vec<u8>,
+    },
+    /// A sealed answer to a question.
+    Reply {
+        ws: String,
+        id: Id,
+        sealed: Vec<u8>,
+    },
 }
 
 impl What {
     fn ws(&self) -> &str {
         match self {
-            What::Answer { ws, .. } | What::Stop { ws, .. } => ws,
+            What::Answer { ws, .. } | What::Stop { ws, .. } | What::Reply { ws, .. } => ws,
         }
     }
 
@@ -134,6 +168,7 @@ impl What {
         match self {
             What::Answer { .. } => "answer",
             What::Stop { .. } => "stop",
+            What::Reply { .. } => "reply",
         }
     }
 }
@@ -144,6 +179,8 @@ struct Mailbox {
     requests: BTreeMap<[u8; 16], Held>,
     /// The notices of its agents that wait, by id. None is ever dropped for its age.
     notices: BTreeMap<[u8; 16], HeldNotice>,
+    /// The questions of its agents, by id, until their expiry.
+    questions: BTreeMap<[u8; 16], HeldQuestion>,
     /// Requests dropped at their expiry, until this time.
     expired: HashMap<[u8; 16], Timestamp>,
     /// Waiting for the machine, oldest first.
@@ -162,6 +199,7 @@ impl Mailbox {
             self.requests.remove(&id);
             self.expired.insert(id, now + EXPIRED_KEPT);
         }
+        self.questions.retain(|_, held| i64::try_from(held.record.expiry).unwrap_or(i64::MAX).saturating_add(grace) > now_secs);
         self.expired.retain(|_, until| now < *until);
         self.done.retain(|item| now.duration_since(item.at) < DONE_LIFE);
         // Each phone's oldest go first, until it has DONE_MAX.
@@ -337,6 +375,63 @@ pub fn notice_body(body: &[u8]) -> Result<(Notice, Vec<u8>, Copies), Refused> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct QuestionsBody {
+    questions: Vec<QuestionListed>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuestionListed {
+    id: String,
+    devices: Vec<String>,
+}
+
+/// A question a machine's link names: its id, and the phones it is sealed to.
+pub type Named = ([u8; 16], Vec<String>);
+
+/// What a machine's link says came of an item it took: its number, the word, and for a sealed
+/// answer the receipt for the phone.
+pub type Done = (u64, String, Option<Vec<u8>>);
+
+/// The questions a machine's link says wait, each with the phones it is sealed to, from the body
+/// of its call.
+pub fn questions_body(body: &[u8]) -> Result<Vec<Named>, Refused> {
+    let body: QuestionsBody = wire::json(body)?;
+    if body.questions.len() > QUESTIONS_MAX {
+        return Err(Refused::Malformed);
+    }
+    body.questions
+        .into_iter()
+        .map(|listed| {
+            if listed.devices.len() > REPORT_MAX {
+                return Err(Refused::Malformed);
+            }
+            Ok((wire::bytes(&listed.id)?, listed.devices.iter().map(|device| name(device)).collect::<Result<_, _>>()?))
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuestionBody {
+    record: String,
+    device: String,
+    sealed: String,
+}
+
+/// One phone's copy of a question a machine posts: its clear fields read, their bytes, the phone
+/// and the sealed bytes, from the body of its call. Only the form is checked: the hub can open
+/// none of it.
+pub fn question_body(body: &[u8]) -> Result<(questions::Record, Vec<u8>, String, Vec<u8>), Refused> {
+    let body: QuestionBody = wire::json(body)?;
+    let bytes = crate::util::unhex(&body.record).ok_or(Refused::Malformed)?;
+    let record = questions::Record::decode(&bytes).ok_or(Refused::Malformed)?;
+    let sealed = crate::util::unhex(&body.sealed).filter(|sealed| (SEALED_MIN..=QUESTION_SEALED_MAX).contains(&sealed.len())).ok_or(Refused::Malformed)?;
+    Ok((record, bytes, name(&body.device)?, sealed))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DoneBody {
     done: Vec<Said>,
 }
@@ -346,15 +441,41 @@ struct DoneBody {
 struct Said {
     n: u64,
     said: String,
+    receipt: Option<String>,
 }
 
-/// What a machine's link says came of the items it took: their numbers and words.
-pub fn done_body(body: &[u8]) -> Result<Vec<(u64, String)>, Refused> {
+/// What a machine's link says came of the items it took: their numbers and words, and for a sealed
+/// answer the receipt for the phone.
+pub fn done_body(body: &[u8]) -> Result<Vec<Done>, Refused> {
     let body: DoneBody = wire::json(body)?;
     if body.done.len() > ITEMS_MAX {
         return Err(Refused::Malformed);
     }
-    body.done.into_iter().map(|said| if wire::is_word(&said.said) { Ok((said.n, said.said)) } else { Err(Refused::Malformed) }).collect()
+    body.done
+        .into_iter()
+        .map(|said| {
+            let receipt = said
+                .receipt
+                .map(|receipt| crate::util::unhex(&receipt).filter(|sealed| (SEALED_MIN..=RECEIPT_SEALED_MAX).contains(&sealed.len())).ok_or(Refused::Malformed))
+                .transpose()?;
+            if wire::is_word(&said.said) { Ok((said.n, said.said, receipt)) } else { Err(Refused::Malformed) }
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyBody {
+    machine: String,
+    id: String,
+    sealed: String,
+}
+
+/// A phone's sealed answer: the machine, the question's id, and the sealed bytes.
+pub fn reply_body(body: &[u8]) -> Result<(String, Id, Vec<u8>), Refused> {
+    let body: ReplyBody = wire::json(body)?;
+    let sealed = crate::util::unhex(&body.sealed).filter(|sealed| (SEALED_MIN..=REPLY_SEALED_MAX).contains(&sealed.len())).ok_or(Refused::Malformed)?;
+    Ok((name(&body.machine)?, Id(wire::bytes(&body.id)?), sealed))
 }
 
 #[derive(Deserialize)]
@@ -542,6 +663,92 @@ impl Relay {
         out
     }
 
+    /// The questions a machine's link says wait, each with the phones it is sealed to: the rest are
+    /// dropped, and the copies of phones not named. The copies it names that the hub lacks come
+    /// back, each the question's id and the phone, for as many questions as it has room for. The
+    /// link posts those.
+    pub fn sync_questions(&mut self, machine: &str, listed: &[Named], now: Timestamp) -> Vec<([u8; 16], String)> {
+        let mailbox = self.mailbox(machine, now);
+        mailbox.questions.retain(|id, _| listed.iter().any(|(named, _)| named == id));
+        let mut missing = Vec::new();
+        let mut room = QUESTIONS_MAX.saturating_sub(mailbox.questions.len());
+        for (id, devices) in listed {
+            match mailbox.questions.get_mut(id) {
+                Some(held) => {
+                    held.sealed.retain(|(device, _)| devices.contains(device));
+                    missing.extend(devices.iter().filter(|device| !held.sealed.iter().any(|(named, _)| named == *device)).map(|device| (*id, device.clone())));
+                }
+                None if room > 0 => {
+                    room -= 1;
+                    missing.extend(devices.iter().map(|device| (*id, device.clone())));
+                }
+                None => {}
+            }
+        }
+        missing
+    }
+
+    /// One phone's copy of a question a machine posts. One the hub holds already with the same
+    /// record takes it in place of that phone's copy; another record of the same id is refused.
+    pub fn post_question(&mut self, machine: &str, record: questions::Record, bytes: Vec<u8>, device: String, sealed: Vec<u8>, now: Timestamp) -> Result<(), Refused> {
+        if record.machine != machine {
+            return Err(Refused::OtherMachine);
+        }
+        if i64::try_from(record.expiry).unwrap_or(i64::MAX).saturating_add(GRACE.as_secs()) <= now.as_second() {
+            return Err(Refused::Gone);
+        }
+        let mailbox = self.mailbox(machine, now);
+        if let Some(held) = mailbox.questions.get_mut(&record.id.0) {
+            if held.bytes != bytes {
+                return Err(Refused::Malformed);
+            }
+            held.sealed.retain(|(named, _)| *named != device);
+            held.sealed.push((device, sealed));
+            return Ok(());
+        }
+        if mailbox.questions.len() >= QUESTIONS_MAX {
+            return Err(Refused::Full);
+        }
+        mailbox.questions.insert(record.id.0, HeldQuestion { record, bytes, sealed: vec![(device, sealed)] });
+        Ok(())
+    }
+
+    /// The questions phone `device`, which sees `scope`, may see: each machine's name, the clear
+    /// fields and the copy sealed to that phone. A question with no copy for it is not its.
+    pub fn questions(&mut self, device: &str, scope: &[WsName], machines: &[String], now: Timestamp) -> Vec<(String, Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        for machine in machines {
+            let Some(mailbox) = self.held(machine, now) else { continue };
+            for held in mailbox.questions.values().filter(|held| in_scope(scope, &held.record.ws)) {
+                if let Some((_, sealed)) = held.sealed.iter().find(|(named, _)| named == device) {
+                    out.push((machine.clone(), held.bytes.clone(), sealed.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The questions `questions` lists for that phone, as its held call tells them apart, by id.
+    pub fn question_keys(&mut self, device: &str, scope: &[WsName], machines: &[String], now: Timestamp) -> Vec<NoticeKey> {
+        let mut out: Vec<NoticeKey> = self
+            .questions(device, scope, machines, now)
+            .into_iter()
+            .filter_map(|(machine, bytes, _)| {
+                let record = questions::Record::decode(&bytes)?;
+                Some(NoticeKey { id: record.id.0, machine, ws: record.ws, box_name: record.box_name })
+            })
+            .collect();
+        out.sort_by_key(|key| key.id);
+        out
+    }
+
+    /// The workspace of question `id` on `machine`, if phone `device` of `scope` may answer it: it
+    /// is held, in its workspaces, with a copy sealed to it.
+    pub fn question_ws(&mut self, machine: &str, id: Id, device: &str, scope: &[WsName], now: Timestamp) -> Option<String> {
+        let held = self.held(machine, now)?.questions.get(&id.0)?;
+        (in_scope(scope, &held.record.ws) && held.sealed.iter().any(|(named, _)| named == device)).then(|| held.record.ws.clone())
+    }
+
     /// The requests phones of `scope` may see: each machine's name and record.
     pub fn requests(&mut self, scope: &[WsName], machines: &[String], now: Timestamp) -> Vec<(String, Vec<u8>)> {
         let mut out = Vec::new();
@@ -589,18 +796,19 @@ impl Relay {
         self.next += 1;
         let n = self.next;
         let mailbox = self.mailbox(machine, now);
-        mailbox.items.push(Item { n, from: from.to_string(), at: now, what, taken: false, said: None });
+        mailbox.items.push(Item { n, from: from.to_string(), at: now, what, taken: false, said: None, receipt: None });
         Ok(n)
     }
 
     /// What `machine`'s link takes: first what it says came of the items it took before, which then
     /// leave the queue; then every item still queued, taken before or not.
-    pub fn take(&mut self, machine: &str, done: &[(u64, String)], now: Timestamp) -> Vec<Item> {
+    pub fn take(&mut self, machine: &str, done: &[Done], now: Timestamp) -> Vec<Item> {
         let mailbox = self.mailbox(machine, now);
-        for (n, said) in done {
+        for (n, said, receipt) in done {
             if let Some(at) = mailbox.items.iter().position(|item| item.n == *n && item.taken) {
                 let mut item = mailbox.items.remove(at);
                 item.said = Some(said.clone());
+                item.receipt = receipt.clone().filter(|_| matches!(item.what, What::Reply { .. }));
                 mailbox.done.push_back(item);
             }
         }
@@ -672,6 +880,12 @@ impl Relay {
                 match &item.what {
                     What::Answer { id, .. } => entry["id"] = id.hex().into(),
                     What::Stop { runs, .. } => entry["runs"] = runs_json(runs).into(),
+                    What::Reply { id, .. } => {
+                        entry["id"] = id.hex().into();
+                        if let Some(receipt) = &item.receipt {
+                            entry["receipt"] = hex(receipt).into();
+                        }
+                    }
                 }
                 sent.push(entry);
             }
@@ -712,6 +926,9 @@ pub fn item_json(item: &Item) -> Value {
         What::Stop { ws, runs, signature } => json!({
             "n": item.n, "kind": "stop", "device": item.from, "ws": ws,
             "runs": runs_json(runs), "signature": hex(signature),
+        }),
+        What::Reply { ws, id, sealed } => json!({
+            "n": item.n, "kind": "reply", "device": item.from, "ws": ws, "id": id.hex(), "sealed": hex(sealed),
         }),
     }
 }
