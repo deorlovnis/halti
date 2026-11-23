@@ -493,13 +493,17 @@ impl Relay {
         ids.iter().filter(|id| !mailbox.notices.contains_key(*id)).take(room).copied().collect()
     }
 
-    /// A notice a machine posts, with its sealed copies. One the hub holds already is left as it is.
+    /// A notice a machine posts, with its sealed copies. One the hub holds already keeps its record,
+    /// and takes these copies in place of its own: the phones trusted for it changed.
     pub fn post_notice(&mut self, machine: &str, notice: Notice, bytes: Vec<u8>, sealed: Copies, now: Timestamp) -> Result<(), Refused> {
         if notice.machine != machine {
             return Err(Refused::OtherMachine);
         }
         let mailbox = self.mailbox(machine, now);
-        if mailbox.notices.contains_key(&notice.id.0) {
+        if let Some(held) = mailbox.notices.get_mut(&notice.id.0) {
+            if held.bytes == bytes {
+                held.sealed = sealed;
+            }
             return Ok(());
         }
         if mailbox.notices.len() >= NOTICES_MAX {

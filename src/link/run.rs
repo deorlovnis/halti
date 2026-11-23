@@ -9,9 +9,9 @@
 //!   that restarted has none), and lists the phones not revoked, from which the trust list is kept:
 //!   a device not on a complete list is no longer trusted. Adding trust takes `halti devices
 //!   trust`, never a list. Then it names the open notices to the hub, which closes the rest, and
-//!   posts each the hub lacks, sealed by the machine key to each device trusted for its workspace.
-//!   That is the only key it reads, and only to seal: a copy is made once, kept while its notice is
-//!   open, and the key read again for the next.
+//!   posts each the hub lacks, sealed by the machine key to each device trusted for its workspace,
+//!   and again when those devices change. That is the only key it reads, and only to seal: a copy
+//!   is made once, kept while its notice is open, and the key read again for the next.
 //! - **Inbox.** It holds one call to the hub that waits for what phones sent this machine: signed
 //!   answers and stops. Each goes to the open workspace it names, which checks it, and what came of
 //!   it is said to the hub with the next call. A stop waits until its boxes are put away, so each
@@ -207,10 +207,16 @@ pub struct Link<'a> {
     /// Each notice's copy sealed to a device, by the notice's bytes, the device's name and its
     /// second key, while the notice is open.
     sealed: Mutex<HashMap<CopyOf, Vec<u8>>>,
+    /// Each open notice the hub was given, with the devices, by name and second key, it was
+    /// sealed to then. When those change it is given again.
+    posted: Mutex<HashMap<[u8; 16], Devices>>,
 }
 
 /// Which copy of a notice: its bytes, and the name and second key of the device it is sealed to.
 type CopyOf = (Vec<u8>, String, String);
+
+/// The devices a notice is sealed to, each its name and second key.
+type Devices = Vec<(String, String)>;
 
 /// Runs the link in `folder` for this machine's workspaces until `stop` is set.
 pub fn run(folder: &Folder, local: &dyn Local, timing: Timing, stop: &AtomicBool) -> Result<()> {
@@ -231,6 +237,7 @@ pub fn run(folder: &Folder, local: &dyn Local, timing: Timing, stop: &AtomicBool
         noted: Mutex::default(),
         handled: Mutex::default(),
         sealed: Mutex::default(),
+        posted: Mutex::default(),
     };
     thread::scope(|scope| {
         let link = &link;
@@ -509,7 +516,9 @@ impl Link<'_> {
     }
 
     /// Names the open notices to the hub, which closes the rest, and posts each it lacks, sealed
-    /// to each device trusted for its workspace. A hub that carries no notices is noted once.
+    /// to each device trusted for its workspace. One whose devices changed since it was posted, as
+    /// a phone was trusted, untrusted or paired again, is posted again with the copies of now. A
+    /// hub that carries no notices is noted once.
     fn post_notices(&self, look: &Look) -> Result<(), Failed> {
         let ids: Vec<String> = look.notices.iter().map(|(notice, _)| notice.id.hex()).collect();
         let reply = match self.call("POST", "/v1/machine/notices", Some(&json!({"notices": ids})), self.timing.call_wait) {
@@ -521,9 +530,15 @@ impl Link<'_> {
             Err(failed) => return Err(failed),
         };
         locked(&self.sealed).retain(|(bytes, _, _), _| look.notices.iter().any(|(_, open)| open == bytes));
-        let missing = reply["missing"].as_array().map(Vec::as_slice).unwrap_or_default();
-        for id in missing.iter().filter_map(|id| id.as_str().and_then(wire::unhex::<16>)) {
-            let Some((notice, bytes)) = look.notices.iter().find(|(notice, _)| notice.id.0 == id) else { continue };
+        locked(&self.posted).retain(|id, _| look.notices.iter().any(|(notice, _)| notice.id.0 == *id));
+        let missing: Vec<[u8; 16]> = reply["missing"].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|id| id.as_str().and_then(wire::unhex::<16>)).collect();
+        for (notice, bytes) in &look.notices {
+            let id = notice.id.0;
+            let devices = sealed_to(&notice.ws, &look.trust).map(|(entry, _)| (entry.name.clone(), entry.agreement_key.clone())).collect::<Vec<_>>();
+            let changed = locked(&self.posted).get(&id).is_some_and(|posted| *posted != devices);
+            if !missing.contains(&id) && !changed {
+                continue;
+            }
             let mut copies = self.copies(notice, bytes, &look.trust);
             let body = |copies: &[Value]| json!({"record": hex(bytes), "sealed": copies});
             while !copies.is_empty() && body(&copies).to_string().len() > BODY_MAX {
@@ -534,7 +549,9 @@ impl Link<'_> {
                 continue;
             }
             match self.call("POST", "/v1/machine/notice", Some(&body(&copies)), self.timing.call_wait) {
-                Ok(_) => {}
+                Ok(_) => {
+                    locked(&self.posted).insert(id, devices);
+                }
                 Err(Failed::Refused(429, _)) => {
                     self.say_once("the hub holds as many of this machine's notices as it takes: the rest aren't told");
                     break;
@@ -550,8 +567,7 @@ impl Link<'_> {
     fn copies(&self, notice: &Notice, bytes: &[u8], trust: &[Entry]) -> Vec<Value> {
         let mut key = None;
         let mut copies = Vec::new();
-        for entry in trust.iter().filter(|entry| entry.ws.iter().any(|ws| ws.as_str() == notice.ws)) {
-            let Some(second) = entry.second_key() else { continue };
+        for (entry, second) in sealed_to(&notice.ws, trust) {
             let held = (bytes.to_vec(), entry.name.clone(), entry.agreement_key.clone());
             let made = locked(&self.sealed).get(&held).cloned();
             let sealed = match made {
@@ -836,6 +852,12 @@ impl Link<'_> {
             Some(word) => format!("no {word}"),
         }
     }
+}
+
+/// The devices in `trust` a notice of workspace `ws` is sealed to: those trusted for it whose second
+/// key reads, each with that key.
+fn sealed_to<'a>(ws: &'a str, trust: &'a [Entry]) -> impl Iterator<Item = (&'a Entry, sealed::AgreementKey)> + 'a {
+    trust.iter().filter(move |entry| entry.ws.iter().any(|named| named.as_str() == ws)).filter_map(|entry| Some((entry, entry.second_key()?)))
 }
 
 /// An item the hub handed over, read whole; or the word it is said with: `unknown` for a kind

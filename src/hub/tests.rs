@@ -1768,10 +1768,17 @@ fn a_machine_posts_notices_sealed_to_each_phone_and_a_phone_lists_only_its_own()
     let listed = |phone: &Phone| hub.call("GET", "/v1/notices", Some(&phone.token), None);
     assert_eq!(listed(&pixel), (200, json!({"notices": [{"machine": "server-1", "record": util::hex(&acme), "sealed": util::hex(&sealed_for("pixel", 1))}]})));
     assert_eq!(listed(&tablet), (200, json!({"notices": []})));
-    // Posting again leaves it as it is; another machine's record, or a phone's token, is refused.
+    // Posted again, as the phones trusted for it changed: its copies are those posted now.
     let post = |token: &str, body: &Value| hub.call("POST", "/v1/machine/notice", Some(token), Some(body));
     assert_eq!(post(&server.token, &post_notice_body(&acme, &["tablet"])), (200, json!({})));
-    assert_eq!(listed(&tablet), (200, json!({"notices": []})));
+    assert_eq!(listed(&tablet), (200, json!({"notices": [{"machine": "server-1", "record": util::hex(&acme), "sealed": util::hex(&sealed_for("tablet", 1))}]})));
+    assert_eq!(listed(&pixel), (200, json!({"notices": []})));
+    // A record of another workspace under its id changes nothing.
+    let other_ws = notice("server-1", "beta", "dev", 1);
+    assert_eq!(post(&server.token, &post_notice_body(&other_ws, &["pixel"])), (200, json!({})));
+    assert_eq!(listed(&pixel), (200, json!({"notices": []})));
+    assert_eq!(post(&server.token, &post_notice_body(&acme, &["pixel"])), (200, json!({})));
+    // Another machine's record, or a phone's token, is refused.
     assert_eq!(post(&other.token, &post_notice_body(&notice("server-1", "acme", "dev", 3), &["pixel"])), (403, error("other-machine")));
     assert_eq!(post(&pixel.token, &post_notice_body(&acme, &["pixel"])), (403, error("wrong-kind")));
     assert_eq!(hub.call("GET", "/v1/notices", Some(&server.token), None), (403, error("wrong-kind")));

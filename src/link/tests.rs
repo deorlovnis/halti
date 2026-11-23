@@ -1217,3 +1217,23 @@ fn a_notice_the_hub_made_up_or_changed_does_not_open() {
     assert_eq!((shown.len(), refused), (1, 1));
     assert_eq!(shown[0].id, crate::notices::Notice::decode(&record).unwrap().id);
 }
+
+#[test]
+fn a_notice_follows_trust_while_it_is_open() {
+    let mut world = World::new();
+    world.open("acme", sent_at_once());
+    let pixel = world.hub.pair_phone("pixel", &["acme"]);
+    let tablet = world.hub.pair_phone("tablet", &["acme"]);
+    world.trust(&pixel, &["acme"]);
+    world.keeper("acme").desk.asker("dev", RunId([3; 8])).tell(crate::notices::Event::Waiting(crate::notices::Kind::TurnEnded), b"tag");
+    until("pixel lists the notice", || listed(&world, &pixel).0.len() == 1);
+    let id = listed(&world, &pixel).0[0].id;
+    // A phone trusted for acme after it was posted is given a copy of the same notice.
+    world.trust(&tablet, &["acme"]);
+    until("tablet lists it", || listed(&world, &tablet).0.len() == 1);
+    assert_eq!((listed(&world, &tablet).0[0].id, listed(&world, &tablet).1), (id, 0));
+    // One untrusted here is no longer given it.
+    assert!(untrust_at(&world.folder, "pixel").unwrap());
+    until("pixel no longer lists it", || pixel.notices(&world.hub).is_empty());
+    assert_eq!(listed(&world, &tablet).0.len(), 1);
+}

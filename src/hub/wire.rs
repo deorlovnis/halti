@@ -409,9 +409,10 @@
 //! ...]}`, those listed that it doesn't hold, as many as it has room for (50 in all). The link
 //! posts each: `POST /v1/machine/notice`, body `{"record": "<bytes>", "sealed": [{"device":
 //! "pixel", "sealed": "<bytes>"}, ...]}`, a copy for each phone trusted for its workspace, 1 to 64,
-//! each 81 to 256 bytes: `200 {}`, also for one held already, which is left as it is. A record
-//! that names another machine is `403 other-machine`; one more than the hub holds, `429 full`. The
-//! link calls with each report, and when the notices change.
+//! each 81 to 256 bytes: `200 {}`. For one held already with the same record, these copies take
+//! the place of those held: the link posts a notice again when the phones trusted for its workspace
+//! change. A record that names another machine is `403 other-machine`; one more than the hub
+//! holds, `429 full`. The link calls with each report, and when the notices change.
 //!
 //! **A phone's keys.** `POST /v1/machine/device`, body `{"name": "pixel"}`: `200 {"name": "pixel",
 //! "signing_key": "<91 bytes>", "agreement_key": "<91 bytes>", "key_signature": "<DER>", "ws":
