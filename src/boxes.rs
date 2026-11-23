@@ -23,7 +23,7 @@
 pub mod browser_vm;
 pub(crate) mod keep;
 mod login;
-mod nofollow;
+pub(crate) mod nofollow;
 pub(crate) mod run;
 pub(crate) mod sessions;
 pub(crate) mod store;
@@ -43,7 +43,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::approval::{self, Action};
-use crate::chain::{self, Chain};
+use crate::chain;
 use crate::config::{Engine, Settings};
 use crate::door::inspect::parse_prefix;
 use crate::engine::Vms;
@@ -919,7 +919,7 @@ pub fn log(name: &str, last: usize, verify: bool) -> Result<()> {
     let ask = || approve::confirm(&mut approve::Answers::default(), &format!("read the log of box {name}"));
     with_store(name, keys, ask, true, |mnt| {
         if verify {
-            let chain = Chain::new(&store::door_log(mnt), log_key(&keys.open_key(name)?));
+            let chain = store::door_chain(mnt, log_key(&keys.open_key(name)?));
             let found = chain.verify().with_context(|| format!("the log of box {name}"))?;
             let head = source::current().box_item(name, BoxItem::LogHead).and_then(|h| serde_json::from_str::<chain::Head>(&h).ok());
             if let Some(head) = &head {
@@ -929,7 +929,7 @@ pub fn log(name: &str, last: usize, verify: bool) -> Result<()> {
             println!("{} lines, chain intact{before}", found.chained);
             return Ok(());
         }
-        let text = fs::read_to_string(store::door_log(mnt)).unwrap_or_default();
+        let text = store::door_log_text(mnt).with_context(|| format!("the log of box {name}"))?;
         let lines: Vec<&str> = text.lines().collect();
         for line in &lines[lines.len().saturating_sub(last)..] {
             println!("{line}");
@@ -971,13 +971,13 @@ fn box_path(rel: &str) -> Result<PathBuf> {
     Ok(rel.to_path_buf())
 }
 
-/// Copy `rel` out of the open store into `to`. A link on the way (one the agent made) is refused,
-/// wherever it leads, and links inside a folder are skipped.
+/// Copy `rel` out of the open store into `to`. Each part of `rel` is opened from the one before: a
+/// link on the way or at `rel` (one the agent made) is refused, wherever it leads, and links inside
+/// a folder are skipped.
 fn export_from(mnt: &Path, rel: &str, to: &Path) -> Result<(Vec<Exported>, usize)> {
     let rel = box_path(rel)?;
-    nofollow::no_link(mnt, &rel)?;
-    let src = mnt.join(&rel);
-    if fs::symlink_metadata(&src).is_err() {
+    let found = nofollow::open(mnt, &rel)?;
+    if matches!(found, nofollow::Found::Missing) {
         bail!("{} isn't in the box", rel.display());
     }
     let to = fs::canonicalize(to).with_context(|| format!("{} isn't a folder", to.display()))?;
@@ -985,8 +985,8 @@ fn export_from(mnt: &Path, rel: &str, to: &Path) -> Result<(Vec<Exported>, usize
         bail!("{} isn't a folder", to.display());
     }
     let dst = to.join(rel.file_name().expect("a normal component"));
-    let copied = store::copy_tree(&src, &dst)?;
-    let single = src.is_file();
+    let single = matches!(found, nofollow::Found::File(_));
+    let copied = store::copy(found, &rel, &dst)?;
     let mut out = Vec::new();
     for file in copied.files {
         let (sha256, size) = sha256_file(&if single { dst.clone() } else { dst.join(&file) })?;

@@ -4,24 +4,46 @@
 //! one out of the middle, breaks the chain from there on, which `verify` reports. Cutting off the
 //! end can't be seen from the log alone; the `Head` that halti keeps elsewhere when a box stops
 //! covers that up to the last stop. (The same scheme as `audit`.)
+//!
+//! The log is in a box's store, which halti treats as hostile, so it is opened without following
+//! a link: each part of its path from the one before (`nofollow`).
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value};
 
 use crate::audit::hmac_sha256;
+use crate::boxes::nofollow::{self, Found};
 
 /// The last line is looked for in this many bytes at the end of the file.
 const TAIL: u64 = 16384;
 const MAC: &str = "mac";
 
 pub struct Chain {
-    path: PathBuf,
+    /// The folder the log is in, or below, taken as it is.
+    root: PathBuf,
+    /// The log's path in `root`, opened a part at a time.
+    rel: PathBuf,
     key: [u8; 32],
+}
+
+/// The text of the log at `rel` in the folder `root`, "" if it isn't there. A link on the way or
+/// at `rel` is refused, never followed.
+pub fn read(root: &Path, rel: &Path) -> Result<String> {
+    let shown = || format!("reading {}", root.join(rel).display());
+    match nofollow::open(root, rel).with_context(shown)? {
+        Found::Missing => Ok(String::new()),
+        Found::File(mut file) => {
+            let mut text = String::new();
+            file.read_to_string(&mut text).with_context(shown)?;
+            Ok(text)
+        }
+        Found::Link => Err(anyhow!("{} is a link; links aren't followed", rel.display())).with_context(shown),
+        Found::Folder(_) | Found::Other => Err(anyhow!("{} isn't a plain file", rel.display())).with_context(shown),
+    }
 }
 
 /// What a check found.
@@ -60,16 +82,30 @@ impl Verified {
 }
 
 impl Chain {
+    /// The log at `path`. Its folder is taken as it is; the file is opened without following a link.
     pub fn new(path: &Path, key: [u8; 32]) -> Self {
-        Self { path: path.to_path_buf(), key }
+        let root = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        Self::within(root, Path::new(path.file_name().unwrap_or_default()), key)
     }
 
-    /// Make sure the log can be written: its folder and the file (private to the user).
+    /// The log at `rel` in the folder `root`, every part of `rel` opened without following a link.
+    pub fn within(root: &Path, rel: &Path, key: [u8; 32]) -> Self {
+        Self { root: root.to_path_buf(), rel: rel.to_path_buf(), key }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.root.join(&self.rel)
+    }
+
+    /// The file, to read and to add to, made private to the user with its folders if it isn't there.
+    fn open(&self) -> Result<File> {
+        nofollow::append(&self.root, &self.rel, 0o600).with_context(|| format!("opening {}", self.path().display()))
+    }
+
+    /// Make sure the log can be written: its folders and the file (private to the user).
     pub fn create(&self) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        OpenOptions::new().append(true).create(true).mode(0o600).open(&self.path).with_context(|| format!("opening {}", self.path.display()))?;
+        fs::create_dir_all(&self.root).with_context(|| format!("creating {}", self.root.display()))?;
+        self.open()?;
         Ok(())
     }
 
@@ -78,7 +114,7 @@ impl Chain {
     pub fn append(&self, line: Value) -> Result<()> {
         let Value::Object(mut fields) = line else { bail!("a log line is a JSON object") };
         fields.remove(MAC);
-        let mut file = OpenOptions::new().read(true).append(true).create(true).mode(0o600).open(&self.path).with_context(|| format!("opening {}", self.path.display()))?;
+        let mut file = self.open()?;
         file.lock()?;
         let prev = last_mac(&mut file)?;
         let mac = self.mac(&prev, &fields)?;
@@ -96,11 +132,7 @@ impl Chain {
     /// Check every line against the chain. A line without a mac is fine only before the first
     /// one that has it (a log from before chaining); anything else that fails names its line.
     pub fn verify(&self) -> Result<Verified> {
-        let text = match fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", self.path.display())),
-        };
+        let text = read(&self.root, &self.rel)?;
         let (mut prev, mut found) = (String::new(), Verified { chained: 0, unchained: 0, macs: Vec::new() });
         for (no, line) in text.lines().enumerate().map(|(i, l)| (i + 1, l)).filter(|(_, l)| !l.trim().is_empty()) {
             let broken = || anyhow!("the chain breaks at line {no}: that line, or one before it, was changed or removed");
@@ -132,6 +164,8 @@ fn last_mac(file: &mut File) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
     use crate::util::TempDir;
     use serde_json::json;
@@ -148,11 +182,11 @@ mod tests {
     }
 
     fn lines(chain: &Chain) -> Vec<String> {
-        fs::read_to_string(&chain.path).unwrap().lines().map(str::to_string).collect()
+        fs::read_to_string(chain.path()).unwrap().lines().map(str::to_string).collect()
     }
 
     fn put(chain: &Chain, lines: &[String]) {
-        fs::write(&chain.path, lines.join("\n") + "\n").unwrap();
+        fs::write(chain.path(), lines.join("\n") + "\n").unwrap();
     }
 
     fn counts(chain: &Chain) -> (usize, usize) {
@@ -192,7 +226,7 @@ mod tests {
         assert!(c.verify().unwrap().check(&head).is_err());
 
         // A whole new log with other lines, chained with the same key.
-        fs::remove_file(&c.path).unwrap();
+        fs::remove_file(c.path()).unwrap();
         c.create().unwrap();
         for i in 0..6 {
             c.append(json!({ "kind": "request", "n": i, "url": "https://other.example.com/" })).unwrap();
@@ -210,9 +244,9 @@ mod tests {
         assert_eq!(counts(&c), (5, 0));
         assert!(lines(&c).iter().all(|l| l.contains("\"mac\":\"")));
         // A second writer carries on from the last line.
-        Chain::new(&c.path, [7; 32]).append(json!({ "kind": "box", "decision": "stopped" })).unwrap();
+        Chain::new(&c.path(), [7; 32]).append(json!({ "kind": "box", "decision": "stopped" })).unwrap();
         assert_eq!(c.verify().unwrap().chained, 6);
-        assert!(Chain::new(&c.path, [8; 32]).verify().is_err(), "another key can't verify it");
+        assert!(Chain::new(&c.path(), [8; 32]).verify().is_err(), "another key can't verify it");
     }
 
     #[test]
@@ -263,7 +297,7 @@ mod tests {
 
         // A log from before chaining: its lines stay unchecked, the new ones chain on.
         let old = [r#"{"kind":"proxy","decision":"allowed"}"#.to_string(), r#"{"kind":"proxy","decision":"closed"}"#.to_string()];
-        fs::remove_file(&c.path).unwrap();
+        fs::remove_file(c.path()).unwrap();
         put(&c, &old);
         c.append(json!({ "kind": "request" })).unwrap();
         c.append(json!({ "kind": "request" })).unwrap();
@@ -283,5 +317,39 @@ mod tests {
         assert!(c.append(json!("text")).is_err());
         c.append(json!({ "kind": "x", "mac": "forged" })).unwrap();
         assert_eq!(c.verify().unwrap().chained, 1);
+    }
+
+    #[test]
+    fn a_link_in_the_log_s_place_or_on_its_way_is_never_followed() {
+        let dir = TempDir::new("halti-chain").unwrap();
+        let (mnt, outside) = (dir.0.join("mnt"), dir.0.join("outside"));
+        fs::create_dir_all(mnt.join("log")).unwrap();
+        fs::create_dir_all(outside.join("log")).unwrap();
+        fs::write(outside.join("file"), "the person's own\n").unwrap();
+        fs::write(outside.join("log/door.log"), "the person's own\n").unwrap();
+        let own = || (fs::read_to_string(outside.join("file")).unwrap(), fs::read_to_string(outside.join("log/door.log")).unwrap());
+
+        // At the end: the log is a link to a file of the person's.
+        std::os::unix::fs::symlink(outside.join("file"), mnt.join("log/door.log")).unwrap();
+        // On the way: the store's folder is a link to a folder of the person's, with a log in it.
+        let linked = dir.0.join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(outside.join("log"), linked.join("log")).unwrap();
+        for (root, error) in [(&mnt, "log/door.log is a link; links aren't followed"), (&linked, "log is a link; links aren't followed")] {
+            let c = Chain::within(root, Path::new("log/door.log"), [7; 32]);
+            for e in [c.create().unwrap_err(), c.append(json!({ "kind": "x" })).unwrap_err(), c.verify().unwrap_err(), read(root, Path::new("log/door.log")).unwrap_err()] {
+                assert_eq!(e.root_cause().to_string(), error);
+            }
+        }
+        assert!(Chain::new(&mnt.join("log/door.log"), [7; 32]).append(json!({ "kind": "x" })).is_err(), "a log given by its path");
+        assert_eq!(own(), ("the person's own\n".to_string(), "the person's own\n".to_string()), "nothing written through a link");
+
+        // A log that isn't there yet is made, its folder too.
+        let c = Chain::within(&mnt, Path::new("new/door.log"), [7; 32]);
+        assert_eq!(read(&mnt, Path::new("new/door.log")).unwrap(), "");
+        c.create().unwrap();
+        c.append(json!({ "kind": "x" })).unwrap();
+        assert_eq!(c.verify().unwrap().chained, 1);
+        assert_eq!(fs::metadata(mnt.join("new/door.log")).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

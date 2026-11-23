@@ -699,22 +699,22 @@ fn log_with(here: &Here, found: &Found, way: &Way<'_>, typing: &dyn Fn() -> TtyP
     }
     found.layout.prepare()?;
     let mnt = found.layout.mount_point(box_name);
-    let read = |mnt: &Path| fs::read_to_string(boxes::store::door_log(mnt)).unwrap_or_default();
+    let read = |mnt: &Path| boxes::store::door_log_text(mnt).with_context(|| format!("the log of box {shown}"));
     if !boxes::store::ENCRYPTED {
-        return Ok(read(boxes::store::open(&bundle, &mnt, "", true)?.path()));
+        return read(boxes::store::open(&bundle, &mnt, "", true)?.path());
     }
     let Some(_held) = boxes::store::lock(&found.layout.lock(box_name))? else {
         if !boxes::store::is_mounted(&mnt) {
             bail!("box {shown} is being opened or closed by another halti: try again in a moment");
         }
-        return Ok(read(&mnt));
+        return read(&mnt);
     };
     let way = Way { world: way.world, copies: way.copies, means: way.means, detail: Some(format!("to read the log of box {box_name}")) };
     let reader = open_for(here, found, &way, &format!("the log of box {shown} was not read"), &format!("ws box log {shown}"), typing)?;
     let key = reader.box_key(&here.keystore, box_name)?.ok_or_else(|| anyhow!("box {shown} has a store but no key. remove it with: halti ws box rm {shown}"))?;
     drop(reader);
     let open = boxes::store::open(&bundle, &mnt, &key.hex(), true)?;
-    Ok(read(open.path()))
+    read(open.path())
 }
 
 // --- deleting a workspace ---

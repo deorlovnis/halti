@@ -28,7 +28,8 @@ use halti_core::ids::WsId;
 use jiff::Timestamp;
 use serde_json::json;
 
-use crate::chain::Chain;
+use super::nofollow::{Folder, Found};
+use crate::chain::{self, Chain};
 use crate::util::store_root;
 use crate::{engine, names};
 
@@ -571,13 +572,24 @@ pub fn usage(bundle: &Path) -> (u64, Option<SystemTime>) {
 /// door's lines chain with the same key, so this one is part of the chain too.
 pub fn log_event(mnt: &Path, log_key: &[u8; 32], kind: &str, path: &str, bytes: u64, decision: &str) -> Result<()> {
     let line = json!({ "time": Timestamp::now().to_string(), "kind": kind, "path": path, "bytes": bytes, "decision": decision });
-    let chain = Chain::new(&door_log(mnt), *log_key);
+    let chain = door_chain(mnt, *log_key);
     chain.create()?;
     chain.append(line)
 }
 
 pub fn door_log(mnt: &Path) -> PathBuf {
     mnt.join(DOOR_LOG)
+}
+
+/// The store's log, chained with `log_key`: each part of its path in the store is opened from the
+/// one before, never through a link.
+pub fn door_chain(mnt: &Path, log_key: [u8; 32]) -> Chain {
+    Chain::within(mnt, Path::new(DOOR_LOG), log_key)
+}
+
+/// The text of the store's log, "" if there is none yet. A link on the way to it is refused.
+pub fn door_log_text(mnt: &Path) -> Result<String> {
+    chain::read(mnt, Path::new(DOOR_LOG))
 }
 
 /// Where the sealed browser sessions are, one file per site.
@@ -598,49 +610,63 @@ pub struct Copied {
     pub skipped: usize,
 }
 
-/// Copy a file or a folder to `dst`, which must not exist. Links, sockets and devices are
-/// skipped, never followed, so a link in a box can't make halti read a file outside it. Modes are
-/// reduced to rw-r--r-- or rwxr-xr-x.
+/// Copy a file or a folder to `dst`, which must not exist. The folder `src` is in is taken as it is
+/// (the person's own); `src` and all in it are opened as `copy` says.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<Copied> {
-    let meta = fs::symlink_metadata(src).with_context(|| format!("reading {}", src.display()))?;
+    let (from, name) = folder_and_name(src)?;
+    copy(Folder::of(from)?.open(name)?, src, dst)
+}
+
+/// Copy what was found at `src` (`nofollow::open`) to `dst`, which must not exist: a file, or a
+/// folder with all in it. Each name in a folder is opened from the folder without following a
+/// link, and so is each made under `dst`. Links, sockets and devices in a folder are skipped,
+/// never followed, so a link in a box can't make halti read a file outside it, and a link at `src`
+/// is refused. Modes are reduced to rw-r--r-- or rwxr-xr-x.
+pub fn copy(found: Found, src: &Path, dst: &Path) -> Result<Copied> {
+    let (to, name) = folder_and_name(dst)?;
     let mut copied = Copied { files: Vec::new(), skipped: 0 };
-    if meta.file_type().is_symlink() {
-        bail!("{} is a link; links aren't followed", src.display());
-    } else if meta.is_dir() {
-        copy_dir(src, dst, Path::new(""), &mut copied)?;
-    } else if meta.is_file() {
-        copy_file(src, dst, &meta)?;
-        copied.files.push(PathBuf::from(dst.file_name().unwrap_or_default()));
-    } else {
-        bail!("{} isn't a file or folder", src.display());
+    match found {
+        Found::Folder(from) => copy_dir(&from, &Folder::of(to)?.make(name, 0o755)?, Path::new(""), &mut copied)?,
+        Found::File(from) => {
+            copy_file(&from, &src.display().to_string(), &Folder::of(to)?, name)?;
+            copied.files.push(PathBuf::from(name));
+        }
+        Found::Link => bail!("{} is a link; links aren't followed", src.display()),
+        Found::Missing => bail!("{} isn't there", src.display()),
+        Found::Other => bail!("{} isn't a file or folder", src.display()),
     }
     Ok(copied)
 }
 
-fn copy_dir(src: &Path, dst: &Path, rel: &Path, copied: &mut Copied) -> Result<()> {
-    fs::DirBuilder::new().mode(0o755).create(dst).with_context(|| format!("creating {}", dst.display()))?;
-    let mut entries: Vec<_> = fs::read_dir(src).with_context(|| format!("reading {}", src.display()))?.collect::<io::Result<_>>()?;
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let (from, to, rel) = (entry.path(), dst.join(entry.file_name()), rel.join(entry.file_name()));
-        let meta = fs::symlink_metadata(&from)?;
-        if meta.is_dir() {
-            copy_dir(&from, &to, &rel, copied)?;
-        } else if meta.is_file() {
-            copy_file(&from, &to, &meta)?;
-            copied.files.push(rel);
-        } else {
-            copied.skipped += 1;
+/// The folder a path is in, and its last name.
+fn folder_and_name(path: &Path) -> Result<(&Path, &std::ffi::OsStr)> {
+    let name = path.file_name().ok_or_else(|| anyhow!("{} isn't a file or folder", path.display()))?;
+    let folder = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    Ok((folder, name))
+}
+
+fn copy_dir(from: &Folder, to: &Folder, rel: &Path, copied: &mut Copied) -> Result<()> {
+    for name in from.names()? {
+        let rel = rel.join(&name);
+        match from.open(&name)? {
+            Found::Folder(sub) => copy_dir(&sub, &to.make(&name, 0o755)?, &rel, copied)?,
+            Found::File(file) => {
+                copy_file(&file, &from.at().join(&name).display().to_string(), to, &name)?;
+                copied.files.push(rel);
+            }
+            // Gone since the folder was read.
+            Found::Missing => {}
+            Found::Link | Found::Other => copied.skipped += 1,
         }
     }
     Ok(())
 }
 
-fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata) -> Result<()> {
-    let mode = if meta.mode() & 0o111 != 0 { 0o755 } else { 0o644 };
-    let mut from = File::open(src).with_context(|| format!("reading {}", src.display()))?;
-    let mut to = OpenOptions::new().write(true).create_new(true).mode(mode).open(dst).with_context(|| format!("creating {}", dst.display()))?;
-    io::copy(&mut from, &mut to).with_context(|| format!("copying {}", src.display()))?;
+/// Copy the open file `from` (`shown` in messages) to a new file `name` in the folder `to`.
+fn copy_file(mut from: &File, shown: &str, to: &Folder, name: &std::ffi::OsStr) -> Result<()> {
+    let mode = if from.metadata().with_context(|| format!("reading {shown}"))?.mode() & 0o111 != 0 { 0o755 } else { 0o644 };
+    let mut out = to.create(name, mode)?;
+    io::copy(&mut from, &mut out).with_context(|| format!("copying {shown}"))?;
     Ok(())
 }
 
@@ -650,41 +676,40 @@ fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata) -> Result<()> {
 /// rwxr-xr-x, owners root's, which an unpacking user that isn't root doesn't keep. Returns the
 /// stream and how many were left out.
 pub fn tar_tree(src: &Path) -> Result<(Vec<u8>, usize)> {
-    let meta = fs::symlink_metadata(src).with_context(|| format!("reading {}", src.display()))?;
-    if !meta.is_dir() {
-        bail!("{} isn't a folder", src.display());
-    }
+    let (from, name) = folder_and_name(src)?;
+    let Found::Folder(folder) = Folder::of(from)?.open(name)? else { bail!("{} isn't a folder", src.display()) };
     let mut tar = Vec::new();
     let mut skipped = 0;
-    tar_dir(src, "", &mut tar, &mut skipped)?;
+    tar_dir(&folder, "", &mut tar, &mut skipped)?;
     // The end: two blocks of zeros.
     tar.extend([0u8; 1024]);
     Ok((tar, skipped))
 }
 
-fn tar_dir(src: &Path, rel: &str, tar: &mut Vec<u8>, skipped: &mut usize) -> Result<()> {
-    let mut entries: Vec<_> = fs::read_dir(src).with_context(|| format!("reading {}", src.display()))?.collect::<io::Result<_>>()?;
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let from = entry.path();
-        let Some(name) = entry.file_name().to_str().map(|name| format!("{rel}{name}")) else {
+fn tar_dir(folder: &Folder, rel: &str, tar: &mut Vec<u8>, skipped: &mut usize) -> Result<()> {
+    for entry in folder.names()? {
+        let Some(name) = entry.to_str().map(|name| format!("{rel}{name}")) else {
             *skipped += 1;
             continue;
         };
-        let meta = fs::symlink_metadata(&from)?;
-        let mtime = meta.mtime().max(0) as u64;
-        if meta.is_dir() {
-            tar_header(tar, &format!("{name}/"), 0o755, 0, mtime, b'5');
-            tar_dir(&from, &format!("{name}/"), tar, skipped)?;
-        } else if meta.is_file() {
-            let mut bytes = Vec::new();
-            File::open(&from).and_then(|mut file| file.read_to_end(&mut bytes)).with_context(|| format!("reading {}", from.display()))?;
-            let mode = if meta.mode() & 0o111 != 0 { 0o755 } else { 0o644 };
-            tar_header(tar, &name, mode, bytes.len() as u64, mtime, b'0');
-            tar.extend(&bytes);
-            tar.resize(tar.len().next_multiple_of(512), 0);
-        } else {
-            *skipped += 1;
+        let mtime = |meta: &fs::Metadata| meta.mtime().max(0) as u64;
+        match folder.open(&entry)? {
+            Found::Folder(sub) => {
+                tar_header(tar, &format!("{name}/"), 0o755, 0, mtime(&sub.metadata()?), b'5');
+                tar_dir(&sub, &format!("{name}/"), tar, skipped)?;
+            }
+            Found::File(mut file) => {
+                let shown = || format!("reading {}", folder.at().join(&entry).display());
+                let meta = file.metadata().with_context(shown)?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).with_context(shown)?;
+                let mode = if meta.mode() & 0o111 != 0 { 0o755 } else { 0o644 };
+                tar_header(tar, &name, mode, bytes.len() as u64, mtime(&meta), b'0');
+                tar.extend(&bytes);
+                tar.resize(tar.len().next_multiple_of(512), 0);
+            }
+            Found::Missing => {}
+            Found::Link | Found::Other => *skipped += 1,
         }
     }
     Ok(())
@@ -775,6 +800,69 @@ mod tests {
         let one = copy_tree(&src.join("a.txt"), &dir.0.join("one.txt")).unwrap();
         assert_eq!(one.files, [PathBuf::from("one.txt")]);
         assert!(copy_tree(&src.join("a.txt"), &dir.0.join("one.txt")).is_err(), "never overwrites");
+    }
+
+    #[test]
+    fn copies_out_of_a_store_follow_no_link_on_the_way_or_at_the_end() {
+        let dir = TempDir::new("halti-copy-links").unwrap();
+        let (mnt, outside, to) = (dir.0.join("mnt"), dir.0.join("outside"), dir.0.join("to"));
+        fs::create_dir_all(mnt.join("work/out/deep")).unwrap();
+        fs::create_dir_all(outside.join("folder")).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::write(outside.join("folder/secret"), "s3cret").unwrap();
+        fs::write(mnt.join("work/out/deep/a"), "a").unwrap();
+        // A link on the way, one at the end, and one in a folder below what is copied.
+        symlink(outside.join("folder"), mnt.join("work/escape")).unwrap();
+        symlink(outside.join("folder/secret"), mnt.join("work/file-link")).unwrap();
+        symlink(outside.join("folder"), mnt.join("work/out/deep/escape")).unwrap();
+        let open = |rel: &str| crate::boxes::nofollow::open(&mnt, Path::new(rel));
+
+        assert_eq!(open("work/escape/secret").err().unwrap().to_string(), "work/escape is a link; links aren't followed");
+        let error = copy(open("work/file-link").unwrap(), Path::new("work/file-link"), &to.join("x")).err().unwrap().to_string();
+        assert_eq!(error, "work/file-link is a link; links aren't followed");
+        let copied = copy(open("work/out").unwrap(), Path::new("work/out"), &to.join("out")).unwrap();
+        assert_eq!((copied.files, copied.skipped), (vec![PathBuf::from("deep/a")], 1));
+        assert_eq!(fs::read_to_string(to.join("out/deep/a")).unwrap(), "a");
+        assert!(!to.join("x").exists() && fs::symlink_metadata(to.join("out/deep/escape")).is_err());
+        let (_, skipped) = tar_tree(&mnt.join("work/out")).unwrap();
+        assert_eq!(skipped, 1, "the link below");
+        assert!(tar_tree(&mnt.join("work/escape")).is_err() && copy_tree(&mnt.join("work/escape"), &to.join("y")).is_err());
+
+        // Into a store: a link where the copy would go is never written through.
+        assert!(copy_tree(&mnt.join("work/out/deep/a"), &mnt.join("work/file-link")).is_err());
+        assert!(copy_tree(&mnt.join("work/out"), &mnt.join("work/escape")).is_err());
+        assert_eq!(fs::read_to_string(outside.join("folder/secret")).unwrap(), "s3cret");
+        assert_eq!(fs::read_dir(outside.join("folder")).unwrap().count(), 1, "nothing was made outside");
+    }
+
+    #[test]
+    fn deleting_a_store_follows_no_link_in_it() {
+        let dir = TempDir::new("halti-shred").unwrap();
+        let layout = Layout::under(&dir.0).unwrap();
+        layout.prepare().unwrap();
+        let outside = dir.0.join("outside");
+        fs::create_dir_all(outside.join("folder")).unwrap();
+        fs::write(outside.join("folder/x"), "the person's own").unwrap();
+        fs::write(outside.join("file"), "the person's own").unwrap();
+        let bundle = layout.bundle("t");
+        // On Linux the folder of halti's files beside the disk goes too.
+        let files = dir.0.join(format!("box/t{}", names::STORE_FILES));
+        for store in [&bundle, &files] {
+            fs::create_dir_all(store.join("bands")).unwrap();
+            // A link on the way to folder/x, and one at the end.
+            symlink(outside.join("folder"), store.join("bands/folder")).unwrap();
+            symlink(outside.join("file"), store.join("file")).unwrap();
+        }
+        shred(&bundle).unwrap();
+        assert!(fs::symlink_metadata(&bundle).is_err());
+        assert_eq!(fs::symlink_metadata(&files).is_err(), cfg!(target_os = "linux"));
+        // A store that is itself a link: the link goes, not what it points to.
+        let linked = layout.bundle("u");
+        symlink(outside.join("folder"), &linked).unwrap();
+        shred(&linked).unwrap();
+        assert!(fs::symlink_metadata(&linked).is_err());
+        assert_eq!(fs::read_to_string(outside.join("file")).unwrap(), "the person's own");
+        assert_eq!(fs::read_to_string(outside.join("folder/x")).unwrap(), "the person's own");
     }
 
     #[test]

@@ -38,7 +38,7 @@ use super::sessions::{InBox, Launch, Sessions};
 use super::store::{self, Layout};
 use super::{BoxPolicy, KeyStore, MountPolicy, MountRule, mount_problem_in};
 use crate::approval::{self, Action, Means};
-use crate::chain::{self, Chain};
+use crate::chain;
 use crate::config::Settings;
 use crate::engine::{self, Vms};
 use crate::index::Index;
@@ -706,7 +706,7 @@ impl Drop for Running<'_> {
 /// stripped or whose end was cut off. A log whose chain is already broken keeps the head it had.
 /// `shown` is the box as messages name it.
 fn record_head(world: &dyn World, name: &str, shown: &str, mnt: &Path, log_key: [u8; 32]) {
-    match Chain::new(&store::door_log(mnt), log_key).verify() {
+    match store::door_chain(mnt, log_key).verify() {
         Ok(found) => {
             if let Some(head) = found.head()
                 && let Err(e) = world.record_log_head(name, &head)
