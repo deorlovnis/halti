@@ -1684,7 +1684,7 @@ fn a_start_through_the_socket_says_why_it_was_refused() {
     // Nothing was started: at each start the engine was asked if it is ready and if the box's VMs run.
     if cfg!(target_os = "macos") {
         let tag = &ws_id(&env, "acme")[..12];
-        assert_eq!(fs::read_to_string(calls).unwrap(), format!("inspect halti-wsbox-{tag}-dev\ninspect halti-wsbrowser-{tag}-dev\nsystem status\n").repeat(2));
+        assert_eq!(fs::read_to_string(calls).unwrap(), format!("inspect halti-wsbox-{tag}-dev\ninspect halti-wsbrowser-{tag}-dev\n--version\nsystem status\n").repeat(2));
     }
 }
 
@@ -3416,6 +3416,9 @@ fn touch_id_approval_pins_the_policy_in_the_real_keychain() {
 
 // --- a workspace's boxes (the parts that need no VM) ---
 
+/// The `container` halti was tested with, as `engine::TESTED_VERSION` names it: the stand-in
+/// engines say they are it.
+const TESTED_CONTAINER: &str = "1.6.1";
 /// An image a box policy pins; no VM starts here, so it need not be there.
 const BOX_IMAGE: &str = "halti-agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -3443,21 +3446,24 @@ impl Env {
         command
     }
 
-    /// A stand-in for the engine, first on PATH: it says it is ready, answers nothing else, and
-    /// notes each call it gets. Returns PATH with it, and where its calls are noted.
+    /// A stand-in for the engine, first on PATH: it says it is the version halti was tested with
+    /// and that it is ready, answers nothing else, and notes each call it gets. Returns PATH with
+    /// it, and where its calls are noted.
     fn fake_engine(&self) -> (String, PathBuf) {
         let (bin, calls) = (self.dir.join("fake-engine"), self.dir.join("engine-calls"));
         fs::create_dir_all(&bin).unwrap();
         let script = bin.join("container");
-        fs::write(&script, format!("#!/bin/sh\necho \"$*\" >> '{}'\n[ \"$1 $2\" = \"system status\" ]\n", calls.display())).unwrap();
+        let version = format!("[ \"$1\" = --version ] && echo 'container CLI version {TESTED_CONTAINER}'");
+        fs::write(&script, format!("#!/bin/sh\necho \"$*\" >> '{}'\n{version}\n[ \"$1 $2\" = \"system status\" ]\n", calls.display())).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         (format!("{}:{}", bin.display(), no_engine()), calls)
     }
 
     /// A stand-in for the engine, first on PATH, whose VMs are files: one whose file is in the
     /// folder runs, and a stop removes it. The agent's command in one leaves `VM-working` beside it
-    /// and runs until its file is gone or says `done`, then ends with 7. It says it is ready, and
-    /// does nothing else. Returns PATH with it, and the folder.
+    /// and runs until its file is gone or says `done`, then ends with 7. It says it is the version
+    /// halti was tested with and that it is ready, and does nothing else. Returns PATH with it,
+    /// and the folder.
     fn engine_of_files(&self) -> (String, PathBuf) {
         let (bin, vms) = (self.dir.join("files-engine"), self.dir.join("files-engine-vms"));
         fs::create_dir_all(&bin).unwrap();
@@ -3465,7 +3471,7 @@ impl Env {
         let vm = format!("'{}'/\"$2\"", vms.display());
         let agent = format!("'{}'/\"$name\"", vms.display());
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\nsystem) [ \"$2\" = status ] ;;\ninspect) [ -e {vm} ] && echo '[{{\"status\":{{\"state\":\"running\"}}}}]' ;;\nstop) rm -f {vm} ;;\n\
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo 'container CLI version {TESTED_CONTAINER}' ;;\nsystem) [ \"$2\" = status ] ;;\ninspect) [ -e {vm} ] && echo '[{{\"status\":{{\"state\":\"running\"}}}}]' ;;\nstop) rm -f {vm} ;;\n\
              exec) for arg; do case \"$arg\" in halti-*) name=\"$arg\"; break ;; esac; done\n  : > {agent}-working\n  \
              while [ -e {agent} ] && [ \"$(cat {agent} 2>/dev/null)\" != done ]; do sleep 0.05; done; exit 7 ;;\n*) exit 1 ;;\nesac\n"
         );
@@ -3612,7 +3618,7 @@ fn a_miss_never_reaches_the_keychain() {
     // names; nothing was started, and no other box's VM was named.
     let tag = &ws_id(&env, "acme")[..12];
     let asked_engine = fs::read_to_string(calls).unwrap();
-    assert_eq!(asked_engine, format!("inspect halti-wsbox-{tag}-dev\ninspect halti-wsbrowser-{tag}-dev\nsystem status\n"));
+    assert_eq!(asked_engine, format!("inspect halti-wsbox-{tag}-dev\ninspect halti-wsbrowser-{tag}-dev\n--version\nsystem status\n"));
 }
 
 #[test]

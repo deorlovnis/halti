@@ -32,13 +32,13 @@ const DEV: &[&str] = &[
     "HALTI_POLICY_DIR",
     "HALTI_BOX_DIR",
     "HALTI_TEST_KVM",
-    // Picks the engine the conformance suite runs against (not read yet).
-    "HALTI_E2E_ENGINE",
 ];
 
 /// Read only by tests.
 const TEST: &[&str] = &[
     "HALTI_E2E_BOX",
+    // The engine the engines' suite runs against (src/engine_tests.rs).
+    "HALTI_E2E_ENGINE",
     "HALTI_E2E_AGENT_IMAGE",
     "HALTI_E2E_JVM_IMAGE",
     "HALTI_E2E_BROWSER",
