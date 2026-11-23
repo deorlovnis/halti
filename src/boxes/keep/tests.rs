@@ -432,6 +432,20 @@ fn until(check: impl Fn() -> bool) {
 }
 
 #[test]
+fn a_test_build_holds_a_notice_as_long_as_its_variable_says_and_else_five_minutes() {
+    use std::ffi::OsStr;
+
+    assert_eq!(limits_with(OsStr::new("3")).notice_delay, Duration::from_secs(3));
+    assert_eq!(limits_with(OsStr::new("0")).notice_delay, Duration::ZERO);
+    for junk in ["", "-1", "3s", "1.5", " 3"] {
+        assert_eq!(limits_with(OsStr::new(junk)).notice_delay, Duration::from_secs(300), "{junk:?}");
+    }
+    // Nothing else moves.
+    let limits = limits_with(OsStr::new("3"));
+    assert_eq!((limits.wait, limits.away_wait, limits.notices_per_box), (requests::LIMITS.wait, requests::LIMITS.away_wait, requests::LIMITS.notices_per_box));
+}
+
+#[test]
 fn an_agent_s_mcp_session_is_served_until_the_workspace_closes_and_the_keys_are_wiped_after() {
     let bench = Bench::new(Fake::default());
     let code = bench.keeping(&[], false, |socket| {

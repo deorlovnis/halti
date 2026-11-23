@@ -13,6 +13,9 @@
 //!
 //! After that line the bytes go both ways until both sides are done (half-close aware).
 //!
+//! `ask` is the asker that Claude Code's hooks run: it tells halti, at halti.internal, whether the
+//! agent waits for its owner (see `ask`).
+//!
 //! In a VM whose host dials in over vsock, `boot` is the VM's first process instead (see `boot`):
 //! it starts `serve --vsock`, where the door is a vsock port (`names::DOOR_PORT`) in place of the
 //! Unix socket, and the exec service (`exec`) listens on `names::EXEC_PORT`. Both serve only the
@@ -27,6 +30,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use std::{env, fs, process, thread};
 
+mod ask;
 // Used by `serve --vsock` and `boot`, which only Linux builds; tested on every system.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod boot;
@@ -59,8 +63,9 @@ fn main() {
         ["mcp"] => UnixStream::connect(LOCAL_SOCK)
             .map_err(|e| io::Error::new(e.kind(), format!("connecting to {LOCAL_SOCK}: {e}")))
             .and_then(|sock| relay(sock, io::stdin(), io::stdout())),
+        ["ask"] => ask::main(),
         _ => {
-            eprintln!("usage: {} serve [--vsock] [--bridges] | boot [--bridges] | mcp", names::SHIM);
+            eprintln!("usage: {} serve [--vsock] [--bridges] | boot [--bridges] | mcp | ask", names::SHIM);
             process::exit(2);
         }
     };

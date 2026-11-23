@@ -54,7 +54,22 @@ fn start_with(limits: Limits) -> Running {
     start_in(dir, limits, Arc::new(Hands(Mutex::new(START.parse().unwrap()))))
 }
 
+/// A hub as `start_now`'s, whose agents' limits are these.
+fn start_with_agents(agents: AgentLimits) -> Running {
+    let dir = TempDir::new("halti-hub").unwrap();
+    start_hub(
+        dir,
+        Limits { request_wait: Duration::from_secs(5), ..Limits::HUB },
+        Arc::new(Hands(Mutex::new(Timestamp::from_second(Timestamp::now().as_second()).unwrap()))),
+        agents,
+    )
+}
+
 fn start_in(dir: TempDir, limits: Limits, clock: Arc<Hands>) -> Running {
+    start_hub(dir, limits, clock, AgentLimits { gap: AGENT_GAP, ..AGENT_LIMITS })
+}
+
+fn start_hub(dir: TempDir, limits: Limits, clock: Arc<Hands>, agents: AgentLimits) -> Running {
     let folder = dir.0.clone();
     let key = tls_key(&folder).unwrap();
     let pin = pin_of(&key);
@@ -63,6 +78,7 @@ fn start_in(dir: TempDir, limits: Limits, clock: Arc<Hands>) -> Running {
     let mut hub = Hub::open(&folder, &address, pin, clock.clone()).unwrap();
     hub.inbox_wait = INBOX_WAIT;
     hub.wait_hold = WAIT_HOLD;
+    hub.agent_limits = agents;
     let hub = Arc::new(hub);
     let admin_socket = crate::keep::bind(&folder.join("admin.sock")).unwrap().unwrap();
     let (for_admin, for_listener) = (hub.clone(), hub.clone());
@@ -1573,9 +1589,10 @@ fn a_wait_answers_at_once_when_the_phone_was_told_something_else_and_holds_other
     let started = std::time::Instant::now();
     assert_eq!(wait(&hub, &pixel.token, &[[2; 16], [1; 16]]), (200, ids(&[[1; 16], [2; 16]])));
     assert!(started.elapsed() >= WAIT_HOLD - Duration::from_millis(50));
-    // The body is checked.
+    // The body is checked; a field it doesn't know is passed over, so a newer app still waits.
     let as_pixel = |body: Value| hub.call_as("POST", "/v1/wait", Some(&format!("Wake {}", wake_of(&pixel.token))), Some(&body));
-    assert_eq!(as_pixel(json!({"seen": "", "more": 1})), (400, error("malformed")));
+    assert_eq!(as_pixel(json!({"seen": "", "more": 1})), (200, ids(&[[1; 16], [2; 16]])));
+    assert_eq!(as_pixel(json!({"seen": "", "notices_seen": "AB".repeat(32)})), (400, error("malformed")));
     assert_eq!(as_pixel(json!({"seen": "AB".repeat(32)})), (400, error("malformed")));
     assert_eq!(as_pixel(json!({})), (400, error("malformed")));
     assert_eq!(as_pixel(json!({"seen": "0".repeat(5000)})), (413, error("too-large")));
@@ -1599,9 +1616,9 @@ fn a_held_wait_ends_when_a_request_comes_leaves_is_hidden_or_expires() {
     let (reply, took) = held(|| wait(&hub, &pixel.token, &[[2; 16]]), hide);
     assert_eq!((reply, took < quick), ((200, ids(&[])), true));
     assert_eq!(wait(&hub, &pixel.token, &[[2; 16]]), (200, ids(&[])));
-    // Past its expiry by the hub's clock.
+    // Past its expiry by the hub's clock, which started a few seconds before the request was made.
     post(&hub, &server, "acme", 3);
-    let (reply, took) = held(|| wait(&hub, &pixel.token, &[[3; 16]]), || hub.advance(SignedDuration::from_secs(181)));
+    let (reply, took) = held(|| wait(&hub, &pixel.token, &[[3; 16]]), || hub.advance(SignedDuration::from_secs(190)));
     assert_eq!((reply, took < quick), ((200, ids(&[])), true));
 }
 
@@ -1680,4 +1697,300 @@ fn a_wake_credential_lives_with_its_token_s_row_and_stops_at_revoke_or_renewal()
     let (reply, took) = held(|| wait(&hub, &new, &[]), || assert!(admin::revoke_at(&hub.socket(), "pixel").unwrap()));
     assert_eq!((reply, took < Duration::from_secs(2)), ((401, error("unknown")), true));
     assert_eq!(wait(&hub, &new, &[[1; 16]]), (401, error("unknown")));
+}
+
+// --- agents' notices ---
+
+/// How long after one wake-up for an agent's notice a phone's held call may be ended by another,
+/// in these tests.
+const AGENT_GAP: Duration = Duration::from_millis(1500);
+
+/// A notice of `machine`'s, in workspace `ws` and box `box_name`, its id all `id`.
+fn notice(machine: &str, ws: &str, box_name: &str, id: u8) -> Vec<u8> {
+    crate::notices::Notice {
+        machine: machine.into(),
+        ws: ws.into(),
+        box_name: box_name.into(),
+        run: crate::requests::RunId([1; 8]),
+        session: 1,
+        kind: crate::notices::Kind::TurnEnded,
+        id: crate::requests::Id([id; 16]),
+        since: 1_763_164_800,
+    }
+    .encode()
+    .unwrap()
+}
+
+/// What stands for a copy sealed to `device` here: the hub opens none, so any bytes of the length.
+fn sealed_for(device: &str, id: u8) -> Vec<u8> {
+    let mut sealed = vec![id; crate::hub::relay::SEALED_MIN];
+    sealed[..device.len()].copy_from_slice(device.as_bytes());
+    sealed
+}
+
+fn post_notice_body(record: &[u8], devices: &[&str]) -> Value {
+    let id = record[record.len() - 11];
+    json!({"record": util::hex(record), "sealed": devices.iter().map(|device| json!({"device": device, "sealed": util::hex(&sealed_for(device, id))})).collect::<Vec<_>>()})
+}
+
+/// The machine's link says these notices are open, and posts each the hub lacks, sealed to these
+/// phones.
+fn open_notices(hub: &Running, machine: &Machine, records: &[Vec<u8>], devices: &[&str]) {
+    let ids: Vec<String> = records.iter().map(|record| util::hex(&crate::notices::Notice::decode(record).unwrap().id.0)).collect();
+    let (status, reply) = hub.call("POST", "/v1/machine/notices", Some(&machine.token), Some(&json!({"notices": ids})));
+    assert_eq!(status, 200, "{reply}");
+    for id in reply["missing"].as_array().unwrap() {
+        let record = records.iter().find(|record| util::hex(&crate::notices::Notice::decode(record).unwrap().id.0) == *id).unwrap();
+        assert_eq!(hub.call("POST", "/v1/machine/notice", Some(&machine.token), Some(&post_notice_body(record, devices))), (200, json!({})));
+    }
+}
+
+/// `POST /v1/wait` from an app that is told of notices: told these request ids and notice ids last.
+fn wait_both(hub: &Running, token_: &str, seen: &[[u8; 16]], notices: &[[u8; 16]]) -> (u16, Value) {
+    let hash = |ids: &[[u8; 16]]| wire::seen_of(ids).map(|hash| util::hex(&hash)).unwrap_or_default();
+    hub.call_as("POST", "/v1/wait", Some(&format!("Wake {}", wake_of(token_))), Some(&json!({"seen": hash(seen), "notices_seen": hash(notices)})))
+}
+
+fn both(requests: &[[u8; 16]], notices: &[[u8; 16]]) -> Value {
+    json!({"requests": requests.iter().map(|id| util::hex(id)).collect::<Vec<_>>(), "notices": notices.iter().map(|id| util::hex(id)).collect::<Vec<_>>()})
+}
+
+#[test]
+fn a_machine_posts_notices_sealed_to_each_phone_and_a_phone_lists_only_its_own() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let other = paired_machine(&hub, "server-2");
+    let pixel = paired_phone(&hub, "pixel");
+    let tablet = paired_phone(&hub, "tablet");
+    let acme = notice("server-1", "acme", "dev", 1);
+    open_notices(&hub, &server, &[acme.clone(), notice("server-1", "beta", "dev", 2)], &["pixel"]);
+    // Pixel gets its own copy of acme's; beta's is outside its workspaces; tablet has no copy.
+    let listed = |phone: &Phone| hub.call("GET", "/v1/notices", Some(&phone.token), None);
+    assert_eq!(listed(&pixel), (200, json!({"notices": [{"machine": "server-1", "record": util::hex(&acme), "sealed": util::hex(&sealed_for("pixel", 1))}]})));
+    assert_eq!(listed(&tablet), (200, json!({"notices": []})));
+    // Posted again, as the phones trusted for it changed: its copies are those posted now.
+    let post = |token: &str, body: &Value| hub.call("POST", "/v1/machine/notice", Some(token), Some(body));
+    assert_eq!(post(&server.token, &post_notice_body(&acme, &["tablet"])), (200, json!({})));
+    assert_eq!(listed(&tablet), (200, json!({"notices": [{"machine": "server-1", "record": util::hex(&acme), "sealed": util::hex(&sealed_for("tablet", 1))}]})));
+    assert_eq!(listed(&pixel), (200, json!({"notices": []})));
+    // A record of another workspace under its id changes nothing.
+    let other_ws = notice("server-1", "beta", "dev", 1);
+    assert_eq!(post(&server.token, &post_notice_body(&other_ws, &["pixel"])), (200, json!({})));
+    assert_eq!(listed(&pixel), (200, json!({"notices": []})));
+    assert_eq!(post(&server.token, &post_notice_body(&acme, &["pixel"])), (200, json!({})));
+    // Another machine's record, or a phone's token, is refused.
+    assert_eq!(post(&other.token, &post_notice_body(&notice("server-1", "acme", "dev", 3), &["pixel"])), (403, error("other-machine")));
+    assert_eq!(post(&pixel.token, &post_notice_body(&acme, &["pixel"])), (403, error("wrong-kind")));
+    assert_eq!(hub.call("GET", "/v1/notices", Some(&server.token), None), (403, error("wrong-kind")));
+    // What isn't the form: a record cut short, no copy, a copy too short or too long, one phone
+    // twice, a name that isn't one, a field more.
+    let good = post_notice_body(&notice("server-1", "acme", "dev", 4), &["pixel"]);
+    let copy = |device: &str, len: usize| json!({"device": device, "sealed": "ab".repeat(len)});
+    for body in [
+        json!({"record": util::hex(&acme[..acme.len() - 1]), "sealed": good["sealed"]}),
+        json!({"record": good["record"], "sealed": []}),
+        json!({"record": good["record"], "sealed": [copy("pixel", 80)]}),
+        json!({"record": good["record"], "sealed": [copy("pixel", 257)]}),
+        json!({"record": good["record"], "sealed": [copy("pixel", 81), copy("pixel", 81)]}),
+        json!({"record": good["record"], "sealed": [copy("Pixel", 81)]}),
+        json!({"record": good["record"], "sealed": good["sealed"], "text": "hi"}),
+    ] {
+        assert_eq!(post(&server.token, &body), (400, error("malformed")), "{body}");
+    }
+    // Closed: the link no longer names it.
+    open_notices(&hub, &server, &[], &["pixel"]);
+    assert_eq!(listed(&pixel), (200, json!({"notices": []})));
+}
+
+#[test]
+fn the_hub_holds_fifty_notices_of_a_machine_and_asks_for_more_as_room_comes() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    let records: Vec<Vec<u8>> = (0..51).map(|n| notice("server-1", "acme", "dev", n)).collect();
+    let ids: Vec<String> = records.iter().map(|record| util::hex(&crate::notices::Notice::decode(record).unwrap().id.0)).collect();
+    let sync = |ids: &[String]| hub.call("POST", "/v1/machine/notices", Some(&server.token), Some(&json!({"notices": ids})));
+    let (status, reply) = sync(&ids[..50]);
+    assert_eq!((status, reply["missing"].as_array().unwrap().len()), (200, 50));
+    assert_eq!(sync(&ids), (400, error("malformed")), "one call names at most 50");
+    for record in &records[..50] {
+        assert_eq!(hub.call("POST", "/v1/machine/notice", Some(&server.token), Some(&post_notice_body(record, &["pixel"]))).0, 200);
+    }
+    assert_eq!(hub.call("POST", "/v1/machine/notice", Some(&server.token), Some(&post_notice_body(&records[50], &["pixel"]))), (429, error("full")));
+    // One closed makes room: the one that waits is asked for.
+    let (_, reply) = sync(&[&ids[1..50], &ids[50..]].concat());
+    assert_eq!(reply["missing"], json!([ids[50]]));
+    assert_eq!(hub.call("GET", "/v1/notices", Some(&pixel.token), None).1["notices"].as_array().unwrap().len(), 49);
+}
+
+#[test]
+fn the_old_wait_body_is_still_served_and_no_notice_ends_its_call() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    post(&hub, &server, "acme", 1);
+    open_notices(&hub, &server, &[notice("server-1", "acme", "dev", 9)], &["pixel"]);
+    // The app as it is today: only `seen`, and a reply of requests alone.
+    assert_eq!(wait(&hub, &pixel.token, &[]), (200, ids(&[[1; 16]])));
+    let started = std::time::Instant::now();
+    let (reply, took) = held(|| wait(&hub, &pixel.token, &[[1; 16]]), || open_notices(&hub, &server, &[notice("server-1", "acme", "dev", 8)], &["pixel"]));
+    assert_eq!(reply, (200, ids(&[[1; 16]])));
+    assert!(took >= WAIT_HOLD - Duration::from_millis(50), "held for the whole hold: {:?}", started.elapsed());
+    // An app that is told of notices gets both lists.
+    assert_eq!(wait_both(&hub, &pixel.token, &[[1; 16]], &[]), (200, both(&[[1; 16]], &[[8; 16]])));
+}
+
+#[test]
+fn a_notice_ends_a_held_wait_at_most_once_in_the_gap() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    let quick = Duration::from_millis(800);
+    // A notice comes: the held call ends at once.
+    let (reply, took) = held(|| wait_both(&hub, &pixel.token, &[], &[]), || open_notices(&hub, &server, &[notice("server-1", "acme", "dev", 1)], &["pixel"]));
+    assert_eq!((reply, took < quick), ((200, both(&[], &[[1; 16]])), true));
+    // Another within the gap waits for the gap's end, and is listed then.
+    let records = [notice("server-1", "acme", "dev", 1), notice("server-1", "acme", "web", 2)];
+    let (reply, took) = held(|| wait_both(&hub, &pixel.token, &[], &[[1; 16]]), || open_notices(&hub, &server, &records, &["pixel"]));
+    assert_eq!(reply, (200, both(&[], &[[1; 16], [2; 16]])));
+    assert!(took >= AGENT_GAP - Duration::from_millis(400) && took < WAIT_HOLD, "{took:?}");
+    // Closed: the call ends too, once the gap allows.
+    thread::sleep(AGENT_GAP);
+    let (reply, took) = held(|| wait_both(&hub, &pixel.token, &[], &[[1; 16], [2; 16]]), || open_notices(&hub, &server, &records[1..], &["pixel"]));
+    assert_eq!((reply, took < quick), ((200, both(&[], &[[2; 16]])), true));
+    // A notice sealed to another phone, or outside the phone's workspaces, ends nothing.
+    thread::sleep(AGENT_GAP);
+    let others = [notice("server-1", "acme", "web", 2), notice("server-1", "acme", "dev", 3), notice("server-1", "beta", "dev", 4), notice("server-1", "acme", "dev", 5)];
+    let (reply, took) = held(
+        || wait_both(&hub, &pixel.token, &[], &[[2; 16]]),
+        || {
+            open_notices(&hub, &server, &others[..2], &["tablet"]);
+            open_notices(&hub, &server, &others[..3], &["pixel"]);
+            thread::sleep(Duration::from_millis(1200));
+            open_notices(&hub, &server, &others, &["pixel"]);
+        },
+    );
+    assert_eq!(reply, (200, both(&[], &[[2; 16], [5; 16]])));
+    assert!(took >= Duration::from_millis(1400) && took < WAIT_HOLD, "{took:?}");
+}
+
+#[test]
+fn an_agent_s_notice_never_delays_a_request() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    // The gap is used up by one notice.
+    let (reply, _) = held(|| wait_both(&hub, &pixel.token, &[], &[]), || open_notices(&hub, &server, &[notice("server-1", "acme", "dev", 1)], &["pixel"]));
+    assert_eq!(reply.0, 200);
+    // A second notice is held back by the gap; a request that comes meanwhile ends the call at once,
+    // and the notice stays held back: the request raises no agent notification with it.
+    let records = [notice("server-1", "acme", "dev", 1), notice("server-1", "acme", "web", 2)];
+    let (reply, took) = held(
+        || wait_both(&hub, &pixel.token, &[], &[[1; 16]]),
+        || {
+            open_notices(&hub, &server, &records, &["pixel"]);
+            post(&hub, &server, "acme", 7);
+        },
+    );
+    assert_eq!(reply, (200, both(&[[7; 16]], &[[1; 16]])));
+    assert!(took < Duration::from_millis(800), "{took:?}");
+    // Once the gap is over, it is told.
+    thread::sleep(AGENT_GAP);
+    assert_eq!(wait_both(&hub, &pixel.token, &[[7; 16]], &[[1; 16]]), (200, both(&[[7; 16]], &[[1; 16], [2; 16]])));
+}
+
+#[test]
+fn a_notice_told_in_an_answer_the_phone_lost_is_still_told_when_the_limits_hold_back_another() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    let records = [notice("server-1", "acme", "dev", 1), notice("server-1", "acme", "web", 2)];
+    open_notices(&hub, &server, &records[..1], &["pixel"]);
+    assert_eq!(wait_both(&hub, &pixel.token, &[], &[]), (200, both(&[], &[[1; 16]])));
+    // Once the gap is over a second notice ends a call at once, but the phone never reads that
+    // answer: it gave up on the call (the app does at each start) or the line dropped.
+    thread::sleep(AGENT_GAP);
+    open_notices(&hub, &server, &records, &["pixel"]);
+    assert_eq!(wait_both(&hub, &pixel.token, &[], &[[1; 16]]), (200, both(&[], &[[1; 16], [2; 16]])));
+    // Its next call names what it was told before. A request ends it within the gap: the notice
+    // the phone was told is still listed, so its agent notification stays up.
+    let (reply, _) = held(|| wait_both(&hub, &pixel.token, &[], &[[1; 16]]), || post(&hub, &server, "acme", 7));
+    assert_eq!(reply, (200, both(&[[7; 16]], &[[1; 16]])));
+}
+
+#[test]
+fn a_notice_the_limits_hold_back_is_not_told_when_the_hold_ends() {
+    let hub = start_with_agents(AgentLimits { gap: Duration::ZERO, per_box: 1, ..AGENT_LIMITS });
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    // The box's one wake-up of the hour.
+    open_notices(&hub, &server, &[notice("server-1", "acme", "dev", 1)], &["pixel"]);
+    assert_eq!(wait_both(&hub, &pixel.token, &[], &[]), (200, both(&[], &[[1; 16]])));
+    // It loops: closed, and a new one opens. The call is held to its end, and its answer tells
+    // nothing new, so the app raises nothing.
+    open_notices(&hub, &server, &[notice("server-1", "acme", "dev", 2)], &["pixel"]);
+    let (reply, took) = held(|| wait_both(&hub, &pixel.token, &[], &[[1; 16]]), || {});
+    assert_eq!(reply, (200, both(&[], &[])));
+    assert!(took >= WAIT_HOLD - Duration::from_millis(50), "{took:?}");
+    // Nor when a request ends the call: the request is told, the notice not.
+    let (reply, _) = held(|| wait_both(&hub, &pixel.token, &[], &[]), || post(&hub, &server, "acme", 7));
+    assert_eq!(reply, (200, both(&[[7; 16]], &[])));
+    // Another box of the machine wakes the phone, and the held-back one is told with it.
+    open_notices(&hub, &server, &[notice("server-1", "acme", "dev", 2), notice("server-1", "acme", "web", 3)], &["pixel"]);
+    assert_eq!(wait_both(&hub, &pixel.token, &[[7; 16]], &[]), (200, both(&[[7; 16]], &[[2; 16], [3; 16]])));
+}
+
+fn key(machine: &str, box_name: &str, id: u8) -> relay::NoticeKey {
+    relay::NoticeKey { id: [id; 16], machine: machine.into(), ws: "acme".into(), box_name: box_name.into() }
+}
+
+#[test]
+fn a_box_wakes_a_phone_six_times_an_hour_and_a_machine_twenty() {
+    let limits = AgentLimits { gap: Duration::from_secs(10), ..AGENT_LIMITS };
+    let start = std::time::Instant::now();
+    let mut agents = listen::Agents::default();
+    let mut listed: Vec<relay::NoticeKey> = Vec::new();
+    let told = |agents: &mut listen::Agents, listed: &[relay::NoticeKey], at: u64| {
+        let seen = wire::seen_of(&agents_told(agents));
+        let woke = agents.wake(seen, listed, &limits, start + Duration::from_secs(at));
+        if woke {
+            set_told(agents, listed);
+        }
+        woke
+    };
+    // One box: six wake-ups, ten seconds apart at least; the seventh waits for the hour.
+    for n in 0..7u8 {
+        listed.push(key("server-1", "dev", n));
+        let at = u64::from(n) * 10;
+        assert_eq!(told(&mut agents, &listed, at), n < 6, "notice {n}");
+        if n < 6 {
+            assert!(!told(&mut agents, &[listed.clone(), vec![key("server-1", "web", 100 + n)]].concat(), at + 1), "within the gap");
+        }
+    }
+    // A change that only closes still ends a call: it adds none.
+    listed.pop();
+    listed.remove(0);
+    assert!(told(&mut agents, &listed, 80));
+    // Other boxes of the machine, to twenty in all; then none of the machine, but another's.
+    let mut at = 100;
+    for n in 0..14u8 {
+        listed.push(key("server-1", &format!("box{n}"), 50 + n));
+        assert!(told(&mut agents, &listed, at), "box {n}");
+        at += 10;
+    }
+    listed.push(key("server-1", "late", 99));
+    assert!(!told(&mut agents, &listed, at));
+    listed.push(key("server-2", "dev", 98));
+    assert!(told(&mut agents, &listed, at + 10));
+    // An hour on, the box wakes the phone again.
+    listed.push(key("server-1", "dev", 97));
+    assert!(told(&mut agents, &listed, 3600 + 60));
+}
+
+fn agents_told(agents: &listen::Agents) -> Vec<[u8; 16]> {
+    agents.told.iter().map(|key| key.id).collect()
+}
+
+fn set_told(agents: &mut listen::Agents, listed: &[relay::NoticeKey]) {
+    agents.told = listed.to_vec();
 }

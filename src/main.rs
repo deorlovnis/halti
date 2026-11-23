@@ -38,6 +38,7 @@ mod link;
 mod mask;
 mod mcp;
 mod names;
+mod notices;
 mod policy;
 mod refresh;
 mod requests;

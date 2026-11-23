@@ -2,7 +2,7 @@
 //! `wire` states. A thread serves each connection; there are never more than `CONNECTIONS` of them.
 //! A machine's call for what phones sent it holds its thread while it waits (`super::INBOX_WAIT`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::PoisonError;
@@ -13,10 +13,10 @@ use std::time::{Duration, Instant};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::{Value, json};
 
-use super::relay::{self, What};
+use super::relay::{self, NoticeKey, What};
 use super::table::{Caller, DeviceKeys};
 use super::wire::{self, Kind, Refused};
-use super::{Hub, locked};
+use super::{AgentLimits, Hub, locked};
 use crate::door::http;
 use crate::requests::answer_bytes;
 use crate::util;
@@ -221,7 +221,7 @@ fn reply(stream: &mut StreamOwned<ServerConnection, Timed>, status: u16, body: &
 }
 
 /// The paths the hub answers, and the method each takes.
-pub(super) const PATHS: [(&str, &str); 15] = [
+pub(super) const PATHS: [(&str, &str); 18] = [
     ("POST", "/v1/pair"),
     ("POST", "/v1/join"),
     ("GET", "/v1/me"),
@@ -229,6 +229,7 @@ pub(super) const PATHS: [(&str, &str); 15] = [
     ("POST", "/v1/renew"),
     ("GET", "/v1/requests"),
     ("GET", "/v1/state"),
+    ("GET", "/v1/notices"),
     ("POST", "/v1/answer"),
     ("POST", "/v1/stop"),
     ("POST", "/v1/hide"),
@@ -237,6 +238,8 @@ pub(super) const PATHS: [(&str, &str); 15] = [
     ("POST", "/v1/machine/request"),
     ("POST", "/v1/machine/inbox"),
     ("POST", "/v1/machine/device"),
+    ("POST", "/v1/machine/notices"),
+    ("POST", "/v1/machine/notice"),
 ];
 
 /// What a request gets: its status and body.
@@ -271,6 +274,8 @@ fn route(hub: &Hub, method: &str, path: &str, authorization: Option<&str>, body:
                 STATE_PATH => report(hub, &caller, body),
                 "/v1/machine/request" => post_request(hub, &caller, body),
                 "/v1/machine/inbox" => inbox(hub, &caller, body),
+                "/v1/machine/notices" => sync_notices(hub, &caller, body),
+                "/v1/machine/notice" => post_notice(hub, &caller, body),
                 _ => device_keys(hub, body),
             }
         }
@@ -282,6 +287,7 @@ fn route(hub: &Hub, method: &str, path: &str, authorization: Option<&str>, body:
             match phone {
                 "/v1/requests" => requests(hub, &scope, body),
                 "/v1/state" => state(hub, &caller, &scope, body),
+                "/v1/notices" => notices(hub, &caller, &scope, body),
                 "/v1/answer" => answer(hub, &caller, &scope, body),
                 "/v1/stop" => stop(hub, &caller, &scope, body),
                 _ => hide(hub, &scope, body),
@@ -379,6 +385,32 @@ fn post_request(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value),
     Ok((200, json!({})))
 }
 
+/// A machine's link says which of its notices are open: the rest are closed. It is told those the
+/// hub lacks and has room for.
+fn sync_notices(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refused> {
+    let ids = relay::notices_body(body)?;
+    let missing = locked(&hub.relay).sync_notices(&caller.name, &ids, hub.now());
+    hub.stir();
+    Ok((200, json!({"missing": missing.iter().map(|id| util::hex(id)).collect::<Vec<_>>()})))
+}
+
+/// A machine posts a notice, sealed to each phone it may go to.
+fn post_notice(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refused> {
+    let (notice, bytes, sealed) = relay::notice_body(body)?;
+    locked(&hub.relay).post_notice(&caller.name, notice, bytes, sealed, hub.now())?;
+    hub.stir();
+    Ok((200, json!({})))
+}
+
+/// A phone lists the notices in its workspaces sealed to it, from every machine.
+fn notices(hub: &Hub, caller: &Caller, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refused> {
+    wire::no_body(body)?;
+    let machines: Vec<String> = hub.with_table(|table, now| table.machines(now)).into_iter().map(|(name, _, _)| name).collect();
+    let held = locked(&hub.relay).notices(&caller.name, scope, &machines, hub.now());
+    let listed: Vec<Value> = held.iter().map(|(machine, record, sealed)| json!({"machine": machine, "record": util::hex(record), "sealed": util::hex(sealed)})).collect();
+    Ok((200, json!({"notices": listed})))
+}
+
 /// A machine takes what phones sent it, saying first what came of what it took before. With
 /// nothing to take, the call waits until something comes or `inbox_wait` is over.
 fn inbox(hub: &Hub, caller: &Caller, body: &[u8]) -> Result<(u16, Value), Refused> {
@@ -471,9 +503,12 @@ fn hide(hub: &Hub, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refuse
     Ok((200, json!({})))
 }
 
-/// A phone's call, with its wake credential alone, to be told the ids of the requests it may see:
-/// at once if they are not what it was last told, else once they change or `wait_hold` is over. A
-/// newer call of the same phone ends it, as does its row's revoking or renewal (`401 unknown`).
+/// A phone's call, with its wake credential alone, to be told the ids of the requests it may see,
+/// and from an app that names the notices it was told, of the notices too: at once if the requests
+/// are not what it was last told, else once they change or `wait_hold` is over. A change of the
+/// notices alone ends it only as `Agents::wake` allows. A notice new to the phone is in an answer
+/// only as `Agents::wake` allows, whatever ends the call: else it is held back for a later one.
+/// A newer call of the same phone ends it, as does its row's revoking or renewal (`401 unknown`).
 fn wait(hub: &Hub, authorization: Option<&str>, body: &[u8]) -> Result<(u16, Value), Refused> {
     if authorization.is_some_and(|value| value.starts_with("Bearer ")) {
         return Err(Refused::WrongKind);
@@ -489,30 +524,134 @@ fn wait(hub: &Hub, authorization: Option<&str>, body: &[u8]) -> Result<(u16, Val
     };
     hub.stir();
     let deadline = Instant::now() + hub.wait_hold;
-    let held = || -> Result<Vec<[u8; 16]>, Refused> {
+    let held = || -> Result<Listed, Refused> {
         loop {
             let stirs = locked(&hub.waits).stirs;
             let (scope, machines) = hub.with_table(|table, now| -> Result<_, Refused> {
                 let (_, scope) = table.wake(&wake, now)?;
                 Ok((scope, table.machines(now).into_iter().map(|(name, _, _)| name).collect::<Vec<_>>()))
             })?;
-            let ids = locked(&hub.relay).ids(&scope, &machines, hub.now());
+            let (ids, notices) = {
+                let mut relay = locked(&hub.relay);
+                let ids = relay.ids(&scope, &machines, hub.now());
+                (ids, seen.notices.map(|_| relay.notice_keys(&name, &scope, &machines, hub.now())))
+            };
             let left = deadline.saturating_duration_since(Instant::now());
-            let waits = locked(&hub.waits);
-            if wire::seen_of(&ids) != seen || left.is_zero() || waits.newest.get(&name) != Some(&mine) {
-                return Ok(ids);
+            let mut waits = locked(&hub.waits);
+            if wire::seen_of(&ids) != seen.requests || left.is_zero() || waits.newest.get(&name) != Some(&mine) {
+                let agents = waits.agents.entry(name.clone()).or_default();
+                let notices = seen.notices.zip(notices).map(|(told, listed)| agents.told_now(told, listed, &hub.agent_limits, Instant::now()));
+                return Ok((ids, notices));
+            }
+            if let (Some(told), Some(listed)) = (seen.notices, &notices)
+                && wire::seen_of(&listed.iter().map(|key| key.id).collect::<Vec<_>>()) != told
+                && waits.agents.entry(name.clone()).or_default().wake(told, listed, &hub.agent_limits, Instant::now())
+            {
+                return Ok((ids, notices));
             }
             if waits.stirs == stirs {
                 drop(hub.stirred.wait_timeout(waits, left.min(WAIT_LOOK)).unwrap_or_else(PoisonError::into_inner));
             }
         }
     };
-    let ids = held();
+    let told = held();
     {
         let mut waits = locked(&hub.waits);
         if waits.newest.get(&name) == Some(&mine) {
             waits.newest.remove(&name);
         }
+        if let Ok((_, Some(notices))) = &told {
+            waits.agents.entry(name.clone()).or_default().answered(notices.clone());
+        }
     }
-    Ok((200, json!({"requests": ids?.iter().map(|id| util::hex(id)).collect::<Vec<_>>()})))
+    let (ids, notices) = told?;
+    let mut reply = json!({"requests": ids.iter().map(|id| util::hex(id)).collect::<Vec<_>>()});
+    if let Some(notices) = notices {
+        reply["notices"] = notices.iter().map(|key| util::hex(&key.id)).collect::<Vec<_>>().into();
+    }
+    Ok((200, reply))
+}
+
+/// What a held call answers: the request ids, and the notices for an app that is told of them.
+type Listed = (Vec<[u8; 16]>, Option<Vec<NoticeKey>>);
+
+/// How many answers before the last one the hub keeps for a phone, to know what it names as told.
+const EARLIER_KEPT: usize = 4;
+
+/// A phone's wake-ups for agents' notices: what its held calls last told it, and when a change of
+/// the notices last ended one, and for which boxes.
+#[derive(Default)]
+pub struct Agents {
+    pub(super) told: Vec<NoticeKey>,
+    /// The answers before `told`, the newest first. A phone that gave up on a call (the app does at
+    /// each start) or lost its answer names one of these as what it was told.
+    earlier: VecDeque<Vec<NoticeKey>>,
+    last: Option<Instant>,
+    /// Each box a notice of which ended a held call within the window: when, and the machine,
+    /// workspace and box.
+    woke: Vec<(Instant, String, String, String)>,
+}
+
+impl Agents {
+    /// Keeps `notices` as what the phone was last answered, and the answer before it among the
+    /// earlier ones.
+    pub(super) fn answered(&mut self, notices: Vec<NoticeKey>) {
+        if notices != self.told {
+            let before = std::mem::replace(&mut self.told, notices);
+            self.earlier.push_front(before);
+            self.earlier.truncate(EARLIER_KEPT);
+        }
+    }
+
+    /// The ids of the notices the phone was told, if `told` names one of the answers kept; else
+    /// none.
+    fn known(&self, told: Option<[u8; 32]>) -> Vec<[u8; 16]> {
+        let ids = |answer: &[NoticeKey]| answer.iter().map(|key| key.id).collect::<Vec<_>>();
+        std::iter::once(&self.told).chain(&self.earlier).map(|answer| ids(answer)).find(|ids| wire::seen_of(ids) == told).unwrap_or_default()
+    }
+
+    /// The notices an answer that ends for another reason (a request, the hold's end, a newer call)
+    /// tells the phone of, out of those `listed`: each one if the change from `told` may end a call
+    /// now (counted, as `wake` says), else only those it was told already. So a notice the limits
+    /// hold back raises the app's agent notification at no answer.
+    pub fn told_now(&mut self, told: Option<[u8; 32]>, listed: Vec<NoticeKey>, limits: &AgentLimits, now: Instant) -> Vec<NoticeKey> {
+        if wire::seen_of(&listed.iter().map(|key| key.id).collect::<Vec<_>>()) == told || self.wake(told, &listed, limits, now) {
+            return listed;
+        }
+        let known = self.known(told);
+        listed.into_iter().filter(|key| known.contains(&key.id)).collect()
+    }
+
+    /// Whether the change from what the phone says it was told, `told`, to the notices `listed` may
+    /// end its held call now, counted if so. Not within `gap` of the last. A change that adds no
+    /// notice may; one that adds notices may if any of them is of a box and a machine under their
+    /// counts in the window, and counts once for each such box. The phone's notices are known from
+    /// the answer of the hub's that `told` names, of the last few; else every notice listed counts
+    /// as new.
+    pub fn wake(&mut self, told: Option<[u8; 32]>, listed: &[NoticeKey], limits: &AgentLimits, now: Instant) -> bool {
+        if self.last.is_some_and(|last| now.duration_since(last) < limits.gap) {
+            return false;
+        }
+        self.woke.retain(|(at, ..)| now.duration_since(*at) < limits.window);
+        let known = self.known(told);
+        let mut boxes: Vec<(&str, &str, &str)> = Vec::new();
+        let mut added = false;
+        for key in listed.iter().filter(|key| !known.contains(&key.id)) {
+            added = true;
+            let named = (key.machine.as_str(), key.ws.as_str(), key.box_name.as_str());
+            let of_box = self.woke.iter().filter(|(_, machine, ws, box_name)| (machine.as_str(), ws.as_str(), box_name.as_str()) == named).count();
+            let of_machine = self.woke.iter().filter(|(_, machine, ..)| machine == &key.machine).count() + boxes.iter().filter(|(machine, ..)| *machine == named.0).count();
+            if of_box < limits.per_box && of_machine < limits.per_machine && !boxes.contains(&named) {
+                boxes.push(named);
+            }
+        }
+        if added && boxes.is_empty() {
+            return false;
+        }
+        for (machine, ws, box_name) in boxes {
+            self.woke.push((now, machine.to_string(), ws.to_string(), box_name.to_string()));
+        }
+        self.last = Some(now);
+        true
+    }
 }

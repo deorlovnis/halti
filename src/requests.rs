@@ -36,6 +36,10 @@
 //! `Limits::away_wait`, never past the mark's end, never less than `Limits::wait`. The wait is
 //! fixed as the request is raised, since its expiry is in the bytes a phone signs: clearing the
 //! mark doesn't shorten a request that waits already.
+//!
+//! The desk also keeps the notices that an agent in one of its boxes waits for its owner
+//! (`crate::notices`), which the door's asker call reports. They are apart from requests: no notice
+//! holds up, replaces or counts against a request, nor the other way round.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -48,6 +52,7 @@ use sha2::{Digest, Sha256};
 
 use crate::fields::{self, NAME_MAX};
 use crate::keep::{Records, Told};
+use crate::notices::{self, Event, Notice};
 use crate::util::{hex, random, say};
 
 /// The first field of every request.
@@ -77,9 +82,23 @@ pub struct Limits {
     /// refused for `rest`.
     pub strikes: u32,
     pub rest: Duration,
+    /// How long a notice that an agent waits is held before it is sent, in a run not marked away
+    /// (`crate::notices`).
+    pub notice_delay: Duration,
+    /// How many notices one box may have open.
+    pub notices_per_box: usize,
 }
 
-pub const LIMITS: Limits = Limits { wait: Duration::from_secs(120), away_wait: Duration::from_secs(30 * 60), per_box: 3, per_desk: 50, strikes: 3, rest: Duration::from_secs(300) };
+pub const LIMITS: Limits = Limits {
+    wait: Duration::from_secs(120),
+    away_wait: Duration::from_secs(30 * 60),
+    per_box: 3,
+    per_desk: 50,
+    strikes: 3,
+    rest: Duration::from_secs(300),
+    notice_delay: Duration::from_secs(5 * 60),
+    notices_per_box: 8,
+};
 
 impl Limits {
     /// How long a request raised at `now` waits, seconds since 1970, for a run whose away mark
@@ -473,6 +492,8 @@ struct Table {
     strikes: HashMap<String, Strikes>,
     /// The runs marked away, and when each mark ends, seconds since 1970.
     away: HashMap<RunId, u64>,
+    /// The notices that agents in its boxes wait.
+    notices: notices::Table,
     closed: bool,
 }
 
@@ -574,10 +595,51 @@ impl Desk {
         self.table().away.get(&run).copied().filter(|until| *until > now)
     }
 
-    /// Withdraws every request, and raises none from now on: the workspace is closing.
+    /// Withdraws every request and closes every notice, and raises none from now on: the workspace
+    /// is closing.
     pub fn close(&self) {
-        self.table().closed = true;
+        let mut table = self.table();
+        table.closed = true;
+        table.notices.clear();
+        drop(table);
         self.changed.notify_all();
+    }
+
+    /// What the asker in box `box_name`'s run `run` reported for its session `tag`.
+    fn tell(&self, box_name: &str, run: RunId, event: Event, tag: &[u8]) {
+        let mut table = self.table();
+        if table.closed {
+            return;
+        }
+        let now = notices::Now { instant: Instant::now(), secs: now_secs() };
+        let away = table.away.get(&run).is_some_and(|until| *until > now.secs);
+        table.notices.tell(box_name, run, event, tag, away, self.limits.notice_delay, self.limits.notices_per_box, now);
+    }
+
+    /// The records of the notices that are sent now: open, and past their delay.
+    pub fn notices(&self) -> Vec<Vec<u8>> {
+        let due = self.table().notices.due(Instant::now());
+        let machine = (self.machine)();
+        due.into_iter()
+            .filter_map(|open| {
+                let notice = Notice {
+                    machine: machine.clone(),
+                    ws: self.ws.clone(),
+                    box_name: open.box_name,
+                    run: open.run,
+                    session: open.session,
+                    kind: open.kind,
+                    id: open.id,
+                    since: open.since,
+                };
+                notice.encode().ok()
+            })
+            .collect()
+    }
+
+    /// Closes the notices of run `run`, which ended.
+    pub fn end_run(&self, run: RunId) {
+        self.table().notices.end_run(run);
     }
 
     /// A phone's answer: `yes` or not, to request `id`, signed by the device named `device`. It
@@ -857,6 +919,7 @@ fn runs_named(runs: usize) -> String {
 pub fn told(desk: &Arc<Desk>, trust: Trust, boxes: &dyn Runs, records: &Records) -> Vec<Told> {
     match records {
         Records::List(_) => desk.records().into_iter().map(Told::Request).chain([Told::End]).collect(),
+        Records::Notices(_) => desk.notices().into_iter().map(Told::Notice).chain([Told::End]).collect(),
         Records::Runs(_) => boxes.runs().into_iter().map(|(name, run)| Told::Run(name, run)).chain([Told::End]).collect(),
         Records::Answer(_, yes, digest) => vec![told_by(desk.answer_here(*yes, digest))],
         Records::Signed { device, yes, id, signature, .. } => vec![desk.once(records, || told_by(desk.answer_signed(trust, device, *yes, *id, signature)))],
@@ -893,6 +956,11 @@ impl Asker {
     /// The numbers its desk keeps to.
     pub fn limits(&self) -> Limits {
         self.desk.limits
+    }
+
+    /// What the asker in the box reported for its session `tag` (`crate::notices`).
+    pub fn tell(&self, event: Event, tag: &[u8]) {
+        self.desk.tell(&self.box_name, self.run, event, tag);
     }
 }
 

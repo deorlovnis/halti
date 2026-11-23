@@ -2,12 +2,16 @@
 //! machine token and no key that signs or decrypts, and decides nothing. Three threads:
 //!
 //! - **Report.** Every second it asks this machine's open workspaces, on their sockets, which
-//!   requests wait and which boxes run, for the workspaces a trusted device may see. When that
-//!   changed, and at least every 20 seconds, it reports the whole state to the hub, cut to what the
-//!   hub takes in a report; the reply names the requests the hub lacks and has room for, which it
-//!   then posts one by one (a hub that restarted has none), and lists the phones not revoked, from
-//!   which the trust list is kept: a device not on a complete list is no longer trusted. Adding
-//!   trust takes `halti devices trust`, never a list.
+//!   requests wait, which notices that an agent waits are sent (`crate::notices`) and which boxes
+//!   run, for the workspaces a trusted device may see. When that changed, and at least every 20
+//!   seconds, it reports the whole state to the hub, cut to what the hub takes in a report; the
+//!   reply names the requests the hub lacks and has room for, which it then posts one by one (a hub
+//!   that restarted has none), and lists the phones not revoked, from which the trust list is kept:
+//!   a device not on a complete list is no longer trusted. Adding trust takes `halti devices
+//!   trust`, never a list. Then it names the open notices to the hub, which closes the rest, and
+//!   posts each the hub lacks, sealed by the machine key to each device trusted for its workspace,
+//!   and again when those devices change. That is the only key it reads, and only to seal: a copy
+//!   is made once, kept while its notice is open, and the key read again for the next.
 //! - **Inbox.** It holds one call to the hub that waits for what phones sent this machine: signed
 //!   answers and stops. Each goes to the open workspace it names, which checks it, and what came of
 //!   it is said to the hub with the next call. A stop waits until its boxes are put away, so each
@@ -48,11 +52,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use halti_core::ids::WsName;
+use halti_core::sealed;
 use serde_json::{Value, json};
 
 use super::files::{Entry, Folder, Joined};
-use crate::hub::{ITEMS_MAX, REPORT_IDS_MAX, REPORT_MAX, STATE_BODY_MAX, pin, wire};
+use crate::hub::{BODY_MAX, ITEMS_MAX, NOTICES_MAX, REPORT_IDS_MAX, REPORT_MAX, STATE_BODY_MAX, pin, wire};
 use crate::keep::{self, Records, STOP_RUNS_MAX, Told};
+use crate::notices::Notice;
 use crate::requests::{Id, Record, RunId};
 use crate::util::{self, hex, say};
 
@@ -170,6 +176,8 @@ struct Look {
     state: Value,
     /// The requests that wait, each with its bytes.
     records: Vec<(Record, Vec<u8>)>,
+    /// The notices that are open, each with its bytes.
+    notices: Vec<(Notice, Vec<u8>)>,
     /// The trust list the report was made from.
     trust: Vec<Entry>,
 }
@@ -196,7 +204,19 @@ pub struct Link<'a> {
     noted: Mutex<Vec<String>>,
     /// What came of the items the hub handed over, until the hub is told.
     handled: Mutex<Handled>,
+    /// Each notice's copy sealed to a device, by the notice's bytes, the device's name and its
+    /// second key, while the notice is open.
+    sealed: Mutex<HashMap<CopyOf, Vec<u8>>>,
+    /// Each open notice the hub was given, with the devices, by name and second key, it was
+    /// sealed to then. When those change it is given again.
+    posted: Mutex<HashMap<[u8; 16], Devices>>,
 }
+
+/// Which copy of a notice: its bytes, and the name and second key of the device it is sealed to.
+type CopyOf = (Vec<u8>, String, String);
+
+/// The devices a notice is sealed to, each its name and second key.
+type Devices = Vec<(String, String)>;
 
 /// Runs the link in `folder` for this machine's workspaces until `stop` is set.
 pub fn run(folder: &Folder, local: &dyn Local, timing: Timing, stop: &AtomicBool) -> Result<()> {
@@ -216,6 +236,8 @@ pub fn run(folder: &Folder, local: &dyn Local, timing: Timing, stop: &AtomicBool
         said: Mutex::default(),
         noted: Mutex::default(),
         handled: Mutex::default(),
+        sealed: Mutex::default(),
+        posted: Mutex::default(),
     };
     thread::scope(|scope| {
         let link = &link;
@@ -325,7 +347,7 @@ impl Link<'_> {
     // --- the report ---
 
     fn report_loop(&self) {
-        let mut last: Option<(Value, Instant)> = None;
+        let mut last: Option<(Value, Vec<[u8; 16]>, Instant)> = None;
         let mut backoff = self.timing.look;
         let mut renew_at = Instant::now();
         while !self.stopping() {
@@ -340,9 +362,10 @@ impl Link<'_> {
             // The reports asked for so far are made by the look that follows.
             let asked = locked(&self.reports).0;
             let look = self.look();
+            let notices: Vec<[u8; 16]> = look.notices.iter().map(|(notice, _)| notice.id.0).collect();
             let due = match &last {
                 None => true,
-                Some((body, at)) => *body != look.state || at.elapsed() >= self.timing.heartbeat || asked > locked(&self.reports).1,
+                Some((body, open, at)) => *body != look.state || *open != notices || at.elapsed() >= self.timing.heartbeat || asked > locked(&self.reports).1,
             };
             if !due {
                 self.nap(self.timing.look);
@@ -350,7 +373,7 @@ impl Link<'_> {
             }
             match self.report(&look) {
                 Ok(()) => {
-                    last = Some((look.state, Instant::now()));
+                    last = Some((look.state, notices, Instant::now()));
                     backoff = self.timing.look;
                     if let Some(joined) = self.joined() {
                         self.say_once(&format!("reporting to the hub at {} as {}", joined.address, joined.name));
@@ -402,6 +425,7 @@ impl Link<'_> {
         }
         let mut workspaces = Vec::new();
         let mut records = Vec::new();
+        let mut notices = Vec::new();
         let mut ids = HashMap::new();
         for (ws, socket) in self.local.workspaces() {
             if !trusted_ws.contains(&ws) {
@@ -430,6 +454,14 @@ impl Link<'_> {
                         records.push((record, bytes));
                     }
                 }
+                for bytes in keep::notices(&socket, &ws, KEEPER_WAIT).and_then(Result::ok).unwrap_or_default() {
+                    let Some(notice) = Notice::decode(&bytes).filter(|notice| notice.ws == ws.as_str() && notice.machine == name) else { continue };
+                    if notices.len() == NOTICES_MAX {
+                        self.note_once(format!("more than {NOTICES_MAX} agents wait: the hub is told of {NOTICES_MAX}"));
+                        break;
+                    }
+                    notices.push((notice, bytes));
+                }
                 if let Some(Ok(running)) = keep::runs(&socket, &ws, KEEPER_WAIT) {
                     runs = running;
                 }
@@ -453,7 +485,7 @@ impl Link<'_> {
             self.note_once("this machine's report is longer than the hub takes: it names fewer requests, and the rest are answered here".to_string());
         }
         *locked(&self.ids) = ids;
-        Look { state: state(&records), records, trust }
+        Look { state: state(&records), records, notices, trust }
     }
 
     /// Reports what `look` saw, posts the requests the hub lacks, and keeps the trust list to the
@@ -480,7 +512,86 @@ impl Link<'_> {
                 Err(failed) => return Err(failed),
             }
         }
+        self.post_notices(look)
+    }
+
+    /// Names the open notices to the hub, which closes the rest, and posts each it lacks, sealed
+    /// to each device trusted for its workspace. One whose devices changed since it was posted, as
+    /// a phone was trusted, untrusted or paired again, is posted again with the copies of now. A
+    /// hub that carries no notices is noted once.
+    fn post_notices(&self, look: &Look) -> Result<(), Failed> {
+        let ids: Vec<String> = look.notices.iter().map(|(notice, _)| notice.id.hex()).collect();
+        let reply = match self.call("POST", "/v1/machine/notices", Some(&json!({"notices": ids})), self.timing.call_wait) {
+            Ok(reply) => reply,
+            Err(Failed::Refused(404, _)) => {
+                self.note_once("the hub carries no notices that an agent waits: it runs an older halti".to_string());
+                return Ok(());
+            }
+            Err(failed) => return Err(failed),
+        };
+        locked(&self.sealed).retain(|(bytes, _, _), _| look.notices.iter().any(|(_, open)| open == bytes));
+        locked(&self.posted).retain(|id, _| look.notices.iter().any(|(notice, _)| notice.id.0 == *id));
+        let missing: Vec<[u8; 16]> = reply["missing"].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|id| id.as_str().and_then(wire::unhex::<16>)).collect();
+        for (notice, bytes) in &look.notices {
+            let id = notice.id.0;
+            let devices = sealed_to(&notice.ws, &look.trust).map(|(entry, _)| (entry.name.clone(), entry.agreement_key.clone())).collect::<Vec<_>>();
+            let changed = locked(&self.posted).get(&id).is_some_and(|posted| *posted != devices);
+            if !missing.contains(&id) && !changed {
+                continue;
+            }
+            let mut copies = self.copies(notice, bytes, &look.trust);
+            let body = |copies: &[Value]| json!({"record": hex(bytes), "sealed": copies});
+            while !copies.is_empty() && body(&copies).to_string().len() > BODY_MAX {
+                copies.pop();
+                self.note_once(format!("more devices are trusted for {} than one notice takes: the last ones aren't told", notice.ws));
+            }
+            if copies.is_empty() {
+                continue;
+            }
+            match self.call("POST", "/v1/machine/notice", Some(&body(&copies)), self.timing.call_wait) {
+                Ok(_) => {
+                    locked(&self.posted).insert(id, devices);
+                }
+                Err(Failed::Refused(429, _)) => {
+                    self.say_once("the hub holds as many of this machine's notices as it takes: the rest aren't told");
+                    break;
+                }
+                Err(failed) => return Err(failed),
+            }
+        }
         Ok(())
+    }
+
+    /// A copy of `notice`, whose bytes are `bytes`, sealed by the machine key to each device in
+    /// `trust` that is trusted for its workspace: those made before, and the rest made now.
+    fn copies(&self, notice: &Notice, bytes: &[u8], trust: &[Entry]) -> Vec<Value> {
+        let mut key = None;
+        let mut copies = Vec::new();
+        for (entry, second) in sealed_to(&notice.ws, trust) {
+            let held = (bytes.to_vec(), entry.name.clone(), entry.agreement_key.clone());
+            let made = locked(&self.sealed).get(&held).cloned();
+            let sealed = match made {
+                Some(sealed) => sealed,
+                None => {
+                    if key.is_none() {
+                        key = match self.folder.sealing_key() {
+                            Ok(Some(key)) => Some(key),
+                            Ok(None) => return Vec::new(),
+                            Err(e) => {
+                                self.say_once(&format!("{e:#}"));
+                                return Vec::new();
+                            }
+                        };
+                    }
+                    let machine = key.as_ref().expect("read above");
+                    let Ok(sealed) = sealed::seal(sealed::Kind::Notice, machine, &second, bytes, b"", &util::random()) else { continue };
+                    locked(&self.sealed).insert(held, sealed.clone());
+                    sealed
+                }
+            };
+            copies.push(json!({"device": entry.name, "sealed": hex(&sealed)}));
+        }
+        copies
     }
 
     /// Drops trust in every device the report named that isn't on the hub's complete list with the
@@ -741,6 +852,12 @@ impl Link<'_> {
             Some(word) => format!("no {word}"),
         }
     }
+}
+
+/// The devices in `trust` a notice of workspace `ws` is sealed to: those trusted for it whose second
+/// key reads, each with that key.
+fn sealed_to<'a>(ws: &'a str, trust: &'a [Entry]) -> impl Iterator<Item = (&'a Entry, sealed::AgreementKey)> + 'a {
+    trust.iter().filter(move |entry| entry.ws.iter().any(|named| named.as_str() == ws)).filter_map(|entry| Some((entry, entry.second_key()?)))
 }
 
 /// An item the hub handed over, read whole; or the word it is said with: `unknown` for a kind

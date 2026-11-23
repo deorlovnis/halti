@@ -1,5 +1,6 @@
 //! The gateway kind (`names::DOOR_KIND`): plain HTTP/1.1 to halti itself, with keep-alive because Claude Code reuses
-//! its connections. Its one route is `/model/...`, the model gateway. The box holds a stand-in
+//! its connections. Its routes are `/model/...`, the model gateway, and `POST /ask`, where the
+//! asker in the box says that its agent waits, or no longer does (`crate::notices`). The box holds a stand-in
 //! key; the gateway checks for it, drops the box's own auth headers, adds the real one from the
 //! model resource's approved policy and fields, sends the call over TLS to the policy's first
 //! host and streams the answer back as it arrives, server-sent events included.
@@ -18,6 +19,7 @@ use ureq::http::{self, Response};
 use super::http::{self as wire, Head};
 use super::{Entry, STANDIN, Shared};
 use crate::mask::Masker;
+use crate::notices::{ASK_MAX, ASK_PATH, Ask, NOBODY};
 use crate::policy::{self, METHODS, Mode};
 use crate::source::{self, Hint};
 
@@ -88,13 +90,17 @@ fn exchange(sh: &Shared, reader: &mut BufReader<UnixStream>, writer: &mut UnixSt
     if head.header("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) {
         writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
     }
-    let body = match wire::read_body(reader, &head, MAX_BODY) {
+    let max = if target == ASK_PATH { ASK_MAX } else { MAX_BODY };
+    let body = match wire::read_body(reader, &head, max) {
         Ok(body) => body,
         Err(e) if e.kind() == io::ErrorKind::FileTooLarge => return close_with(writer, 413, "request body too large"),
         Err(e) if e.kind() == io::ErrorKind::InvalidData => return close_with(writer, 400, "bad request"),
         Err(e) => return Err(e),
     };
 
+    if target == ASK_PATH {
+        return ask(sh, writer, &head, method, &body, keep);
+    }
     let path: String = target.split('?').next().unwrap_or("").chars().filter(|c| c.is_ascii_graphic()).take(MAX_PATH).collect();
     let up = body.len() as u64;
     let entry = |decision: &str| Entry { method: Some(method.to_string()), path: Some(path.clone()), up, ..Entry::new("model", decision) };
@@ -111,6 +117,34 @@ fn exchange(sh: &Shared, reader: &mut BufReader<UnixStream>, writer: &mut UnixSt
     let decision = if result.is_ok() { "allowed" } else { "failed:stream" };
     sh.log.write(&Entry { status: Some(status), down, ..entry(decision) });
     result.map(|()| keep)
+}
+
+/// `POST /ask`: what the asker in the box saw. Its text is dropped as it is read; its event and
+/// session tag go to the open workspace that runs the box, if one does, which makes a notice of
+/// them that holds neither (`crate::notices`). It is answered at once, `nobody`: nobody answers
+/// from the phone. Not logged: nothing in it leaves the box.
+///
+/// It needs no key, so it takes only what a web page in the box can't send: a browser there may
+/// POST to halti.internal with no preflight, but only with a type such as `text/plain`, and it
+/// names the page's origin. A call with `Content-Type: application/octet-stream` and no `Origin`
+/// is the asker's.
+fn ask(sh: &Shared, writer: &mut UnixStream, head: &Head, method: &str, body: &[u8], keep: bool) -> io::Result<bool> {
+    let octets = head.header("content-type").is_some_and(|v| v.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/octet-stream"));
+    let status = match Ask::parse(body) {
+        _ if !method.eq_ignore_ascii_case("POST") => 405,
+        _ if head.header("origin").is_some() => 403,
+        _ if !octets => 415,
+        None => 400,
+        Some(ask) => {
+            if let Some(asker) = &sh.cfg.requests {
+                asker.tell(ask.event, &ask.tag);
+            }
+            200
+        }
+    };
+    let said = if status == 200 { NOBODY } else { "refused" };
+    wire::respond(writer, status, "text/plain", said.as_bytes(), keep)?;
+    Ok(keep)
 }
 
 /// Decide what the request becomes upstream, or why it is refused. The model resource's policy
@@ -359,6 +393,110 @@ mod tests {
         ]);
         let out = rewrite_headers(&incoming, "x-api-key", &BTreeMap::new(), None);
         assert_eq!(names(&out), ["x-keep", "accept-encoding"]);
+    }
+
+    /// A door whose box an open workspace runs, with that workspace's desk, notices sent at once.
+    fn door_of(dir: &std::path::Path, desk: &std::sync::Arc<crate::requests::Desk>) -> Shared {
+        let config = super::super::Config {
+            name: "acme/dev".into(),
+            socket: dir.join("unused.sock"),
+            port: None,
+            allow: Vec::new(),
+            model: None,
+            sites: Vec::new(),
+            net: super::super::inspect::Net { writes: Mode::Ask, allow_writes: Vec::new(), ask: None },
+            log: dir.join("door.log"),
+            log_key: [9; 32],
+            browser: None,
+            ca: None,
+            browser_socket: None,
+            browser_tokens: Default::default(),
+            requests: Some(desk.asker("dev", crate::requests::RunId([7; 8]))),
+        };
+        Shared::new(config, super::super::addr::Net::system()).unwrap()
+    }
+
+    /// Sends `request` on a connection of the gateway kind, and reads until the door closes it.
+    fn exchanged(sh: &Shared, request: &[u8]) -> String {
+        let (mut guest, door) = UnixStream::pair().unwrap();
+        let mut reading = guest.try_clone().unwrap();
+        let replied = std::thread::spawn(move || {
+            let mut reply = String::new();
+            let _ = reading.read_to_string(&mut reply);
+            reply
+        });
+        // Written beside the door, which may answer before it has read it all.
+        let request = request.to_vec();
+        std::thread::spawn(move || {
+            let _ = guest.write_all(&request).and_then(|()| guest.shutdown(std::net::Shutdown::Write));
+        });
+        serve(sh, BufReader::new(door.try_clone().unwrap()), door);
+        replied.join().unwrap()
+    }
+
+    /// A call to `/ask` as the asker makes it, with the headers `more` adds.
+    fn post_ask_with(body: &[u8], more: &str) -> Vec<u8> {
+        [format!("POST /ask HTTP/1.1\r\nHost: halti.internal\r\n{more}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes(), body].concat()
+    }
+
+    fn post_ask(body: &[u8]) -> Vec<u8> {
+        post_ask_with(body, "Content-Type: application/octet-stream\r\n")
+    }
+
+    #[test]
+    fn an_ask_is_answered_nobody_at_once_and_reaches_the_desk_without_its_text() {
+        let dir = crate::util::TempDir::new("halti-gateway-ask").unwrap();
+        let limits = crate::requests::Limits { notice_delay: Duration::ZERO, ..crate::requests::LIMITS };
+        let desk = crate::requests::Desk::new("mac-1".into(), "acme".into(), limits, std::sync::Arc::new(Unshown));
+        let sh = door_of(&dir.0, &desk);
+        let reply = exchanged(&sh, &post_ask(&Ask::bytes(b"turn-ended", b"session-tag", b"PLANTED text")));
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n") && reply.ends_with("\r\n\r\nnobody"), "{reply}");
+        let records = desk.notices();
+        assert_eq!(records.len(), 1);
+        let notice = crate::notices::Notice::decode(&records[0]).unwrap();
+        assert_eq!((notice.box_name.as_str(), notice.session, notice.kind), ("dev", 1, crate::notices::Kind::TurnEnded));
+        assert!(!records[0].windows(7).any(|w| w == b"PLANTED" || w == b"session"));
+        // Working closes it.
+        assert!(exchanged(&sh, &post_ask(&Ask::bytes(b"working", b"session-tag", b""))).ends_with("nobody"));
+        assert!(desk.notices().is_empty());
+        // What isn't the form, or comes by another method, is refused and reaches nothing.
+        let text_too_long = post_ask(&Ask::bytes(b"turn-ended", b"t", &[b'x'; crate::notices::TEXT_MAX + 1]));
+        for bad in [post_ask(&Ask::bytes(b"waiting", b"t", b"")), post_ask(b"turn-ended"), text_too_long, b"GET /ask HTTP/1.1\r\nConnection: close\r\n\r\n".to_vec()] {
+            let reply = exchanged(&sh, &bad);
+            assert!(reply.starts_with("HTTP/1.1 400") || reply.starts_with("HTTP/1.1 405"), "{reply}");
+        }
+        // One longer than the form can be is refused before it is read: the guest may see the
+        // connection reset before the answer.
+        let long = post_ask(&Ask::bytes(b"turn-ended", b"t", &[b'x'; crate::notices::ASK_MAX]));
+        let reply = exchanged(&sh, &long);
+        assert!(reply.is_empty() || reply.starts_with("HTTP/1.1 413"), "{reply}");
+        assert!(desk.notices().is_empty());
+        // A web page in the box can POST with no preflight, but not as the asker does: with a type
+        // a page may send, or with none, or naming its origin, it reaches nothing.
+        let wait = Ask::bytes(b"turn-ended", b"t", b"");
+        for (more, status) in [
+            ("", "415"),
+            ("Content-Type: text/plain;charset=UTF-8\r\n", "415"),
+            ("Content-Type: application/x-www-form-urlencoded\r\n", "415"),
+            ("Content-Type: application/octet-stream\r\nOrigin: http://localhost:3000\r\n", "403"),
+            ("Origin: null\r\nContent-Type: application/octet-stream\r\n", "403"),
+        ] {
+            let reply = exchanged(&sh, &post_ask_with(&wait, more));
+            assert!(reply.starts_with(&format!("HTTP/1.1 {status}")), "{more}: {reply}");
+        }
+        assert!(desk.notices().is_empty());
+        // A door with no open workspace behind it answers the same, and keeps nothing.
+        let alone = Shared::new(super::super::Config { requests: None, ..door_of(&dir.0, &desk).cfg }, super::super::addr::Net::system()).unwrap();
+        assert!(exchanged(&alone, &post_ask(&Ask::bytes(b"question", b"t", b""))).ends_with("nobody"));
+        assert!(desk.notices().is_empty());
+    }
+
+    struct Unshown;
+
+    impl crate::requests::Prompt for Unshown {
+        fn ask(&self, _reason: &str, _withdrawn: &dyn Fn() -> bool) -> crate::requests::Prompted {
+            crate::requests::Prompted::Unshown
+        }
     }
 
     #[test]

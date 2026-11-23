@@ -32,6 +32,7 @@ const DEV: &[&str] = &[
     "HALTI_POLICY_DIR",
     "HALTI_BOX_DIR",
     "HALTI_TEST_KVM",
+    "HALTI_TEST_NOTICE_DELAY",
 ];
 
 /// Read only by tests.

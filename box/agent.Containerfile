@@ -69,6 +69,12 @@ RUN git config --system url."https://github.com/".insteadOf "git@github.com:" \
 # run time, so everything the agent keeps (pip, npm and uv installs, ~/.claude) lands there.
 RUN usermod -l agent -d /home/agent -m node && groupmod -n agent node
 COPY --from=shim /src/target/release/halti-shim /usr/local/bin/halti-shim
+# Claude Code's managed settings, above the user's and the project's: hooks that run the shim's
+# asker, which tells halti when the agent waits for its owner (`halti-shim ask`). The JVM and Rust
+# images, and a Linux server's disk, are made from this image and have it too.
+COPY claude-code/halti.json /etc/claude-code/managed-settings.d/halti.json
+RUN chmod 755 /etc/claude-code /etc/claude-code/managed-settings.d \
+    && chmod 644 /etc/claude-code/managed-settings.d/halti.json
 # The VM can't run with a read-only root: `container` reaches the door socket only on the root
 # filesystem. So the system is made unwritable for the agent instead: no setuid programs (no
 # su, no mount) and no world-writable directory but the memory-backed ones (/tmp, /var/tmp).
