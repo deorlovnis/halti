@@ -15,8 +15,10 @@
 //! text     0 to 8,192 bytes of what the agent wrote; read and dropped here
 //! ```
 //!
-//! It is answered at once, `200` with the body `nobody`: nobody answers from the phone. Anything
-//! else is `400`.
+//! It comes with `Content-Type: application/octet-stream` and no `Origin`, which no web page in the
+//! box can send without a preflight the door never answers: another type is `415`, an `Origin`
+//! `403`. It is answered at once, `200` with the body `nobody`: nobody answers from the phone.
+//! Anything else is `400`.
 //!
 //! The door knows which machine, workspace, box and run it serves; the box names none of them. The
 //! open workspace keeps a run's session tags on this machine and gives each a number of its own, 1,

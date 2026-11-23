@@ -99,7 +99,7 @@ fn exchange(sh: &Shared, reader: &mut BufReader<UnixStream>, writer: &mut UnixSt
     };
 
     if target == ASK_PATH {
-        return ask(sh, writer, method, &body, keep);
+        return ask(sh, writer, &head, method, &body, keep);
     }
     let path: String = target.split('?').next().unwrap_or("").chars().filter(|c| c.is_ascii_graphic()).take(MAX_PATH).collect();
     let up = body.len() as u64;
@@ -123,9 +123,17 @@ fn exchange(sh: &Shared, reader: &mut BufReader<UnixStream>, writer: &mut UnixSt
 /// session tag go to the open workspace that runs the box, if one does, which makes a notice of
 /// them that holds neither (`crate::notices`). It is answered at once, `nobody`: nobody answers
 /// from the phone. Not logged: nothing in it leaves the box.
-fn ask(sh: &Shared, writer: &mut UnixStream, method: &str, body: &[u8], keep: bool) -> io::Result<bool> {
+///
+/// It needs no key, so it takes only what a web page in the box can't send: a browser there may
+/// POST to halti.internal with no preflight, but only with a type such as `text/plain`, and it
+/// names the page's origin. A call with `Content-Type: application/octet-stream` and no `Origin`
+/// is the asker's.
+fn ask(sh: &Shared, writer: &mut UnixStream, head: &Head, method: &str, body: &[u8], keep: bool) -> io::Result<bool> {
+    let octets = head.header("content-type").is_some_and(|v| v.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/octet-stream"));
     let status = match Ask::parse(body) {
         _ if !method.eq_ignore_ascii_case("POST") => 405,
+        _ if head.header("origin").is_some() => 403,
+        _ if !octets => 415,
         None => 400,
         Some(ask) => {
             if let Some(asker) = &sh.cfg.requests {
@@ -426,8 +434,13 @@ mod tests {
         replied.join().unwrap()
     }
 
+    /// A call to `/ask` as the asker makes it, with the headers `more` adds.
+    fn post_ask_with(body: &[u8], more: &str) -> Vec<u8> {
+        [format!("POST /ask HTTP/1.1\r\nHost: halti.internal\r\n{more}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes(), body].concat()
+    }
+
     fn post_ask(body: &[u8]) -> Vec<u8> {
-        [format!("POST /ask HTTP/1.1\r\nHost: halti.internal\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes(), body].concat()
+        post_ask_with(body, "Content-Type: application/octet-stream\r\n")
     }
 
     #[test]
@@ -457,6 +470,20 @@ mod tests {
         let long = post_ask(&Ask::bytes(b"turn-ended", b"t", &[b'x'; crate::notices::ASK_MAX]));
         let reply = exchanged(&sh, &long);
         assert!(reply.is_empty() || reply.starts_with("HTTP/1.1 413"), "{reply}");
+        assert!(desk.notices().is_empty());
+        // A web page in the box can POST with no preflight, but not as the asker does: with a type
+        // a page may send, or with none, or naming its origin, it reaches nothing.
+        let wait = Ask::bytes(b"turn-ended", b"t", b"");
+        for (more, status) in [
+            ("", "415"),
+            ("Content-Type: text/plain;charset=UTF-8\r\n", "415"),
+            ("Content-Type: application/x-www-form-urlencoded\r\n", "415"),
+            ("Content-Type: application/octet-stream\r\nOrigin: http://localhost:3000\r\n", "403"),
+            ("Origin: null\r\nContent-Type: application/octet-stream\r\n", "403"),
+        ] {
+            let reply = exchanged(&sh, &post_ask_with(&wait, more));
+            assert!(reply.starts_with(&format!("HTTP/1.1 {status}")), "{more}: {reply}");
+        }
         assert!(desk.notices().is_empty());
         // A door with no open workspace behind it answers the same, and keeps nothing.
         let alone = Shared::new(super::super::Config { requests: None, ..door_of(&dir.0, &desk).cfg }, super::super::addr::Net::system()).unwrap();
