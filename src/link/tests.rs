@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use base64::Engine as _;
 use halti_core::sealed::{self, AgreementKey, Kind, ReplyKey};
 use jiff::SignedDuration;
 use serde_json::Value;
@@ -372,6 +373,38 @@ fn text_is_sealed_with_the_keys_of_the_join_and_the_trust() {
 }
 
 // --- answers ---
+
+#[test]
+fn the_sealing_key_reads_the_file_halti_writes_and_nothing_else() {
+    let dir = Short::new();
+    let folder = Folder::at(&dir.0.join("link"));
+    assert!(folder.sealing_key().unwrap().is_none());
+    let (key, _) = folder.keep_machine_key().unwrap();
+    let pem = key.serialize_pem();
+    let path = dir.0.join("link").join("machine-key.pem");
+    let sealing = |text: &str| {
+        std::fs::write(&path, text).unwrap();
+        folder.sealing_key().map(|key| key.unwrap().public().spki().to_vec())
+    };
+    // The file as rcgen writes it, with its lines ended either way, is the machine key.
+    assert!(pem.contains('\n') && !pem.contains('\r'));
+    assert_eq!(sealing(&pem).unwrap(), key.subject_public_key_info());
+    assert_eq!(sealing(&pem.replace('\n', "\r\n")).unwrap(), key.subject_public_key_info());
+    // Another label, another curve, a body that isn't base64, a key too long to be one, a bit
+    // changed in the scalar or a file cut short: each is refused, and none of them panics.
+    let refused = |text: &str| sealing(text).unwrap_err().to_string().contains("isn't a P-256 key in the form halti writes");
+    assert!(refused(&pem.replace("PRIVATE KEY", "EC PRIVATE KEY")));
+    assert!(refused(&rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap().serialize_pem()));
+    assert!(refused(&rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap().serialize_pem()));
+    assert!(refused("-----BEGIN PRIVATE KEY-----\n!!!!\n-----END PRIVATE KEY-----\n"));
+    let long = pem.replace("-----END", &format!("{}\n-----END", "A".repeat(400)));
+    assert!(refused(&long));
+    let mut der = key.serialize_der();
+    der[40] ^= 1;
+    assert!(refused(&format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", base64::engine::general_purpose::STANDARD.encode(&der))));
+    assert!(refused(&pem[..pem.len() / 2]));
+    assert!(refused(""));
+}
 
 #[test]
 fn a_phone_approves_and_denies_with_its_signature() {
