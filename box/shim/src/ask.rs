@@ -13,6 +13,7 @@
 //! | Stop | `turn-ended`, or nothing while a background task runs |
 //! | UserPromptSubmit | `typed`, or `working` for a background task's notification |
 //! | PostToolUse, PermissionDenied | `working` |
+//! | SubagentStop, SessionEnd | `working`: the sub-agent or the session is gone |
 //!
 //! Anything else, or input that isn't JSON, sends nothing.
 //!
@@ -26,6 +27,9 @@
 //! sub-agent, its `agent_id`, so each is a session of its own), and the text the hook showed, clipped
 //! to halti's caps. halti keeps neither the tag nor the text in what it tells the phone. The host's
 //! side is halti's src/notices.rs.
+//!
+//! A session that ends, or a sub-agent that returns, waits no more, and no later hook would carry
+//! its tag: a `claude -p` ends with Stop, and a sub-agent's prompt answered No raises nothing.
 //!
 //! A Stop while a background task runs isn't the agent waiting: it ends again when the task does.
 //! A background task's end raises UserPromptSubmit with the task's notification as the prompt, which
@@ -92,7 +96,7 @@ fn said(hook: &Json) -> Said {
             _ => (None, Vec::new()),
         },
         "PreToolUse" if tool == "AskUserQuestion" => (Some("question"), questions(hook.get("tool_input"))),
-        "PreToolUse" | "PostToolUse" | "PermissionDenied" => (Some("working"), Vec::new()),
+        "PreToolUse" | "PostToolUse" | "PermissionDenied" | "SubagentStop" | "SessionEnd" => (Some("working"), Vec::new()),
         "Stop" if background_runs(hook) => (None, Vec::new()),
         "Stop" => (Some("turn-ended"), fields(&[clip_start(text("last_assistant_message"), BODY_MAX)])),
         "UserPromptSubmit" if text("prompt").starts_with("<task-notification>") => (Some("working"), Vec::new()),
@@ -475,10 +479,11 @@ mod tests {
             ("PermissionRequest-Bash", None),
             ("PermissionRequest-Bash-subagent", None),
             ("PermissionRequest-AskUserQuestion", None),
+            // A sub-agent that returns waits no more.
+            ("SubagentStop", Some("working")),
             // Hooks the settings don't name send nothing.
             ("SessionStart", None),
             ("SubagentStart", None),
-            ("SubagentStop", None),
         ] {
             assert_eq!(said(&fixture(name)).event, event, "{name}");
         }
@@ -511,6 +516,10 @@ mod tests {
         let sub = said(&fixture("PermissionRequest-Bash-subagent")).tag;
         assert_ne!(parent, sub, "a sub-agent is a session of its own");
         assert_eq!(sub, said(&fixture("PreToolUse-Bash-subagent")).tag);
+        assert_eq!(sub, said(&fixture("SubagentStop")).tag, "its return closes its own wait");
+        // A session's end closes the wait of that session, not of its sub-agents.
+        let end = said(&parse(br#"{"session_id":"b9d65cd2-f594-409d-a130-eb80345b1e02","hook_event_name":"SessionEnd","reason":"prompt_input_exit"}"#).unwrap());
+        assert_eq!((end.event, end.tag), (Some("working"), parent));
         assert_eq!(tag("a", ""), tag("a", ""));
         assert_ne!(tag("ab", ""), tag("a", "b"));
     }

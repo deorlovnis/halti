@@ -345,7 +345,7 @@ fn the_agent_image_runs_the_asker_from_its_managed_settings_with_a_short_timeout
     let events: Vec<&str> = hooks.keys().map(String::as_str).collect();
     // Not PermissionRequest: it comes as the dialog opens, so a yes and a long build would be told
     // as a wait. The prompt's Notification tells it.
-    let mut expected = ["Notification", "PreToolUse", "PostToolUse", "PermissionDenied", "Stop", "UserPromptSubmit"];
+    let mut expected = ["Notification", "PreToolUse", "PostToolUse", "PermissionDenied", "Stop", "UserPromptSubmit", "SubagentStop", "SessionEnd"];
     expected.sort_unstable();
     assert_eq!(events, expected);
     for (event, matchers) in hooks {
