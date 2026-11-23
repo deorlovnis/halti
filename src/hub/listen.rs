@@ -506,7 +506,8 @@ fn hide(hub: &Hub, scope: &[WsName], body: &[u8]) -> Result<(u16, Value), Refuse
 /// A phone's call, with its wake credential alone, to be told the ids of the requests it may see,
 /// and from an app that names the notices it was told, of the notices too: at once if the requests
 /// are not what it was last told, else once they change or `wait_hold` is over. A change of the
-/// notices alone ends it only as `Agents::wake` allows; one it doesn't is listed at the next answer.
+/// notices alone ends it only as `Agents::wake` allows. A notice new to the phone is in an answer
+/// only as `Agents::wake` allows, whatever ends the call: else it is held back for a later one.
 /// A newer call of the same phone ends it, as does its row's revoking or renewal (`401 unknown`).
 fn wait(hub: &Hub, authorization: Option<&str>, body: &[u8]) -> Result<(u16, Value), Refused> {
     if authorization.is_some_and(|value| value.starts_with("Bearer ")) {
@@ -538,6 +539,8 @@ fn wait(hub: &Hub, authorization: Option<&str>, body: &[u8]) -> Result<(u16, Val
             let left = deadline.saturating_duration_since(Instant::now());
             let mut waits = locked(&hub.waits);
             if wire::seen_of(&ids) != seen.requests || left.is_zero() || waits.newest.get(&name) != Some(&mine) {
+                let agents = waits.agents.entry(name.clone()).or_default();
+                let notices = seen.notices.zip(notices).map(|(told, listed)| agents.told_now(told, listed, &hub.agent_limits, Instant::now()));
                 return Ok((ids, notices));
             }
             if let (Some(told), Some(listed)) = (seen.notices, &notices)
@@ -569,6 +572,11 @@ fn wait(hub: &Hub, authorization: Option<&str>, body: &[u8]) -> Result<(u16, Val
     Ok((200, reply))
 }
 
+/// The notices a phone was told, `answered`, if `told` names them; else none.
+fn known(answered: &[NoticeKey], told: Option<[u8; 32]>) -> &[NoticeKey] {
+    if wire::seen_of(&answered.iter().map(|key| key.id).collect::<Vec<_>>()) == told { answered } else { &[] }
+}
+
 /// What a held call answers: the request ids, and the notices for an app that is told of them.
 type Listed = (Vec<[u8; 16]>, Option<Vec<NoticeKey>>);
 
@@ -584,6 +592,18 @@ pub struct Agents {
 }
 
 impl Agents {
+    /// The notices an answer that ends for another reason (a request, the hold's end, a newer call)
+    /// tells the phone of, out of those `listed`: each one if the change from `told` may end a call
+    /// now (counted, as `wake` says), else only those it was told already. So a notice the limits
+    /// hold back raises the app's agent notification at no answer.
+    pub fn told_now(&mut self, told: Option<[u8; 32]>, listed: Vec<NoticeKey>, limits: &AgentLimits, now: Instant) -> Vec<NoticeKey> {
+        if wire::seen_of(&listed.iter().map(|key| key.id).collect::<Vec<_>>()) == told || self.wake(told, &listed, limits, now) {
+            return listed;
+        }
+        let known = known(&self.told, told);
+        listed.into_iter().filter(|key| known.iter().any(|old| old.id == key.id)).collect()
+    }
+
     /// Whether the change from what the phone says it was told, `told`, to the notices `listed` may
     /// end its held call now, counted if so. Not within `gap` of the last. A change that adds no
     /// notice may; one that adds notices may if any of them is of a box and a machine under their
@@ -594,7 +614,7 @@ impl Agents {
             return false;
         }
         self.woke.retain(|(at, ..)| now.duration_since(*at) < limits.window);
-        let known: &[NoticeKey] = if wire::seen_of(&self.told.iter().map(|key| key.id).collect::<Vec<_>>()) == told { &self.told } else { &[] };
+        let known = known(&self.told, told);
         let mut boxes: Vec<(&str, &str, &str)> = Vec::new();
         let mut added = false;
         for key in listed.iter().filter(|key| !known.iter().any(|old| old.id == key.id)) {

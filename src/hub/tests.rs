@@ -54,7 +54,22 @@ fn start_with(limits: Limits) -> Running {
     start_in(dir, limits, Arc::new(Hands(Mutex::new(START.parse().unwrap()))))
 }
 
+/// A hub as `start_now`'s, whose agents' limits are these.
+fn start_with_agents(agents: AgentLimits) -> Running {
+    let dir = TempDir::new("halti-hub").unwrap();
+    start_hub(
+        dir,
+        Limits { request_wait: Duration::from_secs(5), ..Limits::HUB },
+        Arc::new(Hands(Mutex::new(Timestamp::from_second(Timestamp::now().as_second()).unwrap()))),
+        agents,
+    )
+}
+
 fn start_in(dir: TempDir, limits: Limits, clock: Arc<Hands>) -> Running {
+    start_hub(dir, limits, clock, AgentLimits { gap: AGENT_GAP, ..AGENT_LIMITS })
+}
+
+fn start_hub(dir: TempDir, limits: Limits, clock: Arc<Hands>, agents: AgentLimits) -> Running {
     let folder = dir.0.clone();
     let key = tls_key(&folder).unwrap();
     let pin = pin_of(&key);
@@ -63,7 +78,7 @@ fn start_in(dir: TempDir, limits: Limits, clock: Arc<Hands>) -> Running {
     let mut hub = Hub::open(&folder, &address, pin, clock.clone()).unwrap();
     hub.inbox_wait = INBOX_WAIT;
     hub.wait_hold = WAIT_HOLD;
-    hub.agent_limits = AgentLimits { gap: AGENT_GAP, ..AGENT_LIMITS };
+    hub.agent_limits = agents;
     let hub = Arc::new(hub);
     let admin_socket = crate::keep::bind(&folder.join("admin.sock")).unwrap().unwrap();
     let (for_admin, for_listener) = (hub.clone(), hub.clone());
@@ -1861,7 +1876,7 @@ fn an_agent_s_notice_never_delays_a_request() {
     let (reply, _) = held(|| wait_both(&hub, &pixel.token, &[], &[]), || open_notices(&hub, &server, &[notice("server-1", "acme", "dev", 1)], &["pixel"]));
     assert_eq!(reply.0, 200);
     // A second notice is held back by the gap; a request that comes meanwhile ends the call at once,
-    // and both lists are as they are.
+    // and the notice stays held back: the request raises no agent notification with it.
     let records = [notice("server-1", "acme", "dev", 1), notice("server-1", "acme", "web", 2)];
     let (reply, took) = held(
         || wait_both(&hub, &pixel.token, &[], &[[1; 16]]),
@@ -1870,8 +1885,33 @@ fn an_agent_s_notice_never_delays_a_request() {
             post(&hub, &server, "acme", 7);
         },
     );
-    assert_eq!(reply, (200, both(&[[7; 16]], &[[1; 16], [2; 16]])));
+    assert_eq!(reply, (200, both(&[[7; 16]], &[[1; 16]])));
     assert!(took < Duration::from_millis(800), "{took:?}");
+    // Once the gap is over, it is told.
+    thread::sleep(AGENT_GAP);
+    assert_eq!(wait_both(&hub, &pixel.token, &[[7; 16]], &[[1; 16]]), (200, both(&[[7; 16]], &[[1; 16], [2; 16]])));
+}
+
+#[test]
+fn a_notice_the_limits_hold_back_is_not_told_when_the_hold_ends() {
+    let hub = start_with_agents(AgentLimits { gap: Duration::ZERO, per_box: 1, ..AGENT_LIMITS });
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    // The box's one wake-up of the hour.
+    open_notices(&hub, &server, &[notice("server-1", "acme", "dev", 1)], &["pixel"]);
+    assert_eq!(wait_both(&hub, &pixel.token, &[], &[]), (200, both(&[], &[[1; 16]])));
+    // It loops: closed, and a new one opens. The call is held to its end, and its answer tells
+    // nothing new, so the app raises nothing.
+    open_notices(&hub, &server, &[notice("server-1", "acme", "dev", 2)], &["pixel"]);
+    let (reply, took) = held(|| wait_both(&hub, &pixel.token, &[], &[[1; 16]]), || {});
+    assert_eq!(reply, (200, both(&[], &[])));
+    assert!(took >= WAIT_HOLD - Duration::from_millis(50), "{took:?}");
+    // Nor when a request ends the call: the request is told, the notice not.
+    let (reply, _) = held(|| wait_both(&hub, &pixel.token, &[], &[]), || post(&hub, &server, "acme", 7));
+    assert_eq!(reply, (200, both(&[[7; 16]], &[])));
+    // Another box of the machine wakes the phone, and the held-back one is told with it.
+    open_notices(&hub, &server, &[notice("server-1", "acme", "dev", 2), notice("server-1", "acme", "web", 3)], &["pixel"]);
+    assert_eq!(wait_both(&hub, &pixel.token, &[[7; 16]], &[]), (200, both(&[[7; 16]], &[[2; 16], [3; 16]])));
 }
 
 fn key(machine: &str, box_name: &str, id: u8) -> relay::NoticeKey {

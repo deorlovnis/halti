@@ -243,16 +243,20 @@
 //! with; an app that isn't told of notices leaves it out. A field the hub doesn't know is passed
 //! over. The reply is `200 {"requests": ["<16 bytes>", ...], "notices": ["<16 bytes>", ...]}`:
 //! the ids of the requests `GET /v1/requests` would list now, and of the notices `GET /v1/notices`
-//! would, each sorted by their bytes; `notices` only when the body had `notices_seen`.
+//! would that the phone may be told of now (below), each sorted by their bytes; `notices` only when
+//! the body had `notices_seen`.
 //!
 //! It comes at once when the requests differ from `seen`. When only the notices differ from
 //! `notices_seen`, it comes within the agents' limits: at most once in 10 seconds for a phone, and
 //! in an hour 6 times for one box and 20 for one machine, a box counting once for each answer that
 //! lists a notice of it that is new to the phone. A change that only closes notices counts only
-//! against the 10 seconds. A change the limits hold back is listed in the next answer, whatever
-//! ends the call. Otherwise the hub holds the call until one of those, or 240 seconds, and answers
-//! then. So the app keeps the two lists apart: a new request id raises the request notification, a
-//! new notice id the agent one ("halti: an agent is waiting for you"), and neither raises the other.
+//! against the 10 seconds. Otherwise the hub holds the call until one of those, or 240 seconds, and
+//! answers then. A notice new to the phone is in an answer only as those limits allow, whatever
+//! ends the call: an answer that ends for a request, the 240 seconds or a newer call, at a time the
+//! limits don't allow, lists only the notices the phone was told already that are still open, and
+//! the new one comes in a later answer. So `notices` may list fewer than `GET /v1/notices` does.
+//! The app keeps the two lists apart: a new request id raises the request notification, a new
+//! notice id the agent one ("halti: an agent is waiting for you"), and neither raises the other.
 //! A phone has one such call at a time: a newer one ends the one before with the lists as they are.
 //! The credential tells the hub's holder how many requests and notices wait and when that changes;
 //! it reads, answers, hides or stops nothing.
