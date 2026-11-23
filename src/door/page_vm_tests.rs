@@ -27,7 +27,7 @@ use super::tls::{BoxCa, trust_only};
 use super::{Config, Door, Tokens};
 use crate::boxes::browser_vm::BrowserVm;
 use crate::util::{TempDir, sha256_hex};
-use crate::{approve, engine, policy};
+use crate::{engine, policy};
 
 const FILES_HOST: &str = "files.example.net";
 const FILES_IP: [u8; 4] = [93, 184, 216, 77];
@@ -209,7 +209,6 @@ fn scenario() {
     fs::write(policy::path("example"), "[browse]\norigins = [\"https://example.com\"]\nstart = \"https://example.com\"\n").unwrap();
     fs::write(policy::path("files"), format!("[browse]\norigins = [\"https://{FILES_HOST}\"]\nstart = \"https://{FILES_HOST}/\"\n")).unwrap();
     policy::approve(&["example".into(), "files".into()]).unwrap();
-    approve::take_answers();
 
     let box_ca = Arc::new(BoxCa::generate("e2e").unwrap());
     let signer = BoxCa::generate("sites").unwrap();
@@ -483,7 +482,6 @@ fn session_scenario() {
     fs::write(policy::path("files"), format!("[browse]\norigins = [\"https://{FILES_HOST}\"]\nstart = \"https://{FILES_HOST}/\"\n")).unwrap();
     fs::write(std::env::var("HALTI_INDEX").unwrap(), json!({ "files": { "fields": {} } }).to_string()).unwrap();
     policy::approve(&["files".into()]).unwrap();
-    approve::take_answers();
 
     let box_ca = Arc::new(BoxCa::generate("e2e").unwrap());
     let signer = BoxCa::generate("sites").unwrap();

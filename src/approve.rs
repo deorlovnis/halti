@@ -13,16 +13,33 @@ use crate::requests::Prompted;
 pub const TOUCH_ID_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 thread_local! {
-    /// How each prompt this thread asked was answered since its last `take_answers` (true:
-    /// approved). Kept per thread: where several boxes run in one process, a call reads back only
-    /// what it asked itself.
-    static ANSWERS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    /// The answers to the call `answers_to` runs on this thread, while it runs (true: approved).
+    /// Nothing is kept on a thread no call listens on, such as a door's.
+    static LISTENING: RefCell<Option<Vec<bool>>> = const { RefCell::new(None) };
 }
 
-/// The answers to the prompts this thread asked so far, and forget them. The audit log reads what a
-/// call asked.
-pub fn take_answers() -> Vec<bool> {
-    ANSWERS.with_borrow_mut(std::mem::take)
+/// Runs `call`, and how each prompt it asked was answered, in order. The audit log reads what a call
+/// asked. A call's prompts run on the thread that runs it (halti has no async tasks to move them),
+/// so the prompts of other calls and of door threads in the same process are never among them.
+/// Within another `answers_to`, the outer call hears these answers too.
+pub fn answers_to<T>(call: impl FnOnce() -> T) -> (T, Vec<bool>) {
+    /// The outer call's answers, put back when this call ends, also by a panic.
+    struct Outer(Option<Vec<bool>>);
+    impl Drop for Outer {
+        fn drop(&mut self) {
+            let inner = LISTENING.take().unwrap_or_default();
+            let mut outer = self.0.take();
+            if let Some(outer) = &mut outer {
+                outer.extend(inner);
+            }
+            LISTENING.set(outer);
+        }
+    }
+    let outer = Outer(LISTENING.replace(Some(Vec::new())));
+    let result = call();
+    let answers = LISTENING.with_borrow(|answers| answers.clone().unwrap_or_default());
+    drop(outer);
+    (result, answers)
 }
 
 /// Ask for confirmation; macOS shows it as "halti is trying to <reason>."
@@ -33,7 +50,7 @@ pub fn confirm(reason: &str) -> Result<()> {
 }
 
 fn note(approved: bool) {
-    ANSWERS.with_borrow_mut(|answers| answers.push(approved));
+    LISTENING.with_borrow_mut(|answers| answers.as_mut().map(|answers| answers.push(approved)));
 }
 
 /// How a test that has prompts open at the same time answers each, by its reason.
@@ -169,15 +186,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn answers_are_kept_per_thread() {
-        take_answers();
-        note(true);
-        let other = thread::spawn(|| {
-            note(false);
-            take_answers()
+    fn a_call_hears_only_the_prompts_it_asked_itself() {
+        note(false);
+        let ((), answers) = answers_to(|| {
+            note(true);
+            thread::spawn(|| note(false)).join().unwrap();
         });
-        assert_eq!(other.join().unwrap(), [false], "another thread reads only its own");
-        assert_eq!(take_answers(), [true]);
-        assert!(take_answers().is_empty());
+        assert_eq!(answers, [true], "neither what was asked before nor on another thread");
+        let ((), answers) = answers_to(|| ());
+        assert!(answers.is_empty(), "nothing was kept from outside a call");
+    }
+
+    #[test]
+    fn a_call_within_a_call_is_heard_by_both() {
+        let (inner, outer) = answers_to(|| {
+            note(true);
+            let ((), inner) = answers_to(|| note(false));
+            inner
+        });
+        assert_eq!((inner, outer), (vec![false], vec![true, false]));
+    }
+
+    #[test]
+    fn a_call_that_panics_leaves_the_outer_call_listening() {
+        fn fails() {
+            note(false);
+            panic!("the call fails");
+        }
+        let ((), outer) = answers_to(|| {
+            assert!(std::panic::catch_unwind(|| answers_to(fails)).is_err());
+            note(true);
+        });
+        assert_eq!(outer, [false, true]);
     }
 }

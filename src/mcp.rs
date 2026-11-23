@@ -236,9 +236,8 @@ impl Server {
             return refused(e);
         }
         let (site, method, url) = self.audit_target(name, args);
-        approve::take_answers();
-        let result = self.run_tool(name, args);
-        let decision = audit::decide(&approve::take_answers(), result["isError"].as_bool() != Some(false));
+        let (result, answers) = approve::answers_to(|| self.run_tool(name, args));
+        let decision = audit::decide(&answers, result["isError"].as_bool() != Some(false));
         let masker = self.masker(&site, []).unwrap_or_else(|_| Masker::new([]));
         let mut entry = Body::new(&site, name, method.as_deref(), url.as_deref(), decision, &masker);
         entry.boxed = self.scope.box_name.clone();

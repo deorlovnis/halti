@@ -24,7 +24,7 @@ use super::addr::Net;
 use super::http::{self, Head};
 use super::{Config, Door, STANDIN};
 use crate::util::TempDir;
-use crate::{approve, keychain, names, policy};
+use crate::{keychain, names, policy};
 
 const REAL_KEY: &str = "sk-ant-REAL-0123456789abcdef";
 const PUBLIC_IP: &str = "93.184.216.34";
@@ -267,14 +267,12 @@ fn scenario(dir: &Path) {
     keychain::set("anthropic", "key", REAL_KEY).unwrap();
     keychain::set("readonly", "key", REAL_KEY).unwrap();
     policy::approve(&["anthropic".into(), "readonly".into(), "notes".into(), "other".into()]).unwrap();
-    approve::take_answers();
 
     assert!(!super::model_uses_bearer("anthropic").unwrap());
     assert!(super::model_uses_bearer("no-such-resource").is_err());
     write_policy("subscription", &format!("[fetch]\nhosts = [\"{base}\"]\nwrites = \"allow\"\nauth = \"Bearer {{token}}\"\n"));
     policy::approve(&["subscription".into()]).unwrap();
     assert!(super::model_uses_bearer("subscription").unwrap());
-    approve::take_answers();
 
     // Names resolve to a public address, except one that points at this machine; whatever
     // is dialed lands on a local server that echoes.

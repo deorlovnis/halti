@@ -169,8 +169,7 @@ struct Rig {
     connects: Arc<AtomicUsize>,
     /// While set, the door can't connect to the site.
     unreachable: Arc<AtomicBool>,
-    /// What `serve` counted, and the answers to what the door asked: they are kept on the thread
-    /// that asked.
+    /// What `serve` counted, and the answers to what the door asked on this connection.
     serving: JoinHandle<((u64, u64), Vec<bool>)>,
 }
 
@@ -221,11 +220,10 @@ impl Rig {
         let (shared, host) = (shared.clone(), host.to_string());
         let serving = thread::spawn(move || {
             let ctx = Ctx { shared: &shared, host: &host, caller: &Caller::Agent };
-            let counted = match (made, first) {
+            approve::answers_to(|| match (made, first) {
                 (Some(made), Some((fresh, _))) => serve(door_guest, first_while_fresh(made, fresh, dial), &ctx),
                 _ => serve(door_guest, dial, &ctx),
-            };
-            (counted, approve::take_answers())
+            })
         });
         guest.set_read_timeout(Some(WAIT)).unwrap();
         Self { guest: Conn { reader: BufReader::new(guest.try_clone().unwrap()), stream: guest, seen: Vec::new() }, seen, release, connects, unreachable, serving }
@@ -396,7 +394,6 @@ fn scenario(dir: &Path, yes: bool) {
     store("pending", "token", SECRET);
     fs::write(dir.join("index.json"), json!({ "app": site_index(), "readonly": site_index(), "askme": site_index(), "pending": site_index() }).to_string()).unwrap();
     policy::approve(&["app".into(), "readonly".into(), "askme".into()]).unwrap();
-    approve::take_answers();
     // The policies are approved; from here Touch ID answers as this scenario says.
     // SAFETY: no other thread is running yet; the doors' threads start later.
     unsafe { std::env::set_var("HALTI_TEST_APPROVE", if yes { "yes" } else { "no" }) };

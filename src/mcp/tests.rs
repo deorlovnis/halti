@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use super::*;
 use crate::boxes::sessions::{InBox, Sessions};
 use crate::util::TempDir;
-use crate::{approve, keychain, policy};
+use crate::{keychain, policy};
 
 const KEYCHAIN_TOKEN: &str = "KEYCHAIN-TOKEN-0123456789";
 const FAKE: &str = "mcp::tests::the_fake_runner_scenario";
@@ -94,7 +94,6 @@ fn write_site(dir: &Path, origin: &str, extra_browse: &str) {
     keychain::set("app", "token", KEYCHAIN_TOKEN).unwrap();
     fs::write(dir.join("index.json"), json!({ "app": { "fields": { "token": {} } } }).to_string()).unwrap();
     policy::approve(&["app".into()]).unwrap();
-    approve::take_answers();
 }
 
 /// A box's browser whose runners are `launch`ed on the Mac, with real sealed sessions in `store/browser`.
