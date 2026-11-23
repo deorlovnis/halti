@@ -162,8 +162,13 @@ enum Cmd {
         #[arg(last = true, required = true, value_name = "CMD")]
         command: Vec<String>,
     },
-    /// Serve agents over MCP (stdio): requests and site tools, credentials added by halti
-    Mcp,
+    /// Serve agents over MCP (stdio): requests and site tools, credentials added by halti. Offers no site without --all
+    #[command(after_help = "An agent that works for one client uses that client's workspace instead: halti ws mcp WS.")]
+    Mcp {
+        /// Offer every site in the Keychain whose policy is approved
+        #[arg(long)]
+        all: bool,
+    },
     /// Show what agents did through `halti mcp` (never values); --verify checks nothing was altered
     Audit {
         /// How many of the latest entries to show
@@ -524,6 +529,9 @@ enum WsCmd {
         #[arg(long = "for", value_name = "DURATION", value_parser = parse_away_for, conflicts_with = "off")]
         away_for: Option<u32>,
     },
+    /// Serve an agent over MCP (stdio) with the sites of one open workspace, and no other (asks nothing; the workspace must be open)
+    #[command(after_help = "Open the workspace first with: halti open WS. The agent's session ends when the workspace closes.")]
+    Mcp { name: String },
 }
 
 /// How long an away mark lasts when no --for says.
@@ -1044,7 +1052,8 @@ fn cmd_run(resources: Vec<String>, command: Vec<String>) -> Result<u8> {
 /// only the machine's own items, so they choose no place here: a lookup there fails instead of
 /// reading the Keychain. `ws run` chooses its workspace itself, once it is opened, when it starts a
 /// box, and `open` once it is opened, to keep it open; no other workspace command chooses one.
-/// Every other command keeps its secrets in the Keychain.
+/// `ws mcp` is served by the `open` of its workspace, so an agent's MCP session stays on the one
+/// workspace that process chose. Every other command keeps its secrets in the Keychain.
 fn source_for(cmd: &Cmd) -> Option<source::Source> {
     match cmd {
         Cmd::Ws { .. } | Cmd::Open { .. } | Cmd::Close { .. } | Cmd::Requests { .. } | Cmd::Config { .. } | Cmd::BuildInfo => None,
@@ -1065,7 +1074,7 @@ fn source_for(cmd: &Cmd) -> Option<source::Source> {
         | Cmd::Rm { .. }
         | Cmd::Copy { .. }
         | Cmd::Run { .. }
-        | Cmd::Mcp
+        | Cmd::Mcp { .. }
         | Cmd::Audit { .. }
         | Cmd::Reseal { .. }
         | Cmd::Box { .. } => Some(source::Source::keychain()),
@@ -1117,7 +1126,7 @@ fn run() -> ExitCode {
         Cmd::Rm { resource, field } => ok(cmd_rm(&resource, field)),
         Cmd::Copy { resource, field } => ok(cmd_copy(&resource, &field)),
         Cmd::Run { resources, command } => cmd_run(resources, command),
-        Cmd::Mcp => ok(mcp::serve()),
+        Cmd::Mcp { all } => ok(mcp::serve(all)),
         Cmd::Audit { last, verify } => ok(audit::show(last, verify)),
         Cmd::Reseal { resources } => ok(cmd_reseal(resources)),
         Cmd::Box { action } => match action {
@@ -1168,6 +1177,7 @@ fn run() -> ExitCode {
             },
             WsCmd::Stop { target } => ws::boxes::stop(&target),
             WsCmd::Away { target, off, away_for } => ws::boxes::away(&target, off.is_none().then_some(away_for.unwrap_or(AWAY_DEFAULT))),
+            WsCmd::Mcp { name } => ws::keep::mcp(&name),
             WsCmd::Run { .. } => unreachable!("ws run returns its command's exit code, above"),
         }),
         Cmd::Open { name, type_it } => match ws::keep::open(name.as_deref(), type_it) {

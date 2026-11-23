@@ -6,7 +6,7 @@
 //! reaches it with one line, and gets one line back:
 //!
 //! ```text
-//! request = "halti-keep/1 " VERB " " WS [" " BOX] "\n"      start WS BOX, stop WS BOX, close WS, ping WS
+//! request = "halti-keep/1 " VERB " " WS [" " BOX] "\n"      start WS BOX, stop WS BOX, close WS, ping WS, mcp WS
 //!         | "halti-keep/1 away " WS " " BOX " " (SECS | "off") "\n"
 //! reply   = "halti-keep/1 " WORD [" " ARG] "\n"
 //! ```
@@ -14,6 +14,11 @@
 //! `away` marks the run of the box that runs now away for SECS seconds (60 to 86400), or clears its
 //! mark: its requests wait longer for an answer (`crate::requests`). It is answered `away UNTIL`,
 //! seconds since 1970, or `away off`; `idle` if the box doesn't run.
+//!
+//! `mcp` is answered `serving`, and from then on the connection is an agent's MCP session of the
+//! workspace (`halti ws mcp`): the JSON-RPC lines `halti mcp` reads and writes, until either end
+//! closes it. What it serves is masked as `halti mcp` masks it, so no key or value crosses there
+//! either. It ends when the workspace closes.
 //!
 //! Every line is printable ASCII, at most 128 bytes with its newline, and names only: a workspace,
 //! a box, a site, a count. No passphrase, key, value, policy, path or command crosses, either way.
@@ -186,6 +191,8 @@ pub enum Request {
     Ping(WsName),
     /// Mark the box's run away for this many seconds, or clear its mark.
     Away(WsName, String, Option<u32>),
+    /// Serve an agent over MCP: the connection, held, is its session.
+    Mcp(WsName),
 }
 
 /// The shortest and the longest away mark, in seconds.
@@ -196,7 +203,7 @@ impl Request {
     /// The workspace it names.
     pub fn ws(&self) -> &WsName {
         match self {
-            Request::Start(ws, _) | Request::Stop(ws, _) | Request::Close(ws) | Request::Ping(ws) | Request::Away(ws, _, _) => ws,
+            Request::Start(ws, _) | Request::Stop(ws, _) | Request::Close(ws) | Request::Ping(ws) | Request::Away(ws, _, _) | Request::Mcp(ws) => ws,
         }
     }
 
@@ -208,6 +215,7 @@ impl Request {
             Request::Ping(ws) => format!("{VERSION} ping {ws}\n"),
             Request::Away(ws, name, Some(secs)) => format!("{VERSION} away {ws} {name} {secs}\n"),
             Request::Away(ws, name, None) => format!("{VERSION} away {ws} {name} off\n"),
+            Request::Mcp(ws) => format!("{VERSION} mcp {ws}\n"),
         }
     }
 
@@ -223,6 +231,7 @@ impl Request {
             }
             ["close", ws] => Some(Request::Close(WsName::parse(ws).ok()?)),
             ["ping", ws] => Some(Request::Ping(WsName::parse(ws).ok()?)),
+            ["mcp", ws] => Some(Request::Mcp(WsName::parse(ws).ok()?)),
             ["away", ws, name, secs] => {
                 check_box(name).ok()?;
                 let secs = match secs {
@@ -262,6 +271,8 @@ pub enum Reply {
     Open(u32),
     /// The box's run is marked away until then, seconds since 1970; or its mark is cleared.
     Away(Option<u64>),
+    /// The connection is an MCP session from now on.
+    Serving,
     /// The request named another workspace: nothing was done.
     Other,
     /// Another version, verb or shape.
@@ -285,6 +296,7 @@ impl Reply {
             Reply::Open(n) => format!("open {n}"),
             Reply::Away(Some(until)) => format!("away {until}"),
             Reply::Away(None) => "away off".to_string(),
+            Reply::Serving => "serving".to_string(),
             Reply::Other => "other".to_string(),
             Reply::Unsupported => "unsupported".to_string(),
         };
@@ -310,6 +322,7 @@ impl Reply {
             ["open", n] => Reply::Open(count(n)?),
             ["away", "off"] => Reply::Away(None),
             ["away", until] if until.len() <= 19 && until.bytes().all(|b| b.is_ascii_digit()) => Reply::Away(Some(until.parse().ok()?)),
+            ["serving"] => Reply::Serving,
             ["other"] => Reply::Other,
             ["unsupported"] => Reply::Unsupported,
             _ => return None,
@@ -681,7 +694,9 @@ mod tests {
             Request::Start(longest.clone(), "b".repeat(32)),
             Request::Away(acme(), "dev".into(), Some(AWAY_MIN)),
             Request::Away(acme(), "dev".into(), None),
-            Request::Away(longest, "b".repeat(32), Some(AWAY_MAX)),
+            Request::Away(longest.clone(), "b".repeat(32), Some(AWAY_MAX)),
+            Request::Mcp(acme()),
+            Request::Mcp(longest),
         ] {
             let line = request.line();
             assert_eq!(Request::parse(line.strip_suffix('\n').unwrap()), Some(request), "{line}");
@@ -706,6 +721,7 @@ mod tests {
             Reply::Open(0),
             Reply::Away(Some(1_763_164_800)),
             Reply::Away(None),
+            Reply::Serving,
             Reply::Other,
             Reply::Unsupported,
         ] {
@@ -714,6 +730,11 @@ mod tests {
         }
         assert_eq!(Request::Ping(acme()).line(), "halti-keep/1 ping acme\n");
         assert_eq!(Request::Away(acme(), "dev".into(), Some(28_800)).line(), "halti-keep/1 away acme dev 28800\n");
+        assert_eq!((Request::Mcp(acme()).line().as_str(), Reply::Serving.line().as_str()), ("halti-keep/1 mcp acme\n", "halti-keep/1 serving\n"));
+        // An MCP session names its workspace, and nothing else.
+        for line in ["halti-keep/1 mcp", "halti-keep/1 mcp acme dev", "halti-keep/1 mcp Acme", "halti-keep/1 serving acme"] {
+            assert!(Request::parse(line).is_none() && Reply::parse(line).is_none(), "{line}");
+        }
         // An away mark is a minute to a day, in plain digits.
         for line in [
             "halti-keep/1 away acme dev 59",

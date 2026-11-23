@@ -104,8 +104,9 @@ impl Env {
         assert!(out.status.success(), "approve failed: {}", text(&out.stderr));
     }
 
+    /// `halti mcp --all`: every site in the Keychain.
     fn mcp(&self) -> Mcp {
-        Mcp::start(self.command().arg("mcp"))
+        Mcp::start(self.command().args(["mcp", "--all"]))
     }
 }
 
@@ -691,6 +692,23 @@ fn mcp_handshake_and_tool_list() {
 }
 
 #[test]
+fn mcp_without_all_offers_no_site_and_says_how_to_get_one() {
+    let env = Env::new();
+    let site = Site::start();
+    env.store("app", "token", TOKEN);
+    env.policy("app", &fetch_policy(&site));
+
+    let mut mcp = Mcp::start(env.command().arg("mcp"));
+    mcp.handshake();
+    assert_eq!(mcp.tool_names(), ["sites", "fetch"], "an approved site in the Keychain is not offered");
+    let (is_error, sites) = mcp.call("sites", json!({}));
+    assert!(!is_error && sites.contains("`halti ws mcp WS`") && sites.contains("`halti mcp --all`") && !sites.contains("app:"), "{sites}");
+    let (is_error, reply) = mcp.call("fetch", json!({ "site": "app", "method": "GET", "url": site.url("/echo") }));
+    assert!(is_error && reply.contains("unknown site app"), "{reply}");
+    assert!(site.seen().is_empty(), "{:?}", site.seen());
+}
+
+#[test]
 fn mcp_fetch_adds_credentials_and_masks_the_response() {
     let env = Env::new();
     let site = Site::start();
@@ -747,7 +765,7 @@ fn mcp_asks_for_consent_and_for_writes() {
     let get = json!({ "site": "app", "method": "GET", "url": site.url("/echo") });
 
     // The default policy asks for Touch ID when an agent first uses the site; refused here.
-    let mut mcp = Mcp::start(env.command().arg("mcp").env("HALTI_TEST_APPROVE", "no"));
+    let mut mcp = Mcp::start(env.command().args(["mcp", "--all"]).env("HALTI_TEST_APPROVE", "no"));
     mcp.handshake();
     let (is_error, reply) = mcp.call("fetch", get.clone());
     assert!(is_error && reply.contains("not approved"), "{reply}");
@@ -756,7 +774,7 @@ fn mcp_asks_for_consent_and_for_writes() {
     let policy = format!("[agent]\nconsent = \"none\"\n[fetch]\nhosts = [\"{}\"]\nwrites = \"ask\"\n", site.origin());
     env.policy("app", &policy);
     let post = json!({ "site": "app", "method": "POST", "url": site.url("/echo"), "body": "{}" });
-    let mut refused = Mcp::start(env.command().arg("mcp").env("HALTI_TEST_APPROVE", "no"));
+    let mut refused = Mcp::start(env.command().args(["mcp", "--all"]).env("HALTI_TEST_APPROVE", "no"));
     refused.handshake();
     assert!(!refused.call("fetch", get).0, "reads need no consent here");
     let (is_error, reply) = refused.call("fetch", post.clone());
@@ -1479,6 +1497,83 @@ fn sigint_and_sighup_close_it() {
     // Nothing is left: it opens again.
     let opened = open_then_close(&env, env.ws_box_command(PASSPHRASE, "true").args(["open", "acme"]), "acme");
     assert!(opened.status.success(), "{}", stderr(&opened));
+}
+
+/// Workspace `name`, with its site `res` (the test site, whose token is `token`) approved.
+fn ws_with_site(env: &Env, name: &str, res: &str, site: &Site, token: &str) {
+    assert!(ws(env, PASSPHRASE, &["ws", "new", name]).status.success());
+    let target = format!("{name}/{res}");
+    let stored = ws_with(env, PASSPHRASE, &["ws", "set", &target, "token"], format!("{token}\n").as_bytes());
+    assert!(stored.status.success(), "{}", stderr(&stored));
+    assert!(ws_policy_edit(env, &target, &fetch_policy(site)).status.success());
+    let approved = ws(env, PASSPHRASE, &["ws", "policy", "approve", &target]);
+    assert!(approved.status.success(), "{}", stderr(&approved));
+}
+
+/// Waits until `mcp`'s halti ends by itself: its exit code.
+fn ended(mcp: &mut Mcp) -> Option<i32> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = mcp.child.try_wait().unwrap() {
+            return status.code();
+        }
+        assert!(Instant::now() < deadline, "halti ws mcp never ended");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn two_open_workspaces_serve_their_agents_at_once_and_neither_sees_the_other_s_sites() {
+    let env = Env::new();
+    let site = Site::start();
+    let (acme_token, beta_token) = ("acme-token-0123456789", "beta-token-0123456789");
+    ws_with_site(&env, "acme", "app", &site, acme_token);
+    ws_with_site(&env, "beta", "jira", &site, beta_token);
+    // Refused while it isn't open, asking nothing.
+    let refused = env.halti(&["ws", "mcp", "acme"]);
+    assert!(!refused.status.success() && prompted(&refused) == 0, "{}", stderr(&refused));
+    assert_eq!(stderr(&refused), "halti: acme isn't open, so it serves no agent. open it with: halti open acme\n");
+
+    // Nothing acme serves is approved by a prompt, as on Linux, where nobody can answer one: its
+    // open is the consent to its sites.
+    let acme = Open::start(env.ws_box_command(PASSPHRASE, "true").args(["open", "acme"]).env("HALTI_TEST_APPROVE", "no"));
+    let beta = Open::start(env.ws_box_command(PASSPHRASE, "true").args(["open", "beta"]));
+    assert!(acme.is_open() && beta.is_open(), "{}{}", acme.err.lock().unwrap(), beta.err.lock().unwrap());
+    let mut acme_mcp = Mcp::start(env.command().args(["ws", "mcp", "acme"]));
+    let mut beta_mcp = Mcp::start(env.command().args(["ws", "mcp", "beta"]));
+    let echo = |mcp: &mut Mcp, res: &str| mcp.call("fetch", json!({ "site": res, "method": "GET", "url": site.url("/echo") }));
+    for (mcp, own, other, token) in [(&mut acme_mcp, "app", "jira", acme_token), (&mut beta_mcp, "jira", "app", beta_token)] {
+        assert_eq!(mcp.handshake()["serverInfo"]["name"], "halti");
+        assert_eq!(mcp.tool_names(), ["sites", "fetch", &format!("{own}_echo")]);
+        let (is_error, sites) = mcp.call("sites", json!({}));
+        assert!(!is_error && sites.starts_with(&format!("{own}: ")) && !sites.contains(other), "{sites}");
+        // Its own site gets its own workspace's token; the other's is unknown here, and never asked.
+        let (is_error, reply) = echo(mcp, own);
+        assert!(!is_error && reply.contains("authorization: Bearer ********") && !reply.contains(token), "{reply}");
+        assert!(site.seen().last().unwrap().contains(&format!("authorization: Bearer {token}")), "{:?}", site.seen());
+        let seen = site.seen().len();
+        let (is_error, reply) = echo(mcp, other);
+        assert!(is_error && reply.contains(&format!("unknown site {other}")), "{reply}");
+        assert_eq!(site.seen().len(), seen);
+    }
+    // The Keychain's MCP sees neither.
+    let mut keychain = env.mcp();
+    keychain.handshake();
+    assert_eq!(keychain.tool_names(), ["sites", "fetch"]);
+    drop(keychain);
+
+    // acme closes: its agent's session ends, and beta's goes on.
+    let closed = env.halti(&["close", "acme"]);
+    assert!(closed.status.success() && stdout(&closed) == "closed acme\n", "{}", stderr(&closed));
+    assert_eq!(ended(&mut acme_mcp), Some(1));
+    assert!(!echo(&mut beta_mcp, "jira").0);
+    let said = opened(&acme.wait());
+    assert_eq!(said, format!("{}an agent uses acme through halti ws mcp\nan agent stopped using acme through halti ws mcp\nclosed acme\n", is_open("acme")));
+    let refused = env.halti(&["ws", "mcp", "acme"]);
+    assert_eq!(stderr(&refused), "halti: acme isn't open, so it serves no agent. open it with: halti open acme\n");
+    drop(beta_mcp);
+    assert!(env.halti(&["close", "beta"]).status.success());
+    assert!(beta.wait().status.success());
 }
 
 #[test]
@@ -3277,7 +3372,7 @@ fn browser_opens_a_page_signed_in_and_masks_it() {
     let runner = env::var("HALTI_RUNNER_DIR").unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("runner").display().to_string());
     // The test's HOME is empty, so Playwright must be told where the real one keeps Chromium.
     let browsers = env::var("PLAYWRIGHT_BROWSERS_PATH").unwrap_or_else(|_| format!("{}/Library/Caches/ms-playwright", env::var("HOME").unwrap()));
-    let mut mcp = Mcp::start(env.command().arg("mcp").env("HALTI_RUNNER_DIR", runner).env("PLAYWRIGHT_BROWSERS_PATH", browsers));
+    let mut mcp = Mcp::start(env.command().args(["mcp", "--all"]).env("HALTI_RUNNER_DIR", runner).env("PLAYWRIGHT_BROWSERS_PATH", browsers));
     mcp.handshake();
     assert!(mcp.tool_names().contains(&"browse_open".to_string()));
 

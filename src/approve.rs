@@ -2,6 +2,10 @@
 //! An agent can't answer this prompt, so it gates everything that loosens a policy or
 //! releases a value outside halti.
 
+use std::cell::RefCell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Result, bail};
 
 use crate::requests::Prompted;
@@ -23,14 +27,58 @@ impl Answers {
     }
 }
 
+thread_local! {
+    /// Set once what this thread asks for must be withdrawn (`Withdrawing`).
+    static ENDED: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+/// While it lives, every prompt this thread asks is withdrawn once `ended` is set: one that is up
+/// is taken down, none is shown after, and a yes that comes after counts as no. An open
+/// workspace's agent session asks so, and its close sets the flag.
+pub struct Withdrawing(());
+
+impl Withdrawing {
+    pub fn when(ended: Arc<AtomicBool>) -> Withdrawing {
+        ENDED.with_borrow_mut(|set| *set = Some(ended));
+        Withdrawing(())
+    }
+}
+
+impl Drop for Withdrawing {
+    fn drop(&mut self) {
+        ENDED.with_borrow_mut(|set| *set = None);
+    }
+}
+
 /// Ask for confirmation for the request `answers` belongs to, and keep the answer there; macOS
 /// shows it as "halti is trying to <reason>."
 pub fn confirm(answers: &mut Answers, reason: &str) -> Result<()> {
-    let result = prompt(reason);
+    let result = match ENDED.with_borrow(Clone::clone) {
+        Some(ended) => prompt_until(reason, &ended),
+        None => prompt(reason),
+    };
     #[cfg(test)]
     SHOWN.lock().unwrap().push((reason.to_string(), result.is_ok()));
     answers.0.push(result.is_ok());
     result
+}
+
+/// Asks as `prompt` does, until `ended` is set.
+fn prompt_until(reason: &str, ended: &AtomicBool) -> Result<()> {
+    let over = || ended.load(Ordering::SeqCst);
+    if over() {
+        bail!("not asked: the workspace is closing: {reason}");
+    }
+    let said = ask_until(reason, &over);
+    if over() {
+        bail!("withdrawn: the workspace is closing: {reason}");
+    }
+    match said {
+        Prompted::Yes => Ok(()),
+        Prompted::No => bail!("not approved: {reason}"),
+        Prompted::Unshown if cfg!(target_os = "macos") => bail!("no answer to the approval prompt: {reason}"),
+        Prompted::Unshown => bail!("not approved (Touch ID needs macOS): {reason}"),
+    }
 }
 
 /// Every prompt this test process showed and no test has taken yet, with its answer: tests count
@@ -171,4 +219,28 @@ fn ask_person_until(reason: &str, withdrawn: &dyn Fn() -> bool) -> Prompted {
 #[cfg(not(target_os = "macos"))]
 fn ask_person_until(_reason: &str, _withdrawn: &dyn Fn() -> bool) -> Prompted {
     Prompted::Unshown
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn a_session_that_ended_asks_nothing_more_and_counts_it_as_no() {
+        let ended = Arc::new(AtomicBool::new(true));
+        let asked = thread::spawn(move || {
+            let withdrawing = Withdrawing::when(ended);
+            let mut answers = Answers::default();
+            let refused = confirm(&mut answers, "workspace acme: send POST https://api.example.com/items for app").unwrap_err().to_string();
+            drop(withdrawing);
+            let set = ENDED.with_borrow(Option::is_some);
+            (refused, answers.all().to_vec(), set)
+        });
+        let (refused, answers, set) = asked.join().unwrap();
+        assert_eq!(refused, "not asked: the workspace is closing: workspace acme: send POST https://api.example.com/items for app");
+        assert_eq!(answers, [false]);
+        assert!(!set, "it asks as before once the session is over");
+    }
 }

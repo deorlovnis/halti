@@ -16,8 +16,12 @@
 //! while the agent works in it (`Session`): the box stops when its last session ends. A session
 //! whose connection ends without the word that the box was put away has lost the open workspace,
 //! killed with the door of its box: it stops the box itself.
+//!
+//! `ws mcp` of an open workspace asks it to serve an agent (`mcp`), and from then on copies what
+//! the agent writes to the connection and what comes back to the agent: the open workspace serves
+//! it, so the session stays on that one workspace, and ends when it closes.
 
-use std::io::{ErrorKind, Read};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -231,6 +235,62 @@ pub(super) fn away(kept: &Kept, name: &WsName, box_name: &str, secs: Option<u32>
     }
 }
 
+/// `halti ws mcp NAME`: an agent's MCP session of the open workspace NAME, on this process's
+/// standard input and output, with NAME's sites and no other's. Asks nothing and reads nothing
+/// sealed; refused if NAME isn't open, and ended when it closes.
+pub fn mcp(typed: &str) -> Result<()> {
+    let settings = config::settings();
+    let here = Here::at(&settings.workspaces.path);
+    let name = resolve_name(&here.files, Some(typed))?;
+    let kept = Kept::of(&here, record_id(&here, &name)?)?;
+    if !kept.held() {
+        bail!("{name} isn't open, so it serves no agent. open it with: halti open {name}");
+    }
+    let stream = match keep::ask_held(&kept.socket(), &Request::Mcp(name.clone()), keep::LINE_WAIT) {
+        Asked::Answered(Reply::Serving, stream) => stream,
+        Asked::Answered(Reply::Full, _) => bail!("{name} has too many sessions: end one first"),
+        Asked::Answered(Reply::Other, _) => return Err(other(&name)),
+        Asked::Answered(Reply::Unsupported, _) => {
+            bail!("{name} is open with an older halti, which can't serve an agent. close it and open it again: halti close {name}, then halti open {name}")
+        }
+        _ => return Err(opening(&name)),
+    };
+    if !relay(stream, io::stdin(), io::stdout())? {
+        // It closed, or its server failed: the terminal where it is open says which.
+        bail!("{name} ended the agent's session: it is closing, or the terminal where it is open says why");
+    }
+    Ok(())
+}
+
+/// Copies `input` to `stream`, and `stream` to `output`, until the session ends: true if `input`
+/// ended it, false if the open workspace did.
+fn relay(mut stream: UnixStream, mut input: impl Read + Send + 'static, mut output: impl Write) -> Result<bool> {
+    // The line it was answered with had its time limits; a session has none. A socket whose peer
+    // has closed it refuses the options on a Mac, and has nothing to wait for.
+    let _ = stream.set_read_timeout(None).and_then(|()| stream.set_write_timeout(None));
+    let mut sending = stream.try_clone()?;
+    let ended = Arc::new(AtomicBool::new(false));
+    let ending = ended.clone();
+    thread::spawn(move || {
+        let _ = io::copy(&mut input, &mut sending);
+        ending.store(true, Ordering::SeqCst);
+        let _ = sending.shutdown(Shutdown::Write);
+    });
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                output.write_all(&buf[..n])?;
+                output.flush()?;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    Ok(ended.load(Ordering::SeqCst))
+}
+
 /// A session of a box an open workspace runs: the connection its start holds open while the agent
 /// works in the box. A thread watches it. The word that the box was put away ends the watch; the
 /// connection ending without it means the open workspace is gone, and its box with no door: the
@@ -406,6 +466,34 @@ mod tests {
         assert_eq!(theirs.read(&mut [0u8; 8]).unwrap(), 0);
         thread::sleep(Duration::from_millis(300));
         assert!(!stopped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn an_agent_s_session_is_copied_both_ways_until_the_agent_ends_it() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let workspace = thread::spawn(move || {
+            let mut got = String::new();
+            theirs.read_to_string(&mut got).unwrap();
+            theirs.write_all(b"{\"id\":1,\"result\":{}}\n").unwrap();
+            got
+        });
+        let mut agent_got = Vec::new();
+        let ended_by_agent = relay(ours, io::Cursor::new(b"{\"id\":1,\"method\":\"ping\"}\n".to_vec()), &mut agent_got).unwrap();
+        assert!(ended_by_agent);
+        assert_eq!(workspace.join().unwrap(), "{\"id\":1,\"method\":\"ping\"}\n");
+        assert_eq!(String::from_utf8(agent_got).unwrap(), "{\"id\":1,\"result\":{}}\n");
+    }
+
+    #[test]
+    fn a_session_its_open_workspace_ended_is_not_ended_by_the_agent() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        // The agent writes nothing and stays.
+        let (agent, _staying) = UnixStream::pair().unwrap();
+        theirs.write_all(b"{\"id\":1}\n").unwrap();
+        drop(theirs);
+        let mut agent_got = Vec::new();
+        assert!(!relay(ours, agent, &mut agent_got).unwrap());
+        assert_eq!(agent_got, b"{\"id\":1}\n");
     }
 
     #[test]
