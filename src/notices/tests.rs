@@ -347,14 +347,12 @@ fn the_desk_sends_after_its_delay_at_once_when_away_and_nothing_once_closed() {
 }
 
 #[test]
-fn the_agent_image_runs_the_asker_from_its_managed_settings_with_a_short_timeout() {
+fn the_agent_image_runs_the_asker_from_its_managed_settings_with_a_long_limit_where_it_may_be_held() {
     let root = env!("CARGO_MANIFEST_DIR");
     let settings: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{root}/box/claude-code/halti.json")).unwrap()).unwrap();
     let hooks = settings["hooks"].as_object().unwrap();
     let events: Vec<&str> = hooks.keys().map(String::as_str).collect();
-    // Not PermissionRequest: it comes as the dialog opens, so a yes and a long build would be told
-    // as a wait. The prompt's Notification tells it.
-    let mut expected = ["Notification", "PreToolUse", "PostToolUse", "PermissionDenied", "Stop", "UserPromptSubmit", "SubagentStop", "SessionEnd"];
+    let mut expected = ["Notification", "PermissionRequest", "PreToolUse", "PostToolUse", "PermissionDenied", "Stop", "UserPromptSubmit", "SubagentStop", "SessionEnd"];
     expected.sort_unstable();
     assert_eq!(events, expected);
     for (event, matchers) in hooks {
@@ -366,8 +364,18 @@ fn the_agent_image_runs_the_asker_from_its_managed_settings_with_a_short_timeout
         assert_eq!(hook.as_array().unwrap().len(), 1, "{event}");
         assert_eq!(hook[0]["type"], "command");
         assert_eq!(hook[0]["command"], format!("{} ask", crate::names::SHIM_PATH));
-        // Every call is answered at once; with no timeout set, a hook would be killed only at 600 s.
-        assert!(hook[0]["timeout"].as_u64().is_some_and(|secs| (1..=30).contains(&secs)), "{event}");
+        // A hook that may be held as a question waits past the question's life: with no timeout
+        // set it would be killed at 600 s, and Claude Code would leave its own prompt up. The
+        // rest are answered at once.
+        let held = ["PermissionRequest", "PreToolUse", "Stop"].contains(&event.as_str());
+        let limit = hook[0]["timeout"].as_u64().unwrap();
+        if held {
+            assert!(limit > crate::questions::LIFE.as_secs() && limit <= crate::questions::LIFE.as_secs() + 600, "{event}: {limit}");
+            assert!(hook[0]["statusMessage"].as_str().unwrap().starts_with("halti: "), "{event}: a line in the spinner while it waits");
+        } else {
+            assert!((1..=30).contains(&limit), "{event}");
+            assert!(hook[0].get("statusMessage").is_none(), "{event}");
+        }
     }
     let image = std::fs::read_to_string(format!("{root}/box/agent.Containerfile")).unwrap();
     assert!(image.contains(&format!("COPY claude-code/halti.json {}\n", crate::names::MANAGED_SETTINGS)));
