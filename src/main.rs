@@ -40,6 +40,7 @@ mod mcp;
 mod names;
 mod notices;
 mod policy;
+mod questions;
 mod refresh;
 mod requests;
 #[cfg(all(halti_dev, target_os = "linux"))]
