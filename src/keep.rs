@@ -35,18 +35,20 @@
 //!
 //! ```text
 //! request = "halti-keep/2 list " WS "\n"                      the requests that wait
+//!         | "halti-keep/2 notices " WS "\n"                   the notices that are sent now
 //!         | "halti-keep/2 answer " WS " " ("yes" | "no") " " DIGEST "\n"
 //!         | "halti-keep/2 runs " WS "\n"                      the boxes that run, by run id
 //!         | "halti-keep/2 signed " WS " " DEVICE " " ("yes" | "no") " " ID " " SIGNATURE "\n"
 //!         | "halti-keep/2 stop " WS " " DEVICE " " BOX ":" RUN *("," BOX ":" RUN) " " SIGNATURE "\n"
 //! reply   = *("halti-keep/2 request " HEX "\n") "halti-keep/2 end\n"
+//!         | *("halti-keep/2 notice " HEX "\n") "halti-keep/2 end\n"
 //!         | *("halti-keep/2 run " BOX " " RUN "\n") "halti-keep/2 end\n"
 //!         | "halti-keep/2 " ("approved" | "denied" | "gone" | "declined" | "busy" | "refused"
 //!                           | "other") "\n"
 //!         | "halti-keep/2 stopped " COUNT " " COUNT "\n"
 //! ```
 //!
-//! A request line is held to 2,048 bytes; a reply line may be as long as a record makes it. An
+//! A notice's record (`crate::notices`) holds no byte a box chose. A request line is held to 2,048 bytes; a reply line may be as long as a record makes it. An
 //! answer names its request by the 64 hex characters of `requests::answer_digest`: the record it
 //! was shown and the decision. A signed answer names it by its 32 hex characters of id, and a
 //! stop names up to 32 runs, each by the box the phone named it with and its 16; SIGNATURE is a
@@ -336,6 +338,8 @@ impl Reply {
 pub enum Records {
     /// Say every request that waits.
     List(WsName),
+    /// Say every notice that is sent now.
+    Notices(WsName),
     /// Answer the request whose record, with this decision, makes this digest.
     Answer(WsName, bool, [u8; 32]),
     /// Say every box that runs, with its run id.
@@ -355,7 +359,7 @@ impl Records {
     /// The workspace it names.
     pub fn ws(&self) -> &WsName {
         match self {
-            Records::List(ws) | Records::Answer(ws, _, _) | Records::Runs(ws) | Records::Signed { ws, .. } | Records::Stop { ws, .. } => ws,
+            Records::List(ws) | Records::Notices(ws) | Records::Answer(ws, _, _) | Records::Runs(ws) | Records::Signed { ws, .. } | Records::Stop { ws, .. } => ws,
         }
     }
 
@@ -363,6 +367,7 @@ impl Records {
         let word = |yes: bool| if yes { "yes" } else { "no" };
         match self {
             Records::List(ws) => format!("{RECORDS} list {ws}\n"),
+            Records::Notices(ws) => format!("{RECORDS} notices {ws}\n"),
             Records::Answer(ws, yes, digest) => format!("{RECORDS} answer {ws} {} {}\n", word(*yes), util::hex(digest)),
             Records::Runs(ws) => format!("{RECORDS} runs {ws}\n"),
             Records::Signed { ws, device, yes, id, signature } => format!("{RECORDS} signed {ws} {device} {} {} {}\n", word(*yes), id.hex(), util::hex(signature)),
@@ -380,6 +385,7 @@ impl Records {
         let device = |name: &str| crate::fields::is_name(name).then(|| name.to_string());
         match words[..] {
             ["list", ws] => Some(Records::List(WsName::parse(ws).ok()?)),
+            ["notices", ws] => Some(Records::Notices(WsName::parse(ws).ok()?)),
             ["answer", ws, decision @ ("yes" | "no"), digest] => {
                 let digest = util::unhex(digest)?.try_into().ok()?;
                 Some(Records::Answer(WsName::parse(ws).ok()?, decision == "yes", digest))
@@ -413,6 +419,8 @@ impl Records {
 pub enum Told {
     /// One request that waits: its record.
     Request(Vec<u8>),
+    /// One notice that is sent now: its record.
+    Notice(Vec<u8>),
     /// One box that runs, and its run.
     Run(String, RunId),
     /// No more requests wait, or no more boxes run.
@@ -441,6 +449,7 @@ impl Told {
     pub fn line(&self) -> String {
         let words = match self {
             Told::Request(record) => format!("request {}", util::hex(record)),
+            Told::Notice(record) => format!("notice {}", util::hex(record)),
             Told::Run(name, run) => format!("run {name} {}", run.hex()),
             Told::End => "end".into(),
             Told::Approved => "approved".into(),
@@ -462,6 +471,7 @@ impl Told {
         let count = |text: &str| text.parse::<u32>().ok().filter(|_| text.len() <= 9 && text.bytes().all(|b| b.is_ascii_digit()));
         Some(match words[..] {
             ["request", record] => Told::Request(util::unhex(record).filter(|bytes| !bytes.is_empty())?),
+            ["notice", record] => Told::Notice(util::unhex(record).filter(|bytes| !bytes.is_empty())?),
             ["run", name, run] => {
                 check_box(name).ok()?;
                 Told::Run(name.to_string(), RunId::parse(run)?)
@@ -634,6 +644,22 @@ pub fn list(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<Vec<u
     }
 }
 
+/// The records of the notices the open workspace `ws` at `path` sends now. None if nothing
+/// answered in time, or not as a list does; `Other` as an error word.
+#[expect(dead_code, reason = "the link is its first caller")]
+pub fn notices(path: &Path, ws: &WsName, wait: Duration) -> Option<Result<Vec<Vec<u8>>, Told>> {
+    let mut stream = connect(path)?;
+    write_line(&mut stream, &Records::Notices(ws.clone()).line()).ok()?;
+    let mut records = Vec::new();
+    loop {
+        match Told::parse(&read_line_up_to(&mut stream, wait, RECORD_LINE_MAX)?)? {
+            Told::Notice(record) => records.push(record),
+            Told::End => return Some(Ok(records)),
+            other => return Some(Err(other)),
+        }
+    }
+}
+
 /// Answers a request of the open workspace `ws` at `path`: the one whose record, with `yes`, makes
 /// `digest`. What it says, or None if nothing answered within `wait`.
 pub fn answer(path: &Path, ws: &WsName, yes: bool, digest: [u8; 32], wait: Duration) -> Option<Told> {
@@ -758,16 +784,17 @@ mod tests {
     fn a_line_about_requests_reads_only_as_what_was_written() {
         let digest = [0xab; 32];
         let longest = WsName::parse(&"w".repeat(32)).unwrap();
-        for records in [Records::List(acme()), Records::Answer(acme(), true, digest), Records::Answer(longest.clone(), false, [0; 32])] {
+        for records in [Records::List(acme()), Records::Notices(acme()), Records::Answer(acme(), true, digest), Records::Answer(longest.clone(), false, [0; 32])] {
             let line = records.line();
             assert_eq!(Records::parse(line.strip_suffix('\n').unwrap()), Some(records), "{line}");
             assert_eq!(Request::parse(line.strip_suffix('\n').unwrap()), None, "never a line of names");
         }
         assert_eq!(Records::List(acme()).line(), "halti-keep/2 list acme\n");
+        assert_eq!((Records::Notices(acme()).line().as_str(), Told::Notice(vec![0xab]).line().as_str()), ("halti-keep/2 notices acme\n", "halti-keep/2 notice ab\n"));
         assert_eq!(Records::Answer(acme(), true, digest).line(), format!("halti-keep/2 answer acme yes {}\n", "ab".repeat(32)));
         // An answer fits a line of a request, with the longest name.
         assert_eq!(Records::Answer(longest, true, digest).line().len(), 122);
-        for told in [Told::Request(vec![0, 1, 0xff]), Told::End, Told::Approved, Told::Denied, Told::Gone, Told::Declined, Told::Busy, Told::Other] {
+        for told in [Told::Request(vec![0, 1, 0xff]), Told::Notice(vec![2]), Told::End, Told::Approved, Told::Denied, Told::Gone, Told::Declined, Told::Busy, Told::Other] {
             let line = told.line();
             assert_eq!(Told::parse(line.strip_suffix('\n').unwrap()), Some(told), "{line}");
         }
@@ -784,7 +811,17 @@ mod tests {
         ] {
             assert_eq!(Records::parse(line), None, "{line}");
         }
-        for line in ["halti-keep/2 request", "halti-keep/2 request ", "halti-keep/2 request 0g", "halti-keep/2 request 0001 x", "halti-keep/2 approved yes", "halti-keep/1 end"] {
+        for line in [
+            "halti-keep/2 notice",
+            "halti-keep/2 notice 0g",
+            "halti-keep/2 notices acme",
+            "halti-keep/2 request",
+            "halti-keep/2 request ",
+            "halti-keep/2 request 0g",
+            "halti-keep/2 request 0001 x",
+            "halti-keep/2 approved yes",
+            "halti-keep/1 end",
+        ] {
             assert_eq!(Told::parse(line), None, "{line}");
         }
     }

@@ -559,8 +559,9 @@ impl<'a> Keeper<'a> {
                     Some(why) => warn(&why),
                     None => say(&format!("stopped box {shown}")),
                 }
-                // Its mark goes with its run.
+                // Its mark and its notices go with its run.
                 self.desk.set_away(run, None);
+                self.desk.end_run(run);
                 let mut table = self.table();
                 if table.has(name, round) {
                     table.boxes.remove(name);
