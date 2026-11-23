@@ -21,6 +21,9 @@ mod chain;
 mod config;
 mod door;
 mod engine;
+// What every box engine must give a box, run on request against one of them.
+#[cfg(test)]
+mod engine_tests;
 mod fetch;
 mod fields;
 mod hub;
