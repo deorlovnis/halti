@@ -11,6 +11,7 @@ use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -96,11 +97,36 @@ fn halti_mcp_without_all_offers_no_site_and_says_how_to_get_one() {
 
 #[test]
 fn a_question_names_the_workspace_or_the_workspace_s_box_it_comes_from() {
-    assert_eq!(Scope::workspace("acme").asking(), "workspace acme: ");
+    assert_eq!(Scope::workspace("acme", Arc::default()).asking(), "workspace acme: ");
     assert_eq!(Scope::boxed("acme/dev", &[], None).asking(), "box acme/dev: ");
     for scope in [Scope::all(), Scope::nothing(), Scope::boxed("research", &[], None)] {
         assert_eq!(scope.asking(), "");
     }
+}
+
+#[test]
+fn an_open_workspace_s_agent_has_its_consent_from_the_open_and_its_questions_end_with_the_session() {
+    let ended = Arc::new(AtomicBool::new(false));
+    let scope = Scope::workspace("acme", ended.clone());
+    // No consent is asked, as for the workspace's boxes: where nobody can answer one (Linux), its
+    // sites would never be used.
+    assert!(scope.consented);
+    assert!(scope.ended.as_ref().is_some_and(|flag| Arc::ptr_eq(flag, &ended)));
+    // Elsewhere consent is asked as the policy says, and nothing ends a question but its answer.
+    for scope in [Scope::all(), Scope::nothing()] {
+        assert!(!scope.consented && scope.ended.is_none());
+    }
+}
+
+#[test]
+fn a_line_that_isn_t_utf_8_is_answered_as_a_parse_error_and_the_session_goes_on() {
+    let mut out = Vec::new();
+    let input = b"\xff\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n".to_vec();
+    serve_io(Cursor::new(input), &mut out, Scope::nothing()).unwrap();
+    let replies: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    assert_eq!((replies[0]["id"].clone(), replies[0]["error"]["code"].clone()), (Value::Null, json!(-32700)));
+    assert_eq!(replies[1], json!({ "jsonrpc": "2.0", "id": 1, "result": {} }));
 }
 
 // --- the pieces ---

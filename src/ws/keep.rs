@@ -256,7 +256,8 @@ pub fn mcp(typed: &str) -> Result<()> {
         _ => return Err(opening(&name)),
     };
     if !relay(stream, io::stdin(), io::stdout())? {
-        bail!("{name} was closed, so the agent's session ended");
+        // It closed, or its server failed: the terminal where it is open says which.
+        bail!("{name} ended the agent's session: it is closing, or the terminal where it is open says why");
     }
     Ok(())
 }

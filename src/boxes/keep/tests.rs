@@ -237,6 +237,8 @@ struct Bench {
     desk: Arc<Desk>,
     /// The devices this machine trusts.
     trusted: Mutex<Vec<Trusted>>,
+    /// What the agents' MCP sessions came to, in order (`serve_agent`).
+    agents: Mutex<Vec<String>>,
 }
 
 impl Bench {
@@ -251,6 +253,7 @@ impl Bench {
             looked: AtomicUsize::new(0),
             desk,
             trusted: Mutex::default(),
+            agents: Mutex::default(),
         }
     }
 
@@ -316,7 +319,7 @@ impl Bench {
             refused: &refused,
             desk: &self.desk,
             trust: &|name| self.trust(name),
-            mcp: &echo,
+            mcp: &|reading, writing, ended| self.serve_agent(reading, writing, &ended),
         };
         let socket = self.socket();
         thread::scope(|scope| {
@@ -334,14 +337,51 @@ impl Bench {
     }
 }
 
-/// What the keeper serves an agent here, in place of MCP: each line back, marked.
-fn echo(reading: UnixStream, mut writing: UnixStream) {
-    for line in BufReader::new(reading).lines() {
-        let Ok(line) = line else { return };
-        if writeln!(writing, "served {line}").is_err() {
-            return;
-        }
+impl Bench {
+    /// What the keeper serves an agent here, in place of MCP: each line back, marked. `ask` stands
+    /// for a Touch ID window, which stays up until the session's flag withdraws it. `fail` ends the
+    /// session with an error while a reader still holds the connection, as `mcp::serve_io`'s may.
+    /// As it ends it waits a moment, then notes whether the keys were wiped by then.
+    fn serve_agent(&self, reading: UnixStream, mut writing: UnixStream, ended: &AtomicBool) -> Result<()> {
+        let note = |what: &str| self.agents.lock().unwrap().push(format!("{what}, keys wiped: {}", self.wiped.lock().unwrap().is_some()));
+        let mut lines = BufReader::new(reading.try_clone()?).lines();
+        let served = loop {
+            let Some(Ok(line)) = lines.next() else { break Ok(()) };
+            match line.as_str() {
+                "ask" => {
+                    note("asked");
+                    // Up as long as a test may wait; one never withdrawn says so, and ends.
+                    let up = Instant::now() + Duration::from_secs(10);
+                    while !ended.load(Ordering::SeqCst) && Instant::now() < up {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    note(if ended.load(Ordering::SeqCst) { "withdrawn" } else { "never withdrawn" });
+                }
+                "fail" => {
+                    let mut reading = reading;
+                    thread::spawn(move || reading.read(&mut [0u8; 8]));
+                    break Err(anyhow!("the line isn't UTF-8"));
+                }
+                line => {
+                    if writeln!(writing, "served {line}").is_err() {
+                        break Ok(());
+                    }
+                }
+            }
+        };
+        thread::sleep(Duration::from_millis(300));
+        note("ended");
+        served
     }
+
+    fn agents(&self) -> Vec<String> {
+        self.agents.lock().unwrap().clone()
+    }
+}
+
+/// What the keeper serves an agent where no test sends one.
+fn no_agent(_reading: UnixStream, _writing: UnixStream, _ended: Arc<AtomicBool>) -> Result<()> {
+    bail!("no agent is served here")
 }
 
 /// Sets the flag when dropped.
@@ -410,12 +450,50 @@ fn an_agent_s_mcp_session_is_served_until_the_workspace_closes_and_the_keys_are_
         // A close ends both sessions, then wipes the keys, then answers.
         assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
         assert!(bench.wiped.lock().unwrap().is_some());
+        assert_eq!(bench.agents(), ["ended, keys wiped: false", "ended, keys wiped: false"]);
         // A socket whose peer has closed it refuses the option on a Mac.
         let _ = agent.set_read_timeout(Some(LONG));
         assert_eq!(agent.read(&mut [0u8; 8]).unwrap(), 0, "the session ended");
     });
     assert_eq!(code.unwrap(), 0);
     assert!(!bench.socket().exists());
+}
+
+#[test]
+fn a_close_withdraws_what_an_agent_s_session_asks_before_the_keys_are_wiped() {
+    let bench = Bench::new(Fake::default());
+    let code = bench.keeping(&[], false, |socket| {
+        let (said, mut agent) = mcp_session(socket);
+        assert_eq!(said, Reply::Serving);
+        agent.write_all(b"ask\n").unwrap();
+        until(|| !bench.agents().is_empty());
+        // The close doesn't wait for the window to be answered or to time out: it takes it down.
+        let asked = Instant::now();
+        assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
+        assert!(asked.elapsed() < Duration::from_secs(10), "{:?}", asked.elapsed());
+        assert_eq!(bench.agents(), ["asked, keys wiped: false", "withdrawn, keys wiped: false", "ended, keys wiped: false"]);
+    });
+    assert_eq!(code.unwrap(), 0);
+}
+
+#[test]
+fn a_session_that_fails_ends_for_its_agent_too_and_frees_its_place() {
+    let bench = Bench::new(Fake::default());
+    let code = bench.keeping(&[], false, |socket| {
+        let (said, mut agent) = mcp_session(socket);
+        assert_eq!(said, Reply::Serving);
+        agent.write_all(b"fail\n").unwrap();
+        // Its reader still holds the connection, and the agent is told it is over all the same.
+        agent.set_read_timeout(Some(LONG)).unwrap();
+        assert_eq!(agent.read(&mut [0u8; 8]).unwrap(), 0, "the session ended");
+        until(|| bench.agents().len() == 1);
+        assert_eq!(bench.agents(), ["ended, keys wiped: false"]);
+        // The workspace stays open, and the place is free again.
+        let (said, _again) = mcp_session(socket);
+        assert_eq!(said, Reply::Serving);
+        assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
+    });
+    assert_eq!(code.unwrap(), 0);
 }
 
 #[test]
@@ -730,7 +808,7 @@ fn a_second_keeper_never_takes_a_socket_that_answers() {
     bench.layout().prepare().unwrap();
     let _other = keep::bind(&socket).unwrap().unwrap();
     let ready = |_: &str, _: &str, _: &Checked| Ok(());
-    let outside = Outside { world: None, vms: None, ready: &ready, close: &bench.close, wipe: &|| {}, refused: &|| false, desk: &bench.desk, trust: &|_| None, mcp: &echo };
+    let outside = Outside { world: None, vms: None, ready: &ready, close: &bench.close, wipe: &|| {}, refused: &|| false, desk: &bench.desk, trust: &|_| None, mcp: &no_agent };
     let error = serve_with(bench.keep(&[]), &outside).unwrap_err();
     assert_eq!(error.to_string(), "another workspace is open at acme's socket");
     assert!(socket.exists());
@@ -762,7 +840,7 @@ fn bare<'a>(bench: &'a Bench, name: &'a WsName, layout: &'a Layout, mounts: &'a 
         done: AtomicBool::new(false),
         desk: &bench.desk,
         trust: &|_| None,
-        serve_mcp: &echo,
+        serve_mcp: &no_agent,
     }
 }
 

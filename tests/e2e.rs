@@ -1534,7 +1534,9 @@ fn two_open_workspaces_serve_their_agents_at_once_and_neither_sees_the_other_s_s
     assert!(!refused.status.success() && prompted(&refused) == 0, "{}", stderr(&refused));
     assert_eq!(stderr(&refused), "halti: acme isn't open, so it serves no agent. open it with: halti open acme\n");
 
-    let acme = Open::start(env.ws_box_command(PASSPHRASE, "true").args(["open", "acme"]));
+    // Nothing acme serves is approved by a prompt, as on Linux, where nobody can answer one: its
+    // open is the consent to its sites.
+    let acme = Open::start(env.ws_box_command(PASSPHRASE, "true").args(["open", "acme"]).env("HALTI_TEST_APPROVE", "no"));
     let beta = Open::start(env.ws_box_command(PASSPHRASE, "true").args(["open", "beta"]));
     assert!(acme.is_open() && beta.is_open(), "{}{}", acme.err.lock().unwrap(), beta.err.lock().unwrap());
     let mut acme_mcp = Mcp::start(env.command().args(["ws", "mcp", "acme"]));

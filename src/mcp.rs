@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Instant;
@@ -107,6 +108,9 @@ pub struct Scope {
     browser: Option<Arc<dyn BoxBrowser>>,
     /// The workspace an agent outside a box uses (`halti ws mcp`), named in its questions.
     workspace: Option<String>,
+    /// Set once the session must end (its workspace closes): a question it asks is withdrawn, and a
+    /// yes that comes after counts as no.
+    ended: Option<Arc<AtomicBool>>,
     /// What `sites` says when no site is offered.
     none: &'static str,
 }
@@ -121,7 +125,7 @@ with `halti ws mcp WS`, or every site in the Keychain with `halti mcp --all`.";
 impl Scope {
     /// `halti mcp --all`: every approved site, each asking for consent as its policy says.
     pub fn all() -> Self {
-        Self { sites: None, consented: false, box_name: None, browser: None, workspace: None, none: NO_SITES }
+        Self { sites: None, consented: false, box_name: None, browser: None, workspace: None, ended: None, none: NO_SITES }
     }
 
     /// `halti mcp`: no site, as anywhere outside a workspace.
@@ -130,14 +134,15 @@ impl Scope {
     }
 
     /// `halti ws mcp WS`: every site whose policy is approved in workspace `ws`, which the process
-    /// keeps open, each asking for consent as its policy says.
-    pub fn workspace(ws: &str) -> Self {
-        Self { workspace: Some(ws.to_string()), ..Self::all() }
+    /// keeps open. Its open is the consent, as it is for the workspace's boxes, so none is asked
+    /// here; writes that ask still ask, until `ended` is set.
+    pub fn workspace(ws: &str, ended: Arc<AtomicBool>) -> Self {
+        Self { consented: true, workspace: Some(ws.to_string()), ended: Some(ended), ..Self::all() }
     }
 
     /// A box's connection: only its sites, and consent already given by the box run's Touch ID.
     pub fn boxed(name: &str, sites: &[String], browser: Option<Arc<dyn BoxBrowser>>) -> Self {
-        Self { sites: Some(sites.to_vec()), consented: true, box_name: Some(name.to_string()), browser, workspace: None, none: NO_SITES }
+        Self { sites: Some(sites.to_vec()), consented: true, box_name: Some(name.to_string()), browser, ..Self::all() }
     }
 
     /// What a question about a write or a consent starts with: a workspace's box (`acme/dev`, the
@@ -165,11 +170,13 @@ pub fn serve(all: bool) -> Result<()> {
 
 /// Serve MCP (one JSON-RPC message per line) until the reader ends.
 pub fn serve_io(reader: impl BufRead + Send + 'static, mut writer: impl Write, scope: Scope) -> Result<()> {
+    // What the session asks is withdrawn once it has ended.
+    let _withdrawing = scope.ended.clone().map(approve::Withdrawing::when);
     let mut server = Server::start(scope);
     // Lines arrive through a channel so the loop can wake up to close a browser that went idle.
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        for line in reader.lines() {
+        for line in reader.split(b'\n') {
             if tx.send(line).is_err() {
                 break;
             }
@@ -190,11 +197,13 @@ pub fn serve_io(reader: impl BufRead + Send + 'static, mut writer: impl Write, s
                 Err(_) => break,
             },
         };
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(reply) = server.handle(&line) {
+        // A line that isn't UTF-8 is no JSON either, and is answered so: the session goes on.
+        let reply = match String::from_utf8(line?) {
+            Ok(line) if line.trim().is_empty() => continue,
+            Ok(line) => server.handle(&line),
+            Err(_) => Some(error_reply(Value::Null, -32700, "parse error: the line isn't UTF-8")),
+        };
+        if let Some(reply) = reply {
             writeln!(writer, "{reply}")?;
             writer.flush()?;
         }
