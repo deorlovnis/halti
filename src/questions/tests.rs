@@ -573,7 +573,9 @@ fn leave_it_stopped_releases_the_asker_with_nobody_and_gives_its_notice_back() {
     let [(clear, copy)] = &waiting(&desk, 1, "pixel")[..] else { panic!() };
     let whole = opened(&pixel, &trust, clear, copy);
     assert_eq!(desk.reply("pixel", Record::decode(clear).unwrap().id, &answer(&pixel, &whole, Form::Stopped, b"")).0, Outcome::Delivered);
-    assert!(matches!(asker.told(), requests::Asked::Nobody));
+    // An answer, logged as one; the asker is told nobody, so the agent stops as it was about to.
+    let requests::Asked::Answered { reply: told, line } = asker.told() else { panic!("answered") };
+    assert_eq!((told.as_slice(), line.form), (&b"nobody"[..], Form::Stopped));
     let [(notice, said)] = &notices(&desk)[..] else { panic!("its notice") };
     assert_eq!((notice.kind, said.clone()), (crate::notices::Kind::TurnEnded, Reason::Left.said()));
     assert_eq!(hex(&Reason::Left.said()), "00046c65667400080000000000000000");

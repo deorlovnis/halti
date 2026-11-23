@@ -68,7 +68,8 @@ impl Phones for LinkFiles {
 pub enum Asked {
     /// Nobody answers from the phone: the agent's own prompt shows.
     Nobody,
-    /// The answer, as the asker is told it, and what the door's log says of it.
+    /// The answer, as the asker is told it (`nobody` for "Leave it stopped"), and what the door's
+    /// log says of it.
     Answered { reply: Vec<u8>, line: Line },
 }
 
@@ -303,7 +304,10 @@ impl Desk {
                         self.changed.notify_all();
                         say(&format!("question {}: answered ({})", id.short(), by.word()));
                         let line = Line { by, id, kind: record.kind, form, hash: pending.hash };
-                        if form == Form::Stopped { Asked::Nobody } else { Asked::Answered { reply: questions::reply(form, &content), line } }
+                        // "Leave it stopped" is an answer, logged as one, and the asker is told
+                        // nobody: the agent stops as it was about to.
+                        let reply = if form == Form::Stopped { crate::notices::NOBODY.as_bytes().to_vec() } else { questions::reply(form, &content) };
+                        Asked::Answered { reply, line }
                     }
                     State::Closed(reason) => {
                         if let Some(reason) = reason {
