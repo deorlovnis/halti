@@ -731,7 +731,7 @@ const WS_BOX_ITEMS: &[&str] = &[
     "store::is_held(",
     "store::usage(",
     "store::open(",
-    "store::door_log(",
+    "store::door_log_text(",
     "store::is_mounted(",
     "store::detach(",
     "store::ENCRYPTED",
