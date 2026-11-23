@@ -588,7 +588,7 @@ fn the_hold_ends_on_every_path_and_the_asker_is_released() {
         away(&desk);
         let asker = held(&desk, "dev", Event::Permit, b"s", permit_text());
         waiting(&desk, 1, "pixel");
-        assert!(notices(&desk).is_empty(), "{what}: a question replaces its notice");
+        assert!(notices(&desk).is_empty(), "{what}: a permit's notice comes from its Notification");
         if what == "no phone is trusted any more" {
             trust.set(&[]);
         }
@@ -747,6 +747,55 @@ fn twenty_wait_at_most_in_one_workspace() {
     for held in asked {
         assert!(matches!(held.told(), requests::Asked::Nobody));
     }
+}
+
+#[test]
+fn the_notice_of_a_wait_stays_beside_its_question_for_an_app_that_reads_none() {
+    use crate::notices::Kind as Wait;
+    let pixel = phone("pixel", &["acme"]);
+    let trust = Trust::of(&[&pixel]);
+    let desk = desk(&trust);
+    away(&desk);
+    // A turn's end and an AskUserQuestion make their notices at once, as before there were
+    // questions: an app of before, or a hub that carries no questions, still tells the owner.
+    let idle = held(&desk, "dev", Event::Waiting(Wait::TurnEnded), b"one", idle_text());
+    let choice = held(&desk, "dev", Event::Waiting(Wait::Question), b"two", choice_text(false));
+    let permit = held(&desk, "dev", Event::Permit, b"three", permit_text());
+    let listed = waiting(&desk, 3, "pixel");
+    // A permission prompt's comes from its Notification, which the question doesn't hold back.
+    desk.asker("dev", RUN).tell(Event::Waiting(Wait::PermissionPrompt), b"three");
+    let shown = notices(&desk);
+    let mut kinds: Vec<_> = shown.iter().map(|(notice, said)| (notice.kind, said.is_empty())).collect();
+    kinds.sort_by_key(|(kind, _)| kind.word());
+    assert_eq!(kinds, [(Wait::PermissionPrompt, true), (Wait::Question, true), (Wait::TurnEnded, true)]);
+    // Each names the run and session its question does, so an app that lists the question can
+    // show it in the notice's place.
+    for (clear, _) in &listed {
+        let record = Record::decode(clear).unwrap();
+        assert!(shown.iter().any(|(notice, _)| (notice.box_name.as_str(), notice.run, notice.session) == ("dev", record.run, record.session)), "{record:?}");
+    }
+    // Marked away again, to stay longer: those waits are questions, not waits from before the mark.
+    away(&desk);
+    assert!(notices(&desk).iter().all(|(_, said)| said.is_empty()));
+    let id_of = |kind: Kind| listed.iter().map(|(clear, _)| Record::decode(clear).unwrap()).find(|record| record.kind == kind).unwrap().id;
+    // An answer closes its notice, as the agent goes on; "Leave it stopped" gives it back with the
+    // reason, and so does a question withdrawn while the agent still waits.
+    let whole = |kind: Kind| {
+        let (clear, copy) = listed.iter().find(|(clear, _)| Record::decode(clear).unwrap().kind == kind).unwrap();
+        opened(&pixel, &trust, clear, copy)
+    };
+    desk.reply("pixel", id_of(Kind::Choice), &answer(&pixel, &whole(Kind::Choice), Form::Options, &options_content(&[Pick::Options(vec![1])])));
+    assert!(matches!(choice.told(), requests::Asked::Answered { .. }));
+    desk.reply("pixel", id_of(Kind::Idle), &answer(&pixel, &whole(Kind::Idle), Form::Stopped, b""));
+    assert!(matches!(idle.told(), requests::Asked::Answered { .. }));
+    let mut left: Vec<_> = notices(&desk).into_iter().map(|(notice, said)| (notice.kind, said)).collect();
+    left.sort_by_key(|(kind, _)| kind.word());
+    assert_eq!(left, [(Wait::PermissionPrompt, Vec::new()), (Wait::TurnEnded, Reason::Left.said())]);
+    desk.set_away(RUN, None);
+    assert!(matches!(permit.told(), requests::Asked::Nobody));
+    let mut left: Vec<_> = notices(&desk).into_iter().map(|(notice, said)| (notice.kind, said)).collect();
+    left.sort_by_key(|(kind, _)| kind.word());
+    assert_eq!(left, [(Wait::PermissionPrompt, Reason::NotAway.said()), (Wait::TurnEnded, Reason::Left.said())]);
 }
 
 #[test]

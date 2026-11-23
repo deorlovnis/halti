@@ -58,11 +58,14 @@
 //! that ended opens none: an ask the door read before it stopped may come after. One is open per
 //! session, the first kind kept (two hooks may see one wait), and eight per box.
 //!
-//! A question replaces its session's notice while it waits. When it ends with the agent still
-//! waiting (its time was over, the run is no longer marked away, the owner left it for the
-//! terminal, or no phone is trusted any more), its notice comes back with the reason, as a new
-//! notice: the reason is its sealed text (`Reason`), which no box chose. A notice open as its run is
-//! marked away comes back at once with the reason that its wait began before the mark.
+//! A session's notice stays open while its question waits, so that a phone whose app reads no
+//! questions, or a hub that carries none, still tells the owner of the wait; an app that lists the
+//! question shows it in the notice's place. An answer closes the notice, as the agent goes on. When
+//! the question ends with the agent still waiting (its time was over, the run is no longer marked
+//! away, the owner left it for the terminal, or no phone is trusted any more), a new notice takes
+//! the session's place, with the reason: its sealed text (`Reason`), which no box chose. A notice
+//! open as its run is marked away comes back at once with the reason that its wait began before the
+//! mark.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -388,26 +391,32 @@ impl Table {
         self.open.iter().filter(|open| open.due <= now).cloned().collect()
     }
 
-    /// Closes the notice of session `session` of `run`, if one is open: a question replaces it.
+    /// Closes the notice of session `session` of `run`, if one is open: its question was answered,
+    /// or gives it back with a reason.
     pub fn close_session(&mut self, run: RunId, session: u32) {
         self.open.retain(|open| !(open.run == run && open.session == session));
     }
 
-    /// Opens a notice again for a wait that a question took and gave back, with the reason, as a
-    /// new notice. Nothing once the run ended, or when the box has as many open as it may.
+    /// Opens a notice again for a wait that a question gave back, with the reason, as a new notice
+    /// in place of the session's own. Nothing once the run ended, or when the box has as many open
+    /// as it may.
     #[allow(clippy::too_many_arguments)]
     pub fn reopen(&mut self, box_name: &str, run: RunId, session: u32, kind: Kind, since: u64, reason: Reason, due: Instant, per_box: usize) {
-        if self.ended.contains(&run) || self.open.iter().filter(|open| open.box_name == box_name).count() >= per_box {
+        if self.ended.contains(&run) {
             return;
         }
         self.close_session(run, session);
+        if self.open.iter().filter(|open| open.box_name == box_name).count() >= per_box {
+            return;
+        }
         self.open.push(Open { box_name: box_name.to_string(), run, session, kind, id: Id::random(), since, reason: Some(reason), due });
     }
 
     /// The run `run` was marked away: each notice of it open now comes back at once, as a new
-    /// notice, with the reason that its wait began before the mark.
-    pub fn before_away(&mut self, run: RunId, now: Instant) {
-        for open in self.open.iter_mut().filter(|open| open.run == run && open.reason.is_none()) {
+    /// notice, with the reason that its wait began before the mark. Not those of the sessions
+    /// `asking`, whose waits are questions already: a mark set again leaves them be.
+    pub fn before_away(&mut self, run: RunId, now: Instant, asking: &[u32]) {
+        for open in self.open.iter_mut().filter(|open| open.run == run && open.reason.is_none() && !asking.contains(&open.session)) {
             open.id = Id::random();
             open.reason = Some(Reason::BeforeAway);
             open.due = now;

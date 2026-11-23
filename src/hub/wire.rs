@@ -316,8 +316,15 @@
 //! question in the phone's workspaces that its machine sealed to this phone, from every machine, in
 //! the order of the machines' names, then of the ids. A question leaves the list once its machine
 //! closed it (answered, or withdrawn: the agent went on, its run ended or is no longer marked away,
-//! the workspace closed), and a minute after its expiry by the hub's clock at the latest. It
-//! replaces the notice of its agent's session while it waits.
+//! the workspace closed), and a minute after its expiry by the hub's clock at the latest.
+//!
+//! The notice of its agent's session stays in the notices list while the question waits: an app
+//! that reads no questions (it sends no `questions_seen`), or a hub that carries none, still tells
+//! the owner of the wait, as before there were questions. An app that lists questions shows the
+//! question in the notice's place: it hides a notice whose machine, workspace, box, run and session
+//! are those of a question it lists. Once the question is answered its notice is closed; when it
+//! ends with the agent still waiting, its notice is replaced by a new one with the reason
+//! (above).
 //!
 //! `record` is the question's clear fields, a run of fields as above, in this order and nothing
 //! else:

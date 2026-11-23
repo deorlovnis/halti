@@ -140,7 +140,7 @@ impl Table {
     }
 
     /// The sessions of `run` that have a question waiting.
-    fn asking(&self, run: RunId) -> Vec<u32> {
+    pub(super) fn asking(&self, run: RunId) -> Vec<u32> {
         self.questions.iter().filter(|pending| pending.record.run == run && pending.waiting()).map(|pending| pending.record.session).collect()
     }
 
@@ -182,8 +182,9 @@ impl Desk {
 
     /// What the newer asker in box `box_name`'s run `run` reported for its session `tag`, with the
     /// text its hook showed: held as a question until it is answered, in a run marked away with a
-    /// phone to ask; `nobody` at once otherwise, and the notice made as before. `gone` says the
-    /// asker's call was closed: it gave up, or Claude Code ended its hook.
+    /// phone to ask; `nobody` at once otherwise. The notice is made as before either way: it stays
+    /// beside the question, for a phone whose app reads no questions, and the hub that carries
+    /// none. `gone` says the asker's call was closed: it gave up, or Claude Code ended its hook.
     pub fn ask(self: &Arc<Self>, box_name: &str, run: RunId, event: Event, tag: &[u8], text: &[u8], gone: &dyn Fn() -> bool) -> Asked {
         let kind = match event {
             Event::Permit => Kind::Permit,
@@ -199,10 +200,8 @@ impl Desk {
             (Some(until), Some(said)) => self.open_question(box_name, run, kind, tag, text, said, until),
             _ => None,
         };
-        let Some(id) = opened else {
-            self.tell(box_name, run, event, tag);
-            return Asked::Nobody;
-        };
+        self.tell(box_name, run, event, tag);
+        let Some(id) = opened else { return Asked::Nobody };
         self.wait_question(id, gone)
     }
 
@@ -250,7 +249,6 @@ impl Desk {
             phones.into_iter().filter_map(|(name, second)| Some((name, second, sealed::seal(sealed::Kind::Question, &key, &second, &clear, &sealed, &random()).ok()?))).collect();
         let id = record.id;
         let hash = questions::hash(&clear, &sealed);
-        table.notices.close_session(run, session);
         table.questions.push(Pending {
             record,
             clear,
@@ -271,7 +269,8 @@ impl Desk {
     }
 
     /// Waits until question `id` is answered, expires, or is withdrawn, then it goes: what the asker
-    /// is told. One that ends with the agent still waiting gives its notice back, with the reason.
+    /// is told. One answered closes its session's notice, as the agent goes on; one that ends with
+    /// the agent still waiting gives its notice back, with the reason.
     fn wait_question(&self, id: Id, gone: &dyn Fn() -> bool) -> Asked {
         let mut looked = Instant::now();
         let mut table = self.table();
@@ -299,6 +298,8 @@ impl Desk {
                         if form == Form::Stopped {
                             let due = Instant::now();
                             table.notices.reopen(&record.box_name, record.run, record.session, record.kind.notice(), pending.since, Reason::Left, due, self.limits.notices_per_box);
+                        } else {
+                            table.notices.close_session(record.run, record.session);
                         }
                         drop(table);
                         self.changed.notify_all();

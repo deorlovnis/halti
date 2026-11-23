@@ -614,7 +614,8 @@ impl Desk {
         match until {
             Some(until) => {
                 table.away.insert(run, until);
-                table.notices.before_away(run, Instant::now());
+                let asking = table.asking(run);
+                table.notices.before_away(run, Instant::now(), &asking);
             }
             None => {
                 table.away.remove(&run);
@@ -657,10 +658,6 @@ impl Desk {
         }
         let now = notices::Now { instant: Instant::now(), secs: now_secs() };
         table.told(run, event, tag);
-        // A question replaces its session's notice while it waits.
-        if matches!(event, Event::Waiting(_)) && table.has_question(run, tag) {
-            return;
-        }
         let away = table.away.get(&run).is_some_and(|until| *until > now.secs);
         table.notices.tell(box_name, run, event, tag, away, self.limits.notice_delay, self.limits.notices_per_box, now);
         drop(table);
