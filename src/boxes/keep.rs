@@ -10,15 +10,21 @@
 //! phone's signed answers and stops, which are checked here against the devices this machine
 //! trusts (`crate::link`).
 //!
+//! An agent outside a box uses the workspace through `halti ws mcp`, whose connection it serves
+//! over MCP on a thread of its own (`crate::mcp`): the sites whose policies are approved in this
+//! workspace, looked up through the place, and no other's. A session counts with the boxes'.
+//!
 //! Closing is one order, whatever asked for it (`halti close`, Ctrl-C, a closed terminal, `kill`):
-//! from the first moment every start is refused (`busy`); every box is asked to stop and is put
-//! away, one that is still starting once its start is done; the boxes of the workspace that other
-//! terminals run are stopped; the keys are wiped; whoever asked is answered; the socket goes, and
-//! the lock last. It says it closed only if no other terminal's box held on.
+//! from the first moment every start is refused (`busy`); every agent's MCP session is ended;
+//! every box is asked to stop and is put away, one that is still starting once its start is done;
+//! the boxes of the workspace that other terminals run are stopped; the keys are wiped; whoever
+//! asked is answered; the socket goes, and the lock last. It says it closed only if no other
+//! terminal's box held on.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{ErrorKind, Read};
+use std::io::{BufReader, ErrorKind, Read};
+use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -36,8 +42,8 @@ use crate::config::Settings;
 use crate::engine::Vms;
 use crate::keep::{self, No, Records, Refused, Reply, Request, Told};
 use crate::requests::{self, Desk, RunId, Runs, Trust};
-use crate::source;
 use crate::util::{say, sha256_hex, warn};
+use crate::{mcp, source};
 
 /// How many sessions one open workspace holds, of all its boxes.
 const SESSIONS: usize = 32;
@@ -93,6 +99,11 @@ pub fn serve(keep: Keep) -> Result<u8> {
     let ready = |name: &str, shown: &str, checked: &Checked| super::ready(name, shown, &checked.text, checked.policy.keep, &settings);
     let desk = Desk::following(requests::machine_name, keep.name.to_string(), requests::LIMITS, Arc::new(requests::TouchId));
     let trust = |name: &str| crate::link::trusted(name);
+    let ws = keep.name.to_string();
+    // An agent that left, or a session the close ended, is no failure.
+    let serve_mcp = move |reading: UnixStream, writing: UnixStream| {
+        let _ = mcp::serve_io(BufReader::new(reading), writing, mcp::Scope::workspace(&ws));
+    };
     let outside = Outside {
         world: world.as_ref().map(|world| world as &dyn World),
         vms: keep.vms,
@@ -102,6 +113,7 @@ pub fn serve(keep: Keep) -> Result<u8> {
         refused: &|| source::current().refused_reread(),
         desk: &desk,
         trust: &trust,
+        mcp: &serve_mcp,
     };
     serve_with(keep, &outside)
 }
@@ -124,6 +136,9 @@ struct Outside<'a> {
     desk: &'a Arc<Desk>,
     /// The devices this machine trusts, as a phone's signed answer or stop is checked against them.
     trust: Trust<'a>,
+    /// Serves an agent over MCP on a connection, read from the first and written to the second,
+    /// until it ends.
+    mcp: &'a (dyn Fn(UnixStream, UnixStream) + Sync),
 }
 
 fn serve_with(keep: Keep, outside: &Outside) -> Result<u8> {
@@ -157,6 +172,7 @@ fn serve_with(keep: Keep, outside: &Outside) -> Result<u8> {
         done: AtomicBool::new(false),
         desk: outside.desk,
         trust: outside.trust,
+        serve_mcp: outside.mcp,
     };
     let held = thread::scope(|scope| {
         let keeper = &keeper;
@@ -222,11 +238,14 @@ struct Table {
     next: u64,
     /// The boxes put away while closing.
     put_away: usize,
+    /// Each agent's MCP session, by a number of its own: a copy of its connection, which a close
+    /// shuts.
+    mcp: BTreeMap<u64, UnixStream>,
 }
 
 impl Table {
     fn sessions(&self) -> usize {
-        self.boxes.values().map(|slot| slot.sessions).sum()
+        self.boxes.values().map(|slot| slot.sessions).sum::<usize>() + self.mcp.len()
     }
 
     fn slot(&mut self, name: &str, round: u64) -> Option<&mut Slot> {
@@ -260,6 +279,7 @@ struct Keeper<'a> {
     /// The requests its boxes wait on.
     desk: &'a Arc<Desk>,
     trust: Trust<'a>,
+    serve_mcp: &'a (dyn Fn(UnixStream, UnixStream) + Sync),
 }
 
 fn reply(stream: &mut UnixStream, reply: Reply) {
@@ -319,8 +339,42 @@ impl<'a> Keeper<'a> {
             Some(Request::Close(_)) => return self.asked_to_close(stream),
             Some(Request::Ping(_)) => Reply::Open(self.running()),
             Some(Request::Away(_, name, secs)) => self.away(&name, secs),
+            Some(Request::Mcp(_)) => return self.mcp(stream),
         };
         reply(&mut stream, answer);
+    }
+
+    /// `mcp`: the connection is an agent's MCP session of the workspace, served on this thread
+    /// until the agent leaves or the workspace closes.
+    fn mcp(&self, mut stream: UnixStream) {
+        let mut table = self.table();
+        let refused = if self.closing_in(&table) {
+            Some(Reply::Busy)
+        } else if table.sessions() >= SESSIONS {
+            Some(Reply::Full)
+        } else {
+            None
+        };
+        let copies = stream.try_clone().and_then(|reading| Ok((reading, stream.try_clone()?)));
+        let (reading, held) = match (refused, copies) {
+            (None, Ok(copies)) => copies,
+            (refused, _) => {
+                drop(table);
+                return reply(&mut stream, refused.unwrap_or(Reply::No(No::Failed)));
+            }
+        };
+        table.next += 1;
+        let id = table.next;
+        table.mcp.insert(id, held);
+        drop(table);
+        reply(&mut stream, Reply::Serving);
+        // The line it asked with had its time limits; a session has none.
+        let _ = stream.set_read_timeout(None).and_then(|()| stream.set_write_timeout(None));
+        say(&format!("an agent uses {} through halti ws mcp", self.name));
+        (self.serve_mcp)(reading, stream);
+        self.table().mcp.remove(&id);
+        self.changed.notify_all();
+        say(&format!("an agent stopped using {} through halti ws mcp", self.name));
     }
 
     /// The requests its boxes wait on: each record, or what came of an answer; the boxes that
@@ -573,16 +627,20 @@ impl<'a> Keeper<'a> {
         self.changed.notify_all();
     }
 
-    /// Refuses every start from now on, asks every box to stop, and waits until each is put away
-    /// (one still starting finishes its start first). Returns how many were put away.
+    /// Refuses every start from now on, ends every agent's MCP session, asks every box to stop, and
+    /// waits until each session has ended and each box is put away (one still starting finishes its
+    /// start first). Returns how many boxes were put away.
     fn put_all_away(&self) -> usize {
         self.desk.close();
         let mut table = self.table();
         table.closing = true;
+        for stream in table.mcp.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
         for slot in table.boxes.values() {
             slot.stop.store(true, Ordering::SeqCst);
         }
-        while !table.boxes.is_empty() {
+        while !table.boxes.is_empty() || !table.mcp.is_empty() {
             table = self.wait(table);
         }
         table.put_away

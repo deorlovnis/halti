@@ -105,24 +105,36 @@ pub struct Scope {
     /// A box's browser VM and sealed sessions. Inside a box the browser tools use only this;
     /// without it they have no browser.
     browser: Option<Arc<dyn BoxBrowser>>,
+    /// The workspace an agent outside a box uses (`halti ws mcp`), named in its questions.
+    workspace: Option<String>,
 }
 
 impl Scope {
     /// `halti mcp`: every approved site, each asking for consent as its policy says.
     pub fn all() -> Self {
-        Self { sites: None, consented: false, box_name: None, browser: None }
+        Self { sites: None, consented: false, box_name: None, browser: None, workspace: None }
+    }
+
+    /// `halti ws mcp WS`: every site whose policy is approved in workspace `ws`, which the process
+    /// keeps open, each asking for consent as its policy says.
+    pub fn workspace(ws: &str) -> Self {
+        Self { workspace: Some(ws.to_string()), ..Self::all() }
     }
 
     /// A box's connection: only its sites, and consent already given by the box run's Touch ID.
     pub fn boxed(name: &str, sites: &[String], browser: Option<Arc<dyn BoxBrowser>>) -> Self {
-        Self { sites: Some(sites.to_vec()), consented: true, box_name: Some(name.to_string()), browser }
+        Self { sites: Some(sites.to_vec()), consented: true, box_name: Some(name.to_string()), browser, workspace: None }
     }
 
-    /// What a question about a write starts with: a workspace's box (`acme/dev`, the only box
-    /// names with a `/`) is named, since its agent holds the terminal and the person must see which
-    /// client asks. Today's boxes and halti's own MCP server keep their words.
+    /// What a question about a write or a consent starts with: a workspace's box (`acme/dev`, the
+    /// only box names with a `/`) or a workspace is named, since an agent may use several at once
+    /// and the person must see which client asks. Today's boxes and halti's own MCP server keep
+    /// their words.
     fn asking(&self) -> String {
-        self.box_name.as_deref().filter(|name| name.contains('/')).map_or_else(String::new, |name| format!("box {name}: "))
+        if let Some(name) = self.box_name.as_deref() {
+            return if name.contains('/') { format!("box {name}: ") } else { String::new() };
+        }
+        self.workspace.as_deref().map_or_else(String::new, |ws| format!("workspace {ws}: "))
     }
 }
 
@@ -351,7 +363,7 @@ impl Server {
     /// there is one; otherwise on the Mac. Returns the start page.
     fn open_browser(&mut self, site: &str, approved: &Approved) -> Result<String> {
         let Some(name) = self.scope.box_name.clone() else {
-            let (session, text) = Session::open(site, approved)?;
+            let (session, text) = Session::open(site, approved, &self.scope.asking())?;
             self.browser = Some(session);
             return Ok(text);
         };
@@ -544,7 +556,7 @@ impl Server {
             return Ok(());
         }
         let how_long = if minutes == 0 { "until it disconnects".to_string() } else { format!("for {minutes} minutes") };
-        approve::confirm(answers, &format!("let an agent use {site} through halti {how_long}"))?;
+        approve::confirm(answers, &format!("{}let an agent use {site} through halti {how_long}", self.scope.asking()))?;
         self.consented.insert(site.to_string(), Instant::now());
         Ok(())
     }

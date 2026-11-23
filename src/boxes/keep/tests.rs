@@ -4,6 +4,7 @@
 
 use std::any::Any;
 use std::collections::BTreeSet;
+use std::io::{BufRead, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -315,6 +316,7 @@ impl Bench {
             refused: &refused,
             desk: &self.desk,
             trust: &|name| self.trust(name),
+            mcp: &echo,
         };
         let socket = self.socket();
         thread::scope(|scope| {
@@ -329,6 +331,16 @@ impl Bench {
             test(&socket);
             keeper.join().unwrap()
         })
+    }
+}
+
+/// What the keeper serves an agent here, in place of MCP: each line back, marked.
+fn echo(reading: UnixStream, mut writing: UnixStream) {
+    for line in BufReader::new(reading).lines() {
+        let Ok(line) = line else { return };
+        if writeln!(writing, "served {line}").is_err() {
+            return;
+        }
     }
 }
 
@@ -353,6 +365,14 @@ fn session(socket: &Path, name: &str) -> (Reply, UnixStream) {
     (reply, stream)
 }
 
+/// An agent's MCP session: its reply, and the connection.
+fn mcp_session(socket: &Path) -> (Reply, UnixStream) {
+    let mut stream = keep::connect(socket).unwrap();
+    keep::write_line(&mut stream, &Request::Mcp(acme()).line()).unwrap();
+    let reply = keep::read_line(&mut stream, LONG).and_then(|line| Reply::parse(&line)).unwrap();
+    (reply, stream)
+}
+
 /// What the keeper says on a session when its box is put away.
 fn said_on(stream: &mut UnixStream) -> Option<Reply> {
     keep::read_line(stream, LONG).and_then(|line| Reply::parse(&line))
@@ -369,6 +389,58 @@ fn until(check: impl Fn() -> bool) {
         assert!(Instant::now() < deadline, "it never happened");
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn an_agent_s_mcp_session_is_served_until_the_workspace_closes_and_the_keys_are_wiped_after() {
+    let bench = Bench::new(Fake::default());
+    let code = bench.keeping(&[], false, |socket| {
+        let (said, mut agent) = mcp_session(socket);
+        assert_eq!(said, Reply::Serving);
+        let (second, _other_agent) = mcp_session(socket);
+        assert_eq!(second, Reply::Serving);
+        // Longer than a line may take to come: a session has no time limit.
+        thread::sleep(keep::LINE_WAIT + Duration::from_secs(1));
+        agent.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n").unwrap();
+        assert_eq!(keep::read_line(&mut agent, LONG).as_deref(), Some("served {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}"));
+        // Another workspace's name is served nothing.
+        assert_eq!(ask(socket, Request::Mcp(WsName::parse("globex").unwrap())), Some(Reply::Other));
+        assert_eq!(running(socket), Some(Reply::Open(0)), "a session runs no box");
+        assert!(bench.wiped.lock().unwrap().is_none());
+        // A close ends both sessions, then wipes the keys, then answers.
+        assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
+        assert!(bench.wiped.lock().unwrap().is_some());
+        // A socket whose peer has closed it refuses the option on a Mac.
+        let _ = agent.set_read_timeout(Some(LONG));
+        assert_eq!(agent.read(&mut [0u8; 8]).unwrap(), 0, "the session ended");
+    });
+    assert_eq!(code.unwrap(), 0);
+    assert!(!bench.socket().exists());
+}
+
+#[test]
+fn an_agent_that_leaves_ends_its_mcp_session_and_frees_its_place() {
+    let bench = Bench::new(Fake::default());
+    let code = bench.keeping(&[], false, |socket| {
+        let mut held: Vec<UnixStream> = (0..SESSIONS)
+            .map(|_| mcp_session(socket))
+            .map(|(said, agent)| {
+                assert_eq!(said, Reply::Serving);
+                agent
+            })
+            .collect();
+        // As many sessions as an open workspace takes: one more is refused.
+        assert_eq!(mcp_session(socket).0, Reply::Full);
+        assert_eq!(ask(socket, Request::Start(acme(), "dev".into())), Some(Reply::Full));
+        // One leaves: its place is free again.
+        drop(held.pop());
+        until(|| {
+            let (said, _agent) = mcp_session(socket);
+            said == Reply::Serving
+        });
+        assert_eq!(ask(socket, Request::Close(acme())), Some(Reply::Closed(0)));
+    });
+    assert_eq!(code.unwrap(), 0);
 }
 
 #[test]
@@ -658,7 +730,7 @@ fn a_second_keeper_never_takes_a_socket_that_answers() {
     bench.layout().prepare().unwrap();
     let _other = keep::bind(&socket).unwrap().unwrap();
     let ready = |_: &str, _: &str, _: &Checked| Ok(());
-    let outside = Outside { world: None, vms: None, ready: &ready, close: &bench.close, wipe: &|| {}, refused: &|| false, desk: &bench.desk, trust: &|_| None };
+    let outside = Outside { world: None, vms: None, ready: &ready, close: &bench.close, wipe: &|| {}, refused: &|| false, desk: &bench.desk, trust: &|_| None, mcp: &echo };
     let error = serve_with(bench.keep(&[]), &outside).unwrap_err();
     assert_eq!(error.to_string(), "another workspace is open at acme's socket");
     assert!(socket.exists());
@@ -690,6 +762,7 @@ fn bare<'a>(bench: &'a Bench, name: &'a WsName, layout: &'a Layout, mounts: &'a 
         done: AtomicBool::new(false),
         desk: &bench.desk,
         trust: &|_| None,
+        serve_mcp: &echo,
     }
 }
 

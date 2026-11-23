@@ -93,9 +93,10 @@ pub struct PageWrite {
 
 impl Session {
     /// Start a browser on the Mac for the site with its session in place (the Keychain fields
-    /// its policy names), and open the start page.
-    pub fn open(site: &str, approved: &Approved) -> Result<(Self, String)> {
-        Self::open_with(site, approved, mac_runner()?, None, None, None, "")
+    /// its policy names), and open the start page. `asking` is what the questions about its pages'
+    /// writes start with.
+    pub fn open(site: &str, approved: &Approved, asking: &str) -> Result<(Self, String)> {
+        Self::open_with(site, approved, mac_runner()?, None, None, None, asking)
     }
 
     /// The same over any runner process: `sealed` is the session to start from instead of the

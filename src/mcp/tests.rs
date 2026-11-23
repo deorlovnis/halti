@@ -84,6 +84,15 @@ fn a_rotating_session_survives_with_the_real_runner() {
     finished(private_environment(REAL, &dir).env("PLAYWRIGHT_BROWSERS_PATH", browsers).env("HALTI_RUNNER_DIR", runner));
 }
 
+#[test]
+fn a_question_names_the_workspace_or_the_workspace_s_box_it_comes_from() {
+    assert_eq!(Scope::workspace("acme").asking(), "workspace acme: ");
+    assert_eq!(Scope::boxed("acme/dev", &[], None).asking(), "box acme/dev: ");
+    for scope in [Scope::all(), Scope::boxed("research", &[], None)] {
+        assert_eq!(scope.asking(), "");
+    }
+}
+
 // --- the pieces ---
 
 fn write_site(dir: &Path, origin: &str, extra_browse: &str) {

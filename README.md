@@ -122,7 +122,7 @@ halti audit                                  # what agents did through halti mcp
 
 ## Workspaces
 
-A **workspace** keeps one client's secrets apart from another's, sealed in files under its own passphrase. Its boxes use them (see Boxes in a workspace), and nothing else does yet.
+A **workspace** keeps one client's secrets apart from another's, sealed in files under its own passphrase. Its boxes use them (see Boxes in a workspace), and so does an agent outside a box through `halti ws mcp` while the workspace is open (see Agents).
 
 ```sh
 halti ws new acme                          # asks for a new passphrase (or makes one: --generate)
@@ -136,6 +136,7 @@ halti ws policy show acme                  # which are approved (asks as for ope
 halti ws ls                                # the workspaces (asks nothing)
 halti open acme                            # asks once, then keeps acme open in this terminal until Ctrl-C
 halti close acme                           # from another terminal: stops acme's boxes and wipes its keys (asks nothing)
+halti ws mcp acme                          # what an agent runs: acme's sites over MCP, while acme is open (asks nothing)
 halti requests                             # the writes acme's boxes wait on you to approve, while acme is open
 halti requests approve 1a2b3c4d            # or deny 1a2b3c4d: from any terminal, over ssh -t too
 halti ws delete acme                       # the workspace and everything in it (not while it is open, or one of its boxes has a store)
@@ -151,11 +152,11 @@ halti ws delete acme                       # the workspace and everything in it 
 `halti open acme` asks as `[workspace.approval] open` says, says `acme is open in this terminal`, and stays: that process holds acme's keys until Ctrl-C, a closed terminal or `halti close acme` from another terminal closes it. The terminal says each time a box starts or stops, that one ended unexpectedly when its VM went with no stop asked (killed, or out of memory), and why one wasn't started.
 
 - One terminal keeps a workspace open: a second `halti open acme`, and `halti ws delete acme`, are refused before anything is asked. `halti ws ls` shows `open` for a workspace that answers its socket within a second.
-- It listens on a socket only you can reach, `/tmp/halti-<uid>/ws/TAG.keep.sock`, which no box sees. Each line on it is a request or an answer of names only (a workspace, a box, a site, a count), or a record of a write that waits (below): no passphrase, key, value, policy or file path crosses it. A box started through it asks nothing, after the same checks as `halti ws run`, and stops when the last connection that started or joined it ends.
+- It listens on a socket only you can reach, `/tmp/halti-<uid>/ws/TAG.keep.sock`, which no box sees. Each line on it is a request or an answer of names only (a workspace, a box, a site, a count), or a record of a write that waits (below): no passphrase, key, value, policy or file path crosses it. A box started through it asks nothing, after the same checks as `halti ws run`, and stops when the last connection that started or joined it ends. A `halti ws mcp acme` connection is the exception: once answered, it carries an agent's MCP session, masked as `halti mcp` masks it (see Agents).
 - A write one of its boxes' policies says to ask about waits as a request for up to 120 seconds, then is refused. `halti ws away acme/dev [--for 3h]` (8 hours if left out, a day at most; `off` clears it), or `halti ws run --away acme/dev`, marks the box's current run away: its requests then wait up to 30 minutes, never past the mark's end. The mark ends with the run. A request whose client hangs up while it waits is withdrawn: nothing is sent, even if an approval comes after, and it counts as no refusal. The one exception is a client that sent a body over 1 MiB before it hung up: its request is sent if approved. Its terminal prints the request's id and what the box would send (the method and the URL, masked as the box's log has it), and on a Mac Touch ID asks, as before. `halti requests` in any terminal, over `ssh` too, lists what waits; `halti requests approve ID` or `deny ID` answers one (the 8 characters of its id it lists are enough). Answering needs a terminal: over ssh, `ssh -t`. The first answer counts, from either place: an approval from another terminal takes the Touch ID window down, and on a Mac the open workspace then asks Touch ID itself before it counts, since any program running as you can send the same line; if that isn't given, the first window comes back, and while it is asked a second approval is refused. On Linux nothing more is asked.
 - A box may have 3 requests waiting; after 3 denied or unanswered in a row, its writes that ask are refused for 5 minutes. The box's log line for each request has its id, and for one that was answered, `by: local`.
 - While acme is open, `halti ws run acme/dev` asks nothing: the open workspace starts the box, or it joins the one that runs, and the run holds its connection until the agent's command ends; the box stops once its last run has ended. If acme can't start it, the run says why in a word (a missing approval, a site that isn't ready), and the terminal where acme is open says it in full. `halti ws stop acme/dev` asks the open workspace, which stops the box. A run whose open workspace is killed stops the box itself, since its door is gone, and says `acme is no longer open`. With acme not open, `halti ws run` opens it in its own terminal and asks, as before.
-- Closing stops every box in order, waits for one that is still starting, stops acme's boxes that other terminals run with a `halti ws run` started while acme wasn't open (they hold acme's keys too), wipes the keys, and only then says `closed acme`; `halti close` waits until the open workspace has let go before it says so. If a box another terminal runs doesn't let go, it says that box still runs instead, and exits 1. A box start that arrives while it closes is refused.
+- Closing ends every agent's `halti ws mcp` session, stops every box in order, waits for one that is still starting, stops acme's boxes that other terminals run with a `halti ws run` started while acme wasn't open (they hold acme's keys too), wipes the keys, and only then says `closed acme`; `halti close` waits until the open workspace has let go before it says so. If a box another terminal runs doesn't let go, it says that box still runs instead, and exits 1. A box start that arrives while it closes is refused.
 - What a `halti open` or a run that was killed left behind (a VM, a mounted store) is put away by the next `halti open acme` or `halti close acme`, which say so.
 - Its settings are the ones read when it opened. Secrets set and policies approved in another terminal count at its next lookup, and if its files go back to an older state it refuses every secret and says so once. Core dumps are off, and the pages that hold its keys are locked out of swap.
 
@@ -351,7 +352,15 @@ request = "GET https://api.example.com/items/{id}"
 
 ## Agents
 
-Register once:
+An agent that works for one client gets that client's workspace, and no other's. Register it in the project where you work for acme:
+
+```sh
+claude mcp add --scope project halti -- /usr/local/bin/halti ws mcp acme
+```
+
+`halti ws mcp acme` asks nothing and holds no secret: the terminal where acme is open serves the agent, with the sites whose policies are approved in acme, until the agent ends or acme closes. While acme isn't open it says so and serves nothing. Two workspaces open at once serve their own agents side by side, and neither sees the other's sites. Consents and writes that ask name the workspace (`workspace acme: ...`), and each call is written to acme's audit log, `WSDIR/boxes/audit.log`.
+
+For the sites in the Keychain:
 
 ```sh
 claude mcp add --scope user halti -- /usr/local/bin/halti mcp
