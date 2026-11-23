@@ -1287,13 +1287,13 @@ fn a_question_reaches_the_phone_sealed_and_its_answer_comes_back_with_a_receipt(
     assert_eq!(status, 202, "{reply}");
     let n = reply["n"].as_u64().unwrap();
     assert!(matches!(held.join().unwrap(), requests::Asked::Answered { .. }));
-    assert_eq!(world.said(&pixel, n), "delivered");
+    assert_eq!(world.said(&pixel, n), "maybe-unused", "a permit's dialog is on the terminal too");
     // The receipt opens under the machine key, for this answer; the hub could make none.
     let sent = pixel.state(&world.hub)["sent"].as_array().unwrap().iter().find(|sent| sent["n"] == n).unwrap().clone();
     let receipt = util::unhex(sent["receipt"].as_str().unwrap()).unwrap();
     let said = sealed::open(Kind::Receipt, &pixel.second_key(), &machine_key, &questions::receipt_clear(MACHINE, "acme", record.id), &receipt).unwrap();
     let signed_hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&signed).into();
-    assert_eq!(said.as_slice(), questions::receipt_fields(&signed_hash, Outcome::Delivered));
+    assert_eq!(said.as_slice(), questions::receipt_fields(&signed_hash, Outcome::MaybeUnused));
     until("the question is closed at the hub", || questions().is_empty());
     // Sent again, it is not pending, and its receipt says so.
     let (_, reply) = world.hub.call("POST", "/v1/reply", Some(&pixel.token), Some(&json!({"machine": MACHINE, "id": record.id.hex(), "sealed": util::hex(&sealed)})));

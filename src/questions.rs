@@ -450,8 +450,12 @@ pub fn fits(kind: Kind, said: &Said, form: Form, content: &[u8]) -> bool {
 /// What came of an answer, as a receipt says it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outcome {
-    /// Handed to the agent's waiting hook.
+    /// Handed to the agent's waiting hook: a question that its terminal can't answer meanwhile.
     Delivered,
+    /// Handed to the agent's waiting hook, but its permission dialog is on the terminal's screen
+    /// too, and an answer there, or Esc, doesn't end the hook: if the terminal answered first,
+    /// Claude Code doesn't use this one. halti can't tell, so it never says `delivered` for it.
+    MaybeUnused,
     /// No such question waits: answered already, withdrawn, or the agent no longer waits.
     NotPending,
     /// The question's time was over.
@@ -468,11 +472,13 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    pub const ALL: [Outcome; 7] = [Outcome::Delivered, Outcome::NotPending, Outcome::Expired, Outcome::DoesNotFit, Outcome::BadSignature, Outcome::Untrusted, Outcome::Unreadable];
+    pub const ALL: [Outcome; 8] =
+        [Outcome::Delivered, Outcome::MaybeUnused, Outcome::NotPending, Outcome::Expired, Outcome::DoesNotFit, Outcome::BadSignature, Outcome::Untrusted, Outcome::Unreadable];
 
     pub fn word(self) -> &'static str {
         match self {
             Outcome::Delivered => "delivered",
+            Outcome::MaybeUnused => "maybe-unused",
             Outcome::NotPending => "not-pending",
             Outcome::Expired => "expired",
             Outcome::DoesNotFit => "does-not-fit",
@@ -484,6 +490,12 @@ impl Outcome {
 
     pub fn parse(word: &str) -> Option<Outcome> {
         Outcome::ALL.into_iter().find(|outcome| outcome.word() == word)
+    }
+
+    /// What an answer that counts comes to, for a question of `kind`: Claude Code shows its own
+    /// dialog while a PermissionRequest hook waits, so an answer to a `permit` may go unused.
+    pub fn handed(kind: Kind) -> Outcome {
+        if kind == Kind::Permit { Outcome::MaybeUnused } else { Outcome::Delivered }
     }
 }
 

@@ -378,8 +378,9 @@ impl Desk {
         self.table().questions.iter().filter(|pending| pending.waiting() && !pending.late(now)).map(|pending| [pending.clear.as_slice(), &pending.sealed].concat()).collect()
     }
 
-    /// An answer from `halti requests`, to question `id`: delivered if it still waits and the
-    /// answer fits it. The run's mark ends, and its other questions are withdrawn.
+    /// An answer from `halti requests`, to question `id`: handed to its asker if it still waits and
+    /// the answer fits it (`Outcome::handed`). The run's mark ends, and its other questions are
+    /// withdrawn.
     pub fn answer_question_here(&self, id: Id, form: Form, content: &[u8]) -> Outcome {
         let mut table = self.table();
         let now = Instant::now();
@@ -396,13 +397,13 @@ impl Desk {
             return Outcome::DoesNotFit;
         }
         pending.state = State::Answered { form, content: Zeroizing::new(content.to_vec()), by: By::Local };
-        let run = pending.record.run;
+        let (run, kind) = (pending.record.run, pending.record.kind);
         table.away.remove(&run);
         table.withdraw(|pending| pending.record.run == run, |_| Some(Reason::NotAway));
         drop(table);
         self.changed.notify_all();
         say(&format!("box run {} is no longer away: a question of it was answered here", run.hex()));
-        Outcome::Delivered
+        Outcome::handed(kind)
     }
 
     /// A phone's sealed answer to question `id`, from the device named `device`: what came of it,
@@ -410,7 +411,8 @@ impl Desk {
     /// counts only if the device is trusted for this workspace, it opens under the question's reply
     /// key and the device's second key, the signature is the device's over this question's own
     /// record and the answer, the question still waits and its time isn't over, and the answer fits
-    /// it. The first answer that counts wins.
+    /// it. The first answer that counts wins; it is `delivered`, or `maybe-unused` for a `permit`,
+    /// whose dialog the terminal may have answered meanwhile without ending the hook.
     pub fn reply(&self, device: &str, id: Id, sealed: &[u8]) -> (Outcome, Option<Vec<u8>>) {
         let trusted = self.phones.trusted();
         let Some((trusted, second)) = trusted.into_iter().find(|(trusted, _)| trusted.name == device) else { return (Outcome::Untrusted, None) };
@@ -455,9 +457,10 @@ impl Desk {
         }
         let by = By::Device(Arc::new(Signed { device: trusted.name.clone(), fingerprint: trusted.fingerprint.clone(), record: signed, signature: answer.signature }));
         pending.state = State::Answered { form: answer.form, content: Zeroizing::new(answer.content), by };
+        let outcome = Outcome::handed(pending.record.kind);
         drop(table);
         self.changed.notify_all();
-        (Outcome::Delivered, answered)
+        (outcome, answered)
     }
 }
 

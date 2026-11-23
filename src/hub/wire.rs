@@ -381,14 +381,22 @@
 //! machine, the workspace and the question's id (16), which the app builds from what it sent; and
 //! whose plaintext is the fields: the SHA-256 of the signed bytes as the machine rebuilt them (32;
 //! all zeros for an answer that didn't open), then one word: `delivered` (handed to the agent's
-//! waiting hook), `not-pending` (answered already, withdrawn, or the agent no longer waits),
-//! `expired`, `does-not-fit`, `bad-signature`, `untrusted` (not trusted there for that workspace)
-//! or `unreadable`. The app takes as delivered only a receipt that opens under the key it compared
-//! for that machine and names the hash of what it signed; until then the answer is "sent, not
+//! waiting hook, for a `choice` or an `idle`), `maybe-unused` (handed to it, for a `permit`),
+//! `not-pending` (answered already, withdrawn, or the agent no longer waits), `expired`,
+//! `does-not-fit`, `bad-signature`, `untrusted` (not trusted there for that workspace) or
+//! `unreadable`. The app takes as delivered only a receipt that opens under the key it compared for
+//! that machine and names the hash of what it signed; until then the answer is "sent, not
 //! confirmed". A phone not trusted there at all gets no receipt: the word alone, `refused`. The hub
-//! and a holder of the machine's token can make no receipt that opens. `delivered` says the hook
-//! that asked was handed the answer: an agent whose prompt was answered at its terminal meanwhile
-//! may no longer use it.
+//! and a holder of the machine's token can make no receipt that opens.
+//!
+//! A `permit` is never `delivered`. While its hook waits, Claude Code shows its own permission
+//! dialog at the terminal too, and an answer there (Yes, No or Esc) doesn't end the hook: Claude
+//! Code then ignores what the hook says later, and no hook tells halti after a No or an Esc. So the
+//! machine can't know whether the answer was used, and says `maybe-unused`. The app shows it as
+//! neither done nor refused, for example: "Handed to the agent. Its terminal shows the same prompt:
+//! if it was answered there first, this answer was not used." A `choice` or an `idle` the terminal
+//! can't answer while its hook waits (the question isn't on the screen; what the owner types after
+//! a turn's end withdraws the question at once), so theirs is `delivered`.
 //!
 //! The known answers of the record, the signed bytes, the sealed answer and the receipt are in
 //! `tests/fixtures/question-vectors.json`.

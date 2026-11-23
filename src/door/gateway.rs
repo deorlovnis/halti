@@ -577,7 +577,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let id = Record::decode(&desk.questions()[0].0).unwrap().id;
-        assert_eq!(desk.answer_question_here(id, Form::Yes, b""), crate::questions::Outcome::Delivered);
+        assert_eq!(desk.answer_question_here(id, Form::Yes, b""), crate::questions::Outcome::MaybeUnused);
         let mut reply = Vec::new();
         guest.read_to_end(&mut reply).unwrap();
         serving.join().unwrap();

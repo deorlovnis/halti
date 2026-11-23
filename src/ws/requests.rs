@@ -237,6 +237,11 @@ pub fn reply(typed: &str, leave: bool, words: &[String]) -> Result<()> {
         Some(Told::Receipt(Outcome::Delivered, _)) => {
             println!("answered {short}: the agent in {} goes on. {} is no longer marked away", question.record.shown(), question.record.shown())
         }
+        Some(Told::Receipt(Outcome::MaybeUnused, _)) => println!(
+            "answered {short}: handed to the agent in {}. Its terminal shows the same prompt: if it was answered there first, this answer is not used. {} is no longer marked away",
+            question.record.shown(),
+            question.record.shown()
+        ),
         Some(Told::Receipt(Outcome::DoesNotFit, _)) => bail!("that answer doesn't fit question {short}: see halti requests reply --help"),
         Some(Told::Receipt(Outcome::Expired | Outcome::NotPending, _)) => bail!("question {short} no longer waits: it was answered, or the agent went on"),
         _ => bail!("{} didn't answer: try again in a moment", question.ws),

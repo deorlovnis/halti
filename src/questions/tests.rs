@@ -206,7 +206,7 @@ fn the_bytes_a_phone_signs_hold_no_text() {
     }
     assert_eq!(Answer::decode(&fields::join(&[b"maybe", &[3; 16], b"", &[0x30]])), None);
     assert_eq!(Answer::decode(&fields::join(&[b"yes", &[3; 15], b"", &[0x30]])), None);
-    assert_eq!(Outcome::ALL.map(Outcome::word), ["delivered", "not-pending", "expired", "does-not-fit", "bad-signature", "untrusted", "unreadable"]);
+    assert_eq!(Outcome::ALL.map(Outcome::word), ["delivered", "maybe-unused", "not-pending", "expired", "does-not-fit", "bad-signature", "untrusted", "unreadable"]);
     for outcome in Outcome::ALL {
         assert_eq!(Outcome::parse(outcome.word()), Some(outcome));
         assert!(crate::hub::wire::is_word(outcome.word()));
@@ -419,11 +419,12 @@ fn a_question_goes_sealed_to_each_phone_and_the_first_answer_that_counts_reaches
     let (_, _, _, said) = open_whole(&whole).unwrap();
     assert_eq!(said, Said::parse(Kind::Permit, &permit_text()).unwrap());
     assert_eq!(desk.asked(), std::slice::from_ref(&whole));
-    // The phone's yes reaches the asker, which is told it; a receipt says so.
+    // The phone's yes reaches the asker, which is told it; a receipt says so, as far as halti can
+    // know: the terminal shows the same dialog.
     let (outcome, sealed) = desk.reply("pixel", record.id, &answer(&pixel, &whole, Form::Yes, b""));
-    assert_eq!(outcome, Outcome::Delivered);
+    assert_eq!(outcome, Outcome::MaybeUnused);
     let (hash, said) = receipt(&pixel, &trust, record.id, &sealed.unwrap());
-    assert_eq!(said, Outcome::Delivered);
+    assert_eq!(said, Outcome::MaybeUnused);
     assert_ne!(hash, [0; 32]);
     let requests::Asked::Answered { reply: told, line } = asker.told() else { panic!("answered") };
     assert_eq!(told, reply(Form::Yes, b""));
@@ -516,6 +517,50 @@ fn an_answer_after_its_question_expired_or_was_withdrawn_is_told_so() {
 }
 
 #[test]
+fn an_answer_to_a_permit_the_terminal_may_have_answered_is_never_said_delivered() {
+    let pixel = phone("pixel", &["acme"]);
+    let trust = Trust::of(&[&pixel]);
+    let desk = desk(&trust);
+    away(&desk);
+    // The owner pressed Esc, or picked No, at the terminal: no hook says so, and the question
+    // still waits. The phone's yes later is handed to the asker, whose output Claude Code ignores,
+    // so its receipt can't say it was delivered.
+    let asker = held(&desk, "dev", Event::Permit, b"s", permit_text());
+    let [(clear, copy)] = &waiting(&desk, 1, "pixel")[..] else { panic!() };
+    let id = Record::decode(clear).unwrap().id;
+    let whole = opened(&pixel, &trust, clear, copy);
+    let (outcome, sealed) = desk.reply("pixel", id, &answer(&pixel, &whole, Form::Yes, b""));
+    assert_eq!(outcome, Outcome::MaybeUnused);
+    assert_eq!(receipt(&pixel, &trust, id, &sealed.unwrap()).1, Outcome::MaybeUnused);
+    assert!(matches!(asker.told(), requests::Asked::Answered { .. }));
+    // A no is handed the same way.
+    let asker = held(&desk, "dev", Event::Permit, b"s", permit_text());
+    let [(clear, copy)] = &waiting(&desk, 1, "pixel")[..] else { panic!() };
+    let whole = opened(&pixel, &trust, clear, copy);
+    assert_eq!(desk.reply("pixel", Record::decode(clear).unwrap().id, &answer(&pixel, &whole, Form::No, b"not now")).0, Outcome::MaybeUnused);
+    assert!(matches!(asker.told(), requests::Asked::Answered { .. }));
+    // A choice's question isn't on the terminal's screen while its hook waits, and a turn's end
+    // is withdrawn as the owner types there: theirs are delivered.
+    for (event, text, form, content) in [
+        (Event::Waiting(crate::notices::Kind::Question), choice_text(false), Form::Options, options_content(&[Pick::Options(vec![1])])),
+        (Event::Waiting(crate::notices::Kind::TurnEnded), idle_text(), Form::Text, b"go on".to_vec()),
+    ] {
+        let asker = held(&desk, "dev", event, b"s", text);
+        let [(clear, copy)] = &waiting(&desk, 1, "pixel")[..] else { panic!() };
+        let whole = opened(&pixel, &trust, clear, copy);
+        let (outcome, sealed) = desk.reply("pixel", Record::decode(clear).unwrap().id, &answer(&pixel, &whole, form, &content));
+        assert_eq!(outcome, Outcome::Delivered, "{event:?}");
+        assert_eq!(receipt(&pixel, &trust, Record::decode(clear).unwrap().id, &sealed.unwrap()).1, Outcome::Delivered);
+        assert!(matches!(asker.told(), requests::Asked::Answered { .. }));
+    }
+    // Answered here, the same.
+    let asker = held(&desk, "dev", Event::Permit, b"s", permit_text());
+    waiting(&desk, 1, "pixel");
+    assert_eq!(desk.answer_question_here(only(&desk), Form::Yes, b""), Outcome::MaybeUnused);
+    assert!(matches!(asker.told(), requests::Asked::Answered { .. }));
+}
+
+#[test]
 fn the_hold_ends_on_every_path_and_the_asker_is_released() {
     let pixel = phone("pixel", &["acme"]);
     let trust = Trust::of(&[&pixel]);
@@ -535,7 +580,7 @@ fn the_hold_ends_on_every_path_and_the_asker_is_released() {
             }),
             Some("no-phone"),
         ),
-        ("it was answered here", Box::new(|desk, _| assert_eq!(desk.answer_question_here(only(desk), Form::Yes, b""), Outcome::Delivered)), None),
+        ("it was answered here", Box::new(|desk, _| assert_eq!(desk.answer_question_here(only(desk), Form::Yes, b""), Outcome::MaybeUnused)), None),
     ];
     for (what, end, notice) in ends {
         let desk = desk(&trust);
@@ -597,7 +642,7 @@ fn an_answer_here_ends_the_mark_and_withdraws_the_run_s_other_questions() {
     // What doesn't fit is refused, and nothing changes.
     assert_eq!(desk.answer_question_here(id, Form::Text, b"go"), Outcome::DoesNotFit);
     assert_eq!(desk.answer_question_here(Id([1; 16]), Form::Yes, b""), Outcome::NotPending);
-    assert_eq!(desk.answer_question_here(id, Form::No, b"not now"), Outcome::Delivered);
+    assert_eq!(desk.answer_question_here(id, Form::No, b"not now"), Outcome::MaybeUnused);
     let requests::Asked::Answered { reply: told, line } = first.told() else { panic!() };
     assert_eq!((told, line.by), (reply(Form::No, b"not now"), requests::By::Local));
     assert!(matches!(second.told(), requests::Asked::Nobody));
@@ -635,7 +680,7 @@ fn an_answer_reaches_neither_a_request_nor_anything_but_its_asker() {
     assert_eq!(desk.answer_signed(&lookup, "pixel", true, record.id, &signed), crate::requests::Here::Gone);
     assert_eq!(desk.reply("pixel", request.id, &answer(&pixel, &whole, Form::Yes, b"")).0, Outcome::NotPending);
     // The question's own yes reaches its asker and leaves the request waiting, unanswered.
-    assert_eq!(desk.reply("pixel", record.id, &answer(&pixel, &whole, Form::Yes, b"")).0, Outcome::Delivered);
+    assert_eq!(desk.reply("pixel", record.id, &answer(&pixel, &whole, Form::Yes, b"")).0, Outcome::MaybeUnused);
     assert!(matches!(question.told(), requests::Asked::Answered { .. }));
     assert_eq!(desk.records().len(), 1);
     assert!(!raised.is_finished());
@@ -730,7 +775,7 @@ fn a_phone_trusted_while_a_question_waits_gets_a_copy_and_one_untrusted_loses_it
     let names: Vec<&str> = listed[0].1.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, ["tablet"]);
     let whole = opened(&tablet, &trust, &listed[0].0, &listed[0].1[0].1);
-    assert_eq!(desk.reply("tablet", only(&desk), &answer(&tablet, &whole, Form::Yes, b"")).0, Outcome::Delivered);
+    assert_eq!(desk.reply("tablet", only(&desk), &answer(&tablet, &whole, Form::Yes, b"")).0, Outcome::MaybeUnused);
     assert!(matches!(asker.told(), requests::Asked::Answered { .. }));
 }
 
