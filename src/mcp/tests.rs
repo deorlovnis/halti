@@ -163,6 +163,10 @@ fn started_with(dir: &Path, n: usize) -> Value {
     config["storageState"]["cookies"][0]["value"].as_str().map_or_else(|| config["cookies"][0]["value"].clone(), |v| json!(v))
 }
 
+fn audit_lines(dir: &Path) -> Vec<Value> {
+    fs::read_to_string(dir.join("audit.log")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
 fn sealed_cookie(rig: &Rig) -> Option<String> {
     let state: Value = serde_json::from_str(&rig.sessions.get("app").unwrap()?).unwrap();
     state["cookies"][0]["value"].as_str().map(str::to_string)
@@ -252,6 +256,23 @@ fn fake_scenario(dir: &Path) {
     close(&mut server);
     assert!(fs::read_dir(dir.join("store/browser")).unwrap().next().is_none(), "no session was written");
     assert_eq!(started_with(dir, fs::read_to_string(dir.join("runner.log")).unwrap().lines().count() - 1), json!(KEYCHAIN_TOKEN));
+
+    // A page's write is audited as a request of its own, though its question came while a later
+    // call ran, or while the browser closed: the calls' lines keep their own decisions.
+    let rig = Rig::fake(dir, false);
+    let mut server = rig.server();
+    open(&mut server);
+    let before = audit_lines(dir).len();
+    assert!(!call(&mut server, "browse_click", json!({ "ref": "later-write" })).0);
+    assert!(!call(&mut server, "browse_snapshot", json!({})).0);
+    assert!(!call(&mut server, "browse_click", json!({ "ref": "later-write" })).0);
+    server.close_expired_browser(Instant::now() + Duration::from_secs(11 * 60));
+    let page_write = ("browse_page_write", Some("POST"), Some("http://127.0.0.1:9/later"), "asked:yes");
+    let lines: Vec<_> = audit_lines(dir)[before..].iter().map(|l| (l["tool"].clone(), l["method"].clone(), l["url"].clone(), l["decision"].clone(), l["box"].clone())).collect();
+    let line = |(tool, method, url, decision): (&str, Option<&str>, Option<&str>, &str)| (json!(tool), json!(method), json!(url), json!(decision), json!("research"));
+    let expected = [("browse_click", None, None, "allowed"), page_write, ("browse_snapshot", None, None, "allowed"), ("browse_click", None, None, "allowed"), page_write];
+    assert_eq!(lines, expected.map(line));
+    drop(server);
 
     // A box without a browser VM has no browser at all, and never falls back to the Mac's.
     let mut server = Server::start(Scope::boxed("research", &["app".to_string()], None));

@@ -503,7 +503,7 @@ fn decide(sh: &Shared, kind: Kind, rules: &Rules, method: &str, host: &str, targ
             }
             let asked = match rules {
                 Rules::Net => approval::ask_by(&approval::Real, means, Action::BoxWrite, &reason).map(drop),
-                Rules::Fetch(_) | Rules::Page(_) => approve::confirm(&reason),
+                Rules::Fetch(_) | Rules::Page(_) => approve::confirm(&mut approve::Answers::default(), &reason),
             };
             match asked {
                 Ok(()) => Ok(("asked:yes", Asked::default())),

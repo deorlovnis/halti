@@ -169,8 +169,10 @@ struct Rig {
     connects: Arc<AtomicUsize>,
     /// While set, the door can't connect to the site.
     unreachable: Arc<AtomicBool>,
-    /// What `serve` counted, and the answers to what the door asked on this connection.
-    serving: JoinHandle<((u64, u64), Vec<bool>)>,
+    /// What `serve` counted.
+    serving: JoinHandle<(u64, u64)>,
+    /// What the door's prompts for this box start with.
+    asking: String,
 }
 
 impl Rig {
@@ -217,16 +219,20 @@ impl Rig {
             }
             Ok(site(None))
         };
+        // Prompts the box's earlier connections showed aren't this one's.
+        let asking = format!("let box {} ", shared.cfg.name);
+        approve::shown(&asking);
         let (shared, host) = (shared.clone(), host.to_string());
         let serving = thread::spawn(move || {
             let ctx = Ctx { shared: &shared, host: &host, caller: &Caller::Agent };
-            approve::answers_to(|| match (made, first) {
+            match (made, first) {
                 (Some(made), Some((fresh, _))) => serve(door_guest, first_while_fresh(made, fresh, dial), &ctx),
                 _ => serve(door_guest, dial, &ctx),
-            })
+            }
         });
         guest.set_read_timeout(Some(WAIT)).unwrap();
-        Self { guest: Conn { reader: BufReader::new(guest.try_clone().unwrap()), stream: guest, seen: Vec::new() }, seen, release, connects, unreachable, serving }
+        let guest = Conn { reader: BufReader::new(guest.try_clone().unwrap()), stream: guest, seen: Vec::new() };
+        Self { guest, seen, release, connects, unreachable, serving, asking }
     }
 
     fn connects(&self) -> usize {
@@ -239,18 +245,16 @@ impl Rig {
 
     /// End the guest's side and wait for the door to finish: the log is complete after this.
     fn finish(self) -> (u64, u64) {
-        self.end().0
-    }
-
-    /// `finish`, and how each question the door asked on this connection was answered.
-    fn finish_asked(self) -> Vec<bool> {
-        self.end().1
-    }
-
-    fn end(self) -> ((u64, u64), Vec<bool>) {
         let _ = self.guest.stream.shutdown(Shutdown::Write);
         drop(self.guest);
         self.serving.join().unwrap()
+    }
+
+    /// `finish`, and how each Touch ID prompt the door showed for this connection was answered.
+    fn finish_asked(self) -> Vec<bool> {
+        let asking = self.asking.clone();
+        self.finish();
+        approve::shown(&asking)
     }
 }
 
@@ -463,7 +467,7 @@ fn asked_at_once(dir: &Path) {
     let calls: Vec<(Value, Value)> = audit.iter().map(|l| (l["site"].clone(), l["decision"].clone())).collect();
     assert_eq!(calls, [(json!("agentsite"), json!("asked:yes"))]);
 
-    assert_eq!(rig.finish_asked(), [false], "the door's thread hears only its own answer");
+    assert_eq!(rig.finish_asked(), [false], "the door showed one prompt");
     let door = log_lines(dir, "at-once");
     assert_eq!((door.len(), door[0]["decision"].clone()), (1, json!("asked:no")));
 }
@@ -824,9 +828,9 @@ fn net_allows(sh: &Arc<Shared>) {
     // A WebSocket can't be carried, even where writes are allowed.
     let (reply, body) = rig.guest.get(host, "/socket", &[("Connection", "Upgrade"), ("Upgrade", "websocket")]);
     assert_eq!(reply.status, 501, "{body}");
-    let ((up, down), asked) = rig.end();
-    assert_eq!((up, down), (4, 8));
-    assert!(asked.is_empty());
+    let asking = rig.asking.clone();
+    assert_eq!(rig.finish(), (4, 8));
+    assert!(approve::shown(&asking).is_empty());
 }
 
 /// One line per request, chained, with the URL masked; an edit or a deletion shows.

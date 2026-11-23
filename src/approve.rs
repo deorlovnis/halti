@@ -2,8 +2,6 @@
 //! An agent can't answer this prompt, so it gates everything that loosens a policy or
 //! releases a value outside halti.
 
-use std::cell::RefCell;
-
 use anyhow::{Result, bail};
 
 use crate::requests::Prompted;
@@ -12,45 +10,41 @@ use crate::requests::Prompted;
 /// `ask_person_until`, which is frozen): the request then waits on for an answer from elsewhere.
 pub const TOUCH_ID_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-thread_local! {
-    /// The answers to the call `answers_to` runs on this thread, while it runs (true: approved).
-    /// Nothing is kept on a thread no call listens on, such as a door's.
-    static LISTENING: RefCell<Option<Vec<bool>>> = const { RefCell::new(None) };
-}
+/// The answers to one request's prompts, in order (true: approved). A request that is audited
+/// keeps its own and passes it to every `confirm` it causes, so each answer comes back to the
+/// request that asked and to no other: not another call's, a door's, or another box's in the same
+/// process. A prompt no log records is given a fresh one.
+#[derive(Default, Debug)]
+pub struct Answers(Vec<bool>);
 
-/// Runs `call`, and how each prompt it asked was answered, in order. The audit log reads what a call
-/// asked. A call's prompts run on the thread that runs it (halti has no async tasks to move them),
-/// so the prompts of other calls and of door threads in the same process are never among them.
-/// Within another `answers_to`, the outer call hears these answers too.
-pub fn answers_to<T>(call: impl FnOnce() -> T) -> (T, Vec<bool>) {
-    /// The outer call's answers, put back when this call ends, also by a panic.
-    struct Outer(Option<Vec<bool>>);
-    impl Drop for Outer {
-        fn drop(&mut self) {
-            let inner = LISTENING.take().unwrap_or_default();
-            let mut outer = self.0.take();
-            if let Some(outer) = &mut outer {
-                outer.extend(inner);
-            }
-            LISTENING.set(outer);
-        }
+impl Answers {
+    pub fn all(&self) -> &[bool] {
+        &self.0
     }
-    let outer = Outer(LISTENING.replace(Some(Vec::new())));
-    let result = call();
-    let answers = LISTENING.with_borrow(|answers| answers.clone().unwrap_or_default());
-    drop(outer);
-    (result, answers)
 }
 
-/// Ask for confirmation; macOS shows it as "halti is trying to <reason>."
-pub fn confirm(reason: &str) -> Result<()> {
+/// Ask for confirmation for the request `answers` belongs to, and keep the answer there; macOS
+/// shows it as "halti is trying to <reason>."
+pub fn confirm(answers: &mut Answers, reason: &str) -> Result<()> {
     let result = prompt(reason);
-    note(result.is_ok());
+    #[cfg(test)]
+    SHOWN.lock().unwrap().push((reason.to_string(), result.is_ok()));
+    answers.0.push(result.is_ok());
     result
 }
 
-fn note(approved: bool) {
-    LISTENING.with_borrow_mut(|answers| answers.as_mut().map(|answers| answers.push(approved)));
+/// Every prompt this test process showed and no test has taken yet, with its answer: tests count
+/// the prompts a door raised by their reasons. Nothing outside tests has it.
+#[cfg(test)]
+static SHOWN: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// Takes the answers to the prompts shown so far whose reason starts with `about`, in order.
+#[cfg(test)]
+pub fn shown(about: &str) -> Vec<bool> {
+    let mut shown = SHOWN.lock().unwrap();
+    let (taken, kept) = std::mem::take(&mut *shown).into_iter().partition(|(reason, _)| reason.starts_with(about));
+    *shown = kept;
+    taken.into_iter().map(|(_, answer): (String, bool)| answer).collect()
 }
 
 /// How a test that has prompts open at the same time answers each, by its reason.
@@ -177,46 +171,4 @@ fn ask_person_until(reason: &str, withdrawn: &dyn Fn() -> bool) -> Prompted {
 #[cfg(not(target_os = "macos"))]
 fn ask_person_until(_reason: &str, _withdrawn: &dyn Fn() -> bool) -> Prompted {
     Prompted::Unshown
-}
-
-#[cfg(test)]
-mod tests {
-    use std::thread;
-
-    use super::*;
-
-    #[test]
-    fn a_call_hears_only_the_prompts_it_asked_itself() {
-        note(false);
-        let ((), answers) = answers_to(|| {
-            note(true);
-            thread::spawn(|| note(false)).join().unwrap();
-        });
-        assert_eq!(answers, [true], "neither what was asked before nor on another thread");
-        let ((), answers) = answers_to(|| ());
-        assert!(answers.is_empty(), "nothing was kept from outside a call");
-    }
-
-    #[test]
-    fn a_call_within_a_call_is_heard_by_both() {
-        let (inner, outer) = answers_to(|| {
-            note(true);
-            let ((), inner) = answers_to(|| note(false));
-            inner
-        });
-        assert_eq!((inner, outer), (vec![false], vec![true, false]));
-    }
-
-    #[test]
-    fn a_call_that_panics_leaves_the_outer_call_listening() {
-        fn fails() {
-            note(false);
-            panic!("the call fails");
-        }
-        let ((), outer) = answers_to(|| {
-            assert!(std::panic::catch_unwind(|| answers_to(fails)).is_err());
-            note(true);
-        });
-        assert_eq!(outer, [false, true]);
-    }
 }

@@ -266,7 +266,7 @@ impl World for Real {
     }
 
     fn touch_id(&self, reason: &str) -> Result<()> {
-        approve::confirm(reason)
+        approve::confirm(&mut approve::Answers::default(), reason)
     }
 
     fn sudo(&self, reason: &str) -> Result<()> {
