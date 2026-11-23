@@ -229,6 +229,18 @@ fn a_box_can_t_move_a_session_number_past_eight_however_many_tags_it_sends() {
 }
 
 #[test]
+fn a_run_that_ended_opens_no_notice_however_late_its_ask_comes() {
+    let start = Instant::now();
+    let mut table = Table::default();
+    table.end_run(RUN);
+    tell(&mut table, Event::Waiting(Kind::TurnEnded), b"a", true, at(start, 0));
+    assert!(table.due(start + DELAY).is_empty());
+    // Another run of the box still does.
+    table.tell("dev", RunId([9; 8]), Event::Waiting(Kind::TurnEnded), b"a", true, DELAY, 8, at(start, 0));
+    assert_eq!(table.due(start).len(), 1);
+}
+
+#[test]
 fn a_notice_closes_with_its_run_and_every_one_as_the_workspace_closes() {
     let start = Instant::now();
     let mut table = Table::default();

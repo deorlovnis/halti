@@ -46,10 +46,11 @@
 //!
 //! A notice is sent after `Limits::notice_delay` (5 minutes), or at once in a run marked away;
 //! `working` for its session in that time sends nothing, as the owner was at the keyboard. It is
-//! closed by `working`, by the end of its run, or as the workspace closes; never for its age. One is
-//! open per session, the first kind kept (two hooks may see one wait), and eight per box.
+//! closed by `working`, by the end of its run, or as the workspace closes; never for its age. A run
+//! that ended opens none: an ask the door read before it stopped may come after. One is open per
+//! session, the first kind kept (two hooks may see one wait), and eight per box.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -239,6 +240,8 @@ pub struct Table {
     runs: HashMap<RunId, Sessions>,
     /// Counts uses of a tag, to tell which was used longest ago.
     uses: u64,
+    /// The runs that ended while the workspace is open.
+    ended: HashSet<RunId>,
 }
 
 /// How the table is told the time: the clock a delay counts on, and seconds since 1970.
@@ -251,9 +254,12 @@ pub struct Now {
 impl Table {
     /// What box `box_name`'s run `run` reported for the session `tag`. `away` says whether the run
     /// is marked away now; `delay` is how long a notice waits before it is sent, and `per_box` how
-    /// many may be open for one box.
+    /// many may be open for one box. Nothing, once the run ended.
     #[allow(clippy::too_many_arguments)]
     pub fn tell(&mut self, box_name: &str, run: RunId, event: Event, tag: &[u8], away: bool, delay: Duration, per_box: usize, now: Now) {
+        if self.ended.contains(&run) {
+            return;
+        }
         match event {
             Event::Waiting(kind) => {
                 let known = self.known(run, tag);
@@ -307,10 +313,12 @@ impl Table {
         self.open.iter().filter(|open| open.due <= now).cloned().collect()
     }
 
-    /// Closes the notices of run `run`, which ended, and forgets its sessions.
+    /// Closes the notices of run `run`, which ended, forgets its sessions, and opens none for it
+    /// from now on.
     pub fn end_run(&mut self, run: RunId) {
         self.open.retain(|open| open.run != run);
         self.runs.remove(&run);
+        self.ended.insert(run);
     }
 
     /// Closes every notice: the workspace is closing.
