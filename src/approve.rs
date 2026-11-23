@@ -169,9 +169,21 @@ pub fn ask_until(reason: &str, withdrawn: &dyn Fn() -> bool) -> Prompted {
     #[cfg(halti_dev)]
     if let Some(answer) = crate::util::dev_var("HALTI_TEST_APPROVE") {
         eprintln!("halti: [test] {reason}: {}", answer.to_string_lossy());
-        return if answer == "yes" { Prompted::Yes } else { Prompted::No };
+        return test_answer(&answer);
     }
     ask_person_until(reason, withdrawn)
+}
+
+/// What a test build's `HALTI_TEST_APPROVE` answers a prompt that waits: `yes`, `unshown` as a Mac
+/// where no window could be shown (what is asked then waits for an answer from elsewhere), and no
+/// for anything else.
+#[cfg(any(halti_dev, test))]
+fn test_answer(answer: &std::ffi::OsStr) -> Prompted {
+    match answer.to_str() {
+        Some("yes") => Prompted::Yes,
+        Some("unshown") => Prompted::Unshown,
+        _ => Prompted::No,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -226,6 +238,17 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn a_test_build_shows_no_window_when_told_unshown_and_else_answers_yes_or_no() {
+        use std::ffi::OsStr;
+
+        assert_eq!(test_answer(OsStr::new("yes")), Prompted::Yes);
+        assert_eq!(test_answer(OsStr::new("unshown")), Prompted::Unshown);
+        for no in ["no", "", "Yes", "unshown "] {
+            assert_eq!(test_answer(OsStr::new(no)), Prompted::No, "{no:?}");
+        }
+    }
 
     #[test]
     fn a_session_that_ended_asks_nothing_more_and_counts_it_as_no() {
