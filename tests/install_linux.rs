@@ -2,7 +2,8 @@
 //! it runs on a Mac too), `id`, `sudo` and `cargo`. The stand-in sudo writes down what it was
 //! asked to install and runs nothing; the stand-in cargo makes a halti that only says its
 //! build-info. Nothing is installed, and no real sudo or cargo is run. And what check.sh writes for
-//! it: what it could not run here, with stand-ins for `unshare`, `sysctl` and the debug halti. And
+//! it: what it could not run here, with stand-ins for `unshare`, `sysctl` and the debug halti; and
+//! that it stops on a Rust older than Cargo.toml's, with stand-ins for `rustc` and `cargo`. And
 //! box/to-disk.sh, which turns a box image into the disk a box boots from, by hand on Linux.
 
 #![cfg(unix)]
@@ -471,6 +472,82 @@ fn check_sh_names_the_escape_tests_and_cargo_test_runs_them() {
     let names: Vec<String> = tests.into_iter().map(|(name, _)| name).collect();
     assert_eq!(names.len(), 11, "{names:?}");
     assert_eq!(check_sh_list("escape_tests"), names);
+}
+
+/// Runs a copy of check.sh in the test repo, with the repo's Cargo.toml beside it, a rustc that
+/// says it is the Rust `said` names (none: no rustc), and a cargo that only says it ran.
+fn check_on_rust(repo: &Repo, said: Option<&str>) -> Output {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for file in ["check.sh", "Cargo.toml"] {
+        fs::copy(root.join(file), repo.path("repo").join(file)).unwrap();
+    }
+    write_script(&repo.path("fakes/cargo"), "#!/bin/sh\necho 'cargo ran' >&2\nexit 1\n");
+    let rustc = repo.path("fakes/rustc");
+    match said {
+        Some(said) => write_script(&rustc, &format!("#!/bin/sh\necho '{said}'\n")),
+        None => write_script(&rustc, "#!/bin/sh\nexit 127\n"),
+    }
+    let path = format!("{}:{}", repo.path("fakes").display(), env::var("PATH").unwrap());
+    Command::new(repo.path("repo/check.sh"))
+        .env("PATH", path)
+        .env("GIT_CONFIG_GLOBAL", repo.path("gitconfig"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("RUSTC")
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .unwrap()
+}
+
+/// Cargo.toml's rust-version: the oldest Rust that builds halti.
+fn rust_version() -> String {
+    let manifest = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
+    manifest.lines().find_map(|l| l.strip_prefix("rust-version = \"")).unwrap().trim_end_matches('"').to_string()
+}
+
+#[test]
+fn check_sh_stops_in_one_line_on_a_rust_older_than_cargo_toml_s() {
+    let repo = Repo::new();
+    let floor = rust_version();
+    let (major, minor) = floor.split_once('.').unwrap();
+    let older = format!("{major}.{}.7", minor.parse::<u32>().unwrap() - 1);
+    for said in [format!("rustc {older} (0123456789 2025-06-01)"), format!("rustc {older}-nightly (0123456789 2025-06-01)")] {
+        let out = check_on_rust(&repo, Some(&said));
+        assert!(!out.status.success());
+        assert_eq!(text(&out.stdout), "", "no step began");
+        let line = format!("check.sh: Rust {older} is older than {floor}, the oldest that builds halti (rust-toolchain.toml pins the one it passes with)\n");
+        assert_eq!(text(&out.stderr), line);
+    }
+
+    let out = check_on_rust(&repo, None);
+    assert!(!out.status.success());
+    assert_eq!(text(&out.stdout), "");
+    assert_eq!(text(&out.stderr), format!("check.sh: no rustc here; halti needs Rust {floor} or newer (rust-toolchain.toml pins the one it passes with)\n"));
+}
+
+#[test]
+fn check_sh_goes_on_with_the_rust_cargo_toml_names_or_a_newer_one() {
+    let repo = Repo::new();
+    let floor = rust_version();
+    let (major, minor) = floor.split_once('.').unwrap();
+    // A part is read as a number: 1.100 is newer than 1.91.
+    for have in [floor.clone(), format!("{floor}.0"), format!("{major}.{}.0-nightly", minor.parse::<u32>().unwrap() + 1), format!("{major}.100.0")] {
+        let out = check_on_rust(&repo, Some(&format!("rustc {have} (0123456789 2026-01-01)")));
+        assert!(text(&out.stdout).contains("== format"), "{have}: {}", text(&out.stderr));
+        assert!(text(&out.stderr).ends_with("cargo ran\n"), "{have}: {}", text(&out.stderr));
+    }
+}
+
+#[test]
+fn the_pinned_rust_is_one_and_no_older_than_cargo_toml_s() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let pin = |file: &str, key: &str| {
+        let text = fs::read_to_string(root.join(file)).unwrap();
+        text.lines().find_map(|l| l.strip_prefix(key)).unwrap().trim_matches('"').to_string()
+    };
+    let toolchain = pin("rust-toolchain.toml", "channel = ");
+    assert_eq!(pin("mise.toml", "rust = "), toolchain, "mise.toml and rust-toolchain.toml pin one Rust");
+    let parts = |v: &str| v.split('.').map(|p| p.parse::<u32>().unwrap()).chain([0, 0]).take(3).collect::<Vec<_>>();
+    assert!(parts(&toolchain) >= parts(&rust_version()), "the pinned {toolchain} builds halti");
 }
 
 /// A test folder and a podman image, removed however the test ends.

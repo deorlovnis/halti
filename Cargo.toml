@@ -2,6 +2,7 @@
 name = "halti"
 version = "0.5.1"
 edition = "2024"
+rust-version.workspace = true
 description = "macOS Keychain-backed secrets for humans and agents"
 
 [dependencies]
@@ -120,3 +121,9 @@ opt-level = 3
 [workspace]
 members = ["core"]
 exclude = ["box/shim"]
+
+# The oldest Rust that builds halti and core: the panic hook's payload_as_str needs 1.91.
+# check.sh stops at once, in one line, on an older one. rust-toolchain.toml and mise.toml pin the
+# newer one check.sh passes with.
+[workspace.package]
+rust-version = "1.91"

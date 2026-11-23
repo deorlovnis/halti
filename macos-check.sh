@@ -146,10 +146,13 @@ cred_unchanged() {
 }
 
 write_report() {
-  local i=0 r status seconds name note
+  local i=0 r status seconds name note headline=passed
+  # A run stopped from outside (a hangup, say) has failed nothing yet, but hasn't passed.
+  [ "$failed" = 0 ] || headline=FAILED
+  [ "$finished" = 1 ] || headline="FAILED (stopped before the end)"
   mkdir -p "$(dirname "$report")"
   {
-    echo "halti macos-check: $([ "$failed" = 0 ] && echo passed || echo FAILED)"
+    echo "halti macos-check: $headline"
     echo
     echo "started    $started"
     echo "commit     $commit $(git log -1 --format=%s)"
