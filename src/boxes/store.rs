@@ -497,11 +497,14 @@ pub fn open(bundle: &Path, mnt: &Path, key: &str, readonly: bool) -> Result<Open
     }
     let store = Open { mnt: mnt.to_path_buf(), bundle: bundle.to_path_buf(), shred: false };
     if !readonly {
-        for folder in FOLDERS {
+        for folder in &FOLDERS[..3] {
             fs::create_dir_all(mnt.join(folder))?;
         }
-        for private in ["log", "door", "browser"] {
-            fs::set_permissions(mnt.join(private), fs::Permissions::from_mode(0o700))?;
+        // halti's own folders, which the door writes its log in by path: never a link.
+        // SAFETY: getuid(2) can't fail.
+        let uid = unsafe { libc::getuid() };
+        for private in &FOLDERS[3..] {
+            private_dir(&mnt.join(private), uid)?;
         }
         let marker = mnt.join(".metadata_never_index");
         if !marker.exists() {
@@ -1080,10 +1083,20 @@ mod tests {
         assert!(fs::write(mnt.join("work/new.txt"), "x").is_err());
         std::mem::forget(ro);
         assert!(is_mounted(&mnt));
-        let mut again = open(&bundle, &mnt, &key, false).unwrap();
+        let again = open(&bundle, &mnt, &key, false).unwrap();
         assert!(mnt.join("work/note.txt").exists());
-        again.shred_on_close();
+
+        // A link in place of a folder of halti's is refused, never followed.
+        fs::remove_dir_all(mnt.join("log")).unwrap();
+        symlink(dir.0.join("elsewhere"), mnt.join("log")).unwrap();
         drop(again);
+        let error = open(&bundle, &mnt, &key, false).err().unwrap().to_string();
+        assert!(error.ends_with("/log isn't a folder of yours"), "{error}");
+        assert!(!is_mounted(&mnt) && !dir.0.join("elsewhere").exists());
+
+        let mut last = open(&bundle, &mnt, &key, true).unwrap();
+        last.shred_on_close();
+        drop(last);
         assert!(!is_mounted(&mnt) && !bundle.exists(), "dropping a shredded store detaches and deletes it");
     }
 }
