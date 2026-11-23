@@ -255,6 +255,8 @@
 //! ends the call: an answer that ends for a request, the 240 seconds or a newer call, at a time the
 //! limits don't allow, lists only the notices the phone was told already that are still open, and
 //! the new one comes in a later answer. So `notices` may list fewer than `GET /v1/notices` does.
+//! What the phone was told is the answer its `notices_seen` names, of the last five the hub gave
+//! it: an answer the phone never read, as it gave up on the call or lost it, changes nothing.
 //! The app keeps the two lists apart: a new request id raises the request notification, a new
 //! notice id the agent one ("halti: an agent is waiting for you"), and neither raises the other.
 //! A phone has one such call at a time: a newer one ends the one before with the lists as they are.

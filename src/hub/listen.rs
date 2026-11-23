@@ -2,7 +2,7 @@
 //! `wire` states. A thread serves each connection; there are never more than `CONNECTIONS` of them.
 //! A machine's call for what phones sent it holds its thread while it waits (`super::INBOX_WAIT`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::PoisonError;
@@ -561,7 +561,7 @@ fn wait(hub: &Hub, authorization: Option<&str>, body: &[u8]) -> Result<(u16, Val
             waits.newest.remove(&name);
         }
         if let Ok((_, Some(notices))) = &told {
-            waits.agents.entry(name.clone()).or_default().told = notices.clone();
+            waits.agents.entry(name.clone()).or_default().answered(notices.clone());
         }
     }
     let (ids, notices) = told?;
@@ -572,19 +572,20 @@ fn wait(hub: &Hub, authorization: Option<&str>, body: &[u8]) -> Result<(u16, Val
     Ok((200, reply))
 }
 
-/// The notices a phone was told, `answered`, if `told` names them; else none.
-fn known(answered: &[NoticeKey], told: Option<[u8; 32]>) -> &[NoticeKey] {
-    if wire::seen_of(&answered.iter().map(|key| key.id).collect::<Vec<_>>()) == told { answered } else { &[] }
-}
-
 /// What a held call answers: the request ids, and the notices for an app that is told of them.
 type Listed = (Vec<[u8; 16]>, Option<Vec<NoticeKey>>);
 
-/// A phone's wake-ups for agents' notices: what its held call last told it, and when a change of
+/// How many answers before the last one the hub keeps for a phone, to know what it names as told.
+const EARLIER_KEPT: usize = 4;
+
+/// A phone's wake-ups for agents' notices: what its held calls last told it, and when a change of
 /// the notices last ended one, and for which boxes.
 #[derive(Default)]
 pub struct Agents {
     pub(super) told: Vec<NoticeKey>,
+    /// The answers before `told`, the newest first. A phone that gave up on a call (the app does at
+    /// each start) or lost its answer names one of these as what it was told.
+    earlier: VecDeque<Vec<NoticeKey>>,
     last: Option<Instant>,
     /// Each box a notice of which ended a held call within the window: when, and the machine,
     /// workspace and box.
@@ -592,6 +593,23 @@ pub struct Agents {
 }
 
 impl Agents {
+    /// Keeps `notices` as what the phone was last answered, and the answer before it among the
+    /// earlier ones.
+    pub(super) fn answered(&mut self, notices: Vec<NoticeKey>) {
+        if notices != self.told {
+            let before = std::mem::replace(&mut self.told, notices);
+            self.earlier.push_front(before);
+            self.earlier.truncate(EARLIER_KEPT);
+        }
+    }
+
+    /// The ids of the notices the phone was told, if `told` names one of the answers kept; else
+    /// none.
+    fn known(&self, told: Option<[u8; 32]>) -> Vec<[u8; 16]> {
+        let ids = |answer: &[NoticeKey]| answer.iter().map(|key| key.id).collect::<Vec<_>>();
+        std::iter::once(&self.told).chain(&self.earlier).map(|answer| ids(answer)).find(|ids| wire::seen_of(ids) == told).unwrap_or_default()
+    }
+
     /// The notices an answer that ends for another reason (a request, the hold's end, a newer call)
     /// tells the phone of, out of those `listed`: each one if the change from `told` may end a call
     /// now (counted, as `wake` says), else only those it was told already. So a notice the limits
@@ -600,24 +618,25 @@ impl Agents {
         if wire::seen_of(&listed.iter().map(|key| key.id).collect::<Vec<_>>()) == told || self.wake(told, &listed, limits, now) {
             return listed;
         }
-        let known = known(&self.told, told);
-        listed.into_iter().filter(|key| known.iter().any(|old| old.id == key.id)).collect()
+        let known = self.known(told);
+        listed.into_iter().filter(|key| known.contains(&key.id)).collect()
     }
 
     /// Whether the change from what the phone says it was told, `told`, to the notices `listed` may
     /// end its held call now, counted if so. Not within `gap` of the last. A change that adds no
     /// notice may; one that adds notices may if any of them is of a box and a machine under their
     /// counts in the window, and counts once for each such box. The phone's notices are known from
-    /// what the hub last answered it, if `told` is that; else every notice listed counts as new.
+    /// the answer of the hub's that `told` names, of the last few; else every notice listed counts
+    /// as new.
     pub fn wake(&mut self, told: Option<[u8; 32]>, listed: &[NoticeKey], limits: &AgentLimits, now: Instant) -> bool {
         if self.last.is_some_and(|last| now.duration_since(last) < limits.gap) {
             return false;
         }
         self.woke.retain(|(at, ..)| now.duration_since(*at) < limits.window);
-        let known = known(&self.told, told);
+        let known = self.known(told);
         let mut boxes: Vec<(&str, &str, &str)> = Vec::new();
         let mut added = false;
-        for key in listed.iter().filter(|key| !known.iter().any(|old| old.id == key.id)) {
+        for key in listed.iter().filter(|key| !known.contains(&key.id)) {
             added = true;
             let named = (key.machine.as_str(), key.ws.as_str(), key.box_name.as_str());
             let of_box = self.woke.iter().filter(|(_, machine, ws, box_name)| (machine.as_str(), ws.as_str(), box_name.as_str()) == named).count();

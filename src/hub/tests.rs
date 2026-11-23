@@ -1900,6 +1900,25 @@ fn an_agent_s_notice_never_delays_a_request() {
 }
 
 #[test]
+fn a_notice_told_in_an_answer_the_phone_lost_is_still_told_when_the_limits_hold_back_another() {
+    let hub = start_now();
+    let server = paired_machine(&hub, "server-1");
+    let pixel = paired_phone(&hub, "pixel");
+    let records = [notice("server-1", "acme", "dev", 1), notice("server-1", "acme", "web", 2)];
+    open_notices(&hub, &server, &records[..1], &["pixel"]);
+    assert_eq!(wait_both(&hub, &pixel.token, &[], &[]), (200, both(&[], &[[1; 16]])));
+    // Once the gap is over a second notice ends a call at once, but the phone never reads that
+    // answer: it gave up on the call (the app does at each start) or the line dropped.
+    thread::sleep(AGENT_GAP);
+    open_notices(&hub, &server, &records, &["pixel"]);
+    assert_eq!(wait_both(&hub, &pixel.token, &[], &[[1; 16]]), (200, both(&[], &[[1; 16], [2; 16]])));
+    // Its next call names what it was told before. A request ends it within the gap: the notice
+    // the phone was told is still listed, so its agent notification stays up.
+    let (reply, _) = held(|| wait_both(&hub, &pixel.token, &[], &[[1; 16]]), || post(&hub, &server, "acme", 7));
+    assert_eq!(reply, (200, both(&[[7; 16]], &[[1; 16]])));
+}
+
+#[test]
 fn a_notice_the_limits_hold_back_is_not_told_when_the_hold_ends() {
     let hub = start_with_agents(AgentLimits { gap: Duration::ZERO, per_box: 1, ..AGENT_LIMITS });
     let server = paired_machine(&hub, "server-1");
