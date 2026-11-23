@@ -162,8 +162,13 @@ enum Cmd {
         #[arg(last = true, required = true, value_name = "CMD")]
         command: Vec<String>,
     },
-    /// Serve agents over MCP (stdio): requests and site tools, credentials added by halti
-    Mcp,
+    /// Serve agents over MCP (stdio): requests and site tools, credentials added by halti. Offers no site without --all
+    #[command(after_help = "An agent that works for one client uses that client's workspace instead: halti ws mcp WS.")]
+    Mcp {
+        /// Offer every site in the Keychain whose policy is approved
+        #[arg(long)]
+        all: bool,
+    },
     /// Show what agents did through `halti mcp` (never values); --verify checks nothing was altered
     Audit {
         /// How many of the latest entries to show
@@ -1069,7 +1074,7 @@ fn source_for(cmd: &Cmd) -> Option<source::Source> {
         | Cmd::Rm { .. }
         | Cmd::Copy { .. }
         | Cmd::Run { .. }
-        | Cmd::Mcp
+        | Cmd::Mcp { .. }
         | Cmd::Audit { .. }
         | Cmd::Reseal { .. }
         | Cmd::Box { .. } => Some(source::Source::keychain()),
@@ -1121,7 +1126,7 @@ fn run() -> ExitCode {
         Cmd::Rm { resource, field } => ok(cmd_rm(&resource, field)),
         Cmd::Copy { resource, field } => ok(cmd_copy(&resource, &field)),
         Cmd::Run { resources, command } => cmd_run(resources, command),
-        Cmd::Mcp => ok(mcp::serve()),
+        Cmd::Mcp { all } => ok(mcp::serve(all)),
         Cmd::Audit { last, verify } => ok(audit::show(last, verify)),
         Cmd::Reseal { resources } => ok(cmd_reseal(resources)),
         Cmd::Box { action } => match action {

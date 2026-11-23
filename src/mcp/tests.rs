@@ -85,10 +85,20 @@ fn a_rotating_session_survives_with_the_real_runner() {
 }
 
 #[test]
+fn halti_mcp_without_all_offers_no_site_and_says_how_to_get_one() {
+    let server = Server::start(Scope::nothing());
+    assert!(server.sites.is_empty() && server.tools.is_empty() && server.browsable.is_empty());
+    let names: Vec<String> = server.list().iter().map(|tool| tool["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names, ["sites", "fetch"]);
+    assert!(server.scope.none.contains("`halti ws mcp WS`") && server.scope.none.contains("`halti mcp --all`"), "{}", server.scope.none);
+    assert_eq!(Scope::all().none, NO_SITES);
+}
+
+#[test]
 fn a_question_names_the_workspace_or_the_workspace_s_box_it_comes_from() {
     assert_eq!(Scope::workspace("acme").asking(), "workspace acme: ");
     assert_eq!(Scope::boxed("acme/dev", &[], None).asking(), "box acme/dev: ");
-    for scope in [Scope::all(), Scope::boxed("research", &[], None)] {
+    for scope in [Scope::all(), Scope::nothing(), Scope::boxed("research", &[], None)] {
         assert_eq!(scope.asking(), "");
     }
 }

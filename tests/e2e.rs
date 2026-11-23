@@ -104,8 +104,9 @@ impl Env {
         assert!(out.status.success(), "approve failed: {}", text(&out.stderr));
     }
 
+    /// `halti mcp --all`: every site in the Keychain.
     fn mcp(&self) -> Mcp {
-        Mcp::start(self.command().arg("mcp"))
+        Mcp::start(self.command().args(["mcp", "--all"]))
     }
 }
 
@@ -691,6 +692,23 @@ fn mcp_handshake_and_tool_list() {
 }
 
 #[test]
+fn mcp_without_all_offers_no_site_and_says_how_to_get_one() {
+    let env = Env::new();
+    let site = Site::start();
+    env.store("app", "token", TOKEN);
+    env.policy("app", &fetch_policy(&site));
+
+    let mut mcp = Mcp::start(env.command().arg("mcp"));
+    mcp.handshake();
+    assert_eq!(mcp.tool_names(), ["sites", "fetch"], "an approved site in the Keychain is not offered");
+    let (is_error, sites) = mcp.call("sites", json!({}));
+    assert!(!is_error && sites.contains("`halti ws mcp WS`") && sites.contains("`halti mcp --all`") && !sites.contains("app:"), "{sites}");
+    let (is_error, reply) = mcp.call("fetch", json!({ "site": "app", "method": "GET", "url": site.url("/echo") }));
+    assert!(is_error && reply.contains("unknown site app"), "{reply}");
+    assert!(site.seen().is_empty(), "{:?}", site.seen());
+}
+
+#[test]
 fn mcp_fetch_adds_credentials_and_masks_the_response() {
     let env = Env::new();
     let site = Site::start();
@@ -747,7 +765,7 @@ fn mcp_asks_for_consent_and_for_writes() {
     let get = json!({ "site": "app", "method": "GET", "url": site.url("/echo") });
 
     // The default policy asks for Touch ID when an agent first uses the site; refused here.
-    let mut mcp = Mcp::start(env.command().arg("mcp").env("HALTI_TEST_APPROVE", "no"));
+    let mut mcp = Mcp::start(env.command().args(["mcp", "--all"]).env("HALTI_TEST_APPROVE", "no"));
     mcp.handshake();
     let (is_error, reply) = mcp.call("fetch", get.clone());
     assert!(is_error && reply.contains("not approved"), "{reply}");
@@ -756,7 +774,7 @@ fn mcp_asks_for_consent_and_for_writes() {
     let policy = format!("[agent]\nconsent = \"none\"\n[fetch]\nhosts = [\"{}\"]\nwrites = \"ask\"\n", site.origin());
     env.policy("app", &policy);
     let post = json!({ "site": "app", "method": "POST", "url": site.url("/echo"), "body": "{}" });
-    let mut refused = Mcp::start(env.command().arg("mcp").env("HALTI_TEST_APPROVE", "no"));
+    let mut refused = Mcp::start(env.command().args(["mcp", "--all"]).env("HALTI_TEST_APPROVE", "no"));
     refused.handshake();
     assert!(!refused.call("fetch", get).0, "reads need no consent here");
     let (is_error, reply) = refused.call("fetch", post.clone());
@@ -3352,7 +3370,7 @@ fn browser_opens_a_page_signed_in_and_masks_it() {
     let runner = env::var("HALTI_RUNNER_DIR").unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("runner").display().to_string());
     // The test's HOME is empty, so Playwright must be told where the real one keeps Chromium.
     let browsers = env::var("PLAYWRIGHT_BROWSERS_PATH").unwrap_or_else(|_| format!("{}/Library/Caches/ms-playwright", env::var("HOME").unwrap()));
-    let mut mcp = Mcp::start(env.command().arg("mcp").env("HALTI_RUNNER_DIR", runner).env("PLAYWRIGHT_BROWSERS_PATH", browsers));
+    let mut mcp = Mcp::start(env.command().args(["mcp", "--all"]).env("HALTI_RUNNER_DIR", runner).env("PLAYWRIGHT_BROWSERS_PATH", browsers));
     mcp.handshake();
     assert!(mcp.tool_names().contains(&"browse_open".to_string()));
 

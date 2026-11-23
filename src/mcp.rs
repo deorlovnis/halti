@@ -107,12 +107,26 @@ pub struct Scope {
     browser: Option<Arc<dyn BoxBrowser>>,
     /// The workspace an agent outside a box uses (`halti ws mcp`), named in its questions.
     workspace: Option<String>,
+    /// What `sites` says when no site is offered.
+    none: &'static str,
 }
 
+/// What `sites` says when no policy is approved.
+const NO_SITES: &str = "No sites are available: none has an approved policy.";
+
+/// What `sites` says to an agent of `halti mcp` without --all.
+const NOTHING_HERE: &str = "No sites are offered here: this halti mcp serves no workspace. The person can serve one \
+with `halti ws mcp WS`, or every site in the Keychain with `halti mcp --all`.";
+
 impl Scope {
-    /// `halti mcp`: every approved site, each asking for consent as its policy says.
+    /// `halti mcp --all`: every approved site, each asking for consent as its policy says.
     pub fn all() -> Self {
-        Self { sites: None, consented: false, box_name: None, browser: None, workspace: None }
+        Self { sites: None, consented: false, box_name: None, browser: None, workspace: None, none: NO_SITES }
+    }
+
+    /// `halti mcp`: no site, as anywhere outside a workspace.
+    pub fn nothing() -> Self {
+        Self { sites: Some(Vec::new()), none: NOTHING_HERE, ..Self::all() }
     }
 
     /// `halti ws mcp WS`: every site whose policy is approved in workspace `ws`, which the process
@@ -123,7 +137,7 @@ impl Scope {
 
     /// A box's connection: only its sites, and consent already given by the box run's Touch ID.
     pub fn boxed(name: &str, sites: &[String], browser: Option<Arc<dyn BoxBrowser>>) -> Self {
-        Self { sites: Some(sites.to_vec()), consented: true, box_name: Some(name.to_string()), browser, workspace: None }
+        Self { sites: Some(sites.to_vec()), consented: true, box_name: Some(name.to_string()), browser, workspace: None, none: NO_SITES }
     }
 
     /// What a question about a write or a consent starts with: a workspace's box (`acme/dev`, the
@@ -138,8 +152,15 @@ impl Scope {
     }
 }
 
-pub fn serve() -> Result<()> {
-    serve_io(BufReader::new(io::stdin()), io::stdout().lock(), Scope::all())
+/// `halti mcp`, on standard input and output: every site in the Keychain with `all`, else none.
+pub fn serve(all: bool) -> Result<()> {
+    let scope = if all {
+        Scope::all()
+    } else {
+        eprintln!("halti mcp: offering no sites. serve a workspace's with: halti ws mcp WS, or every site in the Keychain with: halti mcp --all");
+        Scope::nothing()
+    };
+    serve_io(BufReader::new(io::stdin()), io::stdout().lock(), scope)
 }
 
 /// Serve MCP (one JSON-RPC message per line) until the reader ends.
@@ -583,7 +604,7 @@ impl Server {
             }
         }
         if out.is_empty() {
-            out = "No sites are available: none has an approved policy.".into();
+            out = self.scope.none.into();
         }
         out
     }

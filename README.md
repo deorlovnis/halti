@@ -115,7 +115,7 @@ halti run -s github -- gh api user           # if the policy allows: exported fi
 halti ls                                     # one row per resource, with a summary of its policy
 halti info github                            # fields, expiry, refresh, and what the approved policy allows
 halti check                                  # expired / expiring within 14 days
-halti audit                                  # what agents did through halti mcp (never values)
+halti audit                                  # what agents did through halti mcp --all (never values)
 ```
 
 `halti copy RES FIELD` asks for Touch ID. `halti describe RES` edits the link and description, and `halti rm RES [FIELD]` deletes. `halti --help` lists everything.
@@ -360,10 +360,10 @@ claude mcp add --scope project halti -- /usr/local/bin/halti ws mcp acme
 
 `halti ws mcp acme` asks nothing and holds no secret: the terminal where acme is open serves the agent, with the sites whose policies are approved in acme, until the agent ends or acme closes. While acme isn't open it says so and serves nothing. Two workspaces open at once serve their own agents side by side, and neither sees the other's sites. Consents and writes that ask name the workspace (`workspace acme: ...`), and each call is written to acme's audit log, `WSDIR/boxes/audit.log`.
 
-For the sites in the Keychain:
+Plain `halti mcp` offers no site, so a session started anywhere else sees no client's. Until your secrets have moved into workspaces, the Keychain's are offered with `--all`:
 
 ```sh
-claude mcp add --scope user halti -- /usr/local/bin/halti mcp
+claude mcp add --scope user halti -- /usr/local/bin/halti mcp --all
 ```
 
 The agent gets these tools:
