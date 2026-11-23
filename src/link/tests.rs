@@ -1301,6 +1301,85 @@ fn a_question_reaches_the_phone_sealed_and_its_answer_comes_back_with_a_receipt(
 }
 
 #[test]
+fn a_question_past_the_most_the_hub_holds_for_the_machine_is_answered_nobody_whichever_workspace_asks() {
+    use crate::notices::{Event, Kind as Wait};
+    let mut world = World::new();
+    world.open_asking("acme");
+    world.open_asking("beta");
+    let pixel = world.hub.pair_phone("pixel", &["acme", "beta"]);
+    world.trust(&pixel, &["acme", "beta"]);
+    let idle = crate::fields::join(&[&[0, 0, 0, 0], b"done"]);
+    // As many as the hub holds wait in acme, and the phone has them all.
+    let acme = world.keeper("acme").desk.clone();
+    let run = |n: usize| RunId([n as u8 / 3 + 1; 8]);
+    let mut held = Vec::new();
+    for n in 0..crate::hub::QUESTIONS_MAX {
+        acme.set_away(run(n), Some(requests::now_secs() + 3600));
+        let (asker, idle) = (acme.asker(&format!("b{}", n / 3), run(n)), idle.clone());
+        held.push(thread::spawn(move || asker.ask(Event::Waiting(Wait::TurnEnded), format!("s{n}").as_bytes(), &idle, &|| false)));
+    }
+    let questions = || world.hub.call("GET", "/v1/questions", Some(&pixel.token), None).1["questions"].as_array().unwrap().len();
+    until("the phone lists them all", || questions() == crate::hub::QUESTIONS_MAX);
+    // One more, in beta, which has room of its own: the hub can't take it, so it is answered
+    // nobody, and its notice tells the phone.
+    let beta = world.keeper("beta").desk.clone();
+    let late = RunId([99; 8]);
+    beta.set_away(late, Some(requests::now_secs() + 3600));
+    let asker = beta.asker("web", late);
+    let started = Instant::now();
+    assert!(matches!(asker.ask(Event::Waiting(Wait::TurnEnded), b"s", &idle, &|| false), requests::Asked::Nobody));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(beta.questions().is_empty());
+    assert_eq!(beta.notices().len(), 1);
+    // Those the phone has keep their places.
+    assert_eq!(acme.questions().len(), crate::hub::QUESTIONS_MAX);
+    assert_eq!(questions(), crate::hub::QUESTIONS_MAX);
+    acme.close();
+    for held in held {
+        assert!(matches!(held.join().unwrap(), requests::Asked::Nobody));
+    }
+}
+
+#[test]
+fn a_question_a_hub_of_before_questions_can_t_carry_is_answered_nobody_and_its_notice_stays() {
+    use crate::notices::{Event, Kind as Wait};
+    let pixel = Phone::new("pixel");
+    let (signing, agreement) = (pixel.signing_key(), pixel.agreement_key());
+    let signature = hex(&pixel.sign(&wire::keys_bytes(&signing, &agreement)));
+    let listed = json!({"name": "pixel", "signing_key": hex(&signing), "agreement_key": hex(&agreement), "key_signature": signature, "ws": ["acme"]});
+    let dir = Short::new();
+    let socket = dir.0.join("acme.keep.sock");
+    let faked = Faked::new(vec![(WsName::parse("acme").unwrap(), Some(socket))]);
+    // A hub of before questions: it takes the report and the notices, and has no questions' path.
+    faked.hub.answer("/v1/machine/state", 200, &json!({"devices": [listed], "missing": []}).to_string());
+    faked.hub.answer("/v1/machine/notices", 200, r#"{"missing": []}"#);
+    faked.folder.keep_machine_key().unwrap();
+    let entry = Entry { name: "pixel".into(), signing_key: hex(&signing), agreement_key: hex(&agreement), key_signature: signature, ws: vec![WsName::parse("acme").unwrap()] };
+    faked
+        .folder
+        .change_trust(|entries| {
+            entries.push(entry);
+            ((), true)
+        })
+        .unwrap();
+    let desk = Desk::with_phones(MACHINE.into(), "acme".into(), sent_at_once(), Arc::new(Nobody), Box::new(requests::LinkFiles(faked.folder.clone())));
+    let keeper = Keeper::start_with(&dir.0, &faked.folder, "acme", desk);
+    let run = RunId([3; 8]);
+    keeper.desk.set_away(run, Some(requests::now_secs() + 3600));
+    let asker = keeper.desk.asker("dev", run);
+    let idle = crate::fields::join(&[&[0, 0, 0, 0], b"done"]);
+    let started = Instant::now();
+    assert!(matches!(asker.ask(Event::Waiting(Wait::TurnEnded), b"s", &idle, &|| false), requests::Asked::Nobody));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(!faked.hub.sent("/v1/machine/questions").is_empty(), "the link asked the hub to take it");
+    // The agent's own prompt shows, and the phone is told of the wait by its notice.
+    assert!(keeper.desk.questions().is_empty());
+    let notices = keeper.desk.notices();
+    let [(record, said)] = &notices[..] else { panic!("its notice") };
+    assert_eq!((crate::notices::Notice::decode(record).unwrap().kind, said.is_empty()), (Wait::TurnEnded, true));
+}
+
+#[test]
 fn a_reply_from_a_phone_not_trusted_here_gets_no_receipt() {
     let mut world = World::new();
     world.open_asking("acme");

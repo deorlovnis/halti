@@ -95,6 +95,9 @@ pub(super) enum State {
     },
     /// Withdrawn or expired; with the reason its notice comes back with, if the agent still waits.
     Closed(Option<Reason>),
+    /// The link couldn't give it to the hub: answered nobody, as one past the cap is. Its notice,
+    /// open beside it, stays.
+    Unposted,
 }
 
 /// A question that waits for its answer.
@@ -310,6 +313,12 @@ impl Desk {
                         let reply = if form == Form::Stopped { crate::notices::NOBODY.as_bytes().to_vec() } else { questions::reply(form, &content) };
                         Asked::Answered { reply, line }
                     }
+                    State::Unposted => {
+                        drop(table);
+                        self.changed.notify_all();
+                        say(&format!("question {}: the hub can't take it, so it is answered here: back to its terminal", id.short()));
+                        Asked::Nobody
+                    }
                     State::Closed(reason) => {
                         if let Some(reason) = reason {
                             let away = table.away.get(&record.run).is_some_and(|until| *until > now_secs());
@@ -370,6 +379,18 @@ impl Desk {
         drop(table);
         self.changed.notify_all();
         out
+    }
+
+    /// The link couldn't give the hub questions `ids`: more wait on this machine than the hub holds,
+    /// or the hub carries no questions. Each that still waits is answered nobody, as one past the
+    /// cap is: Claude Code shows its own prompt, and the wait's notice tells the phone.
+    pub fn unposted(&self, ids: &[Id]) {
+        let mut table = self.table();
+        for pending in table.questions.iter_mut().filter(|pending| pending.waiting() && ids.contains(&pending.record.id)) {
+            pending.state = State::Unposted;
+        }
+        drop(table);
+        self.changed.notify_all();
     }
 
     /// The whole records of the questions that wait, their sealed fields in the clear: for

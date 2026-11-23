@@ -46,6 +46,7 @@
 //!         | "halti-keep/2 here " WS " " ID " " FORM " " (HEX | "-") "\n"
 //!         | "halti-keep/2 reply " WS " " DEVICE " " ID " " SEALED "\n"
 //!         | "halti-keep/2 marks " WS "\n"                     the runs marked away
+//!         | "halti-keep/2 unposted " WS " " ID *("," ID) "\n"  questions the hub can't take
 //! reply   = *("halti-keep/2 request " HEX "\n") "halti-keep/2 end\n"
 //!         | *("halti-keep/2 notice " HEX [" " HEX] "\n") "halti-keep/2 end\n"
 //!         | *("halti-keep/2 question " HEX "\n" *("halti-keep/2 copy " DEVICE " " HEX "\n"))
@@ -76,8 +77,11 @@
 //! `halti requests`: the question's 32 hex characters of id, the form, and its content in hex, `-`
 //! for none. `reply` is a phone's sealed answer, as the link hands it on; both are answered with
 //! the outcome's word (`questions::Outcome`), and a reply with the receipt sealed to that phone,
-//! unless the phone isn't trusted here at all. A line about questions may be 8 KiB long, and an
-//! answer to one 32 KiB.
+//! unless the phone isn't trusted here at all. `unposted` names the questions, at most as many as
+//! may wait in one workspace, that the link can't give to the hub: more wait on this machine than
+//! the hub holds, or the hub carries no questions. Each is answered nobody, as one past the cap
+//! is, and it is answered `end`. A line about questions may be 8 KiB long, and an answer to one 32
+//! KiB.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -381,6 +385,8 @@ pub enum Records {
     Reply { ws: WsName, device: String, id: Id, sealed: Vec<u8> },
     /// Say every run marked away.
     Marks(WsName),
+    /// The link can't give the hub these questions: each is answered nobody.
+    Unposted { ws: WsName, ids: Vec<Id> },
 }
 
 /// A device's signature as a line carries it: 1 to 72 bytes.
@@ -402,7 +408,8 @@ impl Records {
             | Records::Asked(ws)
             | Records::Here { ws, .. }
             | Records::Reply { ws, .. }
-            | Records::Marks(ws) => ws,
+            | Records::Marks(ws)
+            | Records::Unposted { ws, .. } => ws,
         }
     }
 
@@ -426,6 +433,10 @@ impl Records {
             }
             Records::Reply { ws, device, id, sealed } => format!("{RECORDS} reply {ws} {device} {} {}\n", id.hex(), util::hex(sealed)),
             Records::Marks(ws) => format!("{RECORDS} marks {ws}\n"),
+            Records::Unposted { ws, ids } => {
+                let ids: Vec<String> = ids.iter().map(Id::hex).collect();
+                format!("{RECORDS} unposted {ws} {}\n", ids.join(","))
+            }
         }
     }
 
@@ -463,6 +474,10 @@ impl Records {
             ["questions", ws] => Some(Records::Questions(WsName::parse(ws).ok()?)),
             ["asked", ws] => Some(Records::Asked(WsName::parse(ws).ok()?)),
             ["marks", ws] => Some(Records::Marks(WsName::parse(ws).ok()?)),
+            ["unposted", ws, ids] => {
+                let ids: Vec<Id> = ids.split(',').map(|id| Some(Id(util::unhex(id)?.try_into().ok()?))).collect::<Option<_>>()?;
+                (ids.len() <= crate::requests::QUESTIONS_PER_DESK).then_some(Records::Unposted { ws: WsName::parse(ws).ok()?, ids })
+            }
             ["here", ws, id, form, content] => Some(Records::Here {
                 ws: WsName::parse(ws).ok()?,
                 id: Id(util::unhex(id)?.try_into().ok()?),
@@ -1045,6 +1060,8 @@ mod tests {
             Records::Here { ws: acme(), id: Id([1; 16]), form: Form::Yes, content: Vec::new() },
             Records::Here { ws: acme(), id: Id([1; 16]), form: Form::Text, content: b"run the tests".to_vec() },
             reply.clone(),
+            Records::Unposted { ws: acme(), ids: vec![Id([1; 16])] },
+            Records::Unposted { ws: acme(), ids: vec![Id([2; 16]); crate::requests::QUESTIONS_PER_DESK] },
         ] {
             let line = records.line();
             assert_eq!(Records::parse(line.strip_suffix('\n').unwrap()), Some(records), "{line}");
@@ -1075,6 +1092,10 @@ mod tests {
             &format!("halti-keep/2 reply acme Pixel {} 04", "01".repeat(16)),
             &format!("halti-keep/2 reply acme pixel {} -", "01".repeat(16)),
             "halti-keep/2 questions",
+            "halti-keep/2 unposted acme ",
+            &format!("halti-keep/2 unposted acme {},", "01".repeat(16)),
+            &format!("halti-keep/2 unposted acme {}", "01".repeat(15)),
+            &format!("halti-keep/2 unposted acme {}", vec!["01".repeat(16); crate::requests::QUESTIONS_PER_DESK + 1].join(",")),
         ] {
             assert_eq!(Records::parse(line), None, "{line}");
         }

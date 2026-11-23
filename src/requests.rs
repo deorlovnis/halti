@@ -44,9 +44,9 @@
 
 mod asked;
 
-pub use asked::{Asked, LinkFiles, Phones};
 #[cfg(test)]
-pub use asked::{NoPhones, PER_DESK as QUESTIONS_PER_DESK};
+pub use asked::NoPhones;
+pub use asked::{Asked, LinkFiles, PER_DESK as QUESTIONS_PER_DESK, Phones};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -983,6 +983,10 @@ pub fn told(desk: &Arc<Desk>, trust: Trust, boxes: &dyn Runs, records: &Records)
             lines
         }
         Records::Asked(_) => desk.asked().into_iter().map(Told::Asked).chain([Told::End]).collect(),
+        Records::Unposted { ids, .. } => {
+            desk.unposted(ids);
+            vec![Told::End]
+        }
         Records::Marks(_) => {
             let running = boxes.runs();
             let marks = desk.marks();

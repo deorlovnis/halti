@@ -15,7 +15,10 @@
 //!   of agents in runs marked away come sealed already from the open workspace, which alone can
 //!   read them (`crate::questions`): it names them to the hub, with the phones each is sealed to,
 //!   and posts each copy the hub lacks. So a question asked while the hub can't be reached is
-//!   posted when it can.
+//!   posted when it can. One the hub can't take, past the most it holds for this machine (those it
+//!   was told of keep their places) or as it carries no questions, is given back to its open
+//!   workspace, which answers it nobody: the agent's own prompt shows, and its notice tells the
+//!   phone.
 //! - **Inbox.** It holds one call to the hub that waits for what phones sent this machine: signed
 //!   answers and stops, and sealed answers to questions. Each goes to the open workspace it names,
 //!   which checks it, and what came of it is said to the hub with the next call, with the receipt
@@ -236,6 +239,9 @@ pub struct Link<'a> {
     /// Each open notice the hub was given, with the devices, by name and second key, it was
     /// sealed to then. When those change it is given again.
     posted: Mutex<HashMap<[u8; 16], Devices>>,
+    /// The questions the hub was last told of, by id: they keep their places when more wait than
+    /// it takes.
+    told_questions: Mutex<Vec<[u8; 16]>>,
 }
 
 /// A question that waits: its clear fields read, their bytes, and a copy for each phone.
@@ -268,6 +274,7 @@ pub fn run(folder: &Folder, local: &dyn Local, timing: Timing, stop: &AtomicBool
         handled: Mutex::default(),
         sealed: Mutex::default(),
         posted: Mutex::default(),
+        told_questions: Mutex::default(),
     };
     thread::scope(|scope| {
         let link = &link;
@@ -499,10 +506,6 @@ impl Link<'_> {
                 }
                 for (bytes, copies) in keep::questions(&socket, &ws, KEEPER_WAIT).and_then(Result::ok).unwrap_or_default() {
                     let Some(record) = questions::Record::decode(&bytes).filter(|record| record.ws == ws.as_str() && record.machine == name) else { continue };
-                    if asked.len() == QUESTIONS_MAX {
-                        self.note_once(format!("more than {QUESTIONS_MAX} agents ask: the hub is told of {QUESTIONS_MAX}"));
-                        break;
-                    }
                     asked.push((record, bytes, copies));
                 }
                 if let Some(Ok(running)) = keep::runs(&socket, &ws, KEEPER_WAIT) {
@@ -528,7 +531,39 @@ impl Link<'_> {
             self.note_once("this machine's report is longer than the hub takes: it names fewer requests, and the rest are answered here".to_string());
         }
         *locked(&self.ids) = ids;
+        self.cap_questions(&mut asked);
         Look { state: state(&records), records, notices, questions: asked, trust }
+    }
+
+    /// Keeps as many questions as the hub holds for this machine, those it was told of first, and
+    /// gives the rest back: one past the cap is answered nobody, whichever workspace it is of.
+    fn cap_questions(&self, asked: &mut Vec<Asking>) {
+        if asked.len() <= QUESTIONS_MAX {
+            return;
+        }
+        let told = locked(&self.told_questions).clone();
+        asked.sort_by_key(|(record, _, _)| !told.contains(&record.id.0));
+        let over = asked.split_off(QUESTIONS_MAX);
+        self.note_once(format!("more than {QUESTIONS_MAX} agents ask: the hub takes {QUESTIONS_MAX}, and the rest are answered at their terminals"));
+        self.give_back(over.iter().map(|(record, _, _)| record));
+    }
+
+    /// Gives questions back to their open workspaces, which answer each nobody: the hub can't take
+    /// them.
+    fn give_back<'q>(&self, records: impl Iterator<Item = &'q questions::Record>) {
+        let mut by_ws: Vec<(WsName, Vec<Id>)> = Vec::new();
+        for record in records {
+            let Ok(ws) = WsName::parse(&record.ws) else { continue };
+            match by_ws.iter_mut().find(|(named, _)| *named == ws) {
+                Some((_, ids)) => ids.push(record.id),
+                None => by_ws.push((ws, vec![record.id])),
+            }
+        }
+        for (ws, mut ids) in by_ws {
+            let Some(socket) = self.keeper(&ws) else { continue };
+            ids.truncate(crate::requests::QUESTIONS_PER_DESK);
+            keep::tell(&socket, &Records::Unposted { ws, ids }, KEEPER_WAIT);
+        }
     }
 
     /// Reports what `look` saw, posts the requests the hub lacks, and keeps the trust list to the
@@ -570,11 +605,13 @@ impl Link<'_> {
             Err(Failed::Refused(404, _)) => {
                 if !look.questions.is_empty() {
                     self.note_once("the hub carries no questions of agents: it runs an older halti, so they are answered here".to_string());
+                    self.give_back(look.questions.iter().map(|(record, _, _)| record));
                 }
                 return Ok(());
             }
             Err(failed) => return Err(failed),
         };
+        *locked(&self.told_questions) = look.questions.iter().map(|(record, _, _)| record.id.0).collect();
         let missing = reply["missing"].as_array().map(Vec::as_slice).unwrap_or_default();
         for wanted in missing {
             let (Some(id), Some(device)) = (wanted["id"].as_str().and_then(wire::unhex::<16>), wanted["device"].as_str()) else { continue };
@@ -585,7 +622,8 @@ impl Link<'_> {
                 Ok(_) | Err(Failed::Refused(410, _)) => {}
                 Err(Failed::Refused(429, _)) => {
                     self.say_once("the hub holds as many of this machine's questions as it takes: the rest are answered here");
-                    break;
+                    let given = look.questions.iter().map(|(record, _, _)| record).filter(|record| record.id.0 == id);
+                    self.give_back(given);
                 }
                 Err(failed) => return Err(failed),
             }
