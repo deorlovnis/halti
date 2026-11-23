@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use halti_core::sealed::{self, AgreementKey, Kind, ReplyKey};
 use jiff::SignedDuration;
 use serde_json::Value;
 
@@ -335,6 +336,39 @@ fn trust_takes_the_fingerprint_and_shows_the_machine_code_the_phone_computes() {
     world.start_link();
     world.trust(&phone, &["acme"]);
     assert_eq!(world.folder.trust().unwrap()[0].signing_key, entry.signing_key);
+}
+
+#[test]
+fn text_is_sealed_with_the_keys_of_the_join_and_the_trust() {
+    let world = World::new();
+    let phone = world.hub.pair_phone("pixel", &["acme"]);
+    world.trust(&phone, &["acme"]);
+    // The machine key `hub join` made, and the second key `devices trust` kept: nothing is paired,
+    // joined or trusted again.
+    let machine = world.folder.sealing_key().unwrap().unwrap();
+    assert_eq!(machine.public().spki().to_vec(), world.folder.machine_key().unwrap().unwrap().subject_public_key_info());
+    let entry = world.folder.trust().unwrap().remove(0);
+    let second = entry.second_key().unwrap();
+    assert_eq!(second.spki().to_vec(), phone.agreement_key());
+    // The phone has the machine key as the hub passed it on, which it compared.
+    until("the hub reports the machine", || phone.state(&world.hub)["machines"].as_array().unwrap().len() == 1);
+    let compared = AgreementKey::from_spki(&util::unhex(phone.state(&world.hub)["machines"][0]["key"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(compared, machine.public());
+    // A question opens on the phone, under that key.
+    let clear = b"halti-question-v1 server-1 acme dev";
+    let question = sealed::seal(Kind::Question, &machine, &second, clear, b"Run the tests?", &util::random()).unwrap();
+    assert_eq!(sealed::open(Kind::Question, &phone.second_key(), &compared, clear, &question).unwrap().as_slice(), b"Run the tests?");
+    // Its answer goes to the question's reply key, which the machine key can't stand in for.
+    let reply = ReplyKey::make(&util::random());
+    let answer = sealed::seal(Kind::Answer, &phone.second_key(), &reply.public(), clear, b"yes", &util::random()).unwrap();
+    assert_eq!(reply.open(&second, clear, &answer).unwrap().as_slice(), b"yes");
+    assert_eq!(sealed::open(Kind::Answer, &machine, &second, clear, &answer).unwrap_err(), halti_core::refusal::Refusal::Unreadable);
+    // An entry whose signing key doesn't vouch for its second key gives none.
+    let other = Entry { agreement_key: hex(&Phone::new("x").agreement_key()), ..entry.clone() };
+    assert_eq!(other.second_key(), None);
+    // After a leave there is no machine key to seal with.
+    assert!(world.folder.leave().unwrap());
+    assert!(world.folder.sealing_key().unwrap().is_none());
 }
 
 // --- answers ---

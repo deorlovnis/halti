@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use halti_core::sealed::SecretKey;
 use jiff::{SignedDuration, Timestamp};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData, SigningKey};
 use serde_json::{Value, json};
@@ -298,6 +299,11 @@ impl Phone {
 
     pub fn agreement_key(&self) -> Vec<u8> {
         self.agreement.subject_public_key_info()
+    }
+
+    /// The private half of its second key, as the phone's keystore uses it to open sealed text.
+    pub fn second_key(&self) -> SecretKey {
+        SecretKey::from_pkcs8(&self.agreement.serialize_der()).unwrap()
     }
 
     pub fn fingerprint(&self) -> String {

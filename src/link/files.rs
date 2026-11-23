@@ -3,7 +3,8 @@
 //!
 //! - `machine-key.pem`: the machine key, a P-256 key for key agreement, as PKCS#8. `halti hub join`
 //!   makes it if there is none and keeps one that is there; only `halti hub leave` deletes it. The
-//!   hub and the phones know its public half; the link never reads it.
+//!   hub and the phones know its public half; the link never reads it. Text for a phone is sealed
+//!   with it (`sealing_key`) to the phone's second key, which `trusted.json` keeps.
 //! - `link.json`: the hub's address and pin, the name the hub knows this machine by, the machine
 //!   token, and a new token a renewal was sent for and not yet seen to work. `halti hub join`,
 //!   `halti hub leave` and the link change it one at a time under `link.lock`, and the link writes
@@ -22,11 +23,13 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use halti_core::device::{self, DeviceKey};
 use halti_core::ids::WsName;
+use halti_core::sealed::{AgreementKey, SecretKey};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::hub::wire;
 use crate::requests::Trusted;
@@ -76,6 +79,14 @@ impl Entry {
         device::check_agreement_key(&agreement).ok()?;
         key.verify(&wire::keys_bytes(&signing, &agreement), &util::unhex(&self.key_signature)?).ok()?;
         Some(Trusted { name: self.name.clone(), key, fingerprint: wire::fingerprint(&signing), ws: self.ws.iter().map(|ws| ws.to_string()).collect() })
+    }
+
+    /// Its second key, which text for it is sealed to, if its keys read and its signing key vouches
+    /// for this one.
+    #[cfg_attr(not(test), expect(dead_code, reason = "sealing a question is its first caller outside tests"))]
+    pub fn second_key(&self) -> Option<AgreementKey> {
+        self.trusted()?;
+        AgreementKey::from_spki(&util::unhex(&self.agreement_key)?).ok()
     }
 
     /// The workspaces it may answer for, as text.
@@ -163,6 +174,15 @@ impl Folder {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+
+    /// The machine key, if there is one, as text is sealed with: the same key from the same file.
+    #[cfg_attr(not(test), expect(dead_code, reason = "sealing a question is its first caller outside tests"))]
+    pub fn sealing_key(&self) -> Result<Option<SecretKey>> {
+        let Some(key) = self.machine_key()? else { return Ok(None) };
+        let der = Zeroizing::new(key.serialize_der());
+        let key = SecretKey::from_pkcs8(&der).map_err(|_| anyhow!("{} isn't a P-256 key in the form halti writes", self.file("machine-key.pem").display()))?;
+        Ok(Some(key))
     }
 
     /// The machine key that is there, or one made now; and whether it was made.
