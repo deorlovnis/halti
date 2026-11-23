@@ -32,8 +32,9 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a reconnect to a site that closed an idle connection may take.
 const RECONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// How long the connection to the site made at CONNECT is used for the first request; one older
-/// than this, as after a request that waited for its answer, is dialed again first.
-const FIRST_FRESH: Duration = Duration::from_secs(30);
+/// than this, as after a request that waited for its answer, is dialed again first. Short, since
+/// some sites close a connection nothing was sent on within 10 to 20 seconds.
+const FIRST_FRESH: Duration = Duration::from_secs(5);
 
 /// The guest's side once its TLS is ended: the session, and its socket, which a look while a
 /// request waits sets not to wait, for that one read.
