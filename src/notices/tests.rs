@@ -196,19 +196,36 @@ fn a_box_has_at_most_eight_open_and_each_run_numbers_its_sessions_from_one() {
 }
 
 #[test]
-fn numbers_are_never_given_twice_in_a_run_however_many_tags_come() {
+fn a_box_can_t_move_a_session_number_past_eight_however_many_tags_it_sends() {
     let start = Instant::now();
     let mut table = Table::default();
-    let mut seen = Vec::new();
-    for n in 0..200u32 {
+    // Eight open fill the box; a thousand more waits are refused and number nothing.
+    for n in 0..1008u32 {
+        tell(&mut table, Event::Waiting(Kind::TurnEnded), &n.to_be_bytes(), true, at(start, 0));
+    }
+    let numbers: Vec<u32> = table.due(start).iter().map(|open| open.session).collect();
+    assert_eq!(numbers, (1..=8).collect::<Vec<_>>());
+    // Each closed, then a thousand tags that each open one and close it: never past eight.
+    for n in 0..8u32 {
+        tell(&mut table, Event::Working, &n.to_be_bytes(), true, at(start, 0));
+    }
+    for n in 2000..3000u32 {
         let tag = n.to_be_bytes();
         tell(&mut table, Event::Waiting(Kind::TurnEnded), &tag, true, at(start, 0));
-        let session = table.due(start).into_iter().find(|open| open.session as usize == seen.len() + 1).map(|open| open.session);
-        seen.push(session.unwrap());
+        let due = table.due(start);
+        assert_eq!(due.len(), 1);
+        assert!((1..=8).contains(&due[0].session), "{}", due[0].session);
         tell(&mut table, Event::Working, &tag, true, at(start, 0));
     }
-    assert_eq!(seen, (1..=200).collect::<Vec<_>>());
-    assert!(table.runs[&RUN].tags.len() <= TAGS_KEPT, "the tags a run keeps are bounded");
+    // The tag the box picks last gets a small number all the same.
+    tell(&mut table, Event::Waiting(Kind::TurnEnded), b"x", true, at(start, 0));
+    assert!(table.due(start).iter().all(|open| (1..=8).contains(&open.session)));
+    assert!(table.runs[&RUN].tags.len() <= 8, "the tags a run keeps are bounded");
+    // Two open at once never share a number.
+    tell(&mut table, Event::Waiting(Kind::TurnEnded), b"y", true, at(start, 0));
+    let due = table.due(start);
+    assert_eq!(due.len(), 2);
+    assert_ne!(due[0].session, due[1].session);
 }
 
 #[test]

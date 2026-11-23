@@ -274,7 +274,7 @@
 //! | ws | the workspace's name |
 //! | box | the box's name, a name as a device's is |
 //! | run | the run id (8) |
-//! | session | the agent session's number in that run, from 1, 4 bytes big-endian |
+//! | session | the agent session's number in that run, 1 to 8, 4 bytes big-endian |
 //! | kind | `permission-prompt`, `question`, `turn-ended` or `needs-input` |
 //! | id | 16 bytes the machine drew for this notice |
 //! | since | when the wait began: seconds since 1970 by the machine's clock, 8 bytes big-endian |

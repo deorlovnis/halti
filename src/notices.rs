@@ -20,9 +20,11 @@
 //!
 //! The door knows which machine, workspace, box and run it serves; the box names none of them. The
 //! open workspace keeps a run's session tags on this machine and gives each a number of its own, 1,
-//! 2, 3 within the run, as it first waits. A notice's record carries that number, never the tag, and
-//! the text never reaches it: **no byte a box chose is in a notice**. What a box can choose is
-//! whether there is one, when, and which of four kinds it is.
+//! 2, 3 within the run, as its first notice opens: the smallest that no other tag of the run holds.
+//! Only as many tags of a run keep a number as a box may have notices open, so a number is never
+//! more than that, eight. A notice's record carries that number, never the tag, and the text never
+//! reaches it: **no byte a box chose is in a notice**. What a box can choose is whether there is
+//! one, when, and which of four kinds it is.
 //!
 //! The record, in the same fields, in this order and nothing else:
 //!
@@ -68,9 +70,6 @@ pub const TAG_MAX: usize = 16;
 pub const TEXT_MAX: usize = 8 * 1024;
 /// The longest ask: its four fields at their longest.
 pub const ASK_MAX: usize = 8 + ASK_LABEL.len() + 17 + TAG_MAX + TEXT_MAX;
-/// How many session tags of one run keep their numbers. Past that, the one used longest ago that
-/// has no notice open gives its place up.
-const TAGS_KEPT: usize = 64;
 
 /// What kind of wait a notice is: the box's claim.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -226,10 +225,10 @@ pub struct Open {
     due: Instant,
 }
 
-/// The session tags of one run, with their numbers and when each was last used.
+/// The session tags of one run that had a notice open, with their numbers and when each was last
+/// used.
 #[derive(Default)]
 struct Sessions {
-    last: u32,
     tags: Vec<(Vec<u8>, u32, u64)>,
 }
 
@@ -257,13 +256,15 @@ impl Table {
     pub fn tell(&mut self, box_name: &str, run: RunId, event: Event, tag: &[u8], away: bool, delay: Duration, per_box: usize, now: Now) {
         match event {
             Event::Waiting(kind) => {
-                let Some(session) = self.number(run, tag) else { return };
-                if self.open.iter().any(|open| open.run == run && open.session == session) {
+                let known = self.known(run, tag);
+                if known.is_some_and(|session| self.open.iter().any(|open| open.run == run && open.session == session)) {
                     return;
                 }
                 if self.open.iter().filter(|open| open.box_name == box_name).count() >= per_box {
                     return;
                 }
+                // Numbered only as its notice opens, so a wait that opens none moves no number.
+                let Some(session) = known.or_else(|| self.number(run, tag, per_box)) else { return };
                 let due = if away { now.instant } else { now.instant.checked_add(delay).unwrap_or(now.instant) };
                 self.open.push(Open { box_name: box_name.to_string(), run, session, kind, id: Id::random(), since: now.secs, due });
             }
@@ -275,23 +276,21 @@ impl Table {
         }
     }
 
-    /// The number of `tag` in `run`, given now if it has none. None once numbers run out, or every
-    /// tag kept has a notice open.
-    fn number(&mut self, run: RunId, tag: &[u8]) -> Option<u32> {
-        if let Some(session) = self.known(run, tag) {
-            return Some(session);
-        }
+    /// A number for `tag`, which has none in `run`: the smallest no other tag kept for the run
+    /// holds. At most `keep` tags of a run are kept, so it is never more than `keep`; past that, the
+    /// one used longest ago that has no notice open gives its place up. None if every one has.
+    fn number(&mut self, run: RunId, tag: &[u8], keep: usize) -> Option<u32> {
         let open: Vec<u32> = self.open.iter().filter(|open| open.run == run).map(|open| open.session).collect();
         self.uses += 1;
         let uses = self.uses;
         let sessions = self.runs.entry(run).or_default();
-        if sessions.tags.len() >= TAGS_KEPT {
+        while sessions.tags.len() >= keep {
             let oldest = sessions.tags.iter().enumerate().filter(|(_, (_, session, _))| !open.contains(session)).min_by_key(|(_, (_, _, used))| *used).map(|(at, _)| at)?;
             sessions.tags.remove(oldest);
         }
-        sessions.last = sessions.last.checked_add(1)?;
-        sessions.tags.push((tag.to_vec(), sessions.last, uses));
-        Some(sessions.last)
+        let number = (1..).find(|number| !sessions.tags.iter().any(|(_, session, _)| session == number))?;
+        sessions.tags.push((tag.to_vec(), number, uses));
+        Some(number)
     }
 
     /// The number `tag` has in `run`, if it has one.
